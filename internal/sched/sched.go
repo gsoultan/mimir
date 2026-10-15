@@ -122,11 +122,26 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 			refs[r.buf]++
 		}
 		results[n] = r
+		// The targets the kernel also wrote follow its result in r.buf.
+		for i, s := range w.stores {
+			v := backend.Contiguous(s.n.Shape)
+			v.Offset = (i + 1) * n.Size()
+			results[s.n] = result{r.buf, v}
+			refs[r.buf]++
+		}
 		for _, in := range w.deps {
 			release(in)
 		}
 	}
 
+	for _, t := range targets {
+		if _, ok := results[t]; !ok && !t.Realized() {
+			for buf := range refs {
+				m.release(buf)
+			}
+			return fmt.Errorf("sched: no kernel computed a %s target: %w", t.Op, backend.ErrInternal)
+		}
+	}
 	for _, t := range targets {
 		if t.Realized() {
 			continue
@@ -178,6 +193,14 @@ func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result) (r
 	if err := ctx.Err(); err != nil {
 		return result{}, nil, err
 	}
+	if w.swap {
+		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
+		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
+			ins[0].view.Permute(n.Attrs.Axes), ins[1].view.Permute(n.Attrs.Axes),
+		}}
+		buf, err := run(ctx, m, k, ins[0].buf, ins[1].buf)
+		return result{buf, backend.Contiguous(n.Shape)}, buf, err
+	}
 	switch n.Op {
 	case backend.OpLoad:
 		return result{}, nil, fmt.Errorf("sched: load without data: %w", backend.ErrInternal)
@@ -203,6 +226,9 @@ func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result) (r
 		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog}
 	case w.prog != nil:
 		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: w.prog}
+		for _, s := range w.stores {
+			k.Attrs.Stores = append(k.Attrs.Stores, s.at)
+		}
 	}
 	bufs := make([]backend.Buffer, len(ins))
 	for i, in := range ins {
@@ -215,7 +241,7 @@ func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result) (r
 // run takes the output of k from m and executes it. On error the output
 // goes back to m and nil is returned.
 func run(ctx context.Context, m *pool, k *backend.Kernel, ins ...backend.Buffer) (backend.Buffer, error) {
-	n, ok := backend.NumElements(k.Shape)
+	n, ok := k.OutputLen()
 	if !ok {
 		return nil, fmt.Errorf("sched: %s: shape %v: %w", k.Op, k.Shape, backend.ErrShape)
 	}

@@ -194,11 +194,19 @@ func TestFusedProgramsMatchReference(t *testing.T) {
 			out = backend.Int32
 		}
 		prog := randomProgram(rng, dtypes, 6+trial, out)
+		// Store up to two earlier values of the output's dtype as well.
+		var stores []int
+		for j := len(prog) - 2; j >= 0 && len(stores) < 2; j-- {
+			if prog[j].DType == out && rng.IntN(3) == 0 {
+				stores = append(stores, j)
+			}
+		}
 
-		want := make([]refScalar, size)
+		// want holds the result, then each stored value.
+		want := make([]refScalar, size*(1+len(stores)))
 		vals := make([]refScalar, len(prog))
 		inputs := make([]refScalar, len(data))
-		for e := range want {
+		for e := range size {
 			for i := range data {
 				inputs[i] = data[i][e]
 			}
@@ -206,10 +214,13 @@ func TestFusedProgramsMatchReference(t *testing.T) {
 				vals[j] = refEval(instr, prog, vals, inputs)
 			}
 			want[e] = vals[len(prog)-1]
+			for i, j := range stores {
+				want[(i+1)*size+e] = vals[j]
+			}
 		}
 		for _, workers := range []int{1, 3} {
-			name := fmt.Sprintf("trial %d, %v, %d workers", trial, shape, workers)
-			k := &backend.Kernel{Op: backend.OpFused, DType: out, Shape: shape, In: in, Attrs: backend.Attrs{Program: prog}}
+			name := fmt.Sprintf("trial %d, %v, %d workers, stores %v", trial, shape, workers, stores)
+			k := &backend.Kernel{Op: backend.OpFused, DType: out, Shape: shape, In: in, Attrs: backend.Attrs{Program: prog, Stores: stores}}
 			if out == backend.Float32 {
 				got := runOn[float32](t, workers, k, bufs...)
 				for e, w := range want {
@@ -244,6 +255,26 @@ func TestFusedProgramRejectsMalformedInstructions(t *testing.T) {
 		if _, err := run[float32](t, k, f32buf(1, 2)); err == nil {
 			t.Errorf("%s: no error", name)
 		}
+	}
+	neg := backend.Instr{Op: backend.OpNeg, DType: backend.Float32, Args: []int{0}}
+	cast := backend.Instr{Op: backend.OpCast, DType: backend.Int32, Args: []int{0}}
+	for name, c := range map[string]struct {
+		prog   []backend.Instr
+		stores []int
+	}{
+		"store of the result": {[]backend.Instr{load, neg}, []int{1}},
+		"store out of range":  {[]backend.Instr{load, neg}, []int{-1}},
+		"store twice":         {[]backend.Instr{load, neg, neg}, []int{1, 1}},
+		"store dtype":         {[]backend.Instr{load, cast, neg}, []int{1}},
+	} {
+		k := &backend.Kernel{Op: backend.OpFused, DType: backend.Float32, Shape: []int{2}, In: []backend.View{backend.Contiguous([]int{2})}, Attrs: backend.Attrs{Program: c.prog, Stores: c.stores}}
+		if _, err := run[float32](t, k, f32buf(1, 2)); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+	k := &backend.Kernel{Op: backend.OpNeg, DType: backend.Float32, Shape: []int{2}, In: []backend.View{backend.Contiguous([]int{2})}, Attrs: backend.Attrs{Stores: []int{0}}}
+	if _, err := run[float32](t, k, f32buf(1, 2)); err == nil {
+		t.Error("stores on a single op: no error")
 	}
 }
 
