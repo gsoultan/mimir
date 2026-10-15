@@ -3,6 +3,7 @@ package sched
 import (
 	"slices"
 
+	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
@@ -30,7 +31,7 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 	taken := map[*graph.Storage]bool{}
 	for i, t := range targets {
 		d := dsts[i]
-		if !candidate(t, d) || into[t] != nil || taken[d.Mem] {
+		if !candidate(t, d, p.be) || into[t] != nil || taken[d.Mem] {
 			continue
 		}
 		writer := t
@@ -48,22 +49,22 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 	return into
 }
 
-// candidate reports whether the target t could be computed into the
+// candidate reports whether the target t could be computed on be into the
 // memory of its destination d, as far as the two alone tell: d is
-// realized and not stale, with t's dtype and shape, in a buffer of its
-// own, and t is not computed yet.
-func candidate(t, d *graph.Node) bool {
-	return d != nil && d.Realized() && !d.Stale() && !t.Realized() &&
+// realized on be and not stale, with t's dtype and shape, in a buffer of
+// its own, and t is not computed yet.
+func candidate(t, d *graph.Node, be backend.Backend) bool {
+	return d != nil && d.Realized() && !d.Stale() && d.Mem.Dev == be && !t.Realized() &&
 		t.DType == d.DType && slices.Equal(t.Shape, d.Shape) && ownBuffer(d)
 }
 
 // candidates returns the storages of the destinations that targets could
 // be computed into, which the plan avoids reading after writing. dsts is
 // nil or holds the destination of each target, or nil.
-func candidates(targets, dsts []*graph.Node) map[*graph.Storage]bool {
+func candidates(be backend.Backend, targets, dsts []*graph.Node) map[*graph.Storage]bool {
 	mems := map[*graph.Storage]bool{}
 	for i, t := range targets {
-		if dsts != nil && candidate(t, dsts[i]) {
+		if dsts != nil && candidate(t, dsts[i], be) {
 			mems[dsts[i].Mem] = true
 		}
 	}

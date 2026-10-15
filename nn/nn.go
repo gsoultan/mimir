@@ -74,6 +74,16 @@ func NamedParams(m Module) iter.Seq2[string, *tensor.Param] {
 	}
 }
 
+// To moves the parameters and buffers of m, and their gradients, to d.
+func To(m Module, d tensor.Device) error {
+	for name, p := range NamedParams(m) {
+		if err := p.To(d); err != nil {
+			return fmt.Errorf("nn: move %s to %v: %w", name, d, err)
+		}
+	}
+	return nil
+}
+
 // trainer is a module whose behavior differs between training and
 // inference.
 type trainer interface {

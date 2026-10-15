@@ -23,6 +23,9 @@ var (
 	ErrIndex = errors.New("index out of range")
 	// ErrDivideByZero reports integer division or modulo by zero.
 	ErrDivideByZero = errors.New("integer divide by zero")
+	// ErrDevice reports tensors on different devices combined in one
+	// operation.
+	ErrDevice = errors.New("tensors on different devices")
 	// ErrOutOfMemory reports an allocation the device cannot satisfy.
 	ErrOutOfMemory = errors.New("out of memory")
 	// ErrInternal reports a defect inside mimir, such as a recovered panic

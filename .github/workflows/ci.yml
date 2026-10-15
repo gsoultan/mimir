@@ -41,6 +41,40 @@ jobs:
         env:
           MIMIR_EAGER: '1'
 
+  metal-kernels:
+    name: Metal kernels on the CPU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -count=1 -run Kernels ./backend/metal
+        env:
+          MIMIR_EMULATE: '1'
+
+  gpu:
+    name: GPU (Metal on Apple silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: devices
+        run: go run ./tools/devices
+      - name: kernels on the GPU
+        run: go test -count=1 -v -run Kernels ./backend/metal
+      - name: every test on the GPU
+        run: |
+          if go run ./tools/devices | grep -q metal; then
+            MIMIR_DEVICE=gpu go test -count=1 ./...
+          else
+            echo "::warning::this runner has no Metal device"
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:

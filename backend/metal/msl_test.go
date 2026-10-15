@@ -20,7 +20,8 @@ import (
 	"github.com/gsoultan/mimir/backend/cpu"
 )
 
-// The tests in this file run the generated kernels on the CPU: a C++
+// With MIMIR_EMULATE=1, the tests in this file run the generated kernels
+// on the CPU too: a C++
 // compiler builds each kernel's source against shim, a header that
 // stands in for metal_stdlib, and a driver runs its threadgroups one at a
 // time, the threads of each in turn or, when they synchronize, at once.
@@ -123,11 +124,11 @@ var (
 	emuOnce sync.Once
 )
 
-// newEmulator returns the emulator, or nil if there is no clang++ or the
-// tests are short.
+// newEmulator returns the emulator, or nil unless MIMIR_EMULATE=1 and
+// there is a clang++.
 func newEmulator(t *testing.T) *emulator {
 	t.Helper()
-	if testing.Short() {
+	if os.Getenv("MIMIR_EMULATE") != "1" {
 		return nil
 	}
 	emuOnce.Do(func() {

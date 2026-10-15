@@ -424,12 +424,12 @@ func (g *gen) random(n int) (*launch, error) {
 	g.line("}")
 	g.line("int lane = i %% 4;")
 	if g.k.Op == backend.OpRandUniform {
-		g.line("o0[i] = float(w[lane] >> 8) * 0x1p-24f;")
+		g.line("o0[i] = float(w[lane] >> 8) * 5.9604644775390625e-8f;")
 		return g.perElement(n)
 	}
 	g.line("int pair = lane & ~1;")
-	g.line("float u1 = float((w[pair] >> 8) + 1u) * 0x1p-24f;")
-	g.line("float u2 = float(w[pair + 1] >> 8) * 0x1p-24f;")
+	g.line("float u1 = float((w[pair] >> 8) + 1u) * 5.9604644775390625e-8f;")
+	g.line("float u2 = float(w[pair + 1] >> 8) * 5.9604644775390625e-8f;")
 	g.line("float r = sqrt(-2.0f * log(u1));")
 	g.line("float theta = 6.2831853071795864769f * u2;")
 	g.line("o0[i] = (lane & 1) == 0 ? r * cos(theta) : r * sin(theta);")
