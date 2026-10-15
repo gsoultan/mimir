@@ -267,7 +267,8 @@ func TestSumsOfProductsOverBatchAxesRunAsOneMatMul(t *testing.T) {
 	}{
 		{"batch sum", sum(product, 0), sum(must(graph.MatMul(x, w)), 0), []backend.Op{backend.OpMatMul}},
 		{"with an epilogue", biased(sum(product, 0)), biased(sum(must(graph.MatMul(x, w)), 0)), []backend.Op{backend.OpMatMul}},
-		{"matrix axis", sum(product, 2), sum(must(graph.MatMul(x, w)), 2), []backend.Op{backend.OpMatMul, backend.OpReduceSum}},
+		{"column axis", sum(product, 2), sum(must(graph.MatMul(x, w)), 2), []backend.Op{backend.OpMatMul, backend.OpReduceSum}},
+		{"row axis", sum(product, 1), sum(must(graph.MatMul(x, w)), 1), []backend.Op{backend.OpMatMul, backend.OpReduceSum}},
 	}
 	for _, tt := range tests {
 		want := floats(t, be, tt.separate)
@@ -281,6 +282,44 @@ func TestSumsOfProductsOverBatchAxesRunAsOneMatMul(t *testing.T) {
 				t.Fatalf("%s: element %d = %v, want %v", tt.name, i, got[i], want[i])
 			}
 		}
+	}
+}
+
+func TestProductsReadElsewhereAreComputedOnce(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4, 30, 20}, 1)
+	w := realized(t, be, []int{4, 20, 25}, 2)
+	p := must(graph.MatMul(x, w))
+	s := must(graph.Reduce(backend.OpReduceSum, p, []int{0}))
+	be.ops = nil
+	if err := Realize(t.Context(), be, p, s); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpMatMul, backend.OpReduceSum}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+}
+
+func TestAccumulatingASumOfProductsGoesInPlace(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4, 30, 20}, 1)
+	w := realized(t, be, []int{4, 20, 25}, 2)
+	old := realized(t, be, []int{1, 30, 25}, 3)
+	sum := must(graph.Reduce(backend.OpReduceSum, must(graph.MatMul(x, w)), []int{0}))
+	want := floats(t, be, must(graph.Binary(backend.OpAdd, old, sum)))
+	sum = must(graph.Reduce(backend.OpReduceSum, must(graph.MatMul(x, w)), []int{0}))
+	next := must(graph.Binary(backend.OpAdd, old, sum))
+	buf := old.Buf()
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{old}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A gradient accumulated over a batch, as a convolution's is, is added
+	// to its old value in that value's memory.
+	if next.Buf() != buf {
+		t.Error("the sum was not written over the value it adds to")
+	}
+	if got := floats(t, be, next); !slices.Equal(got, want) {
+		t.Errorf("accumulated sum = %v, want %v", got, want)
 	}
 }
 
@@ -401,7 +440,7 @@ func TestRealizeIntoWritesOverTheDestinations(t *testing.T) {
 	xbuf, mbuf := x.Buf(), m.Buf()
 	allocs := be.allocs
 	be.ops = nil
-	if err := RealizeInto(t.Context(), be, []*graph.Node{nextX, nextM}, []*graph.Node{x, m}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{nextX, nextM}, []*graph.Node{x, m}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if want := []backend.Op{backend.OpFused}; !slices.Equal(be.ops, want) {
@@ -438,7 +477,7 @@ func TestRealizeIntoKeepsValuesReadAfterTheWrite(t *testing.T) {
 	// The product reads x after y is computed, so y cannot go over x.
 	p := must(graph.MatMul(y, x))
 	xbuf := x.Buf()
-	if err := RealizeInto(t.Context(), be, []*graph.Node{y, p}, []*graph.Node{x, nil}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{y, p}, []*graph.Node{x, nil}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if y.Buf() == xbuf {
@@ -471,7 +510,7 @@ func TestRealizeIntoLeavesSharedMemoryAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	y := must(graph.Unary(backend.OpNeg, x))
-	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, view))}, []*graph.Node{view}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, view))}, []*graph.Node{view}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !x.Stale() {
@@ -483,7 +522,7 @@ func TestRealizeIntoLeavesSharedMemoryAlone(t *testing.T) {
 
 	z := realized(t, be, []int{5}, 2)
 	same := must(graph.Reshape(z, []int{5}))
-	if err := RealizeInto(t.Context(), be, []*graph.Node{same}, []*graph.Node{z}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{same}, []*graph.Node{z}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if z.Stale() || same.Stale() {
@@ -497,7 +536,7 @@ func TestRealizeIntoStopsOnlyBeforeWriting(t *testing.T) {
 	y := must(graph.Unary(backend.OpNeg, x))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if err := RealizeInto(ctx, be, []*graph.Node{y}, []*graph.Node{x}); !errors.Is(err, context.Canceled) {
+	if err := RealizeInto(ctx, be, []*graph.Node{y}, []*graph.Node{x}, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
 	if x.Stale() || y.Realized() {
@@ -510,7 +549,7 @@ func TestRealizeIntoLeavesStaleDestinationsAlone(t *testing.T) {
 	x := realized(t, be, []int{4}, 1)
 	want := floats(t, be, x)
 	next := must(graph.Unary(backend.OpNeg, x))
-	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{x}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{x}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if next.Mem != x.Mem {
@@ -519,7 +558,7 @@ func TestRealizeIntoLeavesStaleDestinationsAlone(t *testing.T) {
 	// x is stale and its memory holds next: passing x again changes
 	// nothing.
 	other := realized(t, be, []int{4}, 2)
-	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, other))}, []*graph.Node{x}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, other))}, []*graph.Node{x}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if next.Stale() {
@@ -553,7 +592,7 @@ func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
 	x := realized(t, be, []int{3}, 1)
 	xs, xbuf := floats(t, be, x), x.Buf()
 	view, y := must(graph.Reshape(x, []int{3, 1})), neg(x)
-	if err := RealizeInto(t.Context(), be, []*graph.Node{view, y}, []*graph.Node{nil, x}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{view, y}, []*graph.Node{nil, x}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if y.Buf() == xbuf {
@@ -566,7 +605,7 @@ func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
 	a, b := realized(t, be, []int{3}, 2), realized(t, be, []int{3}, 3)
 	as, bs, abuf := floats(t, be, a), floats(t, be, b), a.Buf()
 	na, nb := neg(a), neg(b)
-	if err := RealizeInto(t.Context(), be, []*graph.Node{na, nb}, []*graph.Node{a, a}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{na, nb}, []*graph.Node{a, a}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if na.Buf() == abuf && nb.Buf() == abuf {
@@ -586,7 +625,7 @@ func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
 		want := floats(t, be, neg(view(x)))
 		xbuf := x.Buf()
 		y := neg(view(x))
-		if err := RealizeInto(t.Context(), be, []*graph.Node{y}, []*graph.Node{x}); err != nil {
+		if err := RealizeInto(t.Context(), be, []*graph.Node{y}, []*graph.Node{x}, nil); err != nil {
 			t.Fatal(err)
 		}
 		if y.Buf() == xbuf {
@@ -603,7 +642,7 @@ func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
 	}
 	bigs, bigbuf := floats(t, be, big), big.Buf()
 	z := neg(realized(t, be, []int{4}, 6))
-	if err := RealizeInto(t.Context(), be, []*graph.Node{z}, []*graph.Node{part}); err != nil {
+	if err := RealizeInto(t.Context(), be, []*graph.Node{z}, []*graph.Node{part}, nil); err != nil {
 		t.Fatal(err)
 	}
 	raw := make([]byte, 4*8)
@@ -637,7 +676,7 @@ func TestRealizeIntoFinishesOnceItStartsWriting(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	be.ops = nil
-	if err := RealizeInto(ctx, &cancelling{be, cancel}, []*graph.Node{nx, p}, []*graph.Node{x, nil}); err != nil {
+	if err := RealizeInto(ctx, &cancelling{be, cancel}, []*graph.Node{nx, p}, []*graph.Node{x, nil}, nil); err != nil {
 		t.Fatalf("cancelled after the first kernel wrote over its destination: %v", err)
 	}
 	if len(be.ops) != 2 {
@@ -665,11 +704,97 @@ func TestReleaseLeavesSharedMemoryAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := floats(t, be, x)
-	Release(be, x)
+	Release(be, x, nil)
 	if x.Stale() {
 		t.Fatal("released memory that a view still reads")
 	}
 	if got := floats(t, be, view); !slices.Equal(got, want) {
 		t.Errorf("view after Release = %v, want %v", got, want)
+	}
+}
+
+func TestRealizeIntoComputesKeptNodesFirst(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	neg := func(n *graph.Node) *graph.Node { return must(graph.Unary(backend.OpNeg, n)) }
+	twice := func(n *graph.Node) *graph.Node { return must(graph.Binary(backend.OpAdd, n, n)) }
+	x, y := realized(t, be, []int{6}, 1), realized(t, be, []int{6}, 2)
+	xs, ys := floats(t, be, x), floats(t, be, y)
+	buf := x.Buf()
+	next := twice(x)
+	// Of these, only reader loses its input: the update stays readable.
+	reader, other, update := neg(x), neg(y), neg(next)
+	keep := func() []*graph.Node { return []*graph.Node{reader, other, reader, update} }
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{x}, keep); err != nil {
+		t.Fatal(err)
+	}
+	if next.Buf() != buf {
+		t.Error("the update was not written over its destination")
+	}
+	if !reader.Realized() || other.Realized() || update.Realized() {
+		t.Errorf("kept nodes realized: %v reading the destination, %v reading another value, %v reading the update; want true, false, false",
+			reader.Realized(), other.Realized(), update.Realized())
+	}
+	for i, v := range floats(t, be, update) {
+		if v != -2*xs[i] {
+			t.Fatalf("kept node reading the update: element %d = %v, want %v", i, v, -2*xs[i])
+		}
+	}
+	for i, v := range floats(t, be, reader) {
+		if v != -xs[i] {
+			t.Fatalf("kept node element %d = %v, want %v", i, v, -xs[i])
+		}
+	}
+	for i, v := range floats(t, be, other) {
+		if v != -ys[i] {
+			t.Fatalf("other kept node element %d = %v, want %v", i, v, -ys[i])
+		}
+	}
+
+	// A kept node that fails to compute is left to go stale, without
+	// failing the schedule or the other kept nodes.
+	z := realized(t, be, []int{6}, 3)
+	zs := floats(t, be, z)
+	failing, reader := must(graph.Unary(backend.OpExp2, z)), neg(z)
+	keep = func() []*graph.Node { return []*graph.Node{failing, reader} }
+	be.failOn = backend.OpExp2
+	err := RealizeInto(t.Context(), be, []*graph.Node{twice(z)}, []*graph.Node{z}, keep)
+	be.failOn = 0
+	if err != nil {
+		t.Fatalf("a failing kept node failed the schedule: %v", err)
+	}
+	if err := Realize(t.Context(), be, failing); !errors.Is(err, graph.ErrOverwritten) {
+		t.Errorf("failed kept node: got %v, want ErrOverwritten", err)
+	}
+	for i, v := range floats(t, be, reader) {
+		if v != -zs[i] {
+			t.Fatalf("kept node beside a failing one: element %d = %v, want %v", i, v, -zs[i])
+		}
+	}
+
+	// So is one that can no longer be computed.
+	broken := must(graph.Binary(backend.OpAdd, failing, next))
+	keep = func() []*graph.Node { return []*graph.Node{broken} }
+	if err := RealizeInto(t.Context(), be, []*graph.Node{twice(next)}, []*graph.Node{next}, keep); err != nil {
+		t.Errorf("a stale kept node failed the schedule: %v", err)
+	}
+}
+
+func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4}, 1)
+	want := floats(t, be, x)
+	reader := must(graph.Unary(backend.OpNeg, must(graph.Reshape(x, []int{2, 2}))))
+	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
+	if x.Stale() {
+		t.Fatal("released memory that a kept node reads")
+	}
+	for i, v := range floats(t, be, reader) {
+		if v != -want[i] {
+			t.Fatalf("kept node element %d = %v, want %v", i, v, -want[i])
+		}
+	}
+	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
+	if !x.Stale() {
+		t.Error("kept memory once nothing kept reads it")
 	}
 }

@@ -98,13 +98,15 @@ const (
 // epilogue rewrites each finished part of out.
 //
 // A batch whose items share a, and whose a is the larger operand, is one
-// wide product; see sgemmWide. Small outputs that sum many products sum
-// groups of them in parallel; see sgemmGrouped. Otherwise a batch with an
-// output for every worker computes its outputs in parallel, and smaller
-// batches compute one output at a time with every worker; see
-// sgemmShared. The order in which each output adds its products depends
-// only on the shapes, so the result does not depend on the number of
-// workers.
+// wide product when a block of its columns has work for every worker; see
+// sgemmWide. Outputs that sum several products, and are small enough to
+// keep partial sums of, sum groups of them in parallel; see sgemmGrouped.
+// Otherwise a batch with an output for every worker computes its outputs
+// in parallel, and smaller batches compute one output at a time with every
+// worker; see sgemmShared. The order in which each output adds its
+// products depends only on the shapes, and splitting an output's rows or
+// columns between workers changes no element's sum, so the result does
+// not depend on the number of workers.
 func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, sums int, epi *evaluator) error {
 	outputs := len(out) / max(m*n, 1)
 	if sums == 0 || m*n == 0 {
@@ -117,8 +119,12 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 	if (groups-1)*len(out) > maxPartials {
 		groups = 1
 	}
+	wide := sums == 1 && outputs > 1 && m >= n && !slices.ContainsFunc(offA, func(off int) bool { return off != offA[0] })
+	// cols counts the columns of a block of the wide product that are not
+	// padding: each item's columns start a panel.
+	cols := min(g.nc, n*max(1, g.nc/roundUp(n, g.nr)), outputs*n)
 	switch {
-	case sums == 1 && outputs > 1 && m >= n && !slices.ContainsFunc(offA, func(off int) bool { return off != offA[0] }):
+	case wide && 2*m*cols*k >= be.workers*minUnitFlops:
 		a.off = offA[0]
 		return be.sgemmWide(ctx, g, out, a, b, offB, m, n, k, epi)
 	case groups > 1:
@@ -149,7 +155,8 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 // sgemmGrouped computes out like sgemm, splitting the sums products of
 // each output into groups of consecutive ones. It sums the groups of every
 // output in parallel, the first into out and the others into partial
-// sums, and then adds the partial sums to out in order.
+// sums, and then adds the partial sums to out in order. When there are
+// fewer groups than workers it splits each group's output too.
 func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, sums, groups int, epi *evaluator) error {
 	size := m * n
 	outputs := len(out) / size
@@ -157,18 +164,22 @@ func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float3
 	defer gemmWorkspaces.Put(shared)
 	shared.partials = grow(shared.partials, (groups-1)*len(out))
 	partials := shared.partials
-	flops := max(2*size*k*(sums/groups), 1)
-	err := be.parallelFor(ctx, outputs*groups, max(1, minUnitFlops/flops), func(lo, hi int) error {
+	depth := k * (sums / groups) // of a group's products, at least
+	p := planGEMM(g, m, n, depth, (be.workers+outputs*groups-1)/(outputs*groups))
+	parts := p.mParts * p.nParts
+	flops := max(2*size*depth/parts, 1)
+	err := be.parallelFor(ctx, outputs*groups*parts, max(1, minUnitFlops/flops), func(lo, hi int) error {
 		ws := gemmWorkspaces.Get().(*gemmWorkspace)
 		defer gemmWorkspaces.Put(ws)
 		for u := lo; u < hi; u++ {
-			o, j := u/groups, u%groups
+			o, j, part := u/parts/groups, u/parts%groups, u%parts
 			t0, t1 := o*sums+j*sums/groups, o*sums+(j+1)*sums/groups
+			i0, j0 := part/p.nParts*p.mStep, part%p.nParts*p.nStep
 			c := out[o*size:][:size]
 			if j > 0 {
 				c = partials[(j-1)*len(out)+o*size:][:size]
 			}
-			gemmBlock(g, ws, a, offA[t0:t1], b, offB[t0:t1], k, c, n, 0, m, 0, n)
+			gemmBlock(g, ws, a, offA[t0:t1], b, offB[t0:t1], k, c, n, i0, min(i0+p.mStep, m), j0, min(j0+p.nStep, n))
 		}
 		return nil
 	})
@@ -260,11 +271,8 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a operand, of
 // product a·[b[0] b[1] ...], whose columns it computes like sgemmShared:
 // a block of A, packed once, then serves every item instead of being
 // packed again for each. Each item's columns start a panel of their own.
+// k must be positive.
 func (be *Backend) sgemmWide(ctx context.Context, g *gemmKernel, out []float32, a, b operand, offB []int, m, n, k int, epi *evaluator) error {
-	if k == 0 {
-		clear(out)
-		return epi.apply(0, len(out))
-	}
 	per := (n + g.nr - 1) / g.nr // panels of each item
 	total := len(offB) * per
 	block := max(1, g.nc/g.nr) // panels of a block of B

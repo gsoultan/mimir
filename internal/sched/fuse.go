@@ -37,7 +37,10 @@ import (
 // reshape), runs as that product's epilogue instead: the GEMM applies the
 // program to each part of its output while the part is in cache, such as
 // adding a bias, a residual or applying an activation, and the product
-// never gets a buffer of its own.
+// never gets a buffer of its own. A group that may be written over a
+// value it reads, as a gradient accumulated into is (see RealizeInto),
+// keeps the product out of its kernel, which would write the product
+// over that value before reading it.
 
 // plan lists the kernels that compute a schedule's targets.
 type plan struct {
@@ -63,8 +66,9 @@ type store struct {
 }
 
 // newPlan plans the kernels for the unrealized nodes in order, which lists
-// every node before its consumers.
-func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
+// every node before its consumers. over holds the storages that targets
+// may be written over; see candidates.
+func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph.Storage]bool) *plan {
 	users := make(map[*graph.Node][]*graph.Node, len(order))
 	for _, n := range order {
 		for i, in := range n.Inputs {
@@ -115,10 +119,17 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
 					p.storer[x] = n
 				}
 			}
-			for i, x := range ins {
-				if gemm := productOf(x, private); w.stores == nil && gemm != nil && gemm.DType == n.DType {
-					w = epilogue(prog, ins, i, gemm)
-					break
+			// The group may be written over a value it loads elementwise;
+			// see overwrites.
+			overwritable := func(x *graph.Node) bool {
+				return x.Realized() && over[x.Mem] && ownBuffer(x) && slices.Equal(x.Shape, n.Shape)
+			}
+			if w.stores == nil && !slices.ContainsFunc(ins, overwritable) {
+				for i, x := range ins {
+					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType {
+						w = epilogue(prog, ins, i, gemm)
+						break
+					}
 				}
 			}
 			if w.gemm == nil && w.stores == nil && len(prog) == len(ins)+1 {
