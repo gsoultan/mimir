@@ -156,3 +156,60 @@ func TestSchedulesHoldAfterTheirLastEpoch(t *testing.T) {
 		t.Errorf("warmup after its last epoch = %v, want 1", got)
 	}
 }
+
+func TestStepOverwritesTheOldValues(t *testing.T) {
+	p := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	opt := optim.Adam([]*tensor.Param{p}, optim.LR(0.5))
+	step := func() {
+		t.Helper()
+		if err := p.Value().Sum().Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		opt.ZeroGrad()
+	}
+	step()
+	old := p.Value()
+	state, _ := opt.Snapshot()
+	step()
+	if _, err := old.Data[float32](t.Context()); !errors.Is(err, tensor.ErrOverwritten) {
+		t.Errorf("value from before a step: got %v, want ErrOverwritten", err)
+	}
+	for key, s := range state {
+		if _, err := s.Data[float32](t.Context()); !errors.Is(err, tensor.ErrOverwritten) {
+			t.Errorf("state %s from before a step: got %v, want ErrOverwritten", key, err)
+		}
+	}
+	// Two Adam steps of 0.5 on a constant gradient move each value by 1.
+	if got, err := p.Value().Data[float32](t.Context()); err != nil || math.Abs(float64(got[0])) > 1e-5 || math.Abs(float64(got[1]-1)) > 1e-5 {
+		t.Errorf("value after two steps = %v, %v; want [0 1]", got, err)
+	}
+}
+
+func TestRulesMayKeepTheGradientAsState(t *testing.T) {
+	p := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	// The first step keeps g as it is; later steps add to it.
+	keep := func(lr float64, step int, p, g *tensor.Tensor, s optim.State) (*tensor.Tensor, optim.State) {
+		sum := g
+		if old := s["sum"]; old != nil {
+			sum = old.Add(g)
+		}
+		return p.Sub(sum.Mul(tensor.Scalar(float32(lr)))), optim.State{"sum": sum}
+	}
+	opt := optim.New([]*tensor.Param{p}, 0.5, keep)
+	for range 2 {
+		if err := p.Value().Sum().Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		opt.ZeroGrad()
+	}
+	// Steps of 0.5·1 and then 0.5·2.
+	if got, err := p.Value().Data[float32](t.Context()); err != nil || got[0] != -0.5 || got[1] != 0.5 {
+		t.Errorf("value after two steps = %v, %v; want [-0.5 0.5]", got, err)
+	}
+}

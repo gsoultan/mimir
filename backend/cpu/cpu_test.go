@@ -15,18 +15,31 @@ func i32buf(v ...int32) backend.Buffer   { return &buffer[int32]{data: slices.Cl
 
 func run[T elem](t *testing.T, k *backend.Kernel, ins ...backend.Buffer) ([]T, error) {
 	t.Helper()
+	return runWith[T](t, New(), k, ins...)
+}
+
+// runWith runs k on b and returns its outputs end to end, the result
+// first and then each stored value.
+func runWith[T elem](t *testing.T, b *Backend, k *backend.Kernel, ins ...backend.Buffer) ([]T, error) {
+	t.Helper()
 	n, _ := backend.NumElements(k.Shape)
-	b := New()
-	out, err := b.Alloc(k.DType, n)
-	if err != nil {
-		t.Fatal(err)
+	outs := make([]backend.Buffer, 1+len(k.Attrs.Stores))
+	for i := range outs {
+		var err error
+		if outs[i], err = b.Alloc(k.DType, n); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := b.Run(t.Context(), k, out, ins); err != nil {
+	if err := b.Run(t.Context(), k, outs, ins); err != nil {
 		return nil, err
 	}
-	got, err := data[T](out)
-	if err != nil {
-		t.Fatal(err)
+	var got []T
+	for _, out := range outs {
+		d, err := data[T](out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, d...)
 	}
 	return got, nil
 }
@@ -155,6 +168,64 @@ func TestMatMulMatchesNaiveOnStridedInputs(t *testing.T) {
 				if g := got[bi*m*n+i*n+j]; g != want {
 					t.Fatalf("[%d,%d,%d] = %v, want %v", bi, i, j, g, want)
 				}
+			}
+		}
+	}
+}
+
+func TestMatMulSumsOverBatchAxes(t *testing.T) {
+	const m, kk, n = 5, 7, 4
+	x := make([]float32, 2*3*m*kk)
+	y := make([]float32, 2*3*kk*n)
+	for i := range x {
+		x[i] = float32(i%11) - 5
+	}
+	for i := range y {
+		y[i] = float32(i%7) - 3
+	}
+	xi, yi := make([]int32, len(x)), make([]int32, len(y))
+	for i, v := range x {
+		xi[i] = int32(v)
+	}
+	for i, v := range y {
+		yi[i] = int32(v)
+	}
+	for _, axes := range [][]int{{0}, {1}, {0, 1}} {
+		shape := []int{2, 3, m, n}
+		for _, a := range axes {
+			shape[a] = 1
+		}
+		want := make([]float32, shape[0]*shape[1]*m*n)
+		for b0 := range 2 {
+			for b1 := range 3 {
+				o0, o1 := min(b0, shape[0]-1), min(b1, shape[1]-1)
+				out, item := want[(o0*shape[1]+o1)*m*n:], b0*3+b1
+				for i := range m {
+					for j := range n {
+						for p := range kk {
+							out[i*n+j] += x[(item*m+i)*kk+p] * y[(item*kk+p)*n+j]
+						}
+					}
+				}
+			}
+		}
+		k := &backend.Kernel{
+			Op: backend.OpMatMul, DType: backend.Float32, Shape: shape,
+			In:    []backend.View{backend.Contiguous([]int{2, 3, m, kk}), backend.Contiguous([]int{2, 3, kk, n})},
+			Attrs: backend.Attrs{Axes: axes},
+		}
+		got, err := run[float32](t, k, f32buf(x...), f32buf(y...))
+		if err != nil || !slices.Equal(got, want) {
+			t.Fatalf("float32 over axes %v: got %v, %v; want %v", axes, got, err, want)
+		}
+		k.DType = backend.Int32
+		goti, err := run[int32](t, k, i32buf(xi...), i32buf(yi...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, v := range goti {
+			if float32(v) != want[i] {
+				t.Fatalf("int32 over axes %v: element %d = %d, want %v", axes, i, v, want[i])
 			}
 		}
 	}
@@ -326,7 +397,7 @@ func TestStridedBinarySplitsLongRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Run(t.Context(), k, out, []backend.Buffer{f32buf(x...), f32buf(y...)}); err != nil {
+	if err := b.Run(t.Context(), k, []backend.Buffer{out}, []backend.Buffer{f32buf(x...), f32buf(y...)}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := data[float32](out)

@@ -50,16 +50,30 @@ const (
 	OpShrink  // Attrs.Ranges
 	OpFlip    // Attrs.Axes
 
-	// Contraction: [..., M, K] x [..., K, N] -> [..., M, N] with equal batch dims.
+	// Contraction: [..., M, K] x [..., K, N] -> [..., M, N] with equal batch
+	// dims. A kernel sums the products over the batch axes Attrs.Axes, which
+	// its output keeps with size 1.
 	OpMatMul
 
 	// Indexing along Attrs.Axis with Int32 indices.
 	OpGather     // out[m] = In[0][m with m[axis] = In[1][m]]
 	OpScatterAdd // out = In[0]; out[m with m[axis] = In[1][m]] += In[2][m]
 
+	// Sliding windows over the trailing len(Attrs.Kernel) dimensions, D,
+	// with Attrs.Stride, Attrs.Dilation and Attrs.Pads before and after
+	// each. Window position o and kernel offset k read input position
+	// i = o*stride - pad + k*dilation.
+	OpUnfold // [B..., D...] -> [B..., K..., O...]: element [b, k, o] is In[0][b, i], or Attrs.Value in the padding
+	OpFold   // [B..., K..., O...] -> [B..., D...]: sums element [b, k, o] into [b, i], dropping the padding
+
 	// OpContiguous copies a strided view into a contiguous buffer. The
 	// scheduler inserts it; it is not part of the public IR.
 	OpContiguous
+
+	// OpFused evaluates the elementwise program Attrs.Program over inputs
+	// read through views of the output's shape. The scheduler inserts it
+	// for chains of elementwise ops; it is not part of the public IR.
+	OpFused
 
 	numOps
 )
@@ -95,7 +109,10 @@ var opNames = [numOps]string{
 	OpMatMul:      "matmul",
 	OpGather:      "gather",
 	OpScatterAdd:  "scatter_add",
+	OpUnfold:      "unfold",
+	OpFold:        "fold",
 	OpContiguous:  "contiguous",
+	OpFused:       "fused",
 }
 
 func (o Op) String() string {
@@ -110,6 +127,10 @@ func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast }
 
 // IsBinary reports whether o takes two same-shaped inputs elementwise.
 func (o Op) IsBinary() bool { return o >= OpAdd && o <= OpMod }
+
+// IsElementwise reports whether o computes each output element from the
+// input elements at the same index, so that it can join a fused program.
+func (o Op) IsElementwise() bool { return o.IsUnary() || o.IsBinary() || o == OpWhere }
 
 // IsReduce reports whether o reduces over Attrs.Axes.
 func (o Op) IsReduce() bool { return o == OpReduceSum || o == OpReduceMax }

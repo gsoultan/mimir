@@ -14,6 +14,7 @@ import (
 	"github.com/gsoultan/mimir/io/safetensors"
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
+	"github.com/gsoultan/mimir/optim"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -209,6 +210,33 @@ func TestBatchNormRunningStatsUpdateOnBackward(t *testing.T) {
 	got := data(t, b.RunningMean.Value())
 	if math.Abs(float64(got[0])-0.38) > 1e-6 || math.Abs(float64(got[1])-3.8) > 1e-5 {
 		t.Errorf("running mean = %v, want [0.38 3.8]", got)
+	}
+}
+
+func TestBatchNormRunningStatsSurviveAStepBeforeBackward(t *testing.T) {
+	lin := nn.NewLinear(2, 2)
+	set(t, lin.Weight, tensor.FromSlice([]float32{1, 0, 0, 1}, 2, 2))
+	set(t, lin.Bias, tensor.Zeros(tensor.Float32, 2))
+	b := nn.NewBatchNorm1d(2)
+	x := tensor.FromSlice([]float32{1, 10, 3, 30}, 2, 2) // channel means 2 and 20
+	// A training pass that no Backward reaches leaves the statistics to be
+	// computed from the weights before the step below writes over them.
+	if err := b.Forward(lin.Forward(x)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	opt := optim.SGD(nn.Parameters(lin), optim.LR(0.5))
+	if err := lin.Forward(x).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := opt.Step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got := data(t, b.RunningMean.Value())
+	if math.Abs(float64(got[0])-0.2) > 1e-6 || math.Abs(float64(got[1])-2) > 1e-5 {
+		t.Errorf("running mean = %v, want [0.2 2]", got)
+	}
+	if err := nn.Save(t.Context(), new(bytes.Buffer), b); err != nil {
+		t.Error(err)
 	}
 }
 
