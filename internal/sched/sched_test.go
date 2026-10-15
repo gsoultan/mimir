@@ -127,6 +127,53 @@ func TestFailedRealizeFreesEverythingAndChangesNothing(t *testing.T) {
 	}
 }
 
+// deferring reports a kernel's error at the next Sync instead of from Run,
+// as a GPU backend does.
+type deferring struct {
+	*counting
+	failed error
+}
+
+func (d *deferring) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	if err := d.counting.Run(ctx, k, outs, ins); err != nil && d.failed == nil {
+		d.failed = err
+	}
+	return nil
+}
+
+func (d *deferring) Sync(context.Context) error {
+	err := d.failed
+	d.failed = nil
+	return err
+}
+
+// held returns the number of elements allocated and not in d's pool.
+func (d *deferring) held() int {
+	mu.Lock()
+	defer mu.Unlock()
+	return d.live - poolOf(d).pooledElements()
+}
+
+func TestRealizeWaitsForErrorsReportedAtSync(t *testing.T) {
+	be := &deferring{counting: &counting{Backend: cpu.New()}}
+	x := realized(t, be, []int{100}, 1)
+	y := must(graph.Unary(backend.OpExp2, x))
+	be.failOn = backend.OpExp2
+	if err := Realize(t.Context(), be, y); !errors.Is(err, backend.ErrIndex) {
+		t.Fatalf("got %v, want the kernel's error", err)
+	}
+	if y.Realized() {
+		t.Error("the target of a failed kernel was realized")
+	}
+	if held := be.held(); held != 100 {
+		t.Errorf("%d elements held after a failed realize, want x's 100", held)
+	}
+	be.failOn = 0
+	if err := Realize(t.Context(), be, must(graph.Unary(backend.OpNeg, x))); err != nil {
+		t.Errorf("the next realize reported %v", err)
+	}
+}
+
 func TestElementwiseChainsFuse(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	x := must(graph.Rand([]int{1000}, 1, false))
@@ -656,27 +703,29 @@ func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
 	}
 }
 
-// cancelling cancels a context when it runs its first kernel.
+// cancelling cancels a context, once it has one, when it runs a kernel.
 type cancelling struct {
 	*counting
 	cancel context.CancelFunc
 }
 
 func (c *cancelling) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
 	return c.counting.Run(ctx, k, outs, ins)
 }
 
 func TestRealizeIntoFinishesOnceItStartsWriting(t *testing.T) {
-	be := &counting{Backend: cpu.New()}
+	be := &cancelling{counting: &counting{Backend: cpu.New()}}
 	x, y := realized(t, be, []int{4, 4}, 1), realized(t, be, []int{4, 4}, 2)
 	xs, ys := floats(t, be, x), floats(t, be, y)
 	nx := must(graph.Unary(backend.OpNeg, x))
 	p := must(graph.MatMul(nx, y))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	be.ops = nil
-	if err := RealizeInto(ctx, &cancelling{be, cancel}, []*graph.Node{nx, p}, []*graph.Node{x, nil}, nil); err != nil {
+	be.ops, be.cancel = nil, cancel
+	if err := RealizeInto(ctx, be, []*graph.Node{nx, p}, []*graph.Node{x, nil}, nil); err != nil {
 		t.Fatalf("cancelled after the first kernel wrote over its destination: %v", err)
 	}
 	if len(be.ops) != 2 {
@@ -704,7 +753,7 @@ func TestReleaseLeavesSharedMemoryAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := floats(t, be, x)
-	Release(be, x, nil)
+	Release(x, nil)
 	if x.Stale() {
 		t.Fatal("released memory that a view still reads")
 	}
@@ -798,7 +847,7 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 	x := realized(t, be, []int{4}, 1)
 	want := floats(t, be, x)
 	reader := must(graph.Unary(backend.OpNeg, must(graph.Reshape(x, []int{2, 2}))))
-	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
+	Release(x, func() []*graph.Node { return []*graph.Node{reader} })
 	if x.Stale() {
 		t.Fatal("released memory that a kept node reads")
 	}
@@ -807,7 +856,7 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 			t.Fatalf("kept node element %d = %v, want %v", i, v, -want[i])
 		}
 	}
-	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
+	Release(x, func() []*graph.Node { return []*graph.Node{reader} })
 	if !x.Stale() {
 		t.Error("kept memory once nothing kept reads it")
 	}
@@ -818,7 +867,7 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, b))}, []*graph.Node{b}, nil); err != nil {
 		t.Fatal(err)
 	}
-	Release(be, a, func() []*graph.Node { return []*graph.Node{broken} })
+	Release(a, func() []*graph.Node { return []*graph.Node{broken} })
 	if !a.Stale() {
 		t.Error("kept memory that only a node reading a stale value reads")
 	}

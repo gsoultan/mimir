@@ -222,11 +222,11 @@ func keptMemory(keep []*graph.Node) map[*graph.Storage]bool {
 	return mems
 }
 
-// Release gives the memory of the realized node n to be's pool for later
-// schedules and makes n stale, if n is the only node realized into that
+// Release gives the memory of the realized node n to its device's pool for
+// later schedules and makes n stale, if n is the only node realized into that
 // memory and no node that keep lists, when it is not nil, reads it (see
 // RealizeInto). The caller must be done with n.
-func Release(be backend.Backend, n *graph.Node, keep func() []*graph.Node) {
+func Release(n *graph.Node, keep func() []*graph.Node) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !n.Realized() || n.Stale() || n.Mem.Refs != 1 {
@@ -237,7 +237,7 @@ func Release(be backend.Backend, n *graph.Node, keep func() []*graph.Node) {
 	}
 	n.Mem.Version++
 	n.Mem.Refs = 0
-	poolOf(be).release(n.Buf())
+	poolOf(n.Mem.Dev).release(n.Buf())
 }
 
 // Realized reports whether n holds its result. Unlike n.Realized, it is
@@ -248,14 +248,33 @@ func Realized(n *graph.Node) bool {
 	return n.Realized()
 }
 
-// Download realizes n and copies its elements into dst as row-major bytes.
-// len(dst) must equal the tensor's size in bytes.
+// Device returns the device that holds n's result, if n is realized, or
+// its inputs, or nil if n is computed from constants alone. Unlike n.Mem,
+// it is safe while other goroutines realize graphs that n is part of.
+func Device(n *graph.Node) backend.Backend {
+	mu.Lock()
+	defer mu.Unlock()
+	if n.Realized() {
+		return n.Mem.Dev
+	}
+	return n.Dev
+}
+
+// Download realizes n on be, unless it is realized, and copies its
+// elements into dst as row-major bytes. len(dst) must equal the tensor's
+// size in bytes.
 func Download(ctx context.Context, be backend.Backend, n *graph.Node, dst []byte) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if err := realize(ctx, be, []*graph.Node{n}, nil); err != nil {
 		return err
 	}
+	return download(ctx, n, dst)
+}
+
+// download copies the elements of the realized node n into dst.
+func download(ctx context.Context, n *graph.Node, dst []byte) error {
+	be := n.Mem.Dev
 	buf, v := n.Buf(), n.View
 	if !v.IsContiguous() || v.Offset != 0 || buf.Len() != n.Size() {
 		m := poolOf(be)
@@ -269,6 +288,24 @@ func Download(ctx context.Context, be backend.Backend, n *graph.Node, dst []byte
 	return be.Download(ctx, dst, buf)
 }
 
+// transfer copies the realized node n, which lives on another device, into
+// a new buffer from m.
+func transfer(ctx context.Context, m *pool, n *graph.Node) (backend.Buffer, error) {
+	data := make([]byte, n.Size()*n.DType.Size())
+	if err := download(ctx, n, data); err != nil {
+		return nil, err
+	}
+	buf, err := m.alloc(n.DType, n.Size())
+	if err != nil {
+		return nil, err
+	}
+	if err := m.be.Upload(ctx, buf, data); err != nil {
+		m.release(buf)
+		return nil, err
+	}
+	return buf, nil
+}
+
 // result is where a computed node's elements live.
 type result struct {
 	buf  backend.Buffer
@@ -276,7 +313,7 @@ type result struct {
 	mem  *graph.Storage // the storage of buf, if realized nodes read it
 }
 
-func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) error {
+func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) (err error) {
 	generation++
 	order, err := topoSort(targets)
 	if err != nil {
@@ -288,11 +325,21 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 	}
 	m := poolOf(be)
 	defer m.tick()
+	// A backend may run kernels after Run returns and report their errors
+	// at Sync, so the schedule waits for them before it changes any node.
+	// On error it still waits, so that the errors of kernels already
+	// queued are not reported by a later schedule.
+	defer func() {
+		if err != nil {
+			_ = be.Sync(context.WithoutCancel(ctx))
+		}
+	}()
 	isTarget := make(map[*graph.Node]bool, len(targets))
 	for _, t := range targets {
 		isTarget[t] = true
 	}
-	p := newPlan(order, isTarget, candidates(targets, dsts))
+	p := newPlan(order, isTarget, candidates(be, targets, dsts))
+	p.be = be
 	into := p.destinations(targets, dsts)
 	uses := make(map[*graph.Node]int, len(p.order))
 	for _, n := range p.order {
@@ -305,7 +352,29 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 	// refs counts the live results that read each buffer allocated here, so
 	// a buffer shared by views is freed only after its last reader.
 	refs := make(map[backend.Buffer]int)
+	// A realized input on another device, such as a constant computed
+	// there, is copied to be first.
+	moved := make(map[*graph.Node]result)
+	for _, n := range p.order {
+		for _, in := range p.work[n].deps {
+			if _, ok := moved[in]; ok || !in.Realized() || in.Mem.Dev == be {
+				continue
+			}
+			buf, err := transfer(ctx, m, in)
+			if err != nil {
+				for buf := range refs {
+					m.release(buf)
+				}
+				return err
+			}
+			refs[buf] = 0
+			moved[in] = result{buf: buf, view: backend.Contiguous(in.Shape)}
+		}
+	}
 	lookup := func(n *graph.Node) result {
+		if r, ok := moved[n]; ok {
+			return r
+		}
 		if n.Realized() {
 			return result{n.Buf(), n.View, n.Mem}
 		}
@@ -374,6 +443,18 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 			return fmt.Errorf("sched: no kernel computed a %s target: %w", t.Op, backend.ErrInternal)
 		}
 	}
+	if err := be.Sync(context.WithoutCancel(ctx)); err != nil {
+		for buf := range refs {
+			m.release(buf)
+		}
+		return err
+	}
+	for _, r := range moved {
+		if refs[r.buf] == 0 {
+			delete(refs, r.buf)
+			m.release(r.buf)
+		}
+	}
 	mems := make(map[backend.Buffer]*graph.Storage)
 	for _, t := range targets {
 		if t.Realized() {
@@ -382,7 +463,7 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 		r := results[t]
 		if r.mem == nil {
 			if r.mem = mems[r.buf]; r.mem == nil {
-				r.mem = &graph.Storage{Buf: r.buf}
+				r.mem = &graph.Storage{Buf: r.buf, Dev: be}
 				mems[r.buf] = r.mem
 			}
 		}

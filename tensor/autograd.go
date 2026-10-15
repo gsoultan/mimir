@@ -126,7 +126,7 @@ func (t *Tensor) ZeroGrad() {
 	gradMu.Lock()
 	defer gradMu.Unlock()
 	if g := t.tape.grad; g != nil && t.tape.own {
-		sched.Release(device, g.node, lazy.values)
+		sched.Release(g.node, lazy.values)
 	}
 	t.tape.grad, t.tape.own = nil, false
 }
@@ -404,6 +404,40 @@ func (p *Param) set(v *Tensor) error {
 		return fmt.Errorf("tensor: set %s%v parameter to %s%v: %w", p.value.node.DType, p.value.node.Shape, v.node.DType, v.node.Shape, ErrShape)
 	}
 	p.value = &Tensor{node: v.node, tape: p.value.tape}
+	return nil
+}
+
+// To moves the parameter's value, and the gradient accumulated since the
+// last ZeroGrad, to d. Tensors built from the old value keep it.
+func (p *Param) To(d Device) error {
+	v := p.Value()
+	if err := firstErr(v); err != nil {
+		return err
+	}
+	moved := v.Detach().To(d)
+	if err := moved.Realize(context.Background()); err != nil {
+		return err
+	}
+	var grad *Tensor
+	if g := v.Grad(); g != nil {
+		if grad = g.To(d); grad.err == nil {
+			grad.err = grad.Realize(context.Background())
+		}
+		if grad.err != nil {
+			return grad.err
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.value != v {
+		return fmt.Errorf("tensor: parameter set while moving to %v: %w", d, ErrInternal)
+	}
+	p.value = &Tensor{node: moved.node, tape: v.tape}
+	if v.tape != nil && grad != nil {
+		gradMu.Lock()
+		v.tape.grad, v.tape.own = grad, true
+		gradMu.Unlock()
+	}
 	return nil
 }
 

@@ -28,6 +28,11 @@ type Node struct {
 	Attrs  backend.Attrs
 	Inputs []*Node
 
+	// Dev is the device that holds the node's inputs, and so computes
+	// it, or nil if it is computed from constants alone and runs on any
+	// device. A realized node's result lives on Mem.Dev.
+	Dev backend.Backend
+
 	Mem  *Storage     // set once realized
 	Ver  int          // the version of Mem that holds the result
 	View backend.View // how Shape is read from Mem.Buf
@@ -38,6 +43,7 @@ type Node struct {
 // Version, which makes the nodes realized with earlier versions stale.
 type Storage struct {
 	Buf     backend.Buffer
+	Dev     backend.Backend // the backend that owns Buf
 	Version int
 	Refs    int // the nodes realized into the storage since Version changed
 }
@@ -76,16 +82,31 @@ func checkDType(op backend.Op, dt backend.DType) error {
 	return nil
 }
 
-// Load wraps a buffer that already holds data of the given shape.
-func Load(buf backend.Buffer, shape []int) (*Node, error) {
+// newNode completes n, whose inputs must share a device, with that
+// device.
+func newNode(n *Node) (*Node, error) {
+	for _, in := range n.Inputs {
+		switch d := in.Dev; {
+		case d == nil:
+		case n.Dev == nil:
+			n.Dev = d
+		case d != n.Dev:
+			return nil, errorf(n.Op, backend.ErrDevice, "inputs on %s and %s", n.Dev.Name(), d.Name())
+		}
+	}
+	return n, nil
+}
+
+// Load wraps a buffer of dev that already holds data of the given shape.
+func Load(dev backend.Backend, buf backend.Buffer, shape []int) (*Node, error) {
 	if err := checkShape(backend.OpLoad, shape); err != nil {
 		return nil, err
 	}
 	if n, _ := backend.NumElements(shape); buf.Len() != n {
 		return nil, errorf(backend.OpLoad, backend.ErrShape, "%d elements for shape %v", buf.Len(), shape)
 	}
-	mem := &Storage{Buf: buf, Refs: 1}
-	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Mem: mem, View: backend.Contiguous(shape)}, nil
+	mem := &Storage{Buf: buf, Dev: dev, Refs: 1}
+	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Dev: dev, Mem: mem, View: backend.Contiguous(shape)}, nil
 }
 
 // Const is a tensor whose elements all equal value. It costs one element of
@@ -122,7 +143,7 @@ func Unary(op backend.Op, x *Node) (*Node, error) {
 	if op != backend.OpNeg && !x.DType.IsFloat() {
 		return nil, errorf(op, backend.ErrDType, "%s input", x.DType)
 	}
-	return &Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}}, nil
+	return newNode(&Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}})
 }
 
 // Cast converts x to dt. Float to integer truncates toward zero.
@@ -130,7 +151,7 @@ func Cast(x *Node, dt backend.DType) (*Node, error) {
 	if err := checkDType(backend.OpCast, dt); err != nil {
 		return nil, err
 	}
-	return &Node{Op: backend.OpCast, DType: dt, Shape: x.Shape, Inputs: []*Node{x}}, nil
+	return newNode(&Node{Op: backend.OpCast, DType: dt, Shape: x.Shape, Inputs: []*Node{x}})
 }
 
 // Binary applies an elementwise op to two inputs of the same shape and dtype.
@@ -144,7 +165,7 @@ func Binary(op backend.Op, x, y *Node) (*Node, error) {
 	if x.DType != y.DType {
 		return nil, errorf(op, backend.ErrDType, "%s and %s", x.DType, y.DType)
 	}
-	return &Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, y}}, nil
+	return newNode(&Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, y}})
 }
 
 // Where selects x where cond is non-zero and y elsewhere. All three share a
@@ -156,7 +177,7 @@ func Where(cond, x, y *Node) (*Node, error) {
 	if x.DType != y.DType {
 		return nil, errorf(backend.OpWhere, backend.ErrDType, "%s and %s", x.DType, y.DType)
 	}
-	return &Node{Op: backend.OpWhere, DType: x.DType, Shape: x.Shape, Inputs: []*Node{cond, x, y}}, nil
+	return newNode(&Node{Op: backend.OpWhere, DType: x.DType, Shape: x.Shape, Inputs: []*Node{cond, x, y}})
 }
 
 // Reduce reduces x over axes, keeping them with size 1. Axes must be valid,
@@ -175,7 +196,7 @@ func Reduce(op backend.Op, x *Node, axes []int) (*Node, error) {
 		}
 		shape[a] = 1
 	}
-	return &Node{Op: op, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}}, nil
+	return newNode(&Node{Op: op, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}})
 }
 
 // Reshape gives x a new shape with the same number of elements.
@@ -186,7 +207,7 @@ func Reshape(x *Node, shape []int) (*Node, error) {
 	if n, _ := backend.NumElements(shape); n != x.Size() {
 		return nil, errorf(backend.OpReshape, backend.ErrShape, "%v to %v", x.Shape, shape)
 	}
-	return &Node{Op: backend.OpReshape, DType: x.DType, Shape: slices.Clone(shape), Inputs: []*Node{x}}, nil
+	return newNode(&Node{Op: backend.OpReshape, DType: x.DType, Shape: slices.Clone(shape), Inputs: []*Node{x}})
 }
 
 // Permute reorders dimensions: output dimension i is input dimension perm[i].
@@ -203,7 +224,7 @@ func Permute(x *Node, perm []int) (*Node, error) {
 		seen[p] = true
 		shape[i] = x.Shape[p]
 	}
-	return &Node{Op: backend.OpPermute, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(perm)}}, nil
+	return newNode(&Node{Op: backend.OpPermute, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(perm)}})
 }
 
 // Expand broadcasts size-1 dimensions of x to shape, which has the same rank.
@@ -219,7 +240,7 @@ func Expand(x *Node, shape []int) (*Node, error) {
 			return nil, errorf(backend.OpExpand, backend.ErrShape, "%v to %v", x.Shape, shape)
 		}
 	}
-	return &Node{Op: backend.OpExpand, DType: x.DType, Shape: slices.Clone(shape), Inputs: []*Node{x}}, nil
+	return newNode(&Node{Op: backend.OpExpand, DType: x.DType, Shape: slices.Clone(shape), Inputs: []*Node{x}})
 }
 
 // Pad adds pads[d][0] elements before and pads[d][1] after dimension d,
@@ -238,7 +259,7 @@ func Pad(x *Node, pads [][2]int, value float64) (*Node, error) {
 	if err := checkShape(backend.OpPad, shape); err != nil {
 		return nil, err
 	}
-	return &Node{Op: backend.OpPad, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Pads: slices.Clone(pads), Value: value}}, nil
+	return newNode(&Node{Op: backend.OpPad, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Pads: slices.Clone(pads), Value: value}})
 }
 
 // Shrink keeps the half-open range [r[0], r[1]) of each dimension.
@@ -253,7 +274,7 @@ func Shrink(x *Node, ranges [][2]int) (*Node, error) {
 		}
 		shape[i] = r[1] - r[0]
 	}
-	return &Node{Op: backend.OpShrink, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Ranges: slices.Clone(ranges)}}, nil
+	return newNode(&Node{Op: backend.OpShrink, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Ranges: slices.Clone(ranges)}})
 }
 
 // Flip reverses x along distinct axes.
@@ -265,7 +286,7 @@ func Flip(x *Node, axes []int) (*Node, error) {
 		}
 		seen[a] = true
 	}
-	return &Node{Op: backend.OpFlip, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}}, nil
+	return newNode(&Node{Op: backend.OpFlip, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}})
 }
 
 // MatMul multiplies [..., M, K] by [..., K, N] with equal batch dimensions.
@@ -281,7 +302,7 @@ func MatMul(x, y *Node) (*Node, error) {
 	if err := checkShape(backend.OpMatMul, shape); err != nil {
 		return nil, err
 	}
-	return &Node{Op: backend.OpMatMul, DType: x.DType, Shape: shape, Inputs: []*Node{x, y}}, nil
+	return newNode(&Node{Op: backend.OpMatMul, DType: x.DType, Shape: shape, Inputs: []*Node{x, y}})
 }
 
 // checkIndex validates an Int32 index of the same rank as x that fits x
@@ -307,7 +328,7 @@ func Gather(x, idx *Node, axis int) (*Node, error) {
 	if err := checkIndex(backend.OpGather, x, idx, axis); err != nil {
 		return nil, err
 	}
-	return &Node{Op: backend.OpGather, DType: x.DType, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}}, nil
+	return newNode(&Node{Op: backend.OpGather, DType: x.DType, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}})
 }
 
 // ScatterAdd returns x with src added at Int32 positions idx along axis,
@@ -322,7 +343,7 @@ func ScatterAdd(x, idx, src *Node, axis int) (*Node, error) {
 	if src.DType != x.DType {
 		return nil, errorf(backend.OpScatterAdd, backend.ErrDType, "%s and %s", x.DType, src.DType)
 	}
-	return &Node{Op: backend.OpScatterAdd, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, idx, src}, Attrs: backend.Attrs{Axis: axis}}, nil
+	return newNode(&Node{Op: backend.OpScatterAdd, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, idx, src}, Attrs: backend.Attrs{Axis: axis}})
 }
 
 // Window describes sliding windows over the trailing len(Kernel)
@@ -380,7 +401,7 @@ func Unfold(x *Node, w Window, value float64) (*Node, error) {
 	if err := checkShape(backend.OpUnfold, shape); err != nil {
 		return nil, err
 	}
-	return &Node{Op: backend.OpUnfold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(value)}, nil
+	return newNode(&Node{Op: backend.OpUnfold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(value)})
 }
 
 // Fold is the adjoint of Unfold: it sums the windows x, shaped
@@ -402,5 +423,5 @@ func Fold(x *Node, spatial []int, w Window) (*Node, error) {
 	if err := checkShape(backend.OpFold, shape); err != nil {
 		return nil, err
 	}
-	return &Node{Op: backend.OpFold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)}, nil
+	return newNode(&Node{Op: backend.OpFold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)})
 }

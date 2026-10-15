@@ -1,7 +1,7 @@
-// Command mnist trains a classifier on the MNIST handwritten digits, on
-// the CPU, with mimir.
+// Command mnist trains a classifier on the MNIST handwritten digits with
+// mimir, on the CPU or the GPU.
 //
-//	go run ./examples/mnist -model cnn -epochs 3
+//	go run ./examples/mnist -model cnn -epochs 3 -device auto
 //
 // It downloads MNIST to -data on first use, checking each file's SHA-256.
 // A multilayer perceptron reaches about 98% test accuracy and the
@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/gsoultan/mimir"
 	"github.com/gsoultan/mimir/data"
 	"github.com/gsoultan/mimir/data/datasets"
 	"github.com/gsoultan/mimir/metrics"
@@ -33,16 +34,34 @@ func main() {
 		lr     = flag.Float64("lr", 1e-3, "AdamW learning rate")
 		dir    = flag.String("data", "data/mnist", "where MNIST is kept")
 		ckpt   = flag.String("checkpoint", "", "directory to checkpoint to and resume from")
+		device = flag.String("device", "cpu", "cpu, gpu or auto")
 	)
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	if err := run(ctx, *kind, *epochs, *batch, *lr, *dir, *ckpt); err != nil {
+	dev, err := pick(*device)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := run(ctx, dev, *kind, *epochs, *batch, *lr, *dir, *ckpt); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, kind string, epochs, batch int, lr float64, dir, ckpt string) error {
+// pick returns the device that name selects.
+func pick(name string) (mimir.Device, error) {
+	switch name {
+	case "cpu":
+		return mimir.CPU(), nil
+	case "gpu":
+		return mimir.GPU()
+	case "auto":
+		return mimir.Auto(), nil
+	}
+	return mimir.Device{}, fmt.Errorf("unknown device %q, want cpu, gpu or auto", name)
+}
+
+func run(ctx context.Context, dev mimir.Device, kind string, epochs, batch int, lr float64, dir, ckpt string) error {
 	if err := datasets.DownloadMNIST(ctx, dir); err != nil {
 		return err
 	}
@@ -70,6 +89,9 @@ func run(ctx context.Context, kind string, epochs, batch int, lr float64, dir, c
 	default:
 		return fmt.Errorf("unknown model %q, want mlp or cnn", kind)
 	}
+	if err := nn.To(model, dev); err != nil {
+		return err
+	}
 	opt := optim.AdamW(nn.Parameters(model), optim.LR(lr), optim.WeightDecay(0.01))
 
 	opts := []train.Option{
@@ -82,6 +104,6 @@ func run(ctx context.Context, kind string, epochs, batch int, lr float64, dir, c
 	if ckpt != "" {
 		opts = append(opts, train.Checkpoint(ckpt))
 	}
-	fmt.Printf("training %s on %d images, testing on %d\n", kind, trainSet.Len(), testSet.Len())
+	fmt.Printf("training %s on %v with %d images, testing on %d\n", kind, dev, trainSet.Len(), testSet.Len())
 	return train.Fit(ctx, model, opt, trainSet, opts...)
 }

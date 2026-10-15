@@ -354,7 +354,7 @@ func TestCoalesceKeepsElementOrder(t *testing.T) {
 		"windows":    {[]int{2, 2, 3}, []backend.View{{Shape: []int{2, 2, 3}, Strides: []int{8, 1, 4}, Offset: 1}}, 3},
 	}
 	for name, tt := range tests {
-		shape, views := coalesce(tt.shape, tt.views)
+		shape, views := backend.Coalesce(tt.shape, tt.views)
 		if len(shape) != tt.wantRank {
 			t.Errorf("%s: coalesced %v to %v, want rank %d", name, tt.shape, shape, tt.wantRank)
 		}
