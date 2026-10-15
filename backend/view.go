@@ -100,12 +100,52 @@ func (v View) Flip(axes []int) View {
 }
 
 // Reshape returns the view with a new shape of the same size. It reports
-// false when the layout cannot be expressed without copying.
+// false when the layout cannot be expressed without copying. Besides
+// contiguous views it handles any view whose merged or split dimensions are
+// contiguous with each other, such as a shrunk or permuted view that is
+// split or merged within its strided blocks.
 func (v View) Reshape(shape []int) (View, bool) {
-	if !v.IsContiguous() {
+	if v.IsContiguous() {
+		out := Contiguous(shape)
+		out.Offset = v.Offset
+		return out, true
+	}
+	strides, ok := reshapeStrides(v.Shape, v.Strides, shape)
+	if !ok {
 		return View{}, false
 	}
-	out := Contiguous(shape)
-	out.Offset = v.Offset
-	return out, true
+	return View{Shape: slices.Clone(shape), Strides: strides, Offset: v.Offset}, true
+}
+
+// reshapeStrides computes strides that read old's elements in row-major
+// order with shape, like PyTorch's computeStride. It walks both shapes from
+// the right, matching blocks of old dimensions that are laid out
+// contiguously relative to each other with blocks of new dimensions of the
+// same size.
+func reshapeStrides(oldShape, oldStrides, shape []int) ([]int, bool) {
+	strides := make([]int, len(shape))
+	if len(oldShape) == 0 {
+		return ContiguousStrides(shape), true
+	}
+	d := len(shape) - 1
+	base := oldStrides[len(oldStrides)-1]
+	oldN, newN := 1, 1
+	for od := len(oldShape) - 1; od >= 0; od-- {
+		oldN *= oldShape[od]
+		if od > 0 && (oldShape[od-1] == 1 || oldStrides[od-1] == oldN*base) {
+			continue // od-1 extends the current block
+		}
+		for d >= 0 && (newN < oldN || shape[d] == 1) {
+			strides[d] = newN * base
+			newN *= shape[d]
+			d--
+		}
+		if newN != oldN {
+			return nil, false
+		}
+		if od > 0 {
+			base, oldN, newN = oldStrides[od-1], 1, 1
+		}
+	}
+	return strides, d == -1
 }

@@ -1,4 +1,4 @@
-// Package safetensors reads the safetensors format: an 8-byte little-endian
+// Package safetensors reads and writes the safetensors format: an 8-byte little-endian
 // header length, a JSON header describing each tensor, then the raw
 // little-endian tensor data. See https://github.com/huggingface/safetensors.
 //
@@ -7,13 +7,16 @@
 package safetensors
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"math"
 	"slices"
-	"sort"
 )
 
 // ErrFormat reports a malformed file.
@@ -96,7 +99,8 @@ func Parse(b []byte) (*File, error) {
 		spans = append(spans, span{lo, hi})
 	}
 	// The data section must be covered exactly, without gaps or overlaps.
-	sort.Slice(spans, func(i, j int) bool { return spans[i].lo < spans[j].lo })
+	// Empty tensors sort before a tensor starting at the same byte.
+	slices.SortFunc(spans, func(a, b span) int { return cmp.Or(cmp.Compare(a.lo, b.lo), cmp.Compare(a.hi, b.hi)) })
 	end := 0
 	for _, s := range spans {
 		if s.lo != end {
@@ -148,4 +152,75 @@ func (t Tensor) Int32s() ([]int32, error) {
 		out[i] = int32(binary.LittleEndian.Uint32(t.Data[4*i:]))
 	}
 	return out, nil
+}
+
+// Float32Tensor returns an F32 tensor of shape holding v.
+func Float32Tensor(shape []int, v []float32) Tensor {
+	b := make([]byte, 4*len(v))
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(x))
+	}
+	return Tensor{DType: "F32", Shape: slices.Clone(shape), Data: b}
+}
+
+// Int32Tensor returns an I32 tensor of shape holding v.
+func Int32Tensor(shape []int, v []int32) Tensor {
+	b := make([]byte, 4*len(v))
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(b[4*i:], uint32(x))
+	}
+	return Tensor{DType: "I32", Shape: slices.Clone(shape), Data: b}
+}
+
+// Write encodes tensors and metadata. Tensors are laid out in name order,
+// so equal inputs produce identical files.
+func Write(w io.Writer, tensors map[string]Tensor, metadata map[string]string) error {
+	header := make(map[string]any, len(tensors)+1)
+	if len(metadata) > 0 {
+		header["__metadata__"] = metadata
+	}
+	names := slices.Sorted(maps.Keys(tensors))
+	offset := 0
+	for _, name := range names {
+		t := tensors[name]
+		size, ok := dtypeSizes[t.DType]
+		if !ok || name == "__metadata__" {
+			return fmt.Errorf("safetensors: write tensor %q of dtype %q: %w", name, t.DType, ErrFormat)
+		}
+		n := size
+		for _, d := range t.Shape {
+			if d < 0 || (d > 0 && n > math.MaxInt/d) {
+				return fmt.Errorf("safetensors: write tensor %q of shape %v: %w", name, t.Shape, ErrFormat)
+			}
+			n *= d
+		}
+		if n != len(t.Data) {
+			return fmt.Errorf("safetensors: tensor %q has %d bytes for %s%v: %w", name, len(t.Data), t.DType, t.Shape, ErrFormat)
+		}
+		shape := t.Shape
+		if shape == nil {
+			shape = []int{}
+		}
+		header[name] = entry{DType: t.DType, Shape: shape, DataOffsets: [2]int{offset, offset + n}}
+		offset += n
+	}
+	h, err := json.Marshal(header)
+	if err != nil {
+		return fmt.Errorf("safetensors: header: %w", err)
+	}
+	h = append(h, bytes.Repeat([]byte(" "), (8-len(h)%8)%8)...) // align the data to 8 bytes
+	var size [8]byte
+	binary.LittleEndian.PutUint64(size[:], uint64(len(h)))
+	if _, err := w.Write(size[:]); err != nil {
+		return err
+	}
+	if _, err := w.Write(h); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if _, err := w.Write(tensors[name].Data); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -35,23 +35,19 @@ func broadcastShape(shapes ...[]int) ([]int, error) {
 	return out, nil
 }
 
-// expandTo broadcasts n to shape, adding leading dimensions as needed.
-func expandTo(n *graph.Node, shape []int) (*graph.Node, error) {
-	if slices.Equal(n.Shape, shape) {
-		return n, nil
+// broadcastTo expands t to shape, adding leading dimensions as needed.
+func (t *Tensor) broadcastTo(shape []int) *Tensor {
+	if err := firstErr(t); err != nil {
+		return fail(err)
 	}
-	if extra := len(shape) - len(n.Shape); extra > 0 {
-		ones := slices.Repeat([]int{1}, extra)
-		var err error
-		if n, err = graph.Reshape(n, slices.Concat(ones, n.Shape)); err != nil {
-			return nil, err
-		}
+	if extra := len(shape) - len(t.node.Shape); extra > 0 {
+		t = t.reshape(slices.Concat(slices.Repeat([]int{1}, extra), t.node.Shape))
 	}
-	return graph.Expand(n, shape)
+	return t.expand(shape)
 }
 
 // broadcast expands every tensor to their common shape.
-func broadcast(ts ...*Tensor) ([]*graph.Node, error) {
+func broadcast(ts ...*Tensor) ([]*Tensor, error) {
 	if err := firstErr(ts...); err != nil {
 		return nil, err
 	}
@@ -63,28 +59,80 @@ func broadcast(ts ...*Tensor) ([]*graph.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	nodes := make([]*graph.Node, len(ts))
+	out := make([]*Tensor, len(ts))
 	for i, t := range ts {
-		if nodes[i], err = expandTo(t.node, shape); err != nil {
-			return nil, err
+		if out[i] = t.broadcastTo(shape); out[i].err != nil {
+			return nil, out[i].err
 		}
 	}
-	return nodes, nil
+	return out, nil
 }
 
 func (t *Tensor) binary(op backend.Op, u *Tensor) *Tensor {
-	n, err := broadcast(t, u)
+	b, err := broadcast(t, u)
 	if err != nil {
 		return fail(err)
 	}
-	return wrap(graph.Binary(op, n[0], n[1]))
+	return binaryPrim(op, b[0], b[1])
+}
+
+// binaryPrim applies a binary primitive to tensors of one shape and records
+// its gradient. Comparisons have none.
+func binaryPrim(op backend.Op, x, y *Tensor) *Tensor {
+	out := wrap(graph.Binary(op, x.node, y.node))
+	if !tracked(x, y) || out.err != nil {
+		return out
+	}
+	a, b := x.detached(), y.detached()
+	var vjp func(g *Tensor) []*Tensor
+	switch op {
+	case backend.OpAdd:
+		vjp = func(g *Tensor) []*Tensor { return grads(g, g) }
+	case backend.OpMul:
+		vjp = func(g *Tensor) []*Tensor { return grads(g.Mul(b), g.Mul(a)) }
+	case backend.OpMax:
+		// Like torch.maximum: ties split the gradient evenly.
+		vjp = func(g *Tensor) []*Tensor {
+			one, tie := g.scalar(1), a.Equal(b).Mul(g.scalar(0.5))
+			return grads(g.Mul(one.Sub(a.Less(b)).Sub(tie)), g.Mul(one.Sub(b.Less(a)).Sub(tie)))
+		}
+	case backend.OpMod:
+		// fmod(a, b) = a - trunc(a/b)*b, and trunc(a/b) = (a - fmod(a, b))/b.
+		r := out.detached()
+		vjp = func(g *Tensor) []*Tensor { return grads(g, g.Mul(a.Sub(r).Div(b)).Neg()) }
+	default:
+		return out
+	}
+	return track(out, vjp, x, y)
 }
 
 func (t *Tensor) unary(op backend.Op) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
 	}
-	return wrap(graph.Unary(op, t.node))
+	out := wrap(graph.Unary(op, t.node))
+	if !tracked(t) || out.err != nil {
+		return out
+	}
+	x, y := t.detached(), out.detached()
+	var dx func(g *Tensor) *Tensor
+	switch op {
+	case backend.OpNeg:
+		dx = func(g *Tensor) *Tensor { return g.Neg() }
+	case backend.OpExp2:
+		dx = func(g *Tensor) *Tensor { return g.Mul(y).Mul(g.scalar(math.Ln2)) }
+	case backend.OpLog2:
+		dx = func(g *Tensor) *Tensor { return g.Div(x.Mul(g.scalar(math.Ln2))) }
+	case backend.OpSin:
+		dx = func(g *Tensor) *Tensor { return g.Mul(x.Cos()) }
+	case backend.OpSqrt:
+		dx = func(g *Tensor) *Tensor { return g.Div(y.Mul(g.scalar(2))) }
+	case backend.OpRecip:
+		dx = func(g *Tensor) *Tensor { return g.Mul(y).Mul(y).Neg() }
+	default:
+		return out
+	}
+	return track(out, func(g *Tensor) []*Tensor { return grads(dx(g)) }, t)
 }
 
 // scalar returns a zero-dimensional constant with t's dtype.
@@ -129,11 +177,16 @@ func (t *Tensor) Fmod(u *Tensor) *Tensor { return t.binary(backend.OpMod, u) }
 // Where returns x where cond is non-zero and y elsewhere, broadcasting all
 // three. cond may have any dtype.
 func Where(cond, x, y *Tensor) *Tensor {
-	n, err := broadcast(cond, x, y)
+	b, err := broadcast(cond, x, y)
 	if err != nil {
 		return fail(err)
 	}
-	return wrap(graph.Where(n[0], n[1], n[2]))
+	c, a, d := b[0].detached(), b[1], b[2]
+	out := wrap(graph.Where(c.node, a.node, d.node))
+	return track(out, func(g *Tensor) []*Tensor {
+		zero := g.scalar(0)
+		return grads(nil, Where(c, g, zero), Where(c, zero, g))
+	}, b[0], a, d)
 }
 
 // Cast converts t to dt. Float to integer truncates toward zero; values
@@ -145,7 +198,7 @@ func (t *Tensor) Cast(dt DType) *Tensor {
 	if t.node.DType == dt {
 		return t
 	}
-	return wrap(graph.Cast(t.node, dt))
+	return wrap(graph.Cast(t.node, dt)) // to or from Int32, which has no gradients
 }
 
 // Neg returns -t.
@@ -178,8 +231,12 @@ func (t *Tensor) Cos() *Tensor { return t.Add(t.scalar(math.Pi / 2)).Sin() }
 // Abs returns |t|.
 func (t *Tensor) Abs() *Tensor { return t.Maximum(t.Neg()) }
 
-// ReLU returns max(t, 0).
-func (t *Tensor) ReLU() *Tensor { return t.Maximum(t.scalar(0)) }
+// ReLU returns max(t, 0). Its gradient is 0 at 0, like PyTorch's.
+func (t *Tensor) ReLU() *Tensor {
+	x := t.detached()
+	out := x.Maximum(x.scalar(0))
+	return track(out, func(g *Tensor) []*Tensor { return grads(g.Mul(x.Greater(g.scalar(0)))) }, t)
+}
 
 // Sigmoid returns 1 / (1 + e^-t).
 func (t *Tensor) Sigmoid() *Tensor {

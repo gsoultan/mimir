@@ -4,12 +4,56 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestones 0 and 1.** Tensors compute on the CPU and match PyTorch
-> on every operation tested. Training (autograd, layers, optimizers) arrives in
-> milestone 2, the Metal GPU backend in milestone 4. The API will change until
-> v0.1.0.
+> **Status: milestone 2.** mimir trains neural networks on the CPU: autograd,
+> layers, losses, optimizers, data loading and a training loop, each checked
+> against PyTorch. Fast CPU kernels arrive in milestone 3 and the Metal GPU
+> backend in milestone 4. The API may change between 0.x releases.
 
 ## Example
+
+Train a convolutional network on MNIST:
+
+```go
+model := nn.NewSequential(
+	nn.NewConv2d(1, 16, 3, nn.Padding(1)), nn.ReLU(), nn.MaxPool2d(2),
+	nn.NewConv2d(16, 32, 3, nn.Padding(1)), nn.ReLU(), nn.MaxPool2d(2),
+	nn.Flatten(), nn.NewLinear(32*7*7, 10),
+)
+opt := optim.AdamW(nn.Parameters(model), optim.LR(1e-3), optim.WeightDecay(0.01))
+trainSet, testSet, err := datasets.MNIST("data/mnist", data.BatchSize(128), data.Shuffle(42))
+if err != nil {
+	return err
+}
+err = train.Fit(ctx, model, opt, trainSet,
+	train.Loss(loss.CrossEntropy),
+	train.Epochs(3),
+	train.Eval(testSet, metrics.Accuracy),
+	train.Checkpoint("ckpt/"),
+	train.Progress(os.Stdout))
+```
+
+`go run ./examples/mnist -model cnn` runs it, downloading MNIST first. On four
+CPU cores this network reaches 97.9% test accuracy in two epochs of about 2m45s
+each, and `-model mlp` reaches 97.1% in three epochs of about 12s. Fast CPU
+kernels in milestone 3 will shorten both. Or write the loop yourself:
+
+```go
+for batch, err := range trainSet.All(ctx) {
+	if err != nil {
+		return err
+	}
+	l := loss.CrossEntropy(model.Forward(batch.X), batch.Y)
+	if err := l.Backward(ctx); err != nil { // loss and gradients in one pass
+		return err
+	}
+	if err := opt.Step(ctx); err != nil {
+		return err
+	}
+	opt.ZeroGrad()
+}
+```
+
+Tensors on their own:
 
 ```go
 ctx := context.Background()
@@ -34,6 +78,25 @@ errors.Is(y.Err(), tensor.ErrShape) // true
 Set `MIMIR_EAGER=1` to compute every operation as soon as it is created, so a
 runtime error such as an out-of-range index surfaces at the line that caused
 it.
+
+## Gradients
+
+Tensors from `RequiresGrad` or a `tensor.Param` require gradients, and so does
+everything computed from them. `Backward` on a one-element loss computes every
+gradient and the loss itself in one schedule, so work the forward and backward
+passes share runs once, then releases the graph:
+
+```go
+w := tensor.Randn(1, 3, 2).RequiresGrad()
+loss := x.MatMul(w).Sum()
+err := loss.Backward(ctx)
+dw := w.Grad() // shaped like w
+```
+
+Every differentiable operation has a gradient, derived from about twenty
+rules for the primitives; `tensor.Func` adds hand-written ones. Parameters (`tensor.Param`)
+are the only mutable values: an optimizer replaces a parameter's value between
+steps, and tensors built earlier keep the value they were built with.
 
 ## Requirements
 
@@ -72,20 +135,40 @@ Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
 | Reductions | `Sum`, `Max`, `Min`, `Mean`, `Var` |
 | Shape | `Reshape`, `Permute`, `Transpose`, `Expand`, `Pad`, `Shrink`, `Flip`, `Unsqueeze`, `Squeeze` |
 | Linear algebra | `MatMul` with NumPy semantics and batch broadcasting |
-| Indexing | `Gather`, `ScatterAdd` |
+| Indexing | `Gather`, `ScatterAdd`, `Argmax` |
+| Joining and windows | `Cat`, `Stack`, `Flatten`, `Unfold` |
+| Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
+| Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func` |
+| Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `Dropout`, `Sequential`, activations, pooling, `Flatten` |
+| Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `MSE`, `L1`, `Huber` |
+| Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`; `StepDecay`, `Cosine`, `Warmup` schedules |
+| Data (`data`, `data/datasets`) | batching, shuffling, MNIST, CSV |
+| Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume; `Accuracy` |
 
 Element types are `float32` and `int32`. Broadcasting follows NumPy.
+Modules are plain structs: `nn.Parameters` finds every `*tensor.Param` a model
+holds, in exported or unexported fields, so custom layers need no
+registration.
 
 ## Layout
 
 ```
-tensor/              public Tensor API
+tensor/              public Tensor API and autograd
+nn/                  layers, parameter discovery, save and load
+nn/loss/             loss functions
+optim/               optimizers and learning-rate schedules
+data/                datasets and batching
+data/datasets/       MNIST and CSV
+train/               Fit, evaluation, checkpoints
+metrics/             accuracy
 backend/             Backend interface, DType, Op, View, Kernel
 backend/cpu/         pure-Go kernels and worker pool
 internal/graph/      lazy IR with shape and dtype checks
 internal/sched/      runs graphs: views, buffer reuse, freeing
 internal/goldentest/ golden-file loading and comparison
-io/safetensors/      safetensors reader
+io/safetensors/      safetensors reader and writer
+examples/mnist/      trains an MLP or CNN on MNIST
+testdata/golden/     expected results from PyTorch or NumPy
 tools/golden/        golden-file generator (Python, development only)
 ```
 
@@ -93,20 +176,25 @@ tools/golden/        golden-file generator (Python, development only)
 
 ```sh
 go test -race ./...
-MIMIR_EAGER=1 go test ./tensor/...
+MIMIR_EAGER=1 go test ./...
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 ```
 
-`tensor/testdata/golden/ops.safetensors` holds inputs and expected outputs for
-every operation, plus a layer norm, an attention block and a two-layer MLP. The
-committed file was computed with NumPy in float64. CI regenerates it with
-PyTorch and runs the same tests against it:
+`testdata/golden/` holds inputs and expected results: every operation's
+output, the gradients of operations and layers, every layer and loss, and
+optimizer steps and learning-rate schedules. The committed files were computed
+with NumPy in float64, with gradients by central differences. CI regenerates
+them with PyTorch, using autograd in float64 for gradients, and runs the same
+tests against them:
 
 ```sh
 pip install numpy torch
 python3 tools/golden/gen.py --oracle torch --out /tmp/golden
-MIMIR_GOLDEN_DIR=/tmp/golden go test -run TestGolden ./tensor
+MIMIR_GOLDEN_DIR=/tmp/golden go test -run TestGolden ./...
 ```
+
+`TestGradientsMatchFiniteDifferences` also checks every operation's gradient
+against finite differences in Go.
 
 ## Roadmap
 
@@ -114,7 +202,7 @@ MIMIR_GOLDEN_DIR=/tmp/golden go test -run TestGolden ./tensor
 | --- | --- |
 | M0 Foundation | module, CI, golden harness, benchmarks, fuzzing (done) |
 | M1 Tensors that compute | lazy graph, CPU kernels, composite ops (done) |
-| M2 Train MNIST | autograd, `nn` layers, losses, optimizers, data loading, `Fit`; first release v0.1.0 |
+| M2 Train MNIST | autograd, `nn` layers, losses, optimizers, data loading, `Fit`; first release v0.1.0 (done) |
 | M3 Fast on CPU | SIMD GEMM microkernels, fused elementwise kernels, arena allocator, schedule cache |
 | M4 Same code on GPU | Metal backend without cgo, unified memory, automatic device choice with CPU fallback |
 | M4b CUDA | cuBLASLt, cuDNN and NVRTC through purego |
