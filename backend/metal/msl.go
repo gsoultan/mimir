@@ -431,8 +431,9 @@ func (g *gen) random(n int) (*launch, error) {
 	g.line("float u1 = float((w[pair] >> 8) + 1u) * 5.9604644775390625e-8f;")
 	g.line("float u2 = float(w[pair + 1] >> 8) * 5.9604644775390625e-8f;")
 	g.line("float r = sqrt(-2.0f * log(u1));")
-	g.line("float theta = 6.2831853071795864769f * u2;")
-	g.line("o0[i] = (lane & 1) == 0 ? r * cos(theta) : r * sin(theta);")
+	// The angle is 2πu2. Doubling u2 is exact, while multiplying by 2π in
+	// float would round the angle by as much as 2.4e-7.
+	g.line("o0[i] = (lane & 1) == 0 ? r * cospi(2.0f * u2) : r * sinpi(2.0f * u2);")
 	return g.perElement(n)
 }
 
