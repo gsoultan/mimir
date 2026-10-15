@@ -872,3 +872,43 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 		t.Error("kept memory that only a node reading a stale value reads")
 	}
 }
+
+// longest records the longest fused program it runs.
+type longest struct {
+	*counting
+	max int
+}
+
+func (l *longest) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	l.max = max(l.max, len(k.Attrs.Program))
+	return l.counting.Run(ctx, k, outs, ins)
+}
+
+func TestLongChainsSplitIntoProgramsOfBoundedLength(t *testing.T) {
+	be := &longest{counting: &counting{Backend: cpu.New()}}
+	x := realized(t, be, []int{3}, 1)
+	xs := floats(t, be, x)
+	y := x
+	const n = 1000
+	for range n {
+		y = must(graph.Binary(backend.OpAdd, y, x))
+	}
+	if err := Realize(t.Context(), be, y); err != nil {
+		t.Fatal(err)
+	}
+	if be.max > maxProgram {
+		t.Errorf("a program of %d instructions, want at most %d", be.max, maxProgram)
+	}
+	if len(be.ops) > 2*n/maxProgram+2 {
+		t.Errorf("%d kernels for a chain of %d adds", len(be.ops), n)
+	}
+	for i, v := range floats(t, be, y) {
+		want := xs[i]
+		for range n {
+			want += xs[i]
+		}
+		if v != want {
+			t.Fatalf("element %d = %v, want %v", i, v, want)
+		}
+	}
+}

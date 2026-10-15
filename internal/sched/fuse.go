@@ -42,6 +42,9 @@ import (
 // keeps the product out of its kernel, which would write the product
 // over that value before reading it.
 
+// maxProgram is the most instructions a fused program grows to.
+const maxProgram = 256
+
 // plan lists the kernels that compute a schedule's targets.
 type plan struct {
 	be     backend.Backend             // the device that runs the kernels
@@ -82,9 +85,35 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	private := func(n *graph.Node) bool {
 		return !n.Realized() && !isTarget[n] && len(users[n]) == 1
 	}
-	inner := func(n *graph.Node) bool {
+	fusable := func(n *graph.Node) bool {
 		return n.Op.IsElementwise() && private(n) && users[n][0].Op.IsElementwise()
 	}
+	// A group stops growing at maxProgram instructions, counting each load
+	// and constant as one: the inputs that would take it past are computed
+	// by kernels of their own. A GPU compiles each program, and a program
+	// of a long chain, such as a running sum, would be too large.
+	cut := map[*graph.Node]bool{}
+	size := make(map[*graph.Node]int, len(order))
+	for _, n := range order {
+		if !n.Op.IsElementwise() {
+			continue
+		}
+		s := 1
+		for i, in := range n.Inputs {
+			switch {
+			case slices.Contains(n.Inputs[:i], in):
+			case !fusable(in):
+				s++
+			case s+size[in] > maxProgram:
+				cut[in] = true
+				s++
+			default:
+				s += size[in]
+			}
+		}
+		size[n] = s
+	}
+	inner := func(n *graph.Node) bool { return fusable(n) && !cut[n] }
 	// stored reports whether n is a target that the kernel of its one
 	// consumer's group computes and writes. That kernel's output holds
 	// the target, so it must have the same dtype; elementwise ops keep
