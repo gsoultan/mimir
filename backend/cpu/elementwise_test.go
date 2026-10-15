@@ -155,8 +155,9 @@ func randomProgram(rng *rand.Rand, dtypes []backend.DType, n int, out backend.DT
 
 func TestFusedProgramsMatchReference(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
-	shapes := [][]int{{7}, {3, 1100}, {2, 3, 5, 4}, {2500}}
-	for trial := range 40 {
+	// Shapes with short rows run in tiles that span rows.
+	shapes := [][]int{{7}, {3, 1100}, {2, 3, 5, 4}, {2500}, {37, 3, 20}, {2, 700, 3}}
+	for trial := range 60 {
 		shape := shapes[trial%len(shapes)]
 		size, _ := backend.NumElements(shape)
 		views := stridedViews(shape)
@@ -198,7 +199,7 @@ func TestFusedProgramsMatchReference(t *testing.T) {
 		// Store up to two earlier values of the output's dtype as well.
 		var stores []int
 		for j := len(prog) - 2; j >= 0 && len(stores) < 2; j-- {
-			if prog[j].DType == out && rng.IntN(3) == 0 {
+			if prog[j].DType == out && prog[j].Op != backend.OpLoad && rng.IntN(3) == 0 {
 				stores = append(stores, j)
 			}
 		}
@@ -267,6 +268,7 @@ func TestFusedProgramRejectsMalformedInstructions(t *testing.T) {
 		"store out of range":  {[]backend.Instr{load, neg}, []int{-1}},
 		"store twice":         {[]backend.Instr{load, neg, neg}, []int{1, 1}},
 		"store dtype":         {[]backend.Instr{load, cast, neg}, []int{1}},
+		"store of a load":     {[]backend.Instr{load, neg}, []int{0}},
 	} {
 		k := &backend.Kernel{Op: backend.OpFused, DType: backend.Float32, Shape: []int{2}, In: []backend.View{backend.Contiguous([]int{2})}, Attrs: backend.Attrs{Program: c.prog, Stores: c.stores}}
 		if _, err := run[float32](t, k, f32buf(1, 2)); err == nil {
@@ -293,14 +295,19 @@ func TestFusedIntegerModByZeroIsAnError(t *testing.T) {
 
 func TestFusedProgramsUpdateTheirInputsInPlace(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
-	shape := []int{3, 1500}
-	size, _ := backend.NumElements(shape)
 	dtypes := []backend.DType{backend.Float32, backend.Float32, backend.Float32, backend.Int32}
 	for trial := range 60 {
+		// In odd trials the integer input is broadcast along short rows,
+		// which tiles then span.
+		shape := []int{3, 1500}
+		if trial%2 == 1 {
+			shape = []int{150, 30}
+		}
+		size, _ := backend.NumElements(shape)
 		prog := randomProgram(rng, dtypes, 6+trial%10, backend.Float32)
 		var stores []int
 		for j := len(prog) - 2; j >= 0 && len(stores) < 2; j-- {
-			if prog[j].DType == backend.Float32 && rng.IntN(3) == 0 {
+			if prog[j].DType == backend.Float32 && prog[j].Op != backend.OpLoad && rng.IntN(3) == 0 {
 				stores = append(stores, j)
 			}
 		}
@@ -316,6 +323,12 @@ func TestFusedProgramsUpdateTheirInputsInPlace(t *testing.T) {
 				f[j] = float32(rng.IntN(13)-6) / 2
 				n[j] = int32(rng.IntN(9) - 4)
 				elems[i][j] = refScalar{f[j], n[j]}
+			}
+			if i == 3 && trial%2 == 1 {
+				in[i] = backend.Contiguous([]int{shape[0], 1}).Expand(shape)
+				for j := range elems[i] {
+					elems[i][j] = refScalar{f[j/shape[1]], n[j/shape[1]]}
+				}
 			}
 			bufs[i] = f32buf(f...)
 			if dt == backend.Int32 {

@@ -28,6 +28,13 @@ const elementGrain = 1 << 15
 // scratch as it has vectors live at once. Values the kernel writes are
 // computed straight into their output.
 //
+// Rows shorter than wideRow make for tiles too short to be worth their
+// dispatches, so tiles then span rows. An input read at one stride across
+// the whole output is still a vector at that stride, or a scalar; any
+// other input is gathered into scratch for each tile first. The trailing
+// dimensions that fit in a tile make up a block, whose elements every
+// gathered input reads at the same offsets from the block's first.
+//
 // An input may also be an output, as in an in-place update. Each element
 // is then read before it is written as long as nothing reads the input
 // after the instruction that writes the output; otherwise the input is
@@ -35,6 +42,9 @@ const elementGrain = 1 << 15
 
 // tileLen is the number of elements an instruction processes at a time.
 const tileLen = 1024
+
+// wideRow is the row length below which tiles span rows.
+const wideRow = 64
 
 // program is a fused program compiled for one kernel.
 type program struct {
@@ -66,6 +76,12 @@ type scratch struct {
 	slotsI [][]int32
 	offs   []int
 	cur    cursor
+	inF    [][]float32 // the inputs, or their gathered tiles
+	inI    [][]int32
+	wideF  [][]float32 // the memory of inF and inI for wide tiles
+	wideI  [][]int32
+	tileF  [][]float32 // the gathered tiles of inputs, by input
+	tileI  [][]int32
 }
 
 var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
@@ -110,7 +126,9 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 	outOf[last] = 0
 	writer := []int{last} // the instruction that writes each output
 	for i, j := range stores {
-		if j < 0 || j >= last || outOf[j] >= 0 || prog[j].DType != out {
+		// A stored load would write its output wherever the load runs,
+		// which may be before other inputs of that output are read.
+		if j < 0 || j >= last || outOf[j] >= 0 || prog[j].DType != out || prog[j].Op == backend.OpLoad {
 			return nil, fmt.Errorf("store %d of instruction %d: %w", i, j, backend.ErrInternal)
 		}
 		outOf[j] = i + 1
@@ -282,9 +300,19 @@ type evaluator struct {
 	p       *program
 	shape   []int          // the coalesced index space, of rank 1 or more
 	outer   []backend.View // the views without their innermost dimension
-	strides []int          // the innermost stride of each view
+	inner   []int          // the innermost stride of each view
+	strides []int          // the stride of each input in a tile: inner, or for wide tiles see wide
 	outF    [][]float32    // the outputs, in their dtype
 	outI    [][]int32
+
+	// Wide tiles span rows. An input read at one stride across the index
+	// space starts at base; the others are gathered, block by block, from
+	// the offsets in pat.
+	wide   bool
+	block  int     // the elements of a block
+	base   []int   // by input
+	gather []int   // the gathered inputs
+	pat    [][]int // by gathered input
 }
 
 // newEvaluator prepares prog to compute outs[0], indexed by shape, and the
@@ -303,10 +331,32 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 		}
 	}
 	r := len(shape)
-	e := &evaluator{shape: shape, outer: make([]backend.View, len(views)), strides: make([]int, len(views))}
+	e := &evaluator{shape: shape, outer: make([]backend.View, len(views)), inner: make([]int, len(views)), wide: r > 1 && shape[r-1] < wideRow}
+	outer := r - 1 // the dimensions the cursor walks
+	if e.wide {
+		e.block = 1
+		for outer = r; outer > 0 && e.block*shape[outer-1] <= tileLen; outer-- {
+			e.block *= shape[outer-1]
+		}
+	}
 	for v, view := range views {
-		e.outer[v] = backend.View{Strides: view.Strides[:r-1], Offset: view.Offset}
-		e.strides[v] = view.Strides[r-1]
+		e.outer[v] = backend.View{Strides: view.Strides[:outer], Offset: view.Offset}
+		e.inner[v] = view.Strides[r-1]
+	}
+	e.strides = e.inner
+	if e.wide {
+		e.strides, e.base = make([]int, len(views)), make([]int, len(views))
+		for v, view := range views {
+			if linear(shape, view.Strides) {
+				e.strides[v], e.base[v] = view.Strides[r-1], view.Offset
+				continue
+			}
+			e.strides[v] = 1
+			e.gather = append(e.gather, v)
+			pat := make([]int, 0, e.block)
+			walk(backend.View{Shape: shape[outer:], Strides: view.Strides[outer:]}, func(off int) { pat = append(pat, off) })
+			e.pat = append(e.pat, pat)
+		}
 	}
 	aliasOf := make([]int, len(ins))
 	for i, in := range ins {
@@ -343,6 +393,10 @@ func (e *evaluator) apply(lo, hi int) error {
 // run computes output elements [lo, hi) with the scratch memory s.
 func (e *evaluator) run(s *scratch, lo, hi int) error {
 	s.size(e.p, len(e.strides))
+	s.inF, s.inI = e.p.inF, e.p.inI
+	if e.wide {
+		return e.runWide(s, lo, hi)
+	}
 	r := len(e.shape)
 	inner := e.shape[r-1]
 	c := &s.cur
@@ -364,6 +418,75 @@ func (e *evaluator) run(s *scratch, lo, hi int) error {
 	return nil
 }
 
+// runWide computes output elements [lo, hi) in tiles that span rows.
+func (e *evaluator) runWide(s *scratch, lo, hi int) error {
+	s.wideF = append(s.wideF[:0], e.p.inF...)
+	s.wideI = append(s.wideI[:0], e.p.inI...)
+	s.inF, s.inI = s.wideF, s.wideI
+	for _, v := range e.gather {
+		if e.p.inF[v] != nil {
+			s.tileF = grow(s.tileF, v+1)
+			s.tileF[v] = grow(s.tileF[v], tileLen)
+			s.inF[v] = s.tileF[v]
+		} else {
+			s.tileI = grow(s.tileI, v+1)
+			s.tileI[v] = grow(s.tileI[v], tileLen)
+			s.inI[v] = s.tileI[v]
+		}
+	}
+	c := &s.cur
+	c.reset(e.shape[:len(e.outer[0].Strides)], e.outer, lo/e.block)
+	j := lo % e.block // the position in the block
+	for i := lo; i < hi; {
+		m := min(tileLen, hi-i)
+		for k := 0; k < m; {
+			n := min(e.block-j, m-k)
+			for g, v := range e.gather {
+				pat := e.pat[g][j : j+n]
+				if src := e.p.inF[v]; src != nil {
+					gatherAt(s.inF[v][k:k+n], src, c.offs[v], pat)
+				} else {
+					gatherAt(s.inI[v][k:k+n], e.p.inI[v], c.offs[v], pat)
+				}
+			}
+			k += n
+			if j += n; j == e.block {
+				j = 0
+				c.next()
+			}
+		}
+		for v, b := range e.base {
+			s.offs[v] = b + i*e.strides[v]
+		}
+		for _, v := range e.gather {
+			s.offs[v] = 0
+		}
+		if err := e.p.tile(s, e.strides, m, e.outF, e.outI, i); err != nil {
+			return err
+		}
+		i += m
+	}
+	return nil
+}
+
+// linear reports whether strides read the elements of shape at one
+// stride, that of the innermost dimension.
+func linear(shape, strides []int) bool {
+	for d := len(shape) - 2; d >= 0; d-- {
+		if strides[d] != strides[d+1]*shape[d+1] {
+			return false
+		}
+	}
+	return true
+}
+
+// gatherAt sets dst to the elements of src at off plus each offset in pat.
+func gatherAt[T elem](dst, src []T, off int, pat []int) {
+	for i, p := range pat {
+		dst[i] = src[off+p]
+	}
+}
+
 // size makes s hold the values and slots of p over inputs inputs.
 func (s *scratch) size(p *program, inputs int) {
 	s.f = grow(s.f, len(p.steps))
@@ -378,15 +501,15 @@ func (s *scratch) size(p *program, inputs int) {
 }
 
 // tile runs the program over the n elements at output index at, whose
-// inputs start at s.offs. Whichever of outF and outI holds the outputs is
+// inputs start at s.offs in s.inF and s.inI. Whichever of outF and outI holds the outputs is
 // written.
 func (p *program) tile(s *scratch, strides []int, n int, outF [][]float32, outI [][]int32, at int) error {
 	for _, j := range p.order {
 		var err error
 		if p.steps[j].DType == backend.Float32 {
-			err = run1(p, j, s.f, s.i, p.inF, s.slotsF, s.offs, strides, n, outF, at)
+			err = run1(p, j, s.f, s.i, s.inF, s.slotsF, s.offs, strides, n, outF, at)
 		} else {
-			err = run1(p, j, s.i, s.f, p.inI, s.slotsI, s.offs, strides, n, outI, at)
+			err = run1(p, j, s.i, s.f, s.inI, s.slotsI, s.offs, strides, n, outI, at)
 		}
 		if err != nil {
 			return err

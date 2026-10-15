@@ -58,6 +58,7 @@ func TestReductionsMatchReference(t *testing.T) {
 		{7}, {3, 5}, {2, 3, 4}, {2, 1, 3, 5},
 		{3, 2500},    // rows split into chunks
 		{4, 3, 1100}, // a chunk shorter than the rest
+		{1100, 3},    // short reduced runs, in rows split into chunks
 	}
 	for _, shape := range shapes {
 		for _, sv := range stridedViews(shape) {

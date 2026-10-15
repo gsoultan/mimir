@@ -74,7 +74,8 @@ type Buffer interface {
 // Backend executes kernels on one device.
 //
 // Implementations must be safe for concurrent use by multiple goroutines on
-// distinct buffers. A kernel's output buffer must not alias any input.
+// distinct buffers. A kernel's outputs share no memory with its inputs,
+// except as Run allows for in-place updates.
 type Backend interface {
 	// Name identifies the device, such as "cpu".
 	Name() string
@@ -129,7 +130,8 @@ type Attrs struct {
 	// Fused: the program; its last instruction computes the output.
 	Program []Instr
 	// Fused: instructions whose values the kernel also writes, value
-	// Stores[i] into output i+1. Stored values have the output's dtype.
+	// Stores[i] into output i+1. Stored values have the output's dtype
+	// and are computed, not loaded: a copy of an input is OpContiguous.
 	Stores []int
 }
 
