@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"weak"
 
 	"github.com/gsoultan/mimir/internal/graph"
 	"github.com/gsoultan/mimir/internal/sched"
@@ -226,7 +227,9 @@ func (t *Tensor) Backward(ctx context.Context) error {
 		return err
 	}
 	for i, l := range leaves {
-		l.grad, l.own = sums[i], own[i]
+		// A gradient that shares its memory, as those of a and b in
+		// a.Reshape(...).Add(b) do, is not the tape's to write over.
+		l.grad, l.own = sums[i], own[i] && sums[i].node.Mem.Refs == 1
 	}
 	for _, n := range order {
 		if !n.leaf {
@@ -372,10 +375,24 @@ func (p *Param) ZeroGrad() { p.Value().ZeroGrad() }
 // parameter never holds a growing recipe; a lazy v is allowed for buffers
 // updated with WithEffects. The parameter takes over v's memory, which
 // optimizer steps write over, so pass v.Clone() to keep using v.
+//
+// A lazy v stays computable: a RealizeInto that would write over memory
+// it reads, such as an optimizer step over the weights that running
+// statistics were computed from, computes it first.
 func (p *Param) Set(v *Tensor) error {
 	if err := firstErr(v); err != nil {
 		return err
 	}
+	if err := p.set(v); err != nil {
+		return err
+	}
+	if !v.node.Realized() {
+		lazy.add(p)
+	}
+	return nil
+}
+
+func (p *Param) set(v *Tensor) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.value.err; err != nil {
@@ -386,4 +403,44 @@ func (p *Param) Set(v *Tensor) error {
 	}
 	p.value = &Tensor{node: v.node, tape: p.value.tape}
 	return nil
+}
+
+// lazy holds the parameters that were set to values not yet computed.
+// Weak pointers let a parameter that nothing else holds go.
+var lazy lazyParams
+
+type lazyParams struct {
+	mu sync.Mutex
+	ps map[weak.Pointer[Param]]struct{}
+}
+
+func (l *lazyParams) add(p *Param) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ps == nil {
+		l.ps = map[weak.Pointer[Param]]struct{}{}
+	}
+	l.ps[weak.Make(p)] = struct{}{}
+}
+
+// values returns the values of the parameters that are still not
+// computed, and forgets the others.
+func (l *lazyParams) values() []*graph.Node {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var nodes []*graph.Node
+	for wp := range l.ps {
+		p := wp.Value()
+		if p == nil {
+			delete(l.ps, wp)
+			continue
+		}
+		v := p.Value()
+		if v.err != nil || v.node.Realized() {
+			delete(l.ps, wp)
+			continue
+		}
+		nodes = append(nodes, v.node)
+	}
+	return nodes
 }

@@ -138,7 +138,8 @@ func (o *Optimizer) Step(ctx context.Context) error {
 // Snapshot returns the state of every parameter, named "<index>.<name>"
 // by the parameter's position, and the number of steps taken, for
 // checkpoints. The tensors are the optimizer's own, which the next step
-// writes over: encode them, or Clone them to keep them, before it.
+// writes over: encode them, or Clone them and Realize the clones, before
+// it.
 func (o *Optimizer) Snapshot() (map[string]*tensor.Tensor, int) {
 	out := map[string]*tensor.Tensor{}
 	for i, s := range o.states {

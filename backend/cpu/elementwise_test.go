@@ -298,11 +298,10 @@ func TestFusedProgramsUpdateTheirInputsInPlace(t *testing.T) {
 	dtypes := []backend.DType{backend.Float32, backend.Float32, backend.Float32, backend.Int32}
 	for trial := range 60 {
 		// In odd trials the integer input is broadcast along short rows,
-		// which tiles then span.
-		shape := []int{3, 1500}
-		if trial%2 == 1 {
-			shape = []int{150, 30}
-		}
+		// which tiles then span. One in three pairs of trials is big enough
+		// for the workers below to split it, mid-row.
+		shapes := [][]int{{3, 1500}, {150, 30}, {3, 29999}, {3001, 30}}
+		shape := shapes[trial%2+trial%6/4*2]
 		size, _ := backend.NumElements(shape)
 		prog := randomProgram(rng, dtypes, 6+trial%10, backend.Float32)
 		var stores []int
@@ -389,7 +388,7 @@ func TestOnlyElementwiseKernelsUpdateInputsInPlace(t *testing.T) {
 	for name, k := range map[string]*backend.Kernel{
 		"product":    {Op: backend.OpMatMul, DType: backend.Float32, Shape: []int{2, 2}, In: []backend.View{square, square}},
 		"transposed": {Op: backend.OpNeg, DType: backend.Float32, Shape: []int{2, 2}, In: []backend.View{square.Permute([]int{1, 0})}},
-		"reduction":  {Op: backend.OpReduceSum, DType: backend.Float32, Shape: []int{2, 1}, In: []backend.View{square}, Attrs: backend.Attrs{Axes: []int{1}}},
+		"reduction":  {Op: backend.OpReduceSum, DType: backend.Float32, Shape: []int{2, 1}, In: []backend.View{backend.Contiguous([]int{2, 1})}, Attrs: backend.Attrs{Axes: []int{1}}},
 	} {
 		ins := []backend.Buffer{x, x}[:len(k.In)]
 		out := x

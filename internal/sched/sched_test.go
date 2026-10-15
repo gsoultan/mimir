@@ -531,3 +531,145 @@ func TestRealizeIntoLeavesStaleDestinationsAlone(t *testing.T) {
 		}
 	}
 }
+
+func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	neg := func(n *graph.Node) *graph.Node { return must(graph.Unary(backend.OpNeg, n)) }
+	equal := func(what string, got, want []float32) {
+		t.Helper()
+		if !slices.Equal(got, want) {
+			t.Errorf("%s = %v, want %v", what, got, want)
+		}
+	}
+	negated := func(xs []float32) []float32 {
+		out := make([]float32, len(xs))
+		for i, v := range xs {
+			out[i] = -v
+		}
+		return out
+	}
+
+	// A target that is a view of the destination keeps its values.
+	x := realized(t, be, []int{3}, 1)
+	xs, xbuf := floats(t, be, x), x.Buf()
+	view, y := must(graph.Reshape(x, []int{3, 1})), neg(x)
+	if err := RealizeInto(t.Context(), be, []*graph.Node{view, y}, []*graph.Node{nil, x}); err != nil {
+		t.Fatal(err)
+	}
+	if y.Buf() == xbuf {
+		t.Error("update written over the memory of a view target")
+	}
+	equal("view of the destination", floats(t, be, view), xs)
+	equal("update", floats(t, be, y), negated(xs))
+
+	// Of two targets with one destination, at most one goes over it.
+	a, b := realized(t, be, []int{3}, 2), realized(t, be, []int{3}, 3)
+	as, bs, abuf := floats(t, be, a), floats(t, be, b), a.Buf()
+	na, nb := neg(a), neg(b)
+	if err := RealizeInto(t.Context(), be, []*graph.Node{na, nb}, []*graph.Node{a, a}); err != nil {
+		t.Fatal(err)
+	}
+	if na.Buf() == abuf && nb.Buf() == abuf {
+		t.Error("two targets written over one destination")
+	}
+	equal("first target", floats(t, be, na), negated(as))
+	equal("second target", floats(t, be, nb), negated(bs))
+
+	// An update that reads its destination in another order cannot go
+	// over it element by element.
+	views := map[string]func(*graph.Node) *graph.Node{
+		"transposed": func(n *graph.Node) *graph.Node { return must(graph.Permute(n, []int{1, 0})) },
+		"flipped":    func(n *graph.Node) *graph.Node { return must(graph.Flip(n, []int{0})) },
+	}
+	for name, view := range views {
+		x := realized(t, be, []int{4, 4}, 4)
+		want := floats(t, be, neg(view(x)))
+		xbuf := x.Buf()
+		y := neg(view(x))
+		if err := RealizeInto(t.Context(), be, []*graph.Node{y}, []*graph.Node{x}); err != nil {
+			t.Fatal(err)
+		}
+		if y.Buf() == xbuf {
+			t.Errorf("update reading its destination %s written over it", name)
+		}
+		equal(name+" update", floats(t, be, y), want)
+	}
+
+	// A destination that views part of a larger buffer is not written.
+	big := realized(t, be, []int{8}, 5)
+	part := must(graph.Shrink(big, [][2]int{{2, 6}}))
+	if err := Realize(t.Context(), be, part); err != nil {
+		t.Fatal(err)
+	}
+	bigs, bigbuf := floats(t, be, big), big.Buf()
+	z := neg(realized(t, be, []int{4}, 6))
+	if err := RealizeInto(t.Context(), be, []*graph.Node{z}, []*graph.Node{part}); err != nil {
+		t.Fatal(err)
+	}
+	raw := make([]byte, 4*8)
+	if err := be.Download(t.Context(), raw, bigbuf); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range bigs {
+		if got := float32frombytes(raw[4*i:]); got != v {
+			t.Fatalf("element %d of the larger buffer = %v, want %v", i, got, v)
+		}
+	}
+}
+
+// cancelling cancels a context when it runs its first kernel.
+type cancelling struct {
+	*counting
+	cancel context.CancelFunc
+}
+
+func (c *cancelling) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	c.cancel()
+	return c.counting.Run(ctx, k, outs, ins)
+}
+
+func TestRealizeIntoFinishesOnceItStartsWriting(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x, y := realized(t, be, []int{4, 4}, 1), realized(t, be, []int{4, 4}, 2)
+	xs, ys := floats(t, be, x), floats(t, be, y)
+	nx := must(graph.Unary(backend.OpNeg, x))
+	p := must(graph.MatMul(nx, y))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	be.ops = nil
+	if err := RealizeInto(ctx, &cancelling{be, cancel}, []*graph.Node{nx, p}, []*graph.Node{x, nil}); err != nil {
+		t.Fatalf("cancelled after the first kernel wrote over its destination: %v", err)
+	}
+	if len(be.ops) != 2 {
+		t.Errorf("kernels %v, want the update and the product", be.ops)
+	}
+	got := floats(t, be, p)
+	for i := range 4 {
+		for j := range 4 {
+			var want float32
+			for k := range 4 {
+				want += -xs[i*4+k] * ys[k*4+j]
+			}
+			if d := got[i*4+j] - want; d > 1e-5 || d < -1e-5 {
+				t.Fatalf("product element %d,%d = %v, want %v", i, j, got[i*4+j], want)
+			}
+		}
+	}
+}
+
+func TestReleaseLeavesSharedMemoryAlone(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{2, 3}, 1)
+	view := must(graph.Reshape(x, []int{6}))
+	if err := Realize(t.Context(), be, view); err != nil {
+		t.Fatal(err)
+	}
+	want := floats(t, be, x)
+	Release(be, x)
+	if x.Stale() {
+		t.Fatal("released memory that a view still reads")
+	}
+	if got := floats(t, be, view); !slices.Equal(got, want) {
+		t.Errorf("view after Release = %v, want %v", got, want)
+	}
+}

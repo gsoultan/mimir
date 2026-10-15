@@ -287,6 +287,10 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 // Cancelling ctx stops the schedule only before it starts writing over
 // any dsts[i]. On error no srcs[i] is computed, and a dsts[i] whose memory
 // was being written over is stale.
+//
+// A parameter's value that is not computed yet, such as running
+// statistics a forward pass updated, is computed in the same schedule if
+// it reads the memory of a dsts[i], so the parameter keeps it.
 func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 	if len(dsts) != len(srcs) {
 		return fmt.Errorf("tensor: RealizeInto: %d destinations for %d tensors: %w", len(dsts), len(srcs), ErrShape)
@@ -310,7 +314,7 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 		}
 		into[i] = d.node
 	}
-	return sched.RealizeInto(ctx, device, targets, into)
+	return sched.RealizeInto(ctx, device, targets, into, lazy.values()...)
 }
 
 // Data computes t and returns its elements in row-major order. T must match
