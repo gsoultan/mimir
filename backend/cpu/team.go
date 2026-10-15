@@ -41,6 +41,11 @@ type team struct {
 // finished, before parking.
 const teamSpin = 50 * time.Microsecond
 
+// yieldEvery is how many polls a helper makes between yields. Yielding
+// lets other goroutines run, but every yield takes the scheduler's lock,
+// which the helpers contend for when they yield after every poll.
+const yieldEvery = 16
+
 // defaultTeam returns the process-wide team, with a helper for every
 // processor beyond the caller's, or nil if there is a single processor.
 var defaultTeam = sync.OnceValue(func() *team {
@@ -105,7 +110,7 @@ func (t *team) work() {
 func (t *team) help() {
 	for {
 		idle := time.Now()
-		for !t.poll() {
+		for polls := 0; !t.poll(); polls++ {
 			switch {
 			case t.left.Load() > 0:
 				// Others are finishing a loop, and the next is likely to
@@ -115,8 +120,10 @@ func (t *team) help() {
 				t.park()
 				idle = time.Now()
 			}
-			// Let other goroutines have the processor between polls.
-			runtime.Gosched()
+			// Let other goroutines have the processor now and then.
+			if polls%yieldEvery == 0 {
+				runtime.Gosched()
+			}
 		}
 		t.work()
 	}
