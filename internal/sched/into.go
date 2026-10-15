@@ -30,8 +30,7 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 	taken := map[*graph.Storage]bool{}
 	for i, t := range targets {
 		d := dsts[i]
-		if d == nil || !d.Realized() || d.Stale() || t.Realized() || into[t] != nil || taken[d.Mem] ||
-			t.DType != d.DType || !slices.Equal(t.Shape, d.Shape) || !ownBuffer(d) {
+		if !candidate(t, d) || into[t] != nil || taken[d.Mem] {
 			continue
 		}
 		writer := t
@@ -47,6 +46,28 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 		}
 	}
 	return into
+}
+
+// candidate reports whether the target t could be computed into the
+// memory of its destination d, as far as the two alone tell: d is
+// realized and not stale, with t's dtype and shape, in a buffer of its
+// own, and t is not computed yet.
+func candidate(t, d *graph.Node) bool {
+	return d != nil && d.Realized() && !d.Stale() && !t.Realized() &&
+		t.DType == d.DType && slices.Equal(t.Shape, d.Shape) && ownBuffer(d)
+}
+
+// candidates returns the storages of the destinations that targets could
+// be computed into, which the plan avoids reading after writing. dsts is
+// nil or holds the destination of each target, or nil.
+func candidates(targets, dsts []*graph.Node) map[*graph.Storage]bool {
+	mems := map[*graph.Storage]bool{}
+	for i, t := range targets {
+		if dsts != nil && candidate(t, dsts[i]) {
+			mems[dsts[i].Mem] = true
+		}
+	}
+	return mems
 }
 
 // ownBuffer reports whether the realized node n reads all of its buffer in
