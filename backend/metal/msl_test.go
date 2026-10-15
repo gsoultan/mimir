@@ -52,6 +52,8 @@ template <class T, class U> T as_type(U u) {
 }
 using std::cos; using std::exp2; using std::fma; using std::fmod; using std::log;
 using std::log2; using std::signbit; using std::sin; using std::sqrt;
+inline float cospi(float x) { return float(std::cos(3.14159265358979323846 * x)); }
+inline float sinpi(float x) { return float(std::sin(3.14159265358979323846 * x)); }
 inline uint mulhi(uint a, uint b) { return uint((uint64_t(a) * b) >> 32); }
 struct uint2 { uint x, y; uint2(uint a, uint b) : x(a), y(b) {} };
 struct uint4 {

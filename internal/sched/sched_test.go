@@ -127,6 +127,53 @@ func TestFailedRealizeFreesEverythingAndChangesNothing(t *testing.T) {
 	}
 }
 
+// deferring reports a kernel's error at the next Sync instead of from Run,
+// as a GPU backend does.
+type deferring struct {
+	*counting
+	failed error
+}
+
+func (d *deferring) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	if err := d.counting.Run(ctx, k, outs, ins); err != nil && d.failed == nil {
+		d.failed = err
+	}
+	return nil
+}
+
+func (d *deferring) Sync(context.Context) error {
+	err := d.failed
+	d.failed = nil
+	return err
+}
+
+// held returns the number of elements allocated and not in d's pool.
+func (d *deferring) held() int {
+	mu.Lock()
+	defer mu.Unlock()
+	return d.live - poolOf(d).pooledElements()
+}
+
+func TestRealizeWaitsForErrorsReportedAtSync(t *testing.T) {
+	be := &deferring{counting: &counting{Backend: cpu.New()}}
+	x := realized(t, be, []int{100}, 1)
+	y := must(graph.Unary(backend.OpExp2, x))
+	be.failOn = backend.OpExp2
+	if err := Realize(t.Context(), be, y); !errors.Is(err, backend.ErrIndex) {
+		t.Fatalf("got %v, want the kernel's error", err)
+	}
+	if y.Realized() {
+		t.Error("the target of a failed kernel was realized")
+	}
+	if held := be.held(); held != 100 {
+		t.Errorf("%d elements held after a failed realize, want x's 100", held)
+	}
+	be.failOn = 0
+	if err := Realize(t.Context(), be, must(graph.Unary(backend.OpNeg, x))); err != nil {
+		t.Errorf("the next realize reported %v", err)
+	}
+}
+
 func TestElementwiseChainsFuse(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	x := must(graph.Rand([]int{1000}, 1, false))

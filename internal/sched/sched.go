@@ -313,7 +313,7 @@ type result struct {
 	mem  *graph.Storage // the storage of buf, if realized nodes read it
 }
 
-func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) error {
+func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) (err error) {
 	generation++
 	order, err := topoSort(targets)
 	if err != nil {
@@ -325,6 +325,15 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 	}
 	m := poolOf(be)
 	defer m.tick()
+	// A backend may run kernels after Run returns and report their errors
+	// at Sync, so the schedule waits for them before it changes any node.
+	// On error it still waits, so that the errors of kernels already
+	// queued are not reported by a later schedule.
+	defer func() {
+		if err != nil {
+			_ = be.Sync(context.WithoutCancel(ctx))
+		}
+	}()
 	isTarget := make(map[*graph.Node]bool, len(targets))
 	for _, t := range targets {
 		isTarget[t] = true
@@ -433,6 +442,12 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 			}
 			return fmt.Errorf("sched: no kernel computed a %s target: %w", t.Op, backend.ErrInternal)
 		}
+	}
+	if err := be.Sync(context.WithoutCancel(ctx)); err != nil {
+		for buf := range refs {
+			m.release(buf)
+		}
+		return err
 	}
 	for _, r := range moved {
 		if refs[r.buf] == 0 {
