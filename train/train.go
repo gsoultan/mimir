@@ -23,6 +23,7 @@ import (
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
 	"github.com/gsoultan/mimir/optim"
+	"github.com/gsoultan/mimir/tensor"
 )
 
 // ErrStop, returned by an OnEpoch or OnBatch callback, ends training without
@@ -182,6 +183,15 @@ func Fit(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dat
 	return nil
 }
 
+// deviceOf returns the device that holds model's parameters, where its
+// batches go, or the default device if it has none.
+func deviceOf(model nn.Module) tensor.Device {
+	for _, p := range nn.NamedParams(model) {
+		return p.Value().Device()
+	}
+	return tensor.DefaultDevice()
+}
+
 func stopped(err error) error {
 	if errors.Is(err, ErrStop) {
 		return nil
@@ -200,11 +210,12 @@ func runEpoch(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds dat
 	}
 	var sum float64
 	n := 0
+	dev := deviceOf(model)
 	for b, err := range ds.All(ctx) {
 		if err != nil {
 			return Epoch{}, err
 		}
-		l := c.loss(model.Forward(b.X), b.Y)
+		l := c.loss(model.Forward(b.X.To(dev)), b.Y.To(dev))
 		if err := l.Backward(ctx); err != nil {
 			return Epoch{}, err
 		}
@@ -245,10 +256,12 @@ func Evaluate(ctx context.Context, model nn.Module, ds data.Dataset, lossFn loss
 	}
 	var sum float64
 	n := 0
+	dev := deviceOf(model)
 	for b, err := range ds.All(ctx) {
 		if err != nil {
 			return nil, err
 		}
+		b.X, b.Y = b.X.To(dev), b.Y.To(dev)
 		pred := model.Forward(b.X).Detach()
 		if lossFn != nil {
 			v, err := lossFn(pred, b.Y).Item[float32](ctx)

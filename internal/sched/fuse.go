@@ -44,6 +44,7 @@ import (
 
 // plan lists the kernels that compute a schedule's targets.
 type plan struct {
+	be     backend.Backend             // the device that runs the kernels
 	order  []*graph.Node               // nodes computed by kernels, inputs first
 	work   map[*graph.Node]*work       // how each is computed
 	storer map[*graph.Node]*graph.Node // the node whose kernel writes each stored target

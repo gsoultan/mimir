@@ -48,8 +48,8 @@ func planReduction(v backend.View, axes []int) reduction {
 			last = d
 		}
 	}
-	_, kv := coalesce(kept.Shape, []backend.View{kept})
-	_, rv := coalesce(red.Shape, []backend.View{red})
+	_, kv := backend.Coalesce(kept.Shape, []backend.View{kept})
+	_, rv := backend.Coalesce(red.Shape, []backend.View{red})
 	p := reduction{rows: kv[0], rowLen: 1, red: rv[0]}
 	short := len(p.red.Shape) > 0 && p.red.Shape[len(p.red.Shape)-1] < shortRun
 	if r := len(p.rows.Shape) - 1; r >= 0 && last >= 0 && (!slices.Contains(axes, last) || short) {

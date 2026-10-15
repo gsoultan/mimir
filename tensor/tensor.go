@@ -36,13 +36,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"os"
 	"slices"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
-	"github.com/gsoultan/mimir/backend/cpu"
 	"github.com/gsoultan/mimir/internal/graph"
 	"github.com/gsoultan/mimir/internal/sched"
 )
@@ -74,9 +74,6 @@ var (
 	ErrOverwritten = graph.ErrOverwritten
 )
 
-// device runs every tensor. Milestone 1 ships the CPU backend only.
-var device backend.Backend = cpu.New()
-
 // eager computes each operation as soon as it is created.
 var eager = os.Getenv("MIMIR_EAGER") == "1"
 
@@ -102,11 +99,14 @@ func Failed(err error) *Tensor {
 
 // wrap turns a graph constructor's result into a tensor.
 func wrap(n *graph.Node, err error) *Tensor {
+	if err == nil {
+		err = defaultErr
+	}
 	if err != nil {
 		return fail(err)
 	}
 	if eager {
-		if err := sched.Realize(context.Background(), device, n); err != nil {
+		if err := sched.Realize(context.Background(), backendOf(n), n); err != nil {
 			return fail(err)
 		}
 	}
@@ -161,15 +161,7 @@ func FromSlice[T Elem](data []T, shape ...int) *Tensor {
 	if n, ok := backend.NumElements(shape); !ok || n != len(data) {
 		return fail(fmt.Errorf("tensor: %d elements for shape %v: %w", len(data), shape, ErrShape))
 	}
-	buf, err := device.Alloc(dtypeOf[T](), len(data))
-	if err != nil {
-		return fail(err)
-	}
-	if err := device.Upload(context.Background(), buf, asBytes(data)); err != nil {
-		device.Free(buf)
-		return fail(err)
-	}
-	return wrap(graph.Load(buf, shape))
+	return upload(defaultDevice().be, dtypeOf[T](), asBytes(data), shape)
 }
 
 // Full returns a tensor of shape whose elements all equal value. It uses one
@@ -267,7 +259,16 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 	for i, t := range ts {
 		nodes[i] = t.node
 	}
-	return sched.Realize(ctx, device, nodes...)
+	for be, idx := range byDevice(nodes) {
+		group := make([]*graph.Node, len(idx))
+		for j, i := range idx {
+			group[j] = nodes[i]
+		}
+		if err := sched.Realize(ctx, be, group...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RealizeInto computes every tensor of srcs in one schedule, like Realize,
@@ -315,7 +316,37 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 		}
 		into[i] = d.node
 	}
-	return sched.RealizeInto(ctx, device, targets, into, lazy.values)
+	for be, idx := range byDevice(targets) {
+		ts, ds := make([]*graph.Node, len(idx)), make([]*graph.Node, len(idx))
+		for j, i := range idx {
+			ts[j], ds[j] = targets[i], into[i]
+		}
+		if err := sched.RealizeInto(ctx, be, ts, ds, lazy.values); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// byDevice groups the indexes of nodes by the device that computes them,
+// in order of their first node, so that each device runs one schedule.
+func byDevice(nodes []*graph.Node) iter.Seq2[backend.Backend, []int] {
+	return func(yield func(backend.Backend, []int) bool) {
+		var order []backend.Backend
+		groups := map[backend.Backend][]int{}
+		for i, n := range nodes {
+			be := backendOf(n)
+			if groups[be] == nil {
+				order = append(order, be)
+			}
+			groups[be] = append(groups[be], i)
+		}
+		for _, be := range order {
+			if !yield(be, groups[be]) {
+				return
+			}
+		}
+	}
 }
 
 // Data computes t and returns its elements in row-major order. T must match
@@ -331,7 +362,7 @@ func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := sched.Download(ctx, device, t.node, asBytes(out)); err != nil {
+	if err := sched.Download(ctx, backendOf(t.node), t.node, asBytes(out)); err != nil {
 		return nil, err
 	}
 	return out, nil
