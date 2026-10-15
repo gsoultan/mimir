@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/gsoultan/mimir/internal/graph"
 	"github.com/gsoultan/mimir/internal/sched"
 )
 
@@ -195,11 +196,14 @@ func (t *Tensor) Backward(ctx context.Context) error {
 
 	// The sums go over the memory of the gradients they add to, where
 	// that memory is the tapes' own. A sum that Backward computes, rather
-	// than one that is already realized, is in memory of its own.
+	// than one that is already realized, is in memory of its own; leaves
+	// whose gradients are the same value, as those of a and b in a+b, each
+	// get a copy, so ZeroGrad on one leaves the others alone.
 	sums := make([]*Tensor, len(leaves))
 	own := make([]bool, len(leaves))
 	targets := append(make([]*Tensor, 0, 1+len(leaves)+len(effects)), t)
 	dsts := make([]*Tensor, 1, cap(targets))
+	computed := map[*graph.Node]bool{t.node: true}
 	for i, l := range leaves {
 		sums[i] = acc[l]
 		var dst *Tensor
@@ -209,6 +213,10 @@ func (t *Tensor) Backward(ctx context.Context) error {
 				dst = l.grad
 			}
 		}
+		if n := sums[i].node; computed[n] && !n.Realized() {
+			sums[i] = sums[i].Clone()
+		}
+		computed[sums[i].node] = true
 		own[i] = !sums[i].node.Realized()
 		targets, dsts = append(targets, sums[i]), append(dsts, dst)
 	}

@@ -187,3 +187,29 @@ func TestStepOverwritesTheOldValues(t *testing.T) {
 		t.Errorf("value after two steps = %v, %v; want [0 1]", got, err)
 	}
 }
+
+func TestRulesMayKeepTheGradientAsState(t *testing.T) {
+	p := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	// The first step keeps g as it is; later steps add to it.
+	keep := func(lr float64, step int, p, g *tensor.Tensor, s optim.State) (*tensor.Tensor, optim.State) {
+		sum := g
+		if old := s["sum"]; old != nil {
+			sum = old.Add(g)
+		}
+		return p.Sub(sum.Mul(tensor.Scalar(float32(lr)))), optim.State{"sum": sum}
+	}
+	opt := optim.New([]*tensor.Param{p}, 0.5, keep)
+	for range 2 {
+		if err := p.Value().Sum().Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		opt.ZeroGrad()
+	}
+	// Steps of 0.5·1 and then 0.5·2.
+	if got, err := p.Value().Data[float32](t.Context()); err != nil || got[0] != -0.5 || got[1] != 0.5 {
+		t.Errorf("value after two steps = %v, %v; want [-0.5 0.5]", got, err)
+	}
+}

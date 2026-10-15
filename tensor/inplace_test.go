@@ -100,3 +100,18 @@ func TestNewParamCopiesItsInitialValue(t *testing.T) {
 		t.Errorf("initial value after the parameter was overwritten = %v, %v; want [3 4]", got, err)
 	}
 }
+
+func TestLeavesWithTheSameGradientEachOwnIt(t *testing.T) {
+	a := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	b := tensor.NewParam(tensor.FromSlice([]float32{3, 4}))
+	for range 2 {
+		if err := a.Value().Add(b.Value()).Sum().Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		a.ZeroGrad()
+		if got, err := b.Grad().Data[float32](t.Context()); err != nil || !slices.Equal(got, []float32{1, 1}) {
+			t.Fatalf("b's gradient after a.ZeroGrad = %v, %v; want [1 1]", got, err)
+		}
+		b.ZeroGrad()
+	}
+}

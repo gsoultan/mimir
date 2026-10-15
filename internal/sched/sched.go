@@ -221,14 +221,15 @@ func assign(t *graph.Node, r result) {
 
 // consume makes stale every destination whose target was computed into
 // memory of its own: the caller is done with it, whether or not its memory
-// was reused.
+// was reused. A destination already stale is left alone, since its memory
+// may hold a newer value.
 func consume(targets, dsts []*graph.Node) {
 	held := make(map[*graph.Storage]bool, len(targets))
 	for _, t := range targets {
 		held[t.Mem] = true
 	}
 	for _, d := range dsts {
-		if d != nil && d.Realized() && !held[d.Mem] {
+		if d != nil && d.Realized() && !d.Stale() && !held[d.Mem] {
 			d.Mem.Version++
 			d.Mem.Refs = 0
 			held[d.Mem] = true
