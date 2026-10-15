@@ -87,6 +87,10 @@ jobs:
             } | tee "$RUNNER_TEMP/bench.txt"
             { echo '### GPU benchmarks'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: profile a GPU training step
+        run: |
+          MIMIR_DEVICE=gpu go test -run '^$' -bench 'TrainStep/mlp' -benchtime 3s -cpuprofile "$RUNNER_TEMP/cpu.out" ./train
+          go tool pprof -top -nodecount=40 train.test "$RUNNER_TEMP/cpu.out" | head -60
 
   lint:
     runs-on: ubuntu-latest
