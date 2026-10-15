@@ -86,6 +86,16 @@ type Tensor struct {
 
 func fail(err error) *Tensor { return &Tensor{err: err} }
 
+// Failed returns a tensor carrying err, for code that builds tensors and
+// reports errors the way tensor operations do: every operation on the
+// result carries err, and Err, Realize, Data and Item return it.
+func Failed(err error) *Tensor {
+	if err == nil {
+		err = fmt.Errorf("tensor: Failed(nil): %w", ErrInternal)
+	}
+	return fail(err)
+}
+
 // wrap turns a graph constructor's result into a tensor.
 func wrap(n *graph.Node, err error) *Tensor {
 	if err != nil {

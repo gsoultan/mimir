@@ -1,12 +1,10 @@
 package tensor_test
 
 import (
-	"fmt"
 	"math"
 	"testing"
 
 	"github.com/gsoultan/mimir/internal/goldentest"
-	"github.com/gsoultan/mimir/io/safetensors"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -121,26 +119,6 @@ var goldenCases = map[string]goldenCase{
 	}, loose},
 }
 
-func fromGolden(t *testing.T, g safetensors.Tensor) *tensor.Tensor {
-	t.Helper()
-	switch g.DType {
-	case "F32":
-		v, err := g.Float32s()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return tensor.FromSlice(v, g.Shape...)
-	case "I32":
-		v, err := g.Int32s()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return tensor.FromSlice(v, g.Shape...)
-	}
-	t.Fatalf("unsupported golden dtype %s", g.DType)
-	return nil
-}
-
 // TestGolden checks every operation against outputs computed by PyTorch or
 // NumPy (see tools/golden/gen.py).
 func TestGolden(t *testing.T) {
@@ -159,7 +137,7 @@ func TestGolden(t *testing.T) {
 			}
 			in := make([]*tensor.Tensor, len(c.Inputs))
 			for i, g := range c.Inputs {
-				in[i] = fromGolden(t, g)
+				in[i] = goldentest.Tensor(t, g)
 			}
 			out := gc.fn(in...)
 			if err := out.Err(); err != nil {
@@ -220,44 +198,12 @@ func TestGoldenGradients(t *testing.T) {
 				}
 				fn = gc.fn
 			}
-			in := make([]*tensor.Tensor, len(c.Inputs))
-			for i, g := range c.Inputs {
-				in[i] = fromGolden(t, g)
-				if _, ok := c.Grads[i]; ok {
-					in[i] = in[i].RequiresGrad()
-				}
+			in := goldentest.Inputs(t, c)
+			grads := map[int]goldentest.Grader{}
+			for i := range c.Grads {
+				grads[i] = in[i]
 			}
-			checkGradients(t, c, in, fn(in...), goldentest.Tol{Atol: 1e-5, Rtol: 1e-4})
+			goldentest.CheckGradients(t, c, fn(in...), grads, goldentest.Tol{Atol: 1e-5, Rtol: 1e-4})
 		})
-	}
-}
-
-// checkGradients compares out with the golden output, backpropagates the
-// golden output gradient and compares each input's gradient.
-func checkGradients(t *testing.T, c goldentest.Case, in []*tensor.Tensor, out *tensor.Tensor, tol goldentest.Tol) {
-	t.Helper()
-	ctx := t.Context()
-	if err := out.Err(); err != nil {
-		t.Fatal(err)
-	}
-	loss := out.Mul(fromGolden(t, c.Gout)).Sum()
-	if err := loss.Backward(ctx); err != nil {
-		t.Fatal(err)
-	}
-	got, err := out.Data[float32](ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	goldentest.Compare(t, c.Want, got, out.Shape(), tol)
-	for i, want := range c.Grads {
-		g := in[i].Grad()
-		if g == nil {
-			t.Fatalf("input %d has no gradient", i)
-		}
-		v, err := g.Data[float32](ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Run(fmt.Sprintf("grad%d", i), func(t *testing.T) { goldentest.Compare(t, want, v, g.Shape(), tol) })
 	}
 }
