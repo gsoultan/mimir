@@ -5,16 +5,22 @@
 package graph
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 )
 
+// ErrOverwritten reports a read of a realized node whose memory now holds
+// other values, such as a parameter's value from before an in-place
+// optimizer step.
+var ErrOverwritten = errors.New("tensor memory was overwritten")
+
 // Node is one primitive operation. Op, DType, Shape and Attrs never change
-// after construction. Buf, View and Inputs are owned by the scheduler: once a
-// node is realized it holds its result and drops its inputs, so a realized
-// tensor does not keep the graph that produced it alive.
+// after construction. Mem, Ver, View and Inputs are owned by the scheduler:
+// once a node is realized it holds its result and drops its inputs, so a
+// realized tensor does not keep the graph that produced it alive.
 type Node struct {
 	Op     backend.Op
 	DType  backend.DType
@@ -22,12 +28,29 @@ type Node struct {
 	Attrs  backend.Attrs
 	Inputs []*Node
 
-	Buf  backend.Buffer // set once realized
-	View backend.View   // how Shape is read from Buf
+	Mem  *Storage     // set once realized
+	Ver  int          // the version of Mem that holds the result
+	View backend.View // how Shape is read from Mem.Buf
+}
+
+// Storage is a buffer that realized nodes read, each through its own view.
+// Writing new values over the buffer, as an in-place update does, bumps
+// Version, which makes the nodes realized with earlier versions stale.
+type Storage struct {
+	Buf     backend.Buffer
+	Version int
+	Refs    int // the nodes realized into the storage since Version changed
 }
 
 // Realized reports whether the node holds its result.
-func (n *Node) Realized() bool { return n.Buf != nil }
+func (n *Node) Realized() bool { return n.Mem != nil }
+
+// Stale reports whether the node's memory has been overwritten since it
+// was realized.
+func (n *Node) Stale() bool { return n.Mem != nil && n.Ver != n.Mem.Version }
+
+// Buf returns the buffer that holds a realized node's result.
+func (n *Node) Buf() backend.Buffer { return n.Mem.Buf }
 
 // Size returns the number of elements.
 func (n *Node) Size() int {
@@ -61,7 +84,8 @@ func Load(buf backend.Buffer, shape []int) (*Node, error) {
 	if n, _ := backend.NumElements(shape); buf.Len() != n {
 		return nil, errorf(backend.OpLoad, backend.ErrShape, "%d elements for shape %v", buf.Len(), shape)
 	}
-	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Buf: buf, View: backend.Contiguous(shape)}, nil
+	mem := &Storage{Buf: buf, Refs: 1}
+	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Mem: mem, View: backend.Contiguous(shape)}, nil
 }
 
 // Const is a tensor whose elements all equal value. It costs one element of
@@ -299,4 +323,84 @@ func ScatterAdd(x, idx, src *Node, axis int) (*Node, error) {
 		return nil, errorf(backend.OpScatterAdd, backend.ErrDType, "%s and %s", x.DType, src.DType)
 	}
 	return &Node{Op: backend.OpScatterAdd, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, idx, src}, Attrs: backend.Attrs{Axis: axis}}, nil
+}
+
+// Window describes sliding windows over the trailing len(Kernel)
+// dimensions of a tensor; see backend.OpUnfold.
+type Window struct {
+	Kernel, Stride, Dilation []int
+	Pads                     [][2]int
+}
+
+// positions returns the number of window positions along each windowed
+// dimension of size spatial[d].
+func (w Window) positions(op backend.Op, spatial []int) ([]int, error) {
+	s := len(w.Kernel)
+	if s == 0 || len(w.Stride) != s || len(w.Dilation) != s || len(w.Pads) != s || len(spatial) != s {
+		return nil, errorf(op, backend.ErrShape, "window %+v over %v", w, spatial)
+	}
+	out := make([]int, s)
+	for d := range s {
+		k, st, dil, p := w.Kernel[d], w.Stride[d], w.Dilation[d], w.Pads[d]
+		if k < 1 || st < 1 || dil < 1 || p[0] < 0 || p[1] < 0 {
+			return nil, errorf(op, backend.ErrShape, "window %+v", w)
+		}
+		span := (k-1)*dil + 1
+		if spatial[d]+p[0]+p[1] < span {
+			return nil, errorf(op, backend.ErrShape, "window %+v larger than %v", w, spatial)
+		}
+		out[d] = (spatial[d]+p[0]+p[1]-span)/st + 1
+	}
+	return out, nil
+}
+
+func (w Window) attrs(value float64) backend.Attrs {
+	return backend.Attrs{
+		Kernel:   slices.Clone(w.Kernel),
+		Stride:   slices.Clone(w.Stride),
+		Dilation: slices.Clone(w.Dilation),
+		Pads:     slices.Clone(w.Pads),
+		Value:    value,
+	}
+}
+
+// Unfold returns the sliding windows w of x, filling the padding with
+// value: [B..., D...] becomes [B..., K..., O...].
+func Unfold(x *Node, w Window, value float64) (*Node, error) {
+	s := len(w.Kernel)
+	if len(x.Shape) < s {
+		return nil, errorf(backend.OpUnfold, backend.ErrShape, "window %+v over %v", w, x.Shape)
+	}
+	lead, spatial := x.Shape[:len(x.Shape)-s], x.Shape[len(x.Shape)-s:]
+	pos, err := w.positions(backend.OpUnfold, spatial)
+	if err != nil {
+		return nil, err
+	}
+	shape := slices.Concat(lead, w.Kernel, pos)
+	if err := checkShape(backend.OpUnfold, shape); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpUnfold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(value)}, nil
+}
+
+// Fold is the adjoint of Unfold: it sums the windows x, shaped
+// [B..., K..., O...], into a [B..., spatial...] result.
+func Fold(x *Node, spatial []int, w Window) (*Node, error) {
+	s := len(w.Kernel)
+	if len(x.Shape) < 2*s {
+		return nil, errorf(backend.OpFold, backend.ErrShape, "window %+v from %v", w, x.Shape)
+	}
+	pos, err := w.positions(backend.OpFold, spatial)
+	if err != nil {
+		return nil, err
+	}
+	lead, win := x.Shape[:len(x.Shape)-2*s], x.Shape[len(x.Shape)-2*s:]
+	if !slices.Equal(win, slices.Concat(w.Kernel, pos)) {
+		return nil, errorf(backend.OpFold, backend.ErrShape, "windows %v for window %+v over %v", x.Shape, w, spatial)
+	}
+	shape := slices.Concat(lead, spatial)
+	if err := checkShape(backend.OpFold, shape); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpFold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)}, nil
 }

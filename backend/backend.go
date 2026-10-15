@@ -74,7 +74,8 @@ type Buffer interface {
 // Backend executes kernels on one device.
 //
 // Implementations must be safe for concurrent use by multiple goroutines on
-// distinct buffers. A kernel's output buffer must not alias any input.
+// distinct buffers. A kernel's outputs share no memory with its inputs,
+// except as Run allows for in-place updates.
 type Backend interface {
 	// Name identifies the device, such as "cpu".
 	Name() string
@@ -89,8 +90,16 @@ type Backend interface {
 	// equal the buffer size in bytes.
 	Download(ctx context.Context, dst []byte, src Buffer) error
 	// Run executes k, reading ins through k.In views and writing a
-	// contiguous result of k.Shape into out.
-	Run(ctx context.Context, k *Kernel, out Buffer, ins []Buffer) error
+	// contiguous result of k.Shape into outs[0], and the values k stores
+	// into the rest of outs. Each output holds exactly the elements of
+	// k.Shape.
+	//
+	// An elementwise kernel (OpFused, a unary or binary op, OpCast,
+	// OpWhere or OpContiguous) may write an output over an input it reads
+	// through Contiguous(k.Shape): it reads every element of that input
+	// before it writes any element of that output, as an in-place update
+	// needs. No other kernel shares memory between its inputs and outputs.
+	Run(ctx context.Context, k *Kernel, outs []Buffer, ins []Buffer) error
 	// Sync waits until all submitted work has finished.
 	Sync(ctx context.Context) error
 }
@@ -107,12 +116,37 @@ type Kernel struct {
 // Attrs holds the operation-specific parameters of a Kernel or graph node.
 // Each Op documents which fields it uses.
 type Attrs struct {
-	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes.
+	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
 	Axis   int      // Gather, ScatterAdd: the indexed axis.
-	Pads   [][2]int // Pad: elements added before and after each dimension.
+	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension.
-	Value  float64  // Const, Pad: the fill value.
+	Value  float64  // Const, Pad, Unfold: the fill value.
 	Seed   uint64   // RandUniform, RandNormal: the Philox key.
+
+	// Unfold, Fold: the window size, step and spacing of its elements in
+	// each windowed dimension.
+	Kernel, Stride, Dilation []int
+
+	// Fused: the program; its last instruction computes the output.
+	Program []Instr
+	// Fused: instructions whose values the kernel also writes, value
+	// Stores[i] into output i+1. Stored values have the output's dtype
+	// and are computed, not loaded: a copy of an input is OpContiguous.
+	Stores []int
+}
+
+// Instr is one instruction of a fused program. Instruction i computes
+// value i, one element per index of the kernel's output, from the values
+// of earlier instructions. Values have the shape of the output, so
+// elementwise ops apply to them index by index.
+type Instr struct {
+	// Op is OpLoad, which reads input Args[0] of the kernel, OpConst,
+	// whose every element is Value, or an elementwise op (unary, binary,
+	// OpCast or OpWhere) applied to the values Args.
+	Op    Op
+	DType DType // element type of the value
+	Args  []int
+	Value float64
 }
 
 // NumElements returns the number of elements in shape. It reports false if

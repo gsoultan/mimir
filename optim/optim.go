@@ -9,8 +9,12 @@
 //	}
 //
 // Step computes every parameter's new value and optimizer state in one
-// schedule and then replaces them, so parameters always hold computed
-// values, never a growing recipe. If Step fails nothing changes.
+// schedule, writing them over the old ones in place like PyTorch, so
+// parameters always hold computed values, never a growing recipe, and a
+// training step reuses the same memory every time. A tensor taken from a
+// parameter or the optimizer state before a step is stale after it:
+// reading it, or computing a tensor built from it, returns
+// tensor.ErrOverwritten.
 package optim
 
 import (
@@ -33,7 +37,9 @@ type State map[string]*tensor.Tensor
 // Rule computes one step for one parameter. From the parameter's value p,
 // its gradient g and its state after the previous step, which is empty
 // before the first, it returns the new value and state. step counts from
-// 1 and lr is the current learning rate.
+// 1 and lr is the current learning rate. ZeroGrad releases g's memory, so
+// a state that keeps g's values holds a copy, such as g.Clone(); Step
+// copies a state that is g itself.
 type Rule func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State)
 
 // Optimizer applies a Rule to every trainable parameter that has a
@@ -73,9 +79,10 @@ func (o *Optimizer) ZeroGrad() {
 	}
 }
 
-// Step updates every trainable parameter that has a gradient. It computes
-// all new values and states in one schedule before replacing any, so on
-// error nothing changes.
+// Step updates every trainable parameter that has a gradient, writing the
+// new values and states over the old ones (see tensor.RealizeInto). If it
+// fails before it starts writing, nothing changes; cancelling ctx after
+// that does not stop it.
 func (o *Optimizer) Step(ctx context.Context) error {
 	if o.err != nil {
 		return o.err
@@ -90,7 +97,7 @@ func (o *Optimizer) Step(ctx context.Context) error {
 	}
 	step := o.steps + 1
 	var updates []update
-	var targets []*tensor.Tensor
+	var targets, dsts []*tensor.Tensor
 	for i, p := range o.params {
 		g := p.Grad()
 		if g == nil || !p.Trainable() {
@@ -104,13 +111,18 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		if !slices.Equal(v.Shape(), cur.Shape()) {
 			return fmt.Errorf("optim: parameter %d: rule returned %v for %v: %w", i, v.Shape(), cur.Shape(), tensor.ErrShape)
 		}
+		for name, t := range s {
+			if t == g {
+				s[name] = g.Clone()
+			}
+		}
 		updates = append(updates, update{i, v, s})
-		targets = append(targets, v)
-		for _, t := range s {
-			targets = append(targets, t)
+		targets, dsts = append(targets, v), append(dsts, cur)
+		for name, t := range s {
+			targets, dsts = append(targets, t), append(dsts, o.states[i][name])
 		}
 	}
-	if err := tensor.Realize(ctx, targets...); err != nil {
+	if err := tensor.RealizeInto(ctx, dsts, targets); err != nil {
 		return err
 	}
 	for _, u := range updates {
@@ -125,7 +137,9 @@ func (o *Optimizer) Step(ctx context.Context) error {
 
 // Snapshot returns the state of every parameter, named "<index>.<name>"
 // by the parameter's position, and the number of steps taken, for
-// checkpoints.
+// checkpoints. The tensors are the optimizer's own, which the next step
+// writes over: encode them, or Clone them and Realize the clones, before
+// it.
 func (o *Optimizer) Snapshot() (map[string]*tensor.Tensor, int) {
 	out := map[string]*tensor.Tensor{}
 	for i, s := range o.states {
@@ -136,10 +150,12 @@ func (o *Optimizer) Snapshot() (map[string]*tensor.Tensor, int) {
 	return out, o.steps
 }
 
-// Restore replaces the optimizer's state with one from Snapshot, taken
-// from an optimizer of the same kind over parameters of the same shapes.
+// Restore replaces the optimizer's state with a copy of one from Snapshot,
+// taken from an optimizer of the same kind over parameters of the same
+// shapes.
 func (o *Optimizer) Restore(state map[string]*tensor.Tensor, steps int) error {
 	states := make([]State, len(o.params))
+	var copies []*tensor.Tensor
 	for _, key := range slices.SortedFunc(maps.Keys(state), cmp.Compare) {
 		idx, name, ok := strings.Cut(key, ".")
 		i, err := strconv.Atoi(idx)
@@ -152,7 +168,12 @@ func (o *Optimizer) Restore(state map[string]*tensor.Tensor, steps int) error {
 		if states[i] == nil {
 			states[i] = State{}
 		}
-		states[i][name] = state[key]
+		c := state[key].Clone()
+		states[i][name] = c
+		copies = append(copies, c)
+	}
+	if err := tensor.Realize(context.Background(), copies...); err != nil {
+		return fmt.Errorf("optim: restore: %w", err)
 	}
 	o.states, o.steps = states, steps
 	return nil
@@ -251,7 +272,7 @@ func SGD(params []*tensor.Param, opts ...Option) *Optimizer {
 			}
 			var next State
 			if c.momentum != 0 {
-				buf := g
+				buf := g.Clone() // memory of its own, which later steps update
 				if prev, ok := s["momentum_buffer"]; ok {
 					buf = prev.Mul(f32(c.momentum)).Add(g.Mul(f32(1 - c.dampening)))
 				}

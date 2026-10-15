@@ -151,6 +151,12 @@ func gradCases() []gradCase {
 		y := x[0].Mul(x[0]).Add(x[0].Exp())
 		return y.Sum(-1).Add(y.Max(-1))
 	}, u(-2, 2, 3, 4))
+	add("conv2d_pointwise_strided", func(x []*tensor.Tensor) *tensor.Tensor {
+		return x[0].Conv2d(x[1], nil, tensor.ConvOptions{Stride: 2})
+	}, u(-1, 1, 1, 2, 5, 5), u(-1, 1, 3, 2, 1, 1))
+	add("max_pool2d_gapped", func(x []*tensor.Tensor) *tensor.Tensor {
+		return x[0].MaxPool2d(2, tensor.ConvOptions{Stride: 3})
+	}, u(-2, 2, 1, 2, 7, 8))
 	return cases
 }
 
