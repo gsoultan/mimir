@@ -56,6 +56,7 @@ type scratch struct {
 	slotsF [][]float32
 	slotsI [][]int32
 	offs   []int
+	cur    cursor
 }
 
 var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
@@ -84,12 +85,12 @@ func singleOp(k *backend.Kernel, ins []backend.Buffer) []backend.Instr {
 	return append(prog, backend.Instr{Op: k.Op, DType: k.DType, Args: args})
 }
 
-// compile checks prog against the kernel and assigns scratch slots. strides
-// holds the innermost stride of each input after coalescing; an input with
-// stride 0 is a scalar in every row.
-func compile(k *backend.Kernel, prog []backend.Instr, ins []backend.Buffer, strides []int) (*program, error) {
-	if len(prog) == 0 || prog[len(prog)-1].DType != k.DType {
-		return nil, fmt.Errorf("program of %d instructions for %s output: %w", len(prog), k.DType, backend.ErrInternal)
+// compile checks prog against its inputs and output dtype and assigns
+// scratch slots. strides holds the innermost stride of each input after
+// coalescing; an input with stride 0 is a scalar in every row.
+func compile(out backend.DType, prog []backend.Instr, ins []backend.Buffer, strides []int) (*program, error) {
+	if len(prog) == 0 || prog[len(prog)-1].DType != out {
+		return nil, fmt.Errorf("program of %d instructions for %s output: %w", len(prog), out, backend.ErrInternal)
 	}
 	p := &program{steps: make([]step, len(prog)), inF: make([][]float32, len(ins)), inI: make([][]int32, len(ins))}
 	for i, buf := range ins {
@@ -213,10 +214,34 @@ func check(in backend.Instr, j int, prog []backend.Instr, ins []backend.Buffer) 
 
 // runProgram computes the elementwise program prog into out.
 func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backend.Instr, out backend.Buffer, ins []backend.Buffer) error {
-	shape, views := coalesce(k.Shape, k.In)
-	total, _ := backend.NumElements(shape)
-	if total == 0 {
-		return nil
+	e, err := newEvaluator(k.Shape, k.In, prog, out, ins)
+	if err != nil || e == nil {
+		return err
+	}
+	total, _ := backend.NumElements(k.Shape)
+	return b.parallelFor(ctx, total, elementGrain, func(lo, hi int) error {
+		s := scratchPool.Get().(*scratch)
+		defer scratchPool.Put(s)
+		return e.run(s, lo, hi)
+	})
+}
+
+// evaluator computes an elementwise program over ranges of its output.
+type evaluator struct {
+	p       *program
+	shape   []int          // the coalesced index space, of rank 1 or more
+	outer   []backend.View // the views without their innermost dimension
+	strides []int          // the innermost stride of each view
+	outF    []float32      // the output, in its dtype
+	outI    []int32
+}
+
+// newEvaluator prepares prog to compute out, indexed by shape, from ins
+// read through views of shape. It returns nil if shape is empty.
+func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, out backend.Buffer, ins []backend.Buffer) (*evaluator, error) {
+	shape, views = coalesce(shape, views)
+	if total, _ := backend.NumElements(shape); total == 0 {
+		return nil, nil
 	}
 	if len(shape) == 0 {
 		shape = []int{1}
@@ -225,53 +250,64 @@ func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backe
 		}
 	}
 	r := len(shape)
-	inner := shape[r-1]
-	outer := make([]backend.View, len(views))
-	strides := make([]int, len(views))
+	e := &evaluator{shape: shape, outer: make([]backend.View, len(views)), strides: make([]int, len(views))}
 	for v, view := range views {
-		outer[v] = backend.View{Strides: view.Strides[:r-1], Offset: view.Offset}
-		strides[v] = view.Strides[r-1]
+		e.outer[v] = backend.View{Strides: view.Strides[:r-1], Offset: view.Offset}
+		e.strides[v] = view.Strides[r-1]
 	}
-	p, err := compile(k, prog, ins, strides)
-	if err != nil {
-		return err
+	var err error
+	if e.p, err = compile(out.DType(), prog, ins, e.strides); err != nil {
+		return nil, err
 	}
-	var outF []float32
-	var outI []int32
 	switch out := out.(type) {
 	case *buffer[float32]:
-		outF = out.data
+		e.outF = out.data
 	case *buffer[int32]:
-		outI = out.data
+		e.outI = out.data
 	}
-	return b.parallelFor(ctx, total, elementGrain, func(lo, hi int) error {
-		s := scratchPool.Get().(*scratch)
-		defer scratchPool.Put(s)
-		s.size(p, len(views))
-		c := newCursor(shape[:r-1], outer, lo/inner)
-		for i := lo; i < hi; c.next() {
-			col := i % inner
-			n := min(inner-col, hi-i)
-			for t := 0; t < n; t += tileLen {
-				m := min(tileLen, n-t)
-				for v := range s.offs {
-					s.offs[v] = c.offs[v] + (col+t)*strides[v]
-				}
-				at := i + t
-				var err error
-				if outF != nil {
-					err = p.tile(s, strides, m, outF[at:at+m], nil)
-				} else {
-					err = p.tile(s, strides, m, nil, outI[at:at+m])
-				}
-				if err != nil {
-					return err
-				}
-			}
-			i += n
-		}
+	return e, nil
+}
+
+// apply computes output elements [lo, hi) with pooled scratch memory. It
+// does nothing if e is nil, for kernels without an epilogue.
+func (e *evaluator) apply(lo, hi int) error {
+	if e == nil || lo == hi {
 		return nil
-	})
+	}
+	s := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(s)
+	return e.run(s, lo, hi)
+}
+
+// run computes output elements [lo, hi) with the scratch memory s.
+func (e *evaluator) run(s *scratch, lo, hi int) error {
+	s.size(e.p, len(e.strides))
+	r := len(e.shape)
+	inner := e.shape[r-1]
+	c := &s.cur
+	c.reset(e.shape[:r-1], e.outer, lo/inner)
+	for i := lo; i < hi; c.next() {
+		col := i % inner
+		n := min(inner-col, hi-i)
+		for t := 0; t < n; t += tileLen {
+			m := min(tileLen, n-t)
+			for v := range s.offs {
+				s.offs[v] = c.offs[v] + (col+t)*e.strides[v]
+			}
+			at := i + t
+			var err error
+			if e.outF != nil {
+				err = e.p.tile(s, e.strides, m, e.outF[at:at+m], nil)
+			} else {
+				err = e.p.tile(s, e.strides, m, nil, e.outI[at:at+m])
+			}
+			if err != nil {
+				return err
+			}
+		}
+		i += n
+	}
+	return nil
 }
 
 // size makes s hold the values and slots of p over inputs inputs.

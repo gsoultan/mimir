@@ -69,7 +69,7 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 	p := newPlan(order, isTarget)
 	uses := make(map[*graph.Node]int, len(p.order))
 	for _, n := range p.order {
-		for _, in := range p.deps[n] {
+		for _, in := range p.work[n].deps {
 			uses[in]++
 		}
 	}
@@ -100,12 +100,12 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 	}
 
 	for _, n := range p.order {
-		deps := p.deps[n]
-		ins := make([]result, len(deps))
-		for i, in := range deps {
+		w := p.work[n]
+		ins := make([]result, len(w.deps))
+		for i, in := range w.deps {
 			ins[i] = lookup(in)
 		}
-		r, fresh, err := step(ctx, m, n, ins, p.progs[n])
+		r, fresh, err := step(ctx, m, n, w, ins)
 		if err != nil {
 			for buf := range refs {
 				m.release(buf)
@@ -122,7 +122,7 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 			refs[r.buf]++
 		}
 		results[n] = r
-		for _, in := range deps {
+		for _, in := range w.deps {
 			release(in)
 		}
 	}
@@ -171,10 +171,10 @@ func topoSort(targets []*graph.Node) []*graph.Node {
 	return order
 }
 
-// step computes one node, running prog over ins if it has a fused program.
-// fresh is the buffer it allocated, if any; the result may also be a view
-// of an input's buffer.
-func step(ctx context.Context, m *pool, n *graph.Node, ins []result, prog []backend.Instr) (r result, fresh backend.Buffer, err error) {
+// step computes one node as w plans, from the results of w.deps. fresh is
+// the buffer it allocated, if any; the result may also be a view of an
+// input's buffer.
+func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result) (r result, fresh backend.Buffer, err error) {
 	if err := ctx.Err(); err != nil {
 		return result{}, nil, err
 	}
@@ -185,32 +185,24 @@ func step(ctx context.Context, m *pool, n *graph.Node, ins []result, prog []back
 		// One element, broadcast to the full shape with zero strides.
 		buf, err := run(ctx, m, &backend.Kernel{Op: backend.OpConst, DType: n.DType, Attrs: n.Attrs})
 		return result{buf, broadcast(n.Shape)}, buf, err
-	case backend.OpPermute:
-		return result{ins[0].buf, ins[0].view.Permute(n.Attrs.Axes)}, nil, nil
-	case backend.OpExpand:
-		return result{ins[0].buf, ins[0].view.Expand(n.Shape)}, nil, nil
-	case backend.OpShrink:
-		return result{ins[0].buf, ins[0].view.Shrink(n.Attrs.Ranges)}, nil, nil
-	case backend.OpFlip:
-		return result{ins[0].buf, ins[0].view.Flip(n.Attrs.Axes)}, nil, nil
-	case backend.OpReshape:
+	case backend.OpPermute, backend.OpExpand, backend.OpShrink, backend.OpFlip, backend.OpReshape:
 		in := ins[0]
-		if v, ok := in.view.Reshape(n.Shape); ok {
+		if v, ok := viewOf(in.view, n); ok {
 			return result{in.buf, v}, nil, nil
 		}
-		if isBroadcastScalar(in.view) {
-			v := broadcast(n.Shape)
-			v.Offset = in.view.Offset
-			return result{in.buf, v}, nil, nil
-		}
+		// Only a reshape can fail, and copying makes it contiguous.
 		k := &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: in.view.Shape, In: []backend.View{in.view}}
 		buf, err := run(ctx, m, k, in.buf)
 		return result{buf, backend.Contiguous(n.Shape)}, buf, err
 	}
 
 	k := &backend.Kernel{Op: n.Op, DType: n.DType, Shape: n.Shape, In: make([]backend.View, len(ins)), Attrs: n.Attrs}
-	if prog != nil {
-		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: prog}
+	switch {
+	case w.gemm != nil:
+		// The product, rewritten in place, holds n in row-major order.
+		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog}
+	case w.prog != nil:
+		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: w.prog}
 	}
 	bufs := make([]backend.Buffer, len(ins))
 	for i, in := range ins {

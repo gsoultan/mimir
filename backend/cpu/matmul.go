@@ -2,16 +2,63 @@ package cpu
 
 import (
 	"context"
+	"fmt"
+	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 )
+
+// runMatMul runs a matmul kernel whose operands have the output's dtype.
+func runMatMul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, ins []backend.Buffer, epi *evaluator) error {
+	out, err := data[T](outBuf)
+	if err != nil {
+		return err
+	}
+	x, err := data[T](ins[0])
+	if err != nil {
+		return err
+	}
+	y, err := data[T](ins[1])
+	if err != nil {
+		return err
+	}
+	return matmul(ctx, b, k, out, x, y, epi)
+}
+
+// epilogue returns the evaluator of a matmul's epilogue program, or nil if
+// it has none. The program reads the product as input 0 and ins[2:],
+// through k.In[2:], as inputs 1 on. Their views share a shape with as many
+// elements as the product, read in row-major order alongside it, so the
+// program can rewrite the product in place.
+func epilogue(k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) (*evaluator, error) {
+	if k.Attrs.Program == nil {
+		return nil, nil
+	}
+	shape := k.Shape
+	if len(k.In) > 2 {
+		shape = k.In[2].Shape
+	}
+	views := []backend.View{backend.Contiguous(shape)}
+	for _, v := range k.In[2:] {
+		if !slices.Equal(v.Shape, shape) {
+			return nil, fmt.Errorf("epilogue inputs of shapes %v and %v: %w", shape, v.Shape, backend.ErrInternal)
+		}
+		views = append(views, v)
+	}
+	if n, _ := backend.NumElements(shape); n != out.Len() {
+		return nil, fmt.Errorf("epilogue of shape %v for %d elements: %w", shape, out.Len(), backend.ErrInternal)
+	}
+	return newEvaluator(shape, views, k.Attrs.Program, out, append([]backend.Buffer{out}, ins[2:]...))
+}
 
 // matmul computes [..., M, K] x [..., K, N] -> [..., M, N]. Batch dimensions
 // are equal in shape but may have any strides, including 0 for broadcast.
 // Float32 products run on the packed GEMM in gemm.go. Int32 products split
 // work by output rows; each row accumulates in i-k-j order so the inner
-// loop streams a row of B and a row of the output.
-func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, y []T) error {
+// loop streams a row of B and a row of the output. If epi is not nil, it
+// rewrites each part of the output once that part is computed, while it is
+// still in cache.
+func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, y []T, epi *evaluator) error {
 	if len(out) == 0 {
 		return nil
 	}
@@ -26,7 +73,7 @@ func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, 
 	if out32, ok := any(out).([]float32); ok {
 		a := operand{data: any(x).([]float32), rs: sxm, cs: sxk}
 		bm := operand{data: any(y).([]float32), rs: syk, cs: syn}
-		return b.sgemm(ctx, gemmKernels[0], out32, a, offX, bm, offY, m, n, kk)
+		return b.sgemm(ctx, gemmKernels[0], out32, a, offX, bm, offY, m, n, kk, epi)
 	}
 
 	grain := max(1, elementGrain/max(1, kk*n))
@@ -50,7 +97,7 @@ func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, 
 				}
 			}
 		}
-		return nil
+		return epi.apply(lo*n, hi*n)
 	})
 }
 
