@@ -25,12 +25,12 @@ func pad[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T
 	for d, p := range k.Attrs.Pads {
 		dst.Offset += p[0] * strides[d]
 	}
-	return b.parallelFor(ctx, src.Size(), elementGrain, func(lo, hi int) error {
-		c := newCursor(src.Shape, []backend.View{src, dst}, lo)
-		for range hi - lo {
-			out[c.offs[1]] = in[c.offs[0]]
-			c.next()
+	return forRows(ctx, b, src.Shape, []backend.View{src, dst}, func(_ int, offs, steps []int, n int) {
+		from, to := offs[0], offs[1]
+		for range n {
+			out[to] = in[from]
+			from += steps[0]
+			to += steps[1]
 		}
-		return nil
 	})
 }
