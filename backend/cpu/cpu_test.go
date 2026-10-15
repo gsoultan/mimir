@@ -15,7 +15,7 @@ func i32buf(v ...int32) backend.Buffer   { return &buffer[int32]{data: slices.Cl
 
 func run[T elem](t *testing.T, k *backend.Kernel, ins ...backend.Buffer) ([]T, error) {
 	t.Helper()
-	n, _ := backend.NumElements(k.Shape)
+	n, _ := k.OutputLen()
 	b := New()
 	out, err := b.Alloc(k.DType, n)
 	if err != nil {

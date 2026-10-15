@@ -38,8 +38,10 @@ type team struct {
 }
 
 // teamSpin is how long a helper polls for a new loop, once the last has
-// finished, before parking.
-const teamSpin = 50 * time.Microsecond
+// finished, before parking. It covers the host work between the schedules
+// of a training step, such as building the next graph: a helper that
+// parked meanwhile starts the next loop late, after the runtime wakes it.
+const teamSpin = 5 * time.Millisecond
 
 // yieldEvery is how many polls a helper makes between yields. Yielding
 // lets other goroutines run, but every yield takes the scheduler's lock,

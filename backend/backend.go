@@ -89,7 +89,8 @@ type Backend interface {
 	// equal the buffer size in bytes.
 	Download(ctx context.Context, dst []byte, src Buffer) error
 	// Run executes k, reading ins through k.In views and writing a
-	// contiguous result of k.Shape into out.
+	// contiguous result of k.Shape into out, which holds k.OutputLen()
+	// elements.
 	Run(ctx context.Context, k *Kernel, out Buffer, ins []Buffer) error
 	// Sync waits until all submitted work has finished.
 	Sync(ctx context.Context) error
@@ -120,6 +121,22 @@ type Attrs struct {
 
 	// Fused: the program; its last instruction computes the output.
 	Program []Instr
+	// Fused: instructions whose values the kernel also writes, after its
+	// result: value Stores[i] fills elements [(i+1)·N, (i+2)·N) of the
+	// output buffer, where N is the size of the kernel's shape. Stored
+	// values have the output's dtype.
+	Stores []int
+}
+
+// OutputLen returns the number of elements k writes: the size of its
+// shape, once more for each stored value. It reports false if that
+// overflows int.
+func (k *Kernel) OutputLen() (int, bool) {
+	n, ok := NumElements(k.Shape)
+	if !ok || (n != 0 && len(k.Attrs.Stores) >= maxInt/n) {
+		return 0, false
+	}
+	return n * (1 + len(k.Attrs.Stores)), true
 }
 
 // Instr is one instruction of a fused program. Instruction i computes

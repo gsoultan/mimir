@@ -15,6 +15,17 @@ import (
 // and writes memory once. Constants, through any views, become immediate
 // values of the programs that read them.
 //
+// A target computed elementwise for one elementwise consumer joins its
+// consumer's group too, and the group's kernel writes it as well as the
+// group's own result. An optimizer step, which computes new moment
+// estimates and from them a new parameter value, then reads the gradient
+// and old state once and writes all three in one pass.
+//
+// A transpose of a product that nothing else reads is computed as the
+// product of the transposed operands, (AB)ᵀ = BᵀAᵀ, so it is written in
+// the order it is read. Linear layers multiply by transposed weights, and
+// the weight gradients come out transposed back.
+//
 // A group that reads the product of a matmul that nothing else reads, in
 // row-major order (directly or through a reshape), runs as that matmul's
 // epilogue instead: the GEMM applies the program to each part of its
@@ -29,9 +40,18 @@ type plan struct {
 
 // work is how a planned node is computed.
 type work struct {
-	deps []*graph.Node   // the nodes its kernel reads
-	prog []backend.Instr // a fused program, or gemm's epilogue
-	gemm *graph.Node     // the matmul whose product prog reads as input 0
+	deps   []*graph.Node   // the nodes its kernel reads
+	prog   []backend.Instr // a fused program, or gemm's epilogue
+	gemm   *graph.Node     // the matmul whose product prog reads as input 0
+	stores []store         // the targets prog also writes
+	swap   bool            // a transposed product, computed from deps transposed
+}
+
+// store is a target that a fused kernel computes for its group and writes
+// too: the value of instruction at.
+type store struct {
+	n  *graph.Node
+	at int
 }
 
 // newPlan plans the kernels for the unrealized nodes in order, which lists
@@ -52,37 +72,60 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
 	inner := func(n *graph.Node) bool {
 		return n.Op.IsElementwise() && private(n) && users[n][0].Op.IsElementwise()
 	}
+	// stored reports whether n is a target that the kernel of its one
+	// consumer's group computes and writes. That kernel's output holds
+	// the target, so it must have the same dtype; elementwise ops keep
+	// their inputs' shape.
+	var stored func(n *graph.Node) bool
+	root := func(n *graph.Node) *graph.Node {
+		for inner(n) || stored(n) {
+			n = users[n][0]
+		}
+		return n
+	}
+	stored = func(n *graph.Node) bool {
+		return isTarget[n] && !n.Realized() && n.Op.IsElementwise() && len(users[n]) == 1 &&
+			users[n][0].Op.IsElementwise() && root(users[n][0]).DType == n.DType
+	}
+	member := func(n *graph.Node) bool { return inner(n) || stored(n) }
 
 	p := &plan{work: make(map[*graph.Node]*work, len(order))}
 	for _, n := range order {
 		switch {
-		case inner(n):
+		case member(n):
+		case transposes(n) && n.Inputs[0].Op == backend.OpMatMul && private(n.Inputs[0]):
+			mm := n.Inputs[0]
+			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true}
 		case n.Op.IsElementwise():
-			prog, ins := fuse(n, inner)
+			prog, nodes, ins := fuse(n, member)
+			w := &work{deps: ins, prog: prog}
+			for j, x := range nodes {
+				if x != n && stored(x) {
+					w.stores = append(w.stores, store{x, j})
+				}
+			}
 			for i, x := range ins {
-				if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType {
-					p.work[n] = epilogue(prog, ins, i, gemm)
+				if gemm := productOf(x, private); w.stores == nil && gemm != nil && gemm.DType == n.DType {
+					w = epilogue(prog, ins, i, gemm)
 					break
 				}
 			}
-			switch {
-			case p.work[n] != nil:
-			case len(prog) == len(ins)+1:
+			if w.gemm == nil && w.stores == nil && len(prog) == len(ins)+1 {
 				// A single op on its own inputs runs as itself.
-				p.work[n] = &work{deps: n.Inputs}
-			default:
-				p.work[n] = &work{deps: ins, prog: prog}
+				w = &work{deps: n.Inputs}
 			}
+			p.work[n] = w
 		default:
 			p.work[n] = &work{deps: n.Inputs}
 		}
 	}
 	// Keep the kernels the targets need: a constant read only by programs
-	// needs none, nor does a product computed inside its epilogue's kernel.
+	// needs none, nor does a product computed inside its epilogue's kernel
+	// or a target its consumer's kernel writes.
 	needed := make(map[*graph.Node]bool, len(order))
 	for i := len(order) - 1; i >= 0; i-- {
 		n := order[i]
-		if !isTarget[n] && !needed[n] {
+		if stored(n) || !isTarget[n] && !needed[n] {
 			continue
 		}
 		needed[n] = true
@@ -95,14 +138,10 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
 	return p
 }
 
-// fuse returns the program that computes root, with its inner nodes, and
-// the nodes it loads.
-func fuse(root *graph.Node, inner func(*graph.Node) bool) ([]backend.Instr, []*graph.Node) {
-	var (
-		prog []backend.Instr
-		ins  []*graph.Node
-		vals = map[*graph.Node]int{}
-	)
+// fuse returns the program that computes root with the members of its
+// group, the node each instruction computes, and the nodes it loads.
+func fuse(root *graph.Node, member func(*graph.Node) bool) (prog []backend.Instr, nodes, ins []*graph.Node) {
+	vals := map[*graph.Node]int{}
 	var value func(n *graph.Node) int
 	value = func(n *graph.Node) int {
 		if v, ok := vals[n]; ok {
@@ -111,7 +150,7 @@ func fuse(root *graph.Node, inner func(*graph.Node) bool) ([]backend.Instr, []*g
 		var in backend.Instr
 		if c, ok := constOf(n); ok {
 			in = backend.Instr{Op: backend.OpConst, DType: n.DType, Value: c}
-		} else if n == root || inner(n) {
+		} else if n == root || member(n) {
 			in = backend.Instr{Op: n.Op, DType: n.DType, Args: make([]int, len(n.Inputs))}
 			for i, x := range n.Inputs {
 				in.Args[i] = value(x)
@@ -120,12 +159,12 @@ func fuse(root *graph.Node, inner func(*graph.Node) bool) ([]backend.Instr, []*g
 			in = backend.Instr{Op: backend.OpLoad, DType: n.DType, Args: []int{len(ins)}}
 			ins = append(ins, n)
 		}
-		prog = append(prog, in)
+		prog, nodes = append(prog, in), append(nodes, n)
 		vals[n] = len(prog) - 1
 		return len(prog) - 1
 	}
 	value(root)
-	return prog, ins
+	return prog, nodes, ins
 }
 
 // epilogue returns the work of a program over ins that runs as the
@@ -148,6 +187,28 @@ func epilogue(prog []backend.Instr, ins []*graph.Node, at int, gemm *graph.Node)
 		}
 	}
 	return w
+}
+
+// transposes reports whether n swaps the last two axes of its input and
+// keeps the others in place.
+func transposes(n *graph.Node) bool {
+	r := len(n.Shape)
+	if n.Op != backend.OpPermute || r < 2 {
+		return false
+	}
+	for i, a := range n.Attrs.Axes {
+		want := i
+		switch i {
+		case r - 2:
+			want = r - 1
+		case r - 1:
+			want = r - 2
+		}
+		if a != want {
+			return false
+		}
+	}
+	return true
 }
 
 // productOf returns the matmul whose product x is, directly or through

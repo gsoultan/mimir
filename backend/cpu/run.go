@@ -22,7 +22,7 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, out backend.Buffer
 	if len(ins) != len(k.In) {
 		return fmt.Errorf("cpu: %s: %d buffers for %d views: %w", k.Op, len(ins), len(k.In), backend.ErrInternal)
 	}
-	n, ok := backend.NumElements(k.Shape)
+	n, ok := k.OutputLen()
 	if !ok || out.Len() != n || out.DType() != k.DType {
 		return fmt.Errorf("cpu: %s: output %s[%d] for %s%v: %w", k.Op, out.DType(), out.Len(), k.DType, k.Shape, backend.ErrInternal)
 	}
@@ -64,11 +64,14 @@ func checkViews(k *backend.Kernel, ins []backend.Buffer) error {
 }
 
 func (b *Backend) run(ctx context.Context, k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) error {
+	if k.Attrs.Stores != nil && k.Op != backend.OpFused {
+		return fmt.Errorf("stored values: %w", backend.ErrInternal)
+	}
 	switch {
 	case k.Op == backend.OpFused:
-		return runProgram(ctx, b, k, k.Attrs.Program, out, ins)
+		return runProgram(ctx, b, k, k.Attrs.Program, k.Attrs.Stores, out, ins)
 	case k.Op.IsElementwise() || k.Op == backend.OpContiguous:
-		return runProgram(ctx, b, k, singleOp(k, ins), out, ins)
+		return runProgram(ctx, b, k, singleOp(k, ins), nil, out, ins)
 	case k.Op == backend.OpMatMul:
 		epi, err := epilogue(k, out, ins)
 		if err != nil {

@@ -241,3 +241,82 @@ func TestElementwiseConsumersOfAProductRunAsItsEpilogue(t *testing.T) {
 		t.Error("product with epilogue differs from the separate kernels")
 	}
 }
+
+func TestTargetsReadByOneConsumerAreWrittenByItsKernel(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := must(graph.Rand([]int{1000}, 1, false))
+	g := must(graph.Rand([]int{1000}, 2, false))
+	if err := Realize(t.Context(), be, x, g); err != nil {
+		t.Fatal(err)
+	}
+	c := func(v float64) *graph.Node { return must(graph.Const(backend.Float32, []int{1000}, v)) }
+	bin := func(op backend.Op, a, b *graph.Node) *graph.Node { return must(graph.Binary(op, a, b)) }
+	un := func(op backend.Op, a *graph.Node) *graph.Node { return must(graph.Unary(op, a)) }
+	// An optimizer-like step: new state m and v, and from them a new x.
+	m := bin(backend.OpAdd, bin(backend.OpMul, x, c(0.9)), g)
+	v := bin(backend.OpMul, g, g)
+	step := bin(backend.OpMul, m, un(backend.OpRecip, bin(backend.OpAdd, un(backend.OpSqrt, v), c(1))))
+	next := bin(backend.OpAdd, x, un(backend.OpNeg, step))
+	be.ops = nil
+	if err := Realize(t.Context(), be, next, m, v); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpFused}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	get := func(n *graph.Node) []float32 {
+		b := make([]byte, 4000)
+		if err := Download(t.Context(), be, n, b); err != nil {
+			t.Fatal(err)
+		}
+		f := make([]float32, 1000)
+		for i := range f {
+			f[i] = float32frombytes(b[4*i:])
+		}
+		return f
+	}
+	xs, gs, ms, vs, nexts := get(x), get(g), get(m), get(v), get(next)
+	for i := range 1000 {
+		wm := xs[i]*0.9 + gs[i]
+		wv := gs[i] * gs[i]
+		wn := xs[i] + -(wm * (1 / (float32(math.Sqrt(float64(wv))) + 1)))
+		if ms[i] != wm || vs[i] != wv || nexts[i] != wn {
+			t.Fatalf("element %d = %v, %v, %v, want %v, %v, %v", i, nexts[i], ms[i], vs[i], wn, wm, wv)
+		}
+	}
+}
+
+func TestTransposedProductsAreComputedTransposed(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	a := must(graph.Rand([]int{2, 5, 3}, 1, false))
+	b := must(graph.Rand([]int{2, 3, 4}, 2, false))
+	if err := Realize(t.Context(), be, a, b); err != nil {
+		t.Fatal(err)
+	}
+	product := must(graph.MatMul(a, b))
+	if err := Realize(t.Context(), be, product); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, 2*4*5*4)
+	if err := Download(t.Context(), be, must(graph.Permute(product, []int{0, 2, 1})), want); err != nil {
+		t.Fatal(err)
+	}
+	transposed := must(graph.Permute(must(graph.MatMul(a, b)), []int{0, 2, 1}))
+	be.ops = nil
+	if err := Realize(t.Context(), be, transposed); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpMatMul}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	if v := transposed.View; !v.IsContiguous() || v.Offset != 0 {
+		t.Errorf("result view %+v, want contiguous", v)
+	}
+	got := make([]byte, len(want))
+	if err := Download(t.Context(), be, transposed, got); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Error("transposed product differs from the product transposed")
+	}
+}

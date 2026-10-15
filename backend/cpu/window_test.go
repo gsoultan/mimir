@@ -71,7 +71,7 @@ func offsetOf(v backend.View, idx []int) int {
 // runOn runs k on a backend with the given number of workers.
 func runOn[T elem](t *testing.T, workers int, k *backend.Kernel, ins ...backend.Buffer) []T {
 	t.Helper()
-	n, _ := backend.NumElements(k.Shape)
+	n, _ := k.OutputLen()
 	b := New()
 	b.workers = workers
 	out, err := b.Alloc(k.DType, n)
