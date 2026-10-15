@@ -4,12 +4,12 @@
 
 package cpu
 
-// tileAVX512 computes a 8×32 tile; see gemmKernel.tile.
+// tileAVX512 computes one 8×32 tile; see gemmKernel.tile.
 //
 //go:noescape
 func tileAVX512(kc int, a *float32, b *float32, c *float32, ldc int, accumulate bool)
 
-// tileAVX2 computes a 6×16 tile; see gemmKernel.tile.
+// tileAVX2 computes one 6×16 tile; see gemmKernel.tile.
 //
 //go:noescape
 func tileAVX2(kc int, a *float32, b *float32, c *float32, ldc int, accumulate bool)

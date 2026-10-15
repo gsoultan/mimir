@@ -85,7 +85,7 @@ func tile(name string, mr, nv int, v isa) {
 	width := 4 * v.lanes // bytes per vector
 	TEXT(name, NOSPLIT, "func(kc int, a, b, c *float32, ldc int, accumulate bool)")
 	Pragma("noescape")
-	Doc(fmt.Sprintf("%s computes a %d×%d tile; see gemmKernel.tile.", name, mr, nr))
+	Doc(fmt.Sprintf("%s computes one %d×%d tile; see gemmKernel.tile.", name, mr, nr))
 
 	acc := func(i, j int) VecPhysical { return v.reg(i*nv + j) }
 	bv := func(j int) VecPhysical { return v.reg(mr*nv + j) }

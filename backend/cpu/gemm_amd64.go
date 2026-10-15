@@ -4,6 +4,9 @@ package cpu
 
 //go:generate sh -c "cd ../../tools/asmgen && go run ./amd64 -out ../../backend/cpu/gemm_amd64.s -stubs ../../backend/cpu/gemm_stub_amd64.go -pkg cpu"
 
+// The kernels are written in assembly rather than with archsimd: built
+// from archsimd with Go 1.27, the compiler spills their accumulators and
+// they run at a quarter of the speed.
 var (
 	avx512Kernel = gemmKernel{name: "avx512", mr: 8, nr: 32, kc: 256, mc: 144, nc: 2048, tile: tileAVX512}
 	avx2Kernel   = gemmKernel{name: "avx2", mr: 6, nr: 16, kc: 256, mc: 144, nc: 2048, tile: tileAVX2}
