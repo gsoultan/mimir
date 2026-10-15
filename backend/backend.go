@@ -109,10 +109,14 @@ type Kernel struct {
 type Attrs struct {
 	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes.
 	Axis   int      // Gather, ScatterAdd: the indexed axis.
-	Pads   [][2]int // Pad: elements added before and after each dimension.
+	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension.
-	Value  float64  // Const, Pad: the fill value.
+	Value  float64  // Const, Pad, Unfold: the fill value.
 	Seed   uint64   // RandUniform, RandNormal: the Philox key.
+
+	// Unfold, Fold: the window size, step and spacing of its elements in
+	// each windowed dimension.
+	Kernel, Stride, Dilation []int
 }
 
 // NumElements returns the number of elements in shape. It reports false if

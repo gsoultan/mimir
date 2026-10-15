@@ -148,6 +148,10 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 			return err
 		}
 		return scatterAdd(ctx, b, k, out, in[0], idx, in[2])
+	case op == backend.OpUnfold:
+		return unfold(ctx, b, k, out, in[0])
+	case op == backend.OpFold:
+		return fold(ctx, b, k, out, in[0])
 	default:
 		return fmt.Errorf("no cpu kernel: %w", backend.ErrInternal)
 	}
