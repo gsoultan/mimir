@@ -243,8 +243,9 @@ func TestBatchNormRunningStatsSurviveAStepBeforeBackward(t *testing.T) {
 
 func TestBatchNormUpdatesAlongsideOtherSchedules(t *testing.T) {
 	// One goroutine updates running statistics while another realizes
-	// unrelated values. The race detector checks that whether statistics
-	// are computed yet is read only under the scheduler's lock.
+	// unrelated values. The race detector checks that the statistics
+	// waiting to be computed are looked at only under the scheduler's
+	// lock.
 	b := nn.NewBatchNorm1d(8)
 	x := tensor.Randn(1, 16, 8)
 	y := tensor.Ones(tensor.Float32, 64)
