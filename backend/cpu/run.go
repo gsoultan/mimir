@@ -131,7 +131,7 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 	case op == backend.OpReduceSum:
 		return reduceSum(ctx, b, k, out, in[0])
 	case op == backend.OpReduceMax:
-		return reduce(ctx, b, k, out, in[0], maxOf[T])
+		return reduceMax(ctx, b, k, out, in[0])
 	case op == backend.OpPad:
 		return pad(ctx, b, k, out, in[0])
 	case op == backend.OpMatMul:
