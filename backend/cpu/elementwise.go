@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
 )
@@ -610,20 +611,11 @@ func mod[T elem](a, b T) (T, error) {
 	return T(int32(a) % int32(b)), nil
 }
 
-// maxOf returns the larger of a and b, propagating NaN like PyTorch.
-func maxOf[T elem](a, b T) T {
-	if a != a {
-		return a
-	}
-	if b != b || b > a {
-		return b
-	}
-	return a
-}
+// maxOf returns the larger of a and b, propagating NaN like PyTorch. The
+// builtin compiles to branch-free code, which matters when the comparison
+// is unpredictable, as in ReLU and max pooling.
+func maxOf[T elem](a, b T) T { return max(a, b) }
 
-func boolTo[T elem](v bool) T {
-	if v {
-		return 1
-	}
-	return 0
-}
+// boolTo returns 1 for true and 0 for false. Reading the bool's byte
+// avoids a branch per element, which mispredicts on random data.
+func boolTo[T elem](v bool) T { return T(*(*uint8)(unsafe.Pointer(&v))) }
