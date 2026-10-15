@@ -8,6 +8,7 @@ package safetensors
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -16,7 +17,6 @@ import (
 	"maps"
 	"math"
 	"slices"
-	"sort"
 )
 
 // ErrFormat reports a malformed file.
@@ -99,7 +99,8 @@ func Parse(b []byte) (*File, error) {
 		spans = append(spans, span{lo, hi})
 	}
 	// The data section must be covered exactly, without gaps or overlaps.
-	sort.Slice(spans, func(i, j int) bool { return spans[i].lo < spans[j].lo })
+	// Empty tensors sort before a tensor starting at the same byte.
+	slices.SortFunc(spans, func(a, b span) int { return cmp.Or(cmp.Compare(a.lo, b.lo), cmp.Compare(a.hi, b.hi)) })
 	end := 0
 	for _, s := range spans {
 		if s.lo != end {
