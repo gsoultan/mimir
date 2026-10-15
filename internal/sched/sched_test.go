@@ -462,3 +462,30 @@ func TestRealizeIntoStopsOnlyBeforeWriting(t *testing.T) {
 		t.Error("a cancelled schedule changed nodes")
 	}
 }
+
+func TestRealizeIntoLeavesStaleDestinationsAlone(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4}, 1)
+	want := floats(t, be, x)
+	next := must(graph.Unary(backend.OpNeg, x))
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{x}); err != nil {
+		t.Fatal(err)
+	}
+	if next.Mem != x.Mem {
+		t.Fatal("the update was not written over its destination")
+	}
+	// x is stale and its memory holds next: passing x again changes
+	// nothing.
+	other := realized(t, be, []int{4}, 2)
+	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, other))}, []*graph.Node{x}); err != nil {
+		t.Fatal(err)
+	}
+	if next.Stale() {
+		t.Fatal("the value in a stale destination's memory was made stale")
+	}
+	for i, v := range floats(t, be, next) {
+		if v != -want[i] {
+			t.Fatalf("value %d = %v, want %v", i, v, -want[i])
+		}
+	}
+}

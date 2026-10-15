@@ -37,7 +37,9 @@ type State map[string]*tensor.Tensor
 // Rule computes one step for one parameter. From the parameter's value p,
 // its gradient g and its state after the previous step, which is empty
 // before the first, it returns the new value and state. step counts from
-// 1 and lr is the current learning rate.
+// 1 and lr is the current learning rate. ZeroGrad releases g's memory, so
+// a state that keeps g's values holds a copy, such as g.Clone(); Step
+// copies a state that is g itself.
 type Rule func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State)
 
 // Optimizer applies a Rule to every trainable parameter that has a
@@ -108,6 +110,11 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		}
 		if !slices.Equal(v.Shape(), cur.Shape()) {
 			return fmt.Errorf("optim: parameter %d: rule returned %v for %v: %w", i, v.Shape(), cur.Shape(), tensor.ErrShape)
+		}
+		for name, t := range s {
+			if t == g {
+				s[name] = g.Clone()
+			}
 		}
 		updates = append(updates, update{i, v, s})
 		targets, dsts = append(targets, v), append(dsts, cur)
