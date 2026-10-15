@@ -277,9 +277,11 @@ func TestTargetsReadByOneConsumerAreWrittenByItsKernel(t *testing.T) {
 	}
 	xs, gs, ms, vs, nexts := get(x), get(g), get(m), get(v), get(next)
 	for i := range 1000 {
-		wm := xs[i]*0.9 + gs[i]
+		// The conversions round each product, as the kernel does, where
+		// the compiler could otherwise fuse it with the addition.
+		wm := float32(xs[i]*0.9) + gs[i]
 		wv := gs[i] * gs[i]
-		wn := xs[i] + -(wm * (1 / (float32(math.Sqrt(float64(wv))) + 1)))
+		wn := xs[i] + -float32(wm*(1/(float32(math.Sqrt(float64(wv)))+1)))
 		if ms[i] != wm || vs[i] != wv || nexts[i] != wn {
 			t.Fatalf("element %d = %v, %v, %v, want %v, %v, %v", i, nexts[i], ms[i], vs[i], wn, wm, wv)
 		}
@@ -372,7 +374,7 @@ func TestRealizeIntoWritesOverTheDestinations(t *testing.T) {
 	gotX, gotM := floats(t, be, nextX), floats(t, be, nextM)
 	for i := range n {
 		wm := ms[i] + gs[i]
-		if wx := wm + xs[i]*ms[i]; gotX[i] != wx || gotM[i] != wm {
+		if wx := wm + float32(xs[i]*ms[i]); gotX[i] != wx || gotM[i] != wm {
 			t.Fatalf("element %d = %v, %v, want %v, %v", i, gotX[i], gotM[i], wx, wm)
 		}
 	}
