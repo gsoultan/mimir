@@ -153,6 +153,16 @@ func typeName(dt backend.DType) string {
 	return "int"
 }
 
+// constant returns an expression of the value v of type dt, read from the
+// parameters, so that kernels that differ only in their constants, such as
+// an optimizer's update at each step, share one compiled pipeline.
+func (g *gen) constant(v float64, dt backend.DType) string {
+	if dt == backend.Float32 {
+		return fmt.Sprintf("as_type<float>(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
+	}
+	return g.param(int(int32(v)))
+}
+
 // literal returns an exact MSL expression for v converted to dt, as the
 // CPU backend converts it.
 func literal(v float64, dt backend.DType) string {
@@ -233,7 +243,7 @@ func (g *gen) program(prog []backend.Instr, load func(a int) string) []string {
 		case backend.OpLoad:
 			e = load(in.Args[0])
 		case backend.OpConst:
-			e = literal(in.Value, in.DType)
+			e = g.constant(in.Value, in.DType)
 		case backend.OpNeg:
 			e = "-" + arg(0)
 		case backend.OpExp2:
@@ -373,7 +383,7 @@ func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
 		}
 		return g.elementwise(n, prog, nil)
 	case op == backend.OpConst:
-		g.line("o0[i] = %s;", literal(k.Attrs.Value, k.DType))
+		g.line("o0[i] = %s;", g.constant(k.Attrs.Value, k.DType))
 		return g.perElement(n)
 	case op == backend.OpRandUniform || op == backend.OpRandNormal:
 		return g.random(n)
@@ -549,7 +559,7 @@ func (g *gen) pad(n int) (*launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", s, s, g.param(v.Shape[d]))
 		g.line("off += %s * %s;", s, g.param(v.Strides[d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", literal(g.k.Attrs.Value, g.k.DType))
+	g.line("o0[i] = inside ? i0[off] : %s;", g.constant(g.k.Attrs.Value, g.k.DType))
 	return g.perElement(n)
 }
 
@@ -653,7 +663,7 @@ func (g *gen) unfold(n int) (*launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", x, x, g.param(v.Shape[lead+d]))
 		g.line("off += %s * %s;", x, g.param(v.Strides[lead+d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", literal(a.Value, g.k.DType))
+	g.line("o0[i] = inside ? i0[off] : %s;", g.constant(a.Value, g.k.DType))
 	return g.perElement(n)
 }
 
