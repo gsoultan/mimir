@@ -51,21 +51,22 @@ func epilogue(k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) (*eva
 	return newEvaluator(shape, views, k.Attrs.Program, nil, []backend.Buffer{out}, append([]backend.Buffer{out}, ins[2:]...))
 }
 
-// matmul computes [..., M, K] x [..., K, N] -> [..., M, N]. Batch dimensions
-// are equal in shape but may have any strides, including 0 for broadcast.
-// Float32 products run on the packed GEMM in gemm.go. Int32 products split
-// work by output rows; each row accumulates in i-k-j order so the inner
-// loop streams a row of B and a row of the output. If epi is not nil, it
+// matmul computes [..., M, K] x [..., K, N] -> [..., M, N], summing the
+// products over the batch axes k.Attrs.Axes. Batch dimensions are equal in
+// shape but may have any strides, including 0 for broadcast. Float32
+// products run on the packed GEMM in gemm.go. Int32 products split work by
+// output rows; each row accumulates in i-k-j order so the inner loop
+// streams a row of B and a row of the output. If epi is not nil, it
 // rewrites each part of the output once that part is computed, while it is
 // still in cache.
 func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, y []T, epi *evaluator) error {
 	if len(out) == 0 {
 		return nil
 	}
-	vx, vy := k.In[0], k.In[1]
+	vx, vy, sums := summed(k)
 	r := len(k.Shape)
 	m, n, kk := k.Shape[r-2], k.Shape[r-1], vx.Shape[r-1]
-	batch := k.Shape[:r-2]
+	batch := vx.Shape[:r-2]
 	offX := batchOffsets(batch, vx)
 	offY := batchOffsets(batch, vy)
 	sxm, sxk := vx.Strides[r-2], vx.Strides[r-1]
@@ -73,32 +74,59 @@ func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, 
 	if out32, ok := any(out).([]float32); ok {
 		a := operand{data: any(x).([]float32), rs: sxm, cs: sxk}
 		bm := operand{data: any(y).([]float32), rs: syk, cs: syn}
-		return b.sgemm(ctx, gemmKernels[0], out32, a, offX, bm, offY, m, n, kk, epi)
+		return b.sgemm(ctx, gemmKernels[0], out32, a, offX, bm, offY, m, n, kk, sums, epi)
 	}
 
-	grain := max(1, elementGrain/max(1, kk*n))
-	return b.parallelFor(ctx, len(offX)*m, grain, func(lo, hi int) error {
+	grain := max(1, elementGrain/max(1, kk*n*sums))
+	return b.parallelFor(ctx, len(out)/n, grain, func(lo, hi int) error {
 		for row := lo; row < hi; row++ {
-			bi, i := row/m, row%m
+			o, i := row/m, row%m
 			dst := out[row*n : row*n+n]
 			clear(dst)
-			xOff := offX[bi] + i*sxm
-			for p := range kk {
-				a := x[xOff+p*sxk]
-				yOff := offY[bi] + p*syk
-				if syn == 1 {
-					for j, v := range y[yOff : yOff+n] {
-						dst[j] += a * v
+			for t := o * sums; t < (o+1)*sums; t++ {
+				xOff := offX[t] + i*sxm
+				for p := range kk {
+					a := x[xOff+p*sxk]
+					yOff := offY[t] + p*syk
+					if syn == 1 {
+						for j, v := range y[yOff : yOff+n] {
+							dst[j] += a * v
+						}
+						continue
 					}
-					continue
-				}
-				for j := range dst {
-					dst[j] += a * y[yOff+j*syn]
+					for j := range dst {
+						dst[j] += a * y[yOff+j*syn]
+					}
 				}
 			}
 		}
 		return epi.apply(lo*n, hi*n)
 	})
+}
+
+// summed returns the operand views of a matmul kernel with the batch axes
+// that it sums over, k.Attrs.Axes, moved after the others, so that the
+// products each output sums are consecutive in row-major batch order, and
+// the number of products each output sums.
+func summed(k *backend.Kernel) (vx, vy backend.View, sums int) {
+	vx, vy = k.In[0], k.In[1]
+	if len(k.Attrs.Axes) == 0 {
+		return vx, vy, 1
+	}
+	r := len(vx.Shape)
+	perm := make([]int, 0, r)
+	for d := range r - 2 {
+		if !slices.Contains(k.Attrs.Axes, d) {
+			perm = append(perm, d)
+		}
+	}
+	sums = 1
+	for _, d := range k.Attrs.Axes {
+		perm = append(perm, d)
+		sums *= vx.Shape[d]
+	}
+	perm = append(perm, r-2, r-1)
+	return vx.Permute(perm), vy.Permute(perm), sums
 }
 
 // batchOffsets returns the buffer offset of each matrix in the batch

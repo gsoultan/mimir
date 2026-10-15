@@ -26,11 +26,18 @@ import (
 // the order it is read. Linear layers multiply by transposed weights, and
 // the weight gradients come out transposed back.
 //
-// A group that reads the product of a matmul that nothing else reads, in
-// row-major order (directly or through a reshape), runs as that matmul's
-// epilogue instead: the GEMM applies the program to each part of its
-// output while the part is in cache, such as adding a bias, a residual or
-// applying an activation, and the product never gets a buffer of its own.
+// A sum over batch axes of a product that nothing else reads runs as one
+// matmul kernel that adds the products of each output as it computes
+// them, so the products never get a buffer of their own. The weight
+// gradient of a layer applied to every item of a batch, such as a
+// convolution, is such a sum.
+//
+// A group that reads a product that nothing else reads, of a matmul or
+// summed over batch axes, in row-major order (directly or through a
+// reshape), runs as that product's epilogue instead: the GEMM applies the
+// program to each part of its output while the part is in cache, such as
+// adding a bias, a residual or applying an activation, and the product
+// never gets a buffer of its own.
 
 // plan lists the kernels that compute a schedule's targets.
 type plan struct {
@@ -43,7 +50,7 @@ type plan struct {
 type work struct {
 	deps   []*graph.Node   // the nodes its kernel reads
 	prog   []backend.Instr // a fused program, or gemm's epilogue
-	gemm   *graph.Node     // the matmul whose product prog reads as input 0
+	gemm   *graph.Node     // a product its kernel computes, which prog, if any, reads as input 0
 	stores []store         // the targets prog also writes
 	swap   bool            // a transposed product, computed from deps transposed
 }
@@ -94,6 +101,8 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
 	for _, n := range order {
 		switch {
 		case member(n):
+		case summedProduct(n, private):
+			p.work[n] = &work{deps: factors(n), gemm: n}
 		case transposes(n) && n.Inputs[0].Op == backend.OpMatMul && private(n.Inputs[0]):
 			mm := n.Inputs[0]
 			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true}
@@ -171,10 +180,10 @@ func fuse(root *graph.Node, member func(*graph.Node) bool) (prog []backend.Instr
 
 // epilogue returns the work of a program over ins that runs as the
 // epilogue of gemm, whose product is ins[at]. The matmul reads its two
-// operands, and the program the product as input 0 and the other loads
+// factors, and the program the product as input 0 and the other loads
 // after it.
 func epilogue(prog []backend.Instr, ins []*graph.Node, at int, gemm *graph.Node) *work {
-	w := &work{deps: slices.Clone(gemm.Inputs), prog: slices.Clone(prog), gemm: gemm}
+	w := &work{deps: factors(gemm), prog: slices.Clone(prog), gemm: gemm}
 	renumber := make([]int, len(ins))
 	for i, x := range ins {
 		if i == at {
@@ -213,9 +222,33 @@ func transposes(n *graph.Node) bool {
 	return true
 }
 
-// productOf returns the matmul whose product x is, directly or through
-// views that read it in row-major order, if x and every node between them
-// is private: computed for its one consumer only.
+// summedProduct reports whether n sums a private matmul over batch axes
+// only.
+func summedProduct(n *graph.Node, private func(*graph.Node) bool) bool {
+	if n.Op != backend.OpReduceSum {
+		return false
+	}
+	mm := n.Inputs[0]
+	if mm.Op != backend.OpMatMul || !private(mm) {
+		return false
+	}
+	r := len(mm.Shape)
+	return !slices.ContainsFunc(n.Attrs.Axes, func(a int) bool { return a >= r-2 })
+}
+
+// factors returns the two matrices whose product gemm is: the inputs of
+// a matmul, or of the matmul that a summed product sums.
+func factors(gemm *graph.Node) []*graph.Node {
+	if gemm.Op == backend.OpReduceSum {
+		gemm = gemm.Inputs[0]
+	}
+	return slices.Clone(gemm.Inputs)
+}
+
+// productOf returns the product that x is, of a matmul or summed over
+// batch axes, directly or through views that read it in row-major order,
+// if x and every node between them is private: computed for its one
+// consumer only.
 func productOf(x *graph.Node, private func(*graph.Node) bool) *graph.Node {
 	var views []*graph.Node
 	n := x
@@ -225,7 +258,7 @@ func productOf(x *graph.Node, private func(*graph.Node) bool) *graph.Node {
 		}
 		views = append(views, n)
 	}
-	if n.Op != backend.OpMatMul || !private(n) {
+	if n.Op != backend.OpMatMul && !summedProduct(n, private) || !private(n) {
 		return nil
 	}
 	v := backend.Contiguous(n.Shape)

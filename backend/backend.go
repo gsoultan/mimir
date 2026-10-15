@@ -116,7 +116,7 @@ type Kernel struct {
 // Attrs holds the operation-specific parameters of a Kernel or graph node.
 // Each Op documents which fields it uses.
 type Attrs struct {
-	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes.
+	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
 	Axis   int      // Gather, ScatterAdd: the indexed axis.
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension.

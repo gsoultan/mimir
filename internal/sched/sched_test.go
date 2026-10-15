@@ -242,6 +242,48 @@ func TestElementwiseConsumersOfAProductRunAsItsEpilogue(t *testing.T) {
 	}
 }
 
+func TestSumsOfProductsOverBatchAxesRunAsOneMatMul(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4, 30, 20}, 1)
+	w := realized(t, be, []int{4, 20, 25}, 2)
+	b := realized(t, be, []int{25}, 3)
+	product := must(graph.MatMul(x, w))
+	if err := Realize(t.Context(), be, product); err != nil {
+		t.Fatal(err)
+	}
+	sum := func(p *graph.Node, axis int) *graph.Node {
+		return must(graph.Reduce(backend.OpReduceSum, p, []int{axis}))
+	}
+	biased := func(s *graph.Node) *graph.Node {
+		flat := must(graph.Reshape(s, []int{30, 25}))
+		bias := must(graph.Expand(must(graph.Reshape(b, []int{1, 25})), []int{30, 25}))
+		return must(graph.Binary(backend.OpAdd, flat, bias))
+	}
+	// The product is realized in separate, so it is summed on its own.
+	tests := []struct {
+		name               string
+		separate, combined *graph.Node
+		ops                []backend.Op
+	}{
+		{"batch sum", sum(product, 0), sum(must(graph.MatMul(x, w)), 0), []backend.Op{backend.OpMatMul}},
+		{"with an epilogue", biased(sum(product, 0)), biased(sum(must(graph.MatMul(x, w)), 0)), []backend.Op{backend.OpMatMul}},
+		{"matrix axis", sum(product, 2), sum(must(graph.MatMul(x, w)), 2), []backend.Op{backend.OpMatMul, backend.OpReduceSum}},
+	}
+	for _, tt := range tests {
+		want := floats(t, be, tt.separate)
+		be.ops = nil
+		got := floats(t, be, tt.combined)
+		if !slices.Equal(be.ops, tt.ops) {
+			t.Errorf("%s: kernels %v, want %v", tt.name, be.ops, tt.ops)
+		}
+		for i := range want {
+			if math.Abs(float64(got[i]-want[i])) > 1e-5*math.Abs(float64(want[i]))+1e-6 {
+				t.Fatalf("%s: element %d = %v, want %v", tt.name, i, got[i], want[i])
+			}
+		}
+	}
+}
+
 func TestTargetsReadByOneConsumerAreWrittenByItsKernel(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	x := must(graph.Rand([]int{1000}, 1, false))

@@ -76,7 +76,7 @@ func TestGEMMKernelsMatchReference(t *testing.T) {
 					for i := range out {
 						out[i] = float32(math.NaN()) // must be overwritten
 					}
-					if err := be.sgemm(t.Context(), g, out, a, []int{a.off}, b, []int{b.off}, m, n, k, nil); err != nil {
+					if err := be.sgemm(t.Context(), g, out, a, []int{a.off}, b, []int{b.off}, m, n, k, 1, nil); err != nil {
 						t.Fatal(err)
 					}
 					want, scale := refGEMM(a, b, m, n, k)
@@ -114,7 +114,7 @@ func TestGEMMBatchesAndSplits(t *testing.T) {
 		whole.workers = 1
 		for _, g := range gemmKernels {
 			want := make([]float32, s.batch*s.m*s.n)
-			if err := whole.sgemm(t.Context(), g, want, a, offA, b, offB, s.m, s.n, s.k, nil); err != nil {
+			if err := whole.sgemm(t.Context(), g, want, a, offA, b, offB, s.m, s.n, s.k, 1, nil); err != nil {
 				t.Fatal(err)
 			}
 			for _, workers := range []int{2, 3, 4, 7, 16} {
@@ -124,7 +124,7 @@ func TestGEMMBatchesAndSplits(t *testing.T) {
 				for i := range got {
 					got[i] = float32(math.NaN()) // must be overwritten
 				}
-				if err := be.sgemm(t.Context(), g, got, a, offA, b, offB, s.m, s.n, s.k, nil); err != nil {
+				if err := be.sgemm(t.Context(), g, got, a, offA, b, offB, s.m, s.n, s.k, 1, nil); err != nil {
 					t.Fatal(err)
 				}
 				for i := range got {
@@ -132,6 +132,73 @@ func TestGEMMBatchesAndSplits(t *testing.T) {
 						t.Fatalf("%+v, %s with %d workers: element %d = %v, want %v", s, g.name, workers, i, got[i], want[i])
 					}
 				}
+			}
+		}
+	}
+}
+
+func TestGEMMSumsAndSharedFactors(t *testing.T) {
+	// Outputs that sum several products, and batches whose items share a,
+	// must match the reference and come out the same with any number of
+	// workers.
+	rng := rand.New(rand.NewPCG(7, 8))
+	for _, s := range []struct {
+		outputs, sums, m, n, k int
+		shared                 bool
+	}{
+		{3, 4, 40, 50, 30, false},     // a sum for each output
+		{1, 20, 70, 300, 49, false},   // one output, many products in uneven groups
+		{2, 3, 150, 2100, 300, false}, // with several blocks of n and k
+		{6, 1, 300, 49, 70, true},     // narrow items side by side
+		{15, 1, 160, 150, 40, true},   // with several blocks of n, one cut within an item
+		{2, 1, 200, 40, 600, true},    // with several blocks of k
+		{2, 0, 5, 6, 7, false},        // nothing to sum
+	} {
+		items := s.outputs * s.sums
+		// Transposed weights against row-major columns, as in the input
+		// gradient of a convolution.
+		a := layout(rng, "column-major", max(items, 1)*s.m, s.k)
+		b := layout(rng, "row-major", s.k, max(items, 1)*s.n)
+		offA, offB := make([]int, items), make([]int, items)
+		for i := range items {
+			offA[i], offB[i] = a.off+i*s.m*a.rs, b.off+i*s.n*b.cs
+			if s.shared {
+				offA[i] = a.off
+			}
+		}
+		want, scale := make([]float64, s.outputs*s.m*s.n), make([]float64, s.outputs*s.m*s.n)
+		for i := range items {
+			ai, bi := a, b
+			ai.off, bi.off = offA[i], offB[i]
+			w, sc := refGEMM(ai, bi, s.m, s.n, s.k)
+			o := i / s.sums * s.m * s.n
+			for e := range w {
+				want[o+e] += w[e]
+				scale[o+e] += sc[e]
+			}
+		}
+		var first []float32
+		for _, workers := range []int{1, 2, 3, 4, 7, 16} {
+			be := New()
+			be.workers = workers
+			got := make([]float32, len(want))
+			for i := range got {
+				got[i] = float32(math.NaN()) // must be overwritten
+			}
+			if err := be.sgemm(t.Context(), gemmKernels[0], got, a, offA, b, offB, s.m, s.n, s.k, s.sums, nil); err != nil {
+				t.Fatal(err)
+			}
+			if first == nil {
+				first = got
+				for e, v := range got {
+					if diff := math.Abs(float64(v) - want[e]); !(diff <= 1e-5*scale[e]+1e-7) {
+						t.Fatalf("%+v: element %d = %v, want %v", s, e, v, want[e])
+					}
+				}
+				continue
+			}
+			if !slices.Equal(got, first) {
+				t.Fatalf("%+v: %d workers differ from one", s, workers)
 			}
 		}
 	}
@@ -197,7 +264,7 @@ func BenchmarkSGEMM(b *testing.B) {
 				out := make([]float32, size*size)
 				be := New()
 				for b.Loop() {
-					if err := be.sgemm(b.Context(), g, out, x, []int{x.off}, y, []int{y.off}, size, size, size, nil); err != nil {
+					if err := be.sgemm(b.Context(), g, out, x, []int{x.off}, y, []int{y.off}, size, size, size, 1, nil); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -218,21 +285,30 @@ func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
 		{Op: backend.OpMax, DType: backend.Float32, Args: []int{4, 5}},
 	}
 	rng := rand.New(rand.NewPCG(5, 6))
-	for _, s := range []struct{ batch, m, n, k, workers int }{
-		{6, 7, 33, 20, 3},     // an item per worker
-		{1, 150, 300, 600, 4}, // one item shared by every worker
-		{1, 6, 2100, 300, 4},  // shared, split by columns
-		{2, 4, 5, 0, 2},       // no inner dimension
+	for _, s := range []struct {
+		batch, m, n, k, workers int
+		wide                    bool // items share a, rather than b
+	}{
+		{6, 7, 33, 20, 3, false},     // an item per worker
+		{1, 150, 300, 600, 4, false}, // one item shared by every worker
+		{1, 6, 2100, 300, 4, false},  // shared, split by columns
+		{2, 4, 5, 0, 2, false},       // no inner dimension
+		{5, 90, 20, 30, 3, true},     // one wide product
+		{3, 300, 200, 300, 4, true},  // wide, with several blocks of k
 	} {
 		name := fmt.Sprintf("%+v", s)
 		be := New()
 		be.workers = s.workers
 		a := layout(rng, "row-major", s.batch*s.m, s.k)
-		b := layout(rng, "column-major", s.k, s.n)
+		b := layout(rng, "column-major", s.k, s.batch*s.n)
+		sa, sb := s.m*a.rs, 0
+		if s.wide {
+			sa, sb = 0, s.n*b.cs
+		}
 		size := s.batch * s.m * s.n
 		in := []backend.View{
-			{Shape: []int{s.batch, s.m, s.k}, Strides: []int{s.m * a.rs, a.rs, a.cs}, Offset: a.off},
-			{Shape: []int{s.batch, s.k, s.n}, Strides: []int{0, b.rs, b.cs}},
+			{Shape: []int{s.batch, s.m, s.k}, Strides: []int{sa, a.rs, a.cs}, Offset: a.off},
+			{Shape: []int{s.batch, s.k, s.n}, Strides: []int{sb, b.rs, b.cs}},
 		}
 		ins := []backend.Buffer{&buffer[float32]{data: a.data}, &buffer[float32]{data: b.data}}
 		// The epilogue sees the product as [batch*m, n].

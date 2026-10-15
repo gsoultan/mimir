@@ -2,6 +2,7 @@ package cpu
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"unsafe"
 )
@@ -49,8 +50,9 @@ type operand struct {
 // at the ragged edges of the output. The tile lives here because a local
 // array passed to a kernel through a function value escapes to the heap.
 type gemmWorkspace struct {
-	a, b []float32
-	tile [maxTile]float32
+	a, b     []float32
+	partials []float32 // sums of groups of products; see sgemmGrouped
+	tile     [maxTile]float32
 }
 
 var gemmWorkspaces = sync.Pool{New: func() any { return new(gemmWorkspace) }}
@@ -81,52 +83,117 @@ const packCost = 8
 // packGrain is the least number of elements worth packing in parallel.
 const packGrain = 1 << 15
 
-// sgemm computes the batched product out[i] = a[i]·b[i], where matrix i of
-// a starts at offset offA[i] and of b at offB[i], and out holds the m×n
-// results contiguously. A non-nil epilogue rewrites each finished part of
-// out.
+// maxGroups is the most groups that sgemm splits the products of an
+// output into, and maxPartials the most elements of their sums that it
+// keeps besides the output.
+const (
+	maxGroups   = 16
+	maxPartials = 1 << 20
+)
+
+// sgemm computes the batched product out[o] = Σ a[i]·b[i] over the sums
+// matrices i = o·sums, ..., o·sums+sums-1 of each output o, where matrix i
+// of a starts at offset offA[i] and of b at offB[i], and out holds the m×n
+// results contiguously. sums is 1 for a plain batched product. A non-nil
+// epilogue rewrites each finished part of out.
 //
-// A batch with an item for every worker computes its items in parallel.
-// Smaller batches compute one item at a time with every worker; see
-// sgemmShared.
-func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k int, epi *evaluator) error {
-	batch := len(offA)
-	item := func(i int) (operand, operand, []float32) {
-		ai, bi := a, b
-		ai.off, bi.off = offA[i], offB[i]
-		return ai, bi, out[i*m*n:][:m*n]
+// A batch whose items share a, and whose a is the larger operand, is one
+// wide product; see sgemmWide. Small outputs that sum many products sum
+// groups of them in parallel; see sgemmGrouped. Otherwise a batch with an
+// output for every worker computes its outputs in parallel, and smaller
+// batches compute one output at a time with every worker; see
+// sgemmShared. The order in which each output adds its products depends
+// only on the shapes, so the result does not depend on the number of
+// workers.
+func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, sums int, epi *evaluator) error {
+	outputs := len(out) / max(m*n, 1)
+	if sums == 0 || m*n == 0 {
+		clear(out)
+		return epi.apply(0, len(out))
 	}
-	flops := max(2*m*n*k, 1)
-	if batch >= be.workers || flops < 4*minUnitFlops {
-		return be.parallelFor(ctx, batch, max(1, minUnitFlops/flops), func(lo, hi int) error {
+	terms := func(o int) ([]int, []int) { return offA[o*sums:][:sums], offB[o*sums:][:sums] }
+	flops := max(2*m*n*k*sums, 1)
+	groups := min(sums, maxGroups)
+	if (groups-1)*len(out) > maxPartials {
+		groups = 1
+	}
+	switch {
+	case sums == 1 && outputs > 1 && m >= n && !slices.ContainsFunc(offA, func(off int) bool { return off != offA[0] }):
+		a.off = offA[0]
+		return be.sgemmWide(ctx, g, out, a, b, offB, m, n, k, epi)
+	case groups > 1:
+		return be.sgemmGrouped(ctx, g, out, a, offA, b, offB, m, n, k, sums, groups, epi)
+	case outputs >= be.workers || flops < 4*minUnitFlops:
+		return be.parallelFor(ctx, outputs, max(1, minUnitFlops/flops), func(lo, hi int) error {
 			ws := gemmWorkspaces.Get().(*gemmWorkspace)
 			defer gemmWorkspaces.Put(ws)
-			for i := lo; i < hi; i++ {
-				ai, bi, c := item(i)
-				gemmBlock(g, ws, ai, bi, k, c, n, 0, m, 0, n)
-				if err := epi.apply(i*m*n, (i+1)*m*n); err != nil {
+			for o := lo; o < hi; o++ {
+				ta, tb := terms(o)
+				gemmBlock(g, ws, a, ta, b, tb, k, out[o*m*n:][:m*n], n, 0, m, 0, n)
+				if err := epi.apply(o*m*n, (o+1)*m*n); err != nil {
 					return err
 				}
 			}
 			return nil
 		})
 	}
-	for i := range batch {
-		ai, bi, c := item(i)
-		if err := be.sgemmShared(ctx, g, ai, bi, c, m, n, k, epi, i*m*n); err != nil {
+	for o := range outputs {
+		ta, tb := terms(o)
+		if err := be.sgemmShared(ctx, g, a, ta, b, tb, out[o*m*n:][:m*n], m, n, k, epi, o*m*n); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// sgemmShared computes the m×n product c = a·b with every worker. For each
+// sgemmGrouped computes out like sgemm, splitting the sums products of
+// each output into groups of consecutive ones. It sums the groups of every
+// output in parallel, the first into out and the others into partial
+// sums, and then adds the partial sums to out in order.
+func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, sums, groups int, epi *evaluator) error {
+	size := m * n
+	outputs := len(out) / size
+	shared := gemmWorkspaces.Get().(*gemmWorkspace)
+	defer gemmWorkspaces.Put(shared)
+	shared.partials = grow(shared.partials, (groups-1)*len(out))
+	partials := shared.partials
+	flops := max(2*size*k*(sums/groups), 1)
+	err := be.parallelFor(ctx, outputs*groups, max(1, minUnitFlops/flops), func(lo, hi int) error {
+		ws := gemmWorkspaces.Get().(*gemmWorkspace)
+		defer gemmWorkspaces.Put(ws)
+		for u := lo; u < hi; u++ {
+			o, j := u/groups, u%groups
+			t0, t1 := o*sums+j*sums/groups, o*sums+(j+1)*sums/groups
+			c := out[o*size:][:size]
+			if j > 0 {
+				c = partials[(j-1)*len(out)+o*size:][:size]
+			}
+			gemmBlock(g, ws, a, offA[t0:t1], b, offB[t0:t1], k, c, n, 0, m, 0, n)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return be.parallelFor(ctx, len(out), elementGrain, func(lo, hi int) error {
+		c := out[lo:hi]
+		for j := range groups - 1 {
+			for i, v := range partials[j*len(out)+lo:][:len(c)] {
+				c[i] += v
+			}
+		}
+		return epi.apply(lo, hi)
+	})
+}
+
+// sgemmShared computes the m×n product c = Σ a[i]·b[i], where matrix i of
+// a starts at offA[i] and of b at offB[i], with every worker. For each
 // block of B, the workers pack its panels together and then compute parts
 // of the output from them, each packing the rows of A that it needs.
 // Packing B separately for each part would repeat it for every part. The
 // epilogue rewrites each part once its last block of A and B is done; c
 // starts at element base of the epilogue's output.
-func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand, c []float32, m, n, k int, epi *evaluator, base int) error {
+func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a operand, offA []int, b operand, offB []int, c []float32, m, n, k int, epi *evaluator, base int) error {
 	if k == 0 {
 		clear(c)
 		return epi.apply(base, base+m*n)
@@ -136,16 +203,99 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand,
 	for jc := 0; jc < n; jc += g.nc {
 		nc := min(g.nc, n-jc)
 		p := planGEMM(g, m, nc, k, be.workers)
+		for t := range offA {
+			at, bt := a, b
+			at.off, bt.off = offA[t], offB[t]
+			for pc := 0; pc < k; pc += g.kc {
+				kc := min(g.kc, k-pc)
+				shared.b = grow(shared.b, roundUp(nc, g.nr)*kc+packSlack)
+				bp := shared.b
+				panels := (nc + g.nr - 1) / g.nr
+				err := be.parallelFor(ctx, panels, packGrain/(kc*g.nr), func(lo, hi int) error {
+					// Bound the panels so that packing stores nothing into those
+					// of other chunks.
+					j0 := lo * g.nr
+					packB(bp[j0*kc:hi*g.nr*kc], bt, pc, kc, jc+j0, min(hi*g.nr, nc)-j0, g.nr)
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+				last := t == len(offA)-1 && pc+kc >= k
+				err = be.parallelFor(ctx, p.mParts*p.nParts, 1, func(lo, hi int) error {
+					ws := gemmWorkspaces.Get().(*gemmWorkspace)
+					defer gemmWorkspaces.Put(ws)
+					for u := lo; u < hi; u++ {
+						i0, j0 := u/p.nParts*p.mStep, u%p.nParts*p.nStep
+						i1, j1 := min(i0+p.mStep, m), min(j0+p.nStep, nc)
+						for ic := i0; ic < i1; ic += g.mc {
+							mc := min(g.mc, i1-ic)
+							ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
+							packA(ws.a, at, ic, mc, pc, kc, g.mr)
+							macroKernel(g, ws.a, bp[j0*kc:], kc, mc, j1-j0, c[ic*n+jc+j0:], n, t > 0 || pc > 0, &ws.tile)
+						}
+						if !last {
+							continue
+						}
+						for i := i0; i < i1; i++ {
+							row := base + i*n + jc
+							if err := epi.apply(row+j0, row+j1); err != nil {
+								return err
+							}
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// sgemmWide computes out[i] = a·b[i] for every matrix i of b, which starts
+// at offB[i], with every worker. Side by side, the products are one wide
+// product a·[b[0] b[1] ...], whose columns it computes like sgemmShared:
+// a block of A, packed once, then serves every item instead of being
+// packed again for each. Each item's columns start a panel of their own.
+func (be *Backend) sgemmWide(ctx context.Context, g *gemmKernel, out []float32, a, b operand, offB []int, m, n, k int, epi *evaluator) error {
+	if k == 0 {
+		clear(out)
+		return epi.apply(0, len(out))
+	}
+	per := (n + g.nr - 1) / g.nr // panels of each item
+	total := len(offB) * per
+	block := max(1, g.nc/g.nr) // panels of a block of B
+	// spans calls fn for each item's run of the panels [q0, q1): item i's
+	// columns [j0, j0+cols), packed from panel q on.
+	spans := func(q0, q1 int, fn func(q, i, j0, cols int)) {
+		for q := q0; q < q1; {
+			i, j0 := q/per, q%per*g.nr
+			end := min(q1, (i+1)*per)
+			fn(q, i, j0, min(n, (end-i*per)*g.nr)-j0)
+			q = end
+		}
+	}
+	shared := gemmWorkspaces.Get().(*gemmWorkspace)
+	defer gemmWorkspaces.Put(shared)
+	for q0 := 0; q0 < total; q0 += block {
+		q1 := min(q0+block, total)
+		p := planGEMM(g, m, (q1-q0)*g.nr, k, be.workers)
 		for pc := 0; pc < k; pc += g.kc {
 			kc := min(g.kc, k-pc)
-			shared.b = grow(shared.b, roundUp(nc, g.nr)*kc+packSlack)
+			shared.b = grow(shared.b, (q1-q0)*g.nr*kc+packSlack)
 			bp := shared.b
-			panels := (nc + g.nr - 1) / g.nr
-			err := be.parallelFor(ctx, panels, packGrain/(kc*g.nr), func(lo, hi int) error {
+			err := be.parallelFor(ctx, q1-q0, packGrain/(kc*g.nr), func(lo, hi int) error {
 				// Bound the panels so that packing stores nothing into those
 				// of other chunks.
-				j0 := lo * g.nr
-				packB(bp[j0*kc:hi*g.nr*kc], b, pc, kc, jc+j0, min(hi*g.nr, nc)-j0, g.nr)
+				end := hi * g.nr * kc
+				spans(q0+lo, q0+hi, func(q, i, j0, cols int) {
+					bi := b
+					bi.off = offB[i]
+					packB(bp[(q-q0)*g.nr*kc:end], bi, pc, kc, j0, cols, g.nr)
+				})
 				return nil
 			})
 			if err != nil {
@@ -155,22 +305,29 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand,
 				ws := gemmWorkspaces.Get().(*gemmWorkspace)
 				defer gemmWorkspaces.Put(ws)
 				for u := lo; u < hi; u++ {
-					i0, j0 := u/p.nParts*p.mStep, u%p.nParts*p.nStep
-					i1, j1 := min(i0+p.mStep, m), min(j0+p.nStep, nc)
+					i0, s0 := u/p.nParts*p.mStep, u%p.nParts*p.nStep/g.nr
+					i1, s1 := min(i0+p.mStep, m), min(s0+p.nStep/g.nr, q1-q0)
 					for ic := i0; ic < i1; ic += g.mc {
 						mc := min(g.mc, i1-ic)
 						ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
 						packA(ws.a, a, ic, mc, pc, kc, g.mr)
-						macroKernel(g, ws.a, bp[j0*kc:], kc, mc, j1-j0, c[ic*n+jc+j0:], n, pc > 0, &ws.tile)
+						spans(q0+s0, q0+s1, func(q, i, j0, cols int) {
+							c := out[i*m*n:][:m*n]
+							macroKernel(g, ws.a, bp[(q-q0)*g.nr*kc:], kc, mc, cols, c[ic*n+j0:], n, pc > 0, &ws.tile)
+						})
 					}
 					if pc+kc < k {
 						continue
 					}
-					for i := i0; i < i1; i++ {
-						row := base + i*n + jc
-						if err := epi.apply(row+j0, row+j1); err != nil {
-							return err
+					var err error
+					spans(q0+s0, q0+s1, func(q, i, j0, cols int) {
+						for r := i0; r < i1 && err == nil; r++ {
+							row := i*m*n + r*n + j0
+							err = epi.apply(row, row+cols)
 						}
+					})
+					if err != nil {
+						return err
 					}
 				}
 				return nil
@@ -213,10 +370,11 @@ func planGEMM(g *gemmKernel, m, n, k, workers int) gemmPlan {
 	return p
 }
 
-// gemmBlock computes rows [i0, i1) and columns [j0, j1) of c = a·b, where
-// a has k columns and c is row-major with rows ldc elements apart.
-func gemmBlock(g *gemmKernel, ws *gemmWorkspace, a, b operand, k int, c []float32, ldc, i0, i1, j0, j1 int) {
-	if k == 0 {
+// gemmBlock computes rows [i0, i1) and columns [j0, j1) of c = Σ a[i]·b[i],
+// where matrix i of a starts at offA[i] and of b at offB[i], a's have k
+// columns and c is row-major with rows ldc elements apart.
+func gemmBlock(g *gemmKernel, ws *gemmWorkspace, a operand, offA []int, b operand, offB []int, k int, c []float32, ldc, i0, i1, j0, j1 int) {
+	if k == 0 || len(offA) == 0 {
 		for i := i0; i < i1; i++ {
 			clear(c[i*ldc+j0 : i*ldc+j1])
 		}
@@ -224,15 +382,19 @@ func gemmBlock(g *gemmKernel, ws *gemmWorkspace, a, b operand, k int, c []float3
 	}
 	for jc := j0; jc < j1; jc += g.nc {
 		nc := min(g.nc, j1-jc)
-		for pc := 0; pc < k; pc += g.kc {
-			kc := min(g.kc, k-pc)
-			ws.b = grow(ws.b, roundUp(nc, g.nr)*kc+packSlack)
-			packB(ws.b, b, pc, kc, jc, nc, g.nr)
-			for ic := i0; ic < i1; ic += g.mc {
-				mc := min(g.mc, i1-ic)
-				ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
-				packA(ws.a, a, ic, mc, pc, kc, g.mr)
-				macroKernel(g, ws.a, ws.b, kc, mc, nc, c[ic*ldc+jc:], ldc, pc > 0, &ws.tile)
+		for t := range offA {
+			at, bt := a, b
+			at.off, bt.off = offA[t], offB[t]
+			for pc := 0; pc < k; pc += g.kc {
+				kc := min(g.kc, k-pc)
+				ws.b = grow(ws.b, roundUp(nc, g.nr)*kc+packSlack)
+				packB(ws.b, bt, pc, kc, jc, nc, g.nr)
+				for ic := i0; ic < i1; ic += g.mc {
+					mc := min(g.mc, i1-ic)
+					ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
+					packA(ws.a, at, ic, mc, pc, kc, g.mr)
+					macroKernel(g, ws.a, ws.b, kc, mc, nc, c[ic*ldc+jc:], ldc, t > 0 || pc > 0, &ws.tile)
+				}
 			}
 		}
 	}
