@@ -771,6 +771,20 @@ func TestRealizeIntoComputesKeptNodesFirst(t *testing.T) {
 		}
 	}
 
+	// A kept view of the destination keeps its memory, as a target does.
+	v := realized(t, be, []int{2, 3}, 5)
+	vs := floats(t, be, v)
+	view := must(graph.Permute(v, []int{1, 0}))
+	keep = func() []*graph.Node { return []*graph.Node{view} }
+	if err := RealizeInto(t.Context(), be, []*graph.Node{twice(v)}, []*graph.Node{v}, keep); err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range floats(t, be, view) {
+		if want := vs[i%2*3+i/2]; got != want {
+			t.Fatalf("kept view of the destination: element %d = %v, want %v", i, got, want)
+		}
+	}
+
 	// So is one that can no longer be computed.
 	broken := must(graph.Binary(backend.OpAdd, failing, next))
 	keep = func() []*graph.Node { return []*graph.Node{broken} }
@@ -796,5 +810,16 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
 	if !x.Stale() {
 		t.Error("kept memory once nothing kept reads it")
+	}
+
+	// Nor does a kept node that can no longer be computed.
+	a, b := realized(t, be, []int{4}, 2), realized(t, be, []int{4}, 3)
+	broken := must(graph.Binary(backend.OpAdd, a, b))
+	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, b))}, []*graph.Node{b}, nil); err != nil {
+		t.Fatal(err)
+	}
+	Release(be, a, func() []*graph.Node { return []*graph.Node{broken} })
+	if !a.Stale() {
+		t.Error("kept memory that only a node reading a stale value reads")
 	}
 }

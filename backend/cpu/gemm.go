@@ -119,12 +119,9 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 	if (groups-1)*len(out) > maxPartials {
 		groups = 1
 	}
-	wide := sums == 1 && outputs > 1 && m >= n && !slices.ContainsFunc(offA, func(off int) bool { return off != offA[0] })
-	// cols counts the columns of a block of the wide product that are not
-	// padding: each item's columns start a panel.
-	cols := min(g.nc, n*max(1, g.nc/roundUp(n, g.nr)), outputs*n)
+	shared := !slices.ContainsFunc(offA, func(off int) bool { return off != offA[0] })
 	switch {
-	case wide && 2*m*cols*k >= be.workers*minUnitFlops:
+	case sums == 1 && outputs > 1 && m >= n && shared && wideEnough(g, m, n, k, outputs, be.workers):
 		a.off = offA[0]
 		return be.sgemmWide(ctx, g, out, a, b, offB, m, n, k, epi)
 	case groups > 1:
@@ -156,7 +153,8 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 // each output into groups of consecutive ones. It sums the groups of every
 // output in parallel, the first into out and the others into partial
 // sums, and then adds the partial sums to out in order. When there are
-// fewer groups than workers it splits each group's output too.
+// fewer groups than workers it splits each group's output too; see
+// groupWorkers.
 func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, sums, groups int, epi *evaluator) error {
 	size := m * n
 	outputs := len(out) / size
@@ -165,7 +163,7 @@ func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float3
 	shared.partials = grow(shared.partials, (groups-1)*len(out))
 	partials := shared.partials
 	depth := k * (sums / groups) // of a group's products, at least
-	p := planGEMM(g, m, n, depth, (be.workers+outputs*groups-1)/(outputs*groups))
+	p := planGEMM(g, m, n, depth, groupWorkers(outputs*groups, be.workers))
 	parts := p.mParts * p.nParts
 	flops := max(2*size*depth/parts, 1)
 	err := be.parallelFor(ctx, outputs*groups*parts, max(1, minUnitFlops/flops), func(lo, hi int) error {
@@ -195,6 +193,29 @@ func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float3
 		}
 		return epi.apply(lo, hi)
 	})
+}
+
+// wideEnough reports whether a block of B of the wide product of a batch
+// of outputs items, m×n and k deep, has work for every worker; see
+// sgemmWide. The kernels compute the padding of each item's last panel
+// too, so it counts as work.
+func wideEnough(g *gemmKernel, m, n, k, outputs, workers int) bool {
+	cols := min(g.nc/g.nr, outputs*((n+g.nr-1)/g.nr)) * g.nr
+	return 2*m*cols*k >= workers*minUnitFlops
+}
+
+// groupWorkers returns the number of workers to split the output of each
+// of groups groups of products between, so that the parts of all of them
+// can be shared evenly by workers workers.
+func groupWorkers(groups, workers int) int {
+	if groups >= workers {
+		return 1
+	}
+	a, b := groups, workers
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return workers / a
 }
 
 // sgemmShared computes the m×n product c = Σ a[i]·b[i], where matrix i of
