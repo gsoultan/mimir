@@ -7,43 +7,53 @@ import (
 	"github.com/gsoultan/mimir/backend"
 )
 
-// reducedSpace returns the shape and strides of the reduced axes of v.
-func reducedSpace(v backend.View, axes []int) backend.View {
-	r := backend.View{Shape: make([]int, 0, len(axes)), Strides: make([]int, 0, len(axes))}
-	for d := range v.Shape {
-		if slices.Contains(axes, d) {
-			r.Shape = append(r.Shape, v.Shape[d])
-			r.Strides = append(r.Strides, v.Strides[d])
-		}
-	}
-	return r
+// A reduction reads its input as kept dimensions, which index the output,
+// and reduced ones. When the innermost input dimension is kept, output
+// elements adjacent along it are computed together as a row: every reduced
+// position combines a strided run of the input into a row of accumulators,
+// so the input streams in order. Otherwise each output element combines
+// runs of the input along the innermost reduced dimension. Either way,
+// every output element visits its reduced positions in row-major order.
+
+// reduction is the plan of a reduction.
+type reduction struct {
+	rows    backend.View // kept dimensions but the row's, with input strides
+	rowLen  int          // output elements computed together
+	rowStep int          // input stride between them
+	red     backend.View // reduced dimensions, at offset 0
 }
 
-// forEachReduced calls visit(i, inner) for each output element i, where
-// inner is the view of the input elements reduced into it. The output shape
-// keeps reduced axes with size 1, so walking it with the input strides
-// yields the offset of the first reduced element.
-func forEachReduced(ctx context.Context, b *Backend, k *backend.Kernel, n int, visit func(i int, inner backend.View)) error {
-	v := k.In[0]
-	red := reducedSpace(v, k.Attrs.Axes)
-	_, rv := coalesce(red.Shape, []backend.View{red})
-	red = rv[0]
-	innerSize, _ := backend.NumElements(red.Shape)
-	grain := max(1, elementGrain/max(innerSize, 1))
-	base := backend.View{Shape: k.Shape, Strides: v.Strides, Offset: v.Offset}
-	return b.parallelFor(ctx, n, grain, func(lo, hi int) error {
-		c := newCursor(k.Shape, []backend.View{base}, lo)
-		for i := lo; i < hi; i++ {
-			visit(i, backend.View{Shape: red.Shape, Strides: red.Strides, Offset: c.offs[0]})
-			c.next()
+// rowChunk bounds the accumulators of a row, which a worker keeps in cache.
+const rowChunk = 1024
+
+func planReduction(v backend.View, axes []int) reduction {
+	kept := backend.View{Offset: v.Offset}
+	var red backend.View
+	last := -1 // innermost dimension with more than one element
+	for d, n := range v.Shape {
+		if slices.Contains(axes, d) {
+			red.Shape = append(red.Shape, n)
+			red.Strides = append(red.Strides, v.Strides[d])
+		} else {
+			kept.Shape = append(kept.Shape, n)
+			kept.Strides = append(kept.Strides, v.Strides[d])
 		}
-		return nil
-	})
+		if n > 1 {
+			last = d
+		}
+	}
+	_, kv := coalesce(kept.Shape, []backend.View{kept})
+	_, rv := coalesce(red.Shape, []backend.View{red})
+	p := reduction{rows: kv[0], rowLen: 1, red: rv[0]}
+	if r := len(p.rows.Shape) - 1; last >= 0 && !slices.Contains(axes, last) && r >= 0 {
+		p.rowLen, p.rowStep = p.rows.Shape[r], p.rows.Strides[r]
+		p.rows.Shape, p.rows.Strides = p.rows.Shape[:r], p.rows.Strides[:r]
+	}
+	return p
 }
 
 // walk calls fn with the buffer offset of every element of v in row-major
-// order. Reductions over one or two axes, the common cases, avoid the
-// cursor.
+// order.
 func walk(v backend.View, fn func(off int)) {
 	switch len(v.Shape) {
 	case 0:
@@ -54,16 +64,6 @@ func walk(v backend.View, fn func(off int)) {
 			fn(off)
 			off += s
 		}
-	case 2:
-		row, s0, s1 := v.Offset, v.Strides[0], v.Strides[1]
-		for range v.Shape[0] {
-			off := row
-			for range v.Shape[1] {
-				fn(off)
-				off += s1
-			}
-			row += s0
-		}
 	default:
 		c := newCursor(v.Shape, []backend.View{v}, 0)
 		for range v.Size() {
@@ -73,35 +73,150 @@ func walk(v backend.View, fn func(off int)) {
 	}
 }
 
-// reduce folds the reduced elements with combine, starting from the first.
-// The graph rejects reductions over empty axes, which have no first element.
-func reduce[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T, combine func(acc, x T) T) error {
-	return forEachReduced(ctx, b, k, len(out), func(i int, inner backend.View) {
-		var acc T
-		first := true
-		walk(inner, func(off int) {
+// forReduction runs a reduction planned by p over n output elements:
+// element(i, off) computes output element i, whose reduced elements start
+// at input offset off, and row(i, off, acc) the len(acc) output elements of
+// a row from i on, the first at input offset off.
+func forReduction[A any](ctx context.Context, b *Backend, p reduction, n int, element func(i, off int), row func(i, off int, acc []A)) error {
+	redSize, _ := backend.NumElements(p.red.Shape)
+	if p.rowLen == 1 {
+		return b.parallelFor(ctx, n, max(1, elementGrain/max(redSize, 1)), func(lo, hi int) error {
+			c := newCursor(p.rows.Shape, []backend.View{p.rows}, lo)
+			for i := lo; i < hi; i++ {
+				element(i, c.offs[0])
+				c.next()
+			}
+			return nil
+		})
+	}
+	chunks := (p.rowLen + rowChunk - 1) / rowChunk
+	width := min(p.rowLen, rowChunk)
+	units := n / p.rowLen * chunks
+	return b.parallelFor(ctx, units, max(1, elementGrain/max(width*redSize, 1)), func(lo, hi int) error {
+		acc := make([]A, width)
+		r := lo / chunks
+		c := newCursor(p.rows.Shape, []backend.View{p.rows}, r)
+		for u := lo; u < hi; u++ {
+			for ; r < u/chunks; r++ {
+				c.next()
+			}
+			j := u % chunks * rowChunk
+			m := min(rowChunk, p.rowLen-j)
+			row(r*p.rowLen+j, c.offs[0]+j*p.rowStep, acc[:m])
+		}
+		return nil
+	})
+}
+
+// reduceMax computes the maximum of the reduced elements, propagating NaN.
+// The graph rejects reductions over empty axes, which have no maximum.
+func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
+	p := planReduction(k.In[0], k.Attrs.Axes)
+	inner, step := 1, 0
+	outer := p.red
+	if r := len(p.red.Shape) - 1; r >= 0 {
+		inner, step = p.red.Shape[r], p.red.Strides[r]
+		outer = backend.View{Shape: p.red.Shape[:r], Strides: p.red.Strides[:r]}
+	}
+	element := func(i, off int) {
+		acc, first := T(0), true
+		walk(outer, func(o int) {
+			src := off + o
 			if first {
-				acc, first = in[off], false
+				acc, first = in[src], false
+				src += step
+				for range inner - 1 {
+					acc = maxOf(acc, in[src])
+					src += step
+				}
 				return
 			}
-			acc = combine(acc, in[off])
+			for range inner {
+				acc = maxOf(acc, in[src])
+				src += step
+			}
 		})
 		out[i] = acc
-	})
+	}
+	row := func(i, off int, acc []T) {
+		first := true
+		walk(p.red, func(o int) {
+			src := off + o
+			switch {
+			case first:
+				for j := range acc {
+					acc[j] = in[src]
+					src += p.rowStep
+				}
+				first = false
+			case p.rowStep == 1:
+				for j, x := range in[src : src+len(acc)] {
+					acc[j] = maxOf(acc[j], x)
+				}
+			default:
+				for j := range acc {
+					acc[j] = maxOf(acc[j], in[src])
+					src += p.rowStep
+				}
+			}
+		})
+		copy(out[i:], acc)
+	}
+	return forReduction(ctx, b, p, len(out), element, row)
 }
 
 // reduceSum accumulates float32 in float64 and int32 in int32 (wrapping).
 func reduceSum[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
 	if dtypeOf[T]() == backend.Float32 {
-		return forEachReduced(ctx, b, k, len(out), func(i int, inner backend.View) {
-			var acc float64
-			walk(inner, func(off int) { acc += float64(in[off]) })
-			out[i] = T(acc)
-		})
+		return sumInto[T, float64](ctx, b, k, out, in)
 	}
-	return forEachReduced(ctx, b, k, len(out), func(i int, inner backend.View) {
-		var acc T
-		walk(inner, func(off int) { acc += in[off] })
-		out[i] = acc
-	})
+	return sumInto[T, T](ctx, b, k, out, in)
+}
+
+// sumInto sums the reduced elements in accumulators of type A.
+func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
+	p := planReduction(k.In[0], k.Attrs.Axes)
+	inner, step := 1, 0
+	outer := p.red
+	if r := len(p.red.Shape) - 1; r >= 0 {
+		inner, step = p.red.Shape[r], p.red.Strides[r]
+		outer = backend.View{Shape: p.red.Shape[:r], Strides: p.red.Strides[:r]}
+	}
+	element := func(i, off int) {
+		var acc A
+		walk(outer, func(o int) {
+			src := off + o
+			if step == 1 {
+				for _, x := range in[src : src+inner] {
+					acc += A(x)
+				}
+				return
+			}
+			for range inner {
+				acc += A(in[src])
+				src += step
+			}
+		})
+		out[i] = T(acc)
+	}
+	row := func(i, off int, acc []A) {
+		clear(acc)
+		walk(p.red, func(o int) {
+			src := off + o
+			if p.rowStep == 1 {
+				for j, x := range in[src : src+len(acc)] {
+					acc[j] += A(x)
+				}
+				return
+			}
+			for j := range acc {
+				acc[j] += A(in[src])
+				src += p.rowStep
+			}
+		})
+		for j, a := range acc {
+			out[i+j] = T(a)
+		}
+	}
+	return forReduction(ctx, b, p, len(out), element, row)
 }
