@@ -56,6 +56,44 @@ func runChunk(ctx context.Context, fn func(lo, hi int) error, lo, hi int) (err e
 	return fn(lo, hi)
 }
 
+// coalesce returns an equivalent walk of shape under views with fewer
+// dimensions: it drops dimensions of size 1 and merges each dimension into
+// the one before it when every view steps through the pair contiguously.
+// Row-major order, and so the linear index of every element, is unchanged,
+// and kernels take longer strides through fewer cursor steps.
+func coalesce(shape []int, views []backend.View) ([]int, []backend.View) {
+	dims := make([]int, 0, len(shape))
+	out := make([]backend.View, len(views))
+	for v, view := range views {
+		out[v] = backend.View{Strides: make([]int, 0, len(shape)), Offset: view.Offset}
+	}
+	for d, n := range shape {
+		if n == 1 {
+			continue
+		}
+		last := len(dims) - 1
+		merge := last >= 0 && n != 0 && dims[last] != 0
+		for v := range views {
+			merge = merge && out[v].Strides[last] == views[v].Strides[d]*n
+		}
+		if merge {
+			dims[last] *= n
+			for v := range views {
+				out[v].Strides[last] = views[v].Strides[d]
+			}
+			continue
+		}
+		dims = append(dims, n)
+		for v := range views {
+			out[v].Strides = append(out[v].Strides, views[v].Strides[d])
+		}
+	}
+	for v := range out {
+		out[v].Shape = dims
+	}
+	return dims, out
+}
+
 // cursor walks a shape in row-major order and tracks, for each view, the
 // buffer offset of the current element. All views share the walked shape.
 type cursor struct {

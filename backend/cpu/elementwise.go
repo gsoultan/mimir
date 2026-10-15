@@ -15,8 +15,11 @@ const elementGrain = 1 << 15
 // dimension and calls fn(i, offs, steps, n) for each: the row covers output
 // elements [i, i+n), offs holds where each view's row starts and steps each
 // view's innermost stride. Strided and broadcast inputs then cost one
-// cursor step per row instead of per element.
+// cursor step per row instead of per element. Dimensions are coalesced
+// first, so rows are as long as the views allow, and long rows are split
+// between workers.
 func forRows(ctx context.Context, b *Backend, shape []int, views []backend.View, fn func(i int, offs, steps []int, n int)) error {
+	shape, views = coalesce(shape, views)
 	r := len(shape)
 	if r == 0 {
 		offs := make([]int, len(views))
@@ -28,7 +31,7 @@ func forRows(ctx context.Context, b *Backend, shape []int, views []backend.View,
 	}
 	inner := shape[r-1]
 	total, _ := backend.NumElements(shape)
-	if inner == 0 || total == 0 {
+	if total == 0 {
 		return nil
 	}
 	outer := make([]backend.View, len(views))
@@ -37,11 +40,17 @@ func forRows(ctx context.Context, b *Backend, shape []int, views []backend.View,
 		outer[v] = backend.View{Strides: view.Strides[:r-1], Offset: view.Offset}
 		steps[v] = view.Strides[r-1]
 	}
-	return b.parallelFor(ctx, total/inner, max(1, elementGrain/inner), func(lo, hi int) error {
-		c := newCursor(shape[:r-1], outer, lo)
-		for row := lo; row < hi; row++ {
-			fn(row*inner, c.offs, steps, inner)
-			c.next()
+	return b.parallelFor(ctx, total, elementGrain, func(lo, hi int) error {
+		c := newCursor(shape[:r-1], outer, lo/inner)
+		offs := make([]int, len(views))
+		for i := lo; i < hi; c.next() {
+			col := i % inner
+			n := min(inner-col, hi-i)
+			for v := range offs {
+				offs[v] = c.offs[v] + col*steps[v]
+			}
+			fn(i, offs, steps, n)
+			i += n
 		}
 		return nil
 	})

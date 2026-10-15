@@ -26,6 +26,8 @@ func reducedSpace(v backend.View, axes []int) backend.View {
 func forEachReduced(ctx context.Context, b *Backend, k *backend.Kernel, n int, visit func(i int, inner backend.View)) error {
 	v := k.In[0]
 	red := reducedSpace(v, k.Attrs.Axes)
+	_, rv := coalesce(red.Shape, []backend.View{red})
+	red = rv[0]
 	innerSize, _ := backend.NumElements(red.Shape)
 	grain := max(1, elementGrain/max(innerSize, 1))
 	base := backend.View{Shape: k.Shape, Strides: v.Strides, Offset: v.Offset}
@@ -40,7 +42,8 @@ func forEachReduced(ctx context.Context, b *Backend, k *backend.Kernel, n int, v
 }
 
 // walk calls fn with the buffer offset of every element of v in row-major
-// order. Reductions over a single axis, the common case, avoid the cursor.
+// order. Reductions over one or two axes, the common cases, avoid the
+// cursor.
 func walk(v backend.View, fn func(off int)) {
 	switch len(v.Shape) {
 	case 0:
@@ -50,6 +53,16 @@ func walk(v backend.View, fn func(off int)) {
 		for range v.Shape[0] {
 			fn(off)
 			off += s
+		}
+	case 2:
+		row, s0, s1 := v.Offset, v.Strides[0], v.Strides[1]
+		for range v.Shape[0] {
+			off := row
+			for range v.Shape[1] {
+				fn(off)
+				off += s1
+			}
+			row += s0
 		}
 	default:
 		c := newCursor(v.Shape, []backend.View{v}, 0)
