@@ -656,27 +656,29 @@ func TestRealizeIntoKeepsWhatOtherTargetsRead(t *testing.T) {
 	}
 }
 
-// cancelling cancels a context when it runs its first kernel.
+// cancelling cancels a context, once it has one, when it runs a kernel.
 type cancelling struct {
 	*counting
 	cancel context.CancelFunc
 }
 
 func (c *cancelling) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
 	return c.counting.Run(ctx, k, outs, ins)
 }
 
 func TestRealizeIntoFinishesOnceItStartsWriting(t *testing.T) {
-	be := &counting{Backend: cpu.New()}
+	be := &cancelling{counting: &counting{Backend: cpu.New()}}
 	x, y := realized(t, be, []int{4, 4}, 1), realized(t, be, []int{4, 4}, 2)
 	xs, ys := floats(t, be, x), floats(t, be, y)
 	nx := must(graph.Unary(backend.OpNeg, x))
 	p := must(graph.MatMul(nx, y))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	be.ops = nil
-	if err := RealizeInto(ctx, &cancelling{be, cancel}, []*graph.Node{nx, p}, []*graph.Node{x, nil}, nil); err != nil {
+	be.ops, be.cancel = nil, cancel
+	if err := RealizeInto(ctx, be, []*graph.Node{nx, p}, []*graph.Node{x, nil}, nil); err != nil {
 		t.Fatalf("cancelled after the first kernel wrote over its destination: %v", err)
 	}
 	if len(be.ops) != 2 {
@@ -704,7 +706,7 @@ func TestReleaseLeavesSharedMemoryAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := floats(t, be, x)
-	Release(be, x, nil)
+	Release(x, nil)
 	if x.Stale() {
 		t.Fatal("released memory that a view still reads")
 	}
@@ -798,7 +800,7 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 	x := realized(t, be, []int{4}, 1)
 	want := floats(t, be, x)
 	reader := must(graph.Unary(backend.OpNeg, must(graph.Reshape(x, []int{2, 2}))))
-	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
+	Release(x, func() []*graph.Node { return []*graph.Node{reader} })
 	if x.Stale() {
 		t.Fatal("released memory that a kept node reads")
 	}
@@ -807,7 +809,7 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 			t.Fatalf("kept node element %d = %v, want %v", i, v, -want[i])
 		}
 	}
-	Release(be, x, func() []*graph.Node { return []*graph.Node{reader} })
+	Release(x, func() []*graph.Node { return []*graph.Node{reader} })
 	if !x.Stale() {
 		t.Error("kept memory once nothing kept reads it")
 	}
@@ -818,7 +820,7 @@ func TestReleaseKeepsMemoryThatKeptNodesRead(t *testing.T) {
 	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, b))}, []*graph.Node{b}, nil); err != nil {
 		t.Fatal(err)
 	}
-	Release(be, a, func() []*graph.Node { return []*graph.Node{broken} })
+	Release(a, func() []*graph.Node { return []*graph.Node{broken} })
 	if !a.Stale() {
 		t.Error("kept memory that only a node reading a stale value reads")
 	}
