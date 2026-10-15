@@ -7,7 +7,8 @@ import "github.com/gsoultan/mimir/backend"
 // output of the same dtype and length, later in the same schedule or in a
 // later one. A training step runs the same kernels every time, so after
 // the first step it takes every intermediate from the pool and allocates
-// only the buffers that outlive it, such as new parameter values.
+// only the buffers that outlive it, such as the loss it returns; new
+// parameter values go over the old ones (see RealizeInto).
 //
 // A buffer that no schedule takes within poolAge schedules goes back to
 // the backend, so memory that one phase of a program used is released when

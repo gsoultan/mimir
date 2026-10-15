@@ -101,6 +101,51 @@ func TestNewParamCopiesItsInitialValue(t *testing.T) {
 	}
 }
 
+func TestLeavesWhoseGradientsShareMemoryKeepTheirs(t *testing.T) {
+	a := tensor.NewParam(tensor.Zeros(tensor.Float32, 2, 3))
+	b := tensor.NewParam(tensor.Zeros(tensor.Float32, 6))
+	c := tensor.FromSlice([]float32{1, 2, 3, 4, 5, 6})
+	twice := []float32{2, 4, 6, 8, 10, 12}
+	grad := func(p *tensor.Param, want []float32) {
+		t.Helper()
+		if got, err := p.Grad().Data[float32](t.Context()); err != nil || !slices.Equal(got, want) {
+			t.Fatalf("gradient = %v, %v; want %v", got, err, want)
+		}
+	}
+	// a's gradient is a view of b's.
+	if err := a.Value().Reshape(6).Add(b.Value()).Mul(c).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// Adding to a's gradient alone leaves b's.
+	if err := a.Value().Reshape(6).Mul(c).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	grad(a, twice)
+	grad(b, []float32{1, 2, 3, 4, 5, 6})
+	// So does zeroing it.
+	a.ZeroGrad()
+	grad(b, []float32{1, 2, 3, 4, 5, 6})
+	if err := b.Value().Mul(c).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	grad(b, twice)
+}
+
+func TestLazyParameterValuesSurviveWritesOverWhatTheyRead(t *testing.T) {
+	a := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	b := tensor.NewParam(tensor.Zeros(tensor.Float32, 2))
+	if err := b.Set(a.Value().Clone()); err != nil {
+		t.Fatal(err)
+	}
+	old := a.Value()
+	if err := tensor.RealizeInto(t.Context(), []*tensor.Tensor{old}, []*tensor.Tensor{old.Neg()}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.Value().Data[float32](t.Context()); err != nil || !slices.Equal(got, []float32{1, 2}) {
+		t.Errorf("copy of a value written over = %v, %v; want [1 2]", got, err)
+	}
+}
+
 func TestLeavesWithTheSameGradientEachOwnIt(t *testing.T) {
 	a := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
 	b := tensor.NewParam(tensor.FromSlice([]float32{3, 4}))

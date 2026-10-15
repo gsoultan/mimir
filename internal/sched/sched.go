@@ -45,13 +45,50 @@ func Realize(ctx context.Context, be backend.Backend, targets ...*graph.Node) er
 // cancellation, so that it does not stop with some targets written and
 // others not. If the backend fails after that, the targets are unchanged
 // and the destinations written over are stale.
-func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) error {
+//
+// keep lists unrealized nodes that must stay computable, such as values
+// that parameters hold as recipes. Each of them that reads the memory of
+// a destination, and could still be computed before, is computed with the
+// targets.
+func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep ...*graph.Node) error {
 	if len(dsts) != len(targets) {
 		return fmt.Errorf("sched: %d destinations for %d targets: %w", len(dsts), len(targets), backend.ErrInternal)
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if k := endangered(keep, targets, dsts); len(k) > 0 {
+		targets = append(slices.Clip(targets), k...)
+		dsts = append(slices.Clip(dsts), make([]*graph.Node, len(k))...)
+	}
 	return realize(ctx, be, targets, dsts)
+}
+
+// endangered returns the nodes of keep that read the memory of a realized
+// destination in dsts, which the schedule makes stale, and that are not
+// targets, realized or stale already.
+func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
+	mems := map[*graph.Storage]bool{}
+	for _, d := range dsts {
+		if d != nil && d.Realized() && !d.Stale() {
+			mems[d.Mem] = true
+		}
+	}
+	if len(mems) == 0 {
+		return nil
+	}
+	reads := func(n *graph.Node) bool {
+		return slices.ContainsFunc(n.Inputs, func(in *graph.Node) bool { return in.Realized() && mems[in.Mem] })
+	}
+	var out []*graph.Node
+	for _, k := range keep {
+		if k.Realized() || slices.Contains(targets, k) || slices.Contains(out, k) {
+			continue
+		}
+		if order, err := topoSort([]*graph.Node{k}); err == nil && slices.ContainsFunc(order, reads) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // Release gives the memory of the realized node n to be's pool for later
