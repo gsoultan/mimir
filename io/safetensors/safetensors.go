@@ -1,0 +1,151 @@
+// Package safetensors reads the safetensors format: an 8-byte little-endian
+// header length, a JSON header describing each tensor, then the raw
+// little-endian tensor data. See https://github.com/huggingface/safetensors.
+//
+// Parse validates everything before returning, so a corrupt or hostile file
+// yields an error, never a panic or an out-of-range read.
+package safetensors
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"sort"
+)
+
+// ErrFormat reports a malformed file.
+var ErrFormat = errors.New("safetensors: invalid file")
+
+// maxHeader bounds the JSON header, as the reference implementation does.
+const maxHeader = 100 << 20
+
+var dtypeSizes = map[string]int{
+	"BOOL": 1, "U8": 1, "I8": 1, "F8_E5M2": 1, "F8_E4M3": 1,
+	"I16": 2, "U16": 2, "F16": 2, "BF16": 2,
+	"I32": 4, "U32": 4, "F32": 4,
+	"I64": 8, "U64": 8, "F64": 8,
+}
+
+// Tensor is one named tensor in a file. Data aliases the parsed bytes.
+type Tensor struct {
+	DType string
+	Shape []int
+	Data  []byte
+}
+
+// File is a parsed safetensors file.
+type File struct {
+	Metadata map[string]string
+	tensors  map[string]Tensor
+}
+
+type entry struct {
+	DType       string `json:"dtype"`
+	Shape       []int  `json:"shape"`
+	DataOffsets [2]int `json:"data_offsets"`
+}
+
+// Parse decodes b. The returned tensors alias b.
+func Parse(b []byte) (*File, error) {
+	if len(b) < 8 {
+		return nil, fmt.Errorf("%w: %d bytes", ErrFormat, len(b))
+	}
+	n := binary.LittleEndian.Uint64(b)
+	if n > maxHeader || n > uint64(len(b)-8) {
+		return nil, fmt.Errorf("%w: header of %d bytes in %d-byte file", ErrFormat, n, len(b))
+	}
+	header, data := b[8:8+n], b[8+n:]
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(header, &raw); err != nil {
+		return nil, fmt.Errorf("%w: header: %v", ErrFormat, err)
+	}
+	f := &File{tensors: make(map[string]Tensor, len(raw))}
+	type span struct{ lo, hi int }
+	spans := make([]span, 0, len(raw))
+	for name, msg := range raw {
+		if name == "__metadata__" {
+			if err := json.Unmarshal(msg, &f.Metadata); err != nil {
+				return nil, fmt.Errorf("%w: metadata: %v", ErrFormat, err)
+			}
+			continue
+		}
+		var e entry
+		if err := json.Unmarshal(msg, &e); err != nil {
+			return nil, fmt.Errorf("%w: tensor %q: %v", ErrFormat, name, err)
+		}
+		size, ok := dtypeSizes[e.DType]
+		if !ok {
+			return nil, fmt.Errorf("%w: tensor %q: dtype %q", ErrFormat, name, e.DType)
+		}
+		count := 1
+		for _, d := range e.Shape {
+			if d < 0 || (d != 0 && count > math.MaxInt/size/d) {
+				return nil, fmt.Errorf("%w: tensor %q: shape %v", ErrFormat, name, e.Shape)
+			}
+			count *= d
+		}
+		lo, hi := e.DataOffsets[0], e.DataOffsets[1]
+		if lo < 0 || lo > hi || hi > len(data) || hi-lo != count*size {
+			return nil, fmt.Errorf("%w: tensor %q: offsets %v for %d bytes of %v %s", ErrFormat, name, e.DataOffsets, len(data), e.Shape, e.DType)
+		}
+		f.tensors[name] = Tensor{DType: e.DType, Shape: e.Shape, Data: data[lo:hi:hi]}
+		spans = append(spans, span{lo, hi})
+	}
+	// The data section must be covered exactly, without gaps or overlaps.
+	sort.Slice(spans, func(i, j int) bool { return spans[i].lo < spans[j].lo })
+	end := 0
+	for _, s := range spans {
+		if s.lo != end {
+			return nil, fmt.Errorf("%w: data is not packed at byte %d", ErrFormat, end)
+		}
+		end = s.hi
+	}
+	if end != len(data) {
+		return nil, fmt.Errorf("%w: %d unused data bytes", ErrFormat, len(data)-end)
+	}
+	return f, nil
+}
+
+// Names returns the tensor names in sorted order.
+func (f *File) Names() []string {
+	names := make([]string, 0, len(f.tensors))
+	for name := range f.tensors {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Tensor returns the named tensor.
+func (f *File) Tensor(name string) (Tensor, bool) {
+	t, ok := f.tensors[name]
+	return t, ok
+}
+
+// Float32s decodes an F32 tensor.
+func (t Tensor) Float32s() ([]float32, error) {
+	if t.DType != "F32" {
+		return nil, fmt.Errorf("safetensors: %s tensor read as F32", t.DType)
+	}
+	out := make([]float32, len(t.Data)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(t.Data[4*i:]))
+	}
+	return out, nil
+}
+
+// Int32s decodes an I32 tensor.
+func (t Tensor) Int32s() ([]int32, error) {
+	if t.DType != "I32" {
+		return nil, fmt.Errorf("safetensors: %s tensor read as I32", t.DType)
+	}
+	out := make([]int32, len(t.Data)/4)
+	for i := range out {
+		out[i] = int32(binary.LittleEndian.Uint32(t.Data[4*i:]))
+	}
+	return out, nil
+}

@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, simd ${{ matrix.simd }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        simd: ['off', 'on']
+    runs-on: ${{ matrix.os }}
+    env:
+      GOEXPERIMENT: ${{ matrix.simd == 'on' && 'simd' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go vet ./...
+      - name: go test -race
+        if: runner.os != 'Windows'
+        run: go test -race ./...
+      - name: go test
+        if: runner.os == 'Windows'
+        run: go test ./...
+      - name: go test (MIMIR_EAGER=1)
+        run: go test ./tensor/...
+        env:
+          MIMIR_EAGER: '1'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -run='^$' -fuzz=FuzzParse -fuzztime=60s ./io/safetensors
+      - run: go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
+
+  golden-parity:
+    name: golden parity with PyTorch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python tools/golden/gen.py --oracle torch --out "$RUNNER_TEMP/golden"
+      - run: go test -count=1 -run TestGolden -v ./tensor
+        env:
+          MIMIR_GOLDEN_DIR: ${{ runner.temp }}/golden
+
+  bench:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go install golang.org/x/perf/cmd/benchstat@latest
+      - name: benchmark the pull request
+        run: go test -run='^$' -bench=. -count=6 ./... | tee "$RUNNER_TEMP/head.txt"
+      - name: benchmark the base branch
+        run: |
+          git checkout --quiet ${{ github.event.pull_request.base.sha }}
+          if [ -f go.mod ]; then
+            go test -run='^$' -bench=. -count=6 ./... | tee "$RUNNER_TEMP/base.txt" || true
+          fi
+          touch "$RUNNER_TEMP/base.txt"
+      - name: compare
+        run: |
+          {
+            echo '### Benchmarks (base vs pull request)'
+            echo '```'
+            benchstat "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt" || benchstat "$RUNNER_TEMP/head.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
