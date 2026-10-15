@@ -5,9 +5,9 @@
 // implementation that every other backend is tested against.
 //
 // Float32 matrix products run on assembly micro-kernels where the CPU
-// supports them, chosen at startup: AVX-512 or AVX2 with FMA on amd64.
-// Elsewhere, or when built with the purego tag, they run on a portable Go
-// kernel.
+// supports them: AVX-512 or AVX2 with FMA on amd64, chosen at startup, and
+// NEON on arm64. Elsewhere, or when built with the purego tag, they run on
+// a portable Go kernel.
 package cpu
 
 import (
