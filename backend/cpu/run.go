@@ -3,14 +3,15 @@ package cpu
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 )
 
-// Run executes one kernel. Inputs are read through k.In; the output is
+// Run executes one kernel. Inputs are read through k.In; the outputs are
 // written contiguously. Any panic inside a kernel is reported as
 // backend.ErrInternal instead of crashing the program.
-func (b *Backend) Run(ctx context.Context, k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) (err error) {
+func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buffer, ins []backend.Buffer) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("cpu: panic in %s: %v: %w", k.Op, r, backend.ErrInternal)
@@ -22,14 +23,22 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, out backend.Buffer
 	if len(ins) != len(k.In) {
 		return fmt.Errorf("cpu: %s: %d buffers for %d views: %w", k.Op, len(ins), len(k.In), backend.ErrInternal)
 	}
-	n, ok := k.OutputLen()
-	if !ok || out.Len() != n || out.DType() != k.DType {
-		return fmt.Errorf("cpu: %s: output %s[%d] for %s%v: %w", k.Op, out.DType(), out.Len(), k.DType, k.Shape, backend.ErrInternal)
+	n, ok := backend.NumElements(k.Shape)
+	if !ok || len(outs) != 1+len(k.Attrs.Stores) || (k.Attrs.Stores != nil && k.Op != backend.OpFused) {
+		return fmt.Errorf("cpu: %s: %d outputs for %d stored values: %w", k.Op, len(outs), len(k.Attrs.Stores), backend.ErrInternal)
+	}
+	for i, out := range outs {
+		if out.Len() != n || out.DType() != k.DType || slices.Contains(outs[:i], out) {
+			return fmt.Errorf("cpu: %s: output %d of %s[%d] for %s%v: %w", k.Op, i, out.DType(), out.Len(), k.DType, k.Shape, backend.ErrInternal)
+		}
 	}
 	if err := checkViews(k, ins); err != nil {
 		return err
 	}
-	if err := b.run(ctx, k, out, ins); err != nil {
+	if err := checkAliases(k, outs, ins); err != nil {
+		return err
+	}
+	if err := b.run(ctx, k, outs, ins); err != nil {
 		return fmt.Errorf("cpu: %s: %w", k.Op, err)
 	}
 	return nil
@@ -63,15 +72,33 @@ func checkViews(k *backend.Kernel, ins []backend.Buffer) error {
 	return nil
 }
 
-func (b *Backend) run(ctx context.Context, k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) error {
-	if k.Attrs.Stores != nil && k.Op != backend.OpFused {
-		return fmt.Errorf("stored values: %w", backend.ErrInternal)
+// checkAliases verifies that an output is also an input only where Run
+// allows it: an elementwise kernel reading that input contiguously, as the
+// output is written.
+func checkAliases(k *backend.Kernel, outs, ins []backend.Buffer) error {
+	for i, in := range ins {
+		if !slices.Contains(outs, in) {
+			continue
+		}
+		if v := k.In[i]; !elementwise(k.Op) || !v.IsContiguous() || v.Offset != 0 || !slices.Equal(v.Shape, k.Shape) {
+			return fmt.Errorf("cpu: %s: input %d is also an output: %w", k.Op, i, backend.ErrInternal)
+		}
 	}
+	return nil
+}
+
+// elementwise reports whether op runs as an elementwise program.
+func elementwise(op backend.Op) bool {
+	return op == backend.OpFused || op.IsElementwise() || op == backend.OpContiguous
+}
+
+func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buffer, ins []backend.Buffer) error {
+	out := outs[0]
 	switch {
 	case k.Op == backend.OpFused:
-		return runProgram(ctx, b, k, k.Attrs.Program, k.Attrs.Stores, out, ins)
-	case k.Op.IsElementwise() || k.Op == backend.OpContiguous:
-		return runProgram(ctx, b, k, singleOp(k, ins), nil, out, ins)
+		return runProgram(ctx, b, k, k.Attrs.Program, k.Attrs.Stores, outs, ins)
+	case elementwise(k.Op):
+		return runProgram(ctx, b, k, singleOp(k, ins), nil, outs, ins)
 	case k.Op == backend.OpMatMul:
 		epi, err := epilogue(k, out, ins)
 		if err != nil {

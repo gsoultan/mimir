@@ -249,18 +249,18 @@ func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
 
 		product, _ := be.Alloc(backend.Float32, size)
 		plain := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: []int{s.batch, s.m, s.n}, In: in}
-		if err := be.Run(t.Context(), plain, product, ins); err != nil {
+		if err := be.Run(t.Context(), plain, []backend.Buffer{product}, ins); err != nil {
 			t.Fatal(err)
 		}
 		want, _ := be.Alloc(backend.Float32, size)
 		fused := &backend.Kernel{Op: backend.OpFused, DType: backend.Float32, Shape: eshape, In: append([]backend.View{backend.Contiguous(eshape)}, views...), Attrs: backend.Attrs{Program: prog}}
-		if err := be.Run(t.Context(), fused, want, append([]backend.Buffer{product}, bufs...)); err != nil {
+		if err := be.Run(t.Context(), fused, []backend.Buffer{want}, append([]backend.Buffer{product}, bufs...)); err != nil {
 			t.Fatal(err)
 		}
 
 		got, _ := be.Alloc(backend.Float32, size)
 		withEpilogue := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: plain.Shape, In: append(slices.Clone(in), views...), Attrs: backend.Attrs{Program: prog}}
-		if err := be.Run(t.Context(), withEpilogue, got, append(slices.Clone(ins), bufs...)); err != nil {
+		if err := be.Run(t.Context(), withEpilogue, []backend.Buffer{got}, append(slices.Clone(ins), bufs...)); err != nil {
 			t.Fatal(err)
 		}
 		g, _ := data[float32](got)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"unsafe"
 
@@ -24,8 +25,13 @@ const elementGrain = 1 << 15
 // a value computed from scalars only. Inputs read with stride 1 are used in
 // place. Other vectors are computed into scratch slots, which are reused
 // once their value is dead, so a program needs only as many tiles of
-// scratch as it has vectors live at once. Stored values are computed
-// straight into their part of the output.
+// scratch as it has vectors live at once. Values the kernel writes are
+// computed straight into their output.
+//
+// An input may also be an output, as in an in-place update. Each element
+// is then read before it is written as long as nothing reads the input
+// after the instruction that writes the output; otherwise the input is
+// copied into scratch at the start of each tile.
 
 // tileLen is the number of elements an instruction processes at a time.
 const tileLen = 1024
@@ -33,6 +39,7 @@ const tileLen = 1024
 // program is a fused program compiled for one kernel.
 type program struct {
 	steps          []step
+	order          []int       // the steps in the order they run
 	slotsF, slotsI int         // scratch slots of each dtype
 	inF            [][]float32 // the inputs by kernel input, in their dtype
 	inI            [][]int32
@@ -42,7 +49,7 @@ type program struct {
 type step struct {
 	backend.Instr
 	slot int // the scratch slot of a vector value, or -1
-	part int // the part of the output it writes: 0 for the result, i+1 for Stores[i], or -1
+	out  int // the output it writes: 0 for the result, i+1 for Stores[i], or -1
 }
 
 // lane is a value over one tile: a vector, or a scalar when vec is nil.
@@ -90,21 +97,24 @@ func singleOp(k *backend.Kernel, ins []backend.Buffer) []backend.Instr {
 // compile checks prog and stores against its inputs and output dtype and
 // assigns scratch slots. strides holds the innermost stride of each input
 // after coalescing; an input with stride 0 is a scalar in every row.
-func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backend.Buffer, strides []int) (*program, error) {
+// aliasOf holds, for each input, the output it is too, or -1.
+func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backend.Buffer, aliasOf, strides []int) (*program, error) {
 	if len(prog) == 0 || prog[len(prog)-1].DType != out {
 		return nil, fmt.Errorf("program of %d instructions for %s output: %w", len(prog), out, backend.ErrInternal)
 	}
 	last := len(prog) - 1
-	part := make([]int, len(prog))
-	for j := range part {
-		part[j] = -1
+	outOf := make([]int, len(prog))
+	for j := range outOf {
+		outOf[j] = -1
 	}
-	part[last] = 0
+	outOf[last] = 0
+	writer := []int{last} // the instruction that writes each output
 	for i, j := range stores {
-		if j < 0 || j >= last || part[j] >= 0 || prog[j].DType != out {
+		if j < 0 || j >= last || outOf[j] >= 0 || prog[j].DType != out {
 			return nil, fmt.Errorf("store %d of instruction %d: %w", i, j, backend.ErrInternal)
 		}
-		part[j] = i + 1
+		outOf[j] = i + 1
+		writer = append(writer, j)
 	}
 	p := &program{steps: make([]step, len(prog)), inF: make([][]float32, len(ins)), inI: make([][]int32, len(ins))}
 	for i, buf := range ins {
@@ -137,6 +147,32 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 			}
 		}
 	}
+	// Run first the loads of inputs that are read after their output is
+	// written, copying them; then the rest in program order. Last uses
+	// become positions in that order.
+	hoist := make([]bool, len(prog))
+	for j, in := range prog {
+		if in.Op == backend.OpLoad {
+			o := aliasOf[in.Args[0]]
+			hoist[j] = o >= 0 && lastUse[j] > writer[o]
+		}
+	}
+	p.order = make([]int, 0, len(prog))
+	for _, first := range []bool{true, false} {
+		for j := range prog {
+			if hoist[j] == first {
+				p.order = append(p.order, j)
+			}
+		}
+	}
+	pos := make([]int, len(prog))
+	for at, j := range p.order {
+		pos[j] = at
+	}
+	for j := range lastUse {
+		lastUse[j] = pos[lastUse[j]]
+	}
+
 	// Free the slots of arguments at their last use before taking one for
 	// the result, which may then overwrite an argument in place: every loop
 	// reads index i of its arguments before writing index i of its result.
@@ -160,18 +196,19 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 			released[j] = true
 		}
 	}
-	for j, in := range prog {
+	for at, j := range p.order {
+		in := prog[j]
 		for _, a := range in.Args {
-			if in.Op != backend.OpLoad && lastUse[a] == j {
+			if in.Op != backend.OpLoad && lastUse[a] == at {
 				release(a)
 			}
 		}
-		p.steps[j] = step{Instr: in, slot: -1, part: part[j]}
-		inPlace := in.Op == backend.OpLoad && strides[in.Args[0]] == 1
-		if part[j] < 0 && !scalar[j] && !inPlace {
+		p.steps[j] = step{Instr: in, slot: -1, out: outOf[j]}
+		inPlace := in.Op == backend.OpLoad && strides[in.Args[0]] == 1 && !hoist[j]
+		if outOf[j] < 0 && !scalar[j] && !inPlace {
 			p.steps[j].slot = slot(in.DType)
 		}
-		if lastUse[j] == j {
+		if lastUse[j] == at {
 			release(j)
 		}
 	}
@@ -225,10 +262,10 @@ func check(in backend.Instr, j int, prog []backend.Instr, ins []backend.Buffer) 
 	return nil
 }
 
-// runProgram computes the elementwise program prog, and the values it
-// stores, into out.
-func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backend.Instr, stores []int, out backend.Buffer, ins []backend.Buffer) error {
-	e, err := newEvaluator(k.Shape, k.In, prog, stores, out, ins)
+// runProgram computes the elementwise program prog into outs[0], and the
+// values it stores into the other outputs.
+func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backend.Instr, stores []int, outs, ins []backend.Buffer) error {
+	e, err := newEvaluator(k.Shape, k.In, prog, stores, outs, ins)
 	if err != nil || e == nil {
 		return err
 	}
@@ -246,15 +283,14 @@ type evaluator struct {
 	shape   []int          // the coalesced index space, of rank 1 or more
 	outer   []backend.View // the views without their innermost dimension
 	strides []int          // the innermost stride of each view
-	size    int            // the number of elements in shape
-	outF    []float32      // the output, in its dtype, with its stored values
-	outI    []int32
+	outF    [][]float32    // the outputs, in their dtype
+	outI    [][]int32
 }
 
-// newEvaluator prepares prog to compute out, indexed by shape, and the
-// values stores lists after it, from ins read through views of shape. It
-// returns nil if shape is empty.
-func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, stores []int, out backend.Buffer, ins []backend.Buffer) (*evaluator, error) {
+// newEvaluator prepares prog to compute outs[0], indexed by shape, and the
+// values stores lists into the other outputs, from ins read through views
+// of shape. It returns nil if shape is empty.
+func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, stores []int, outs, ins []backend.Buffer) (*evaluator, error) {
 	shape, views = coalesce(shape, views)
 	total, _ := backend.NumElements(shape)
 	if total == 0 {
@@ -267,20 +303,28 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 		}
 	}
 	r := len(shape)
-	e := &evaluator{shape: shape, outer: make([]backend.View, len(views)), strides: make([]int, len(views)), size: total}
+	e := &evaluator{shape: shape, outer: make([]backend.View, len(views)), strides: make([]int, len(views))}
 	for v, view := range views {
 		e.outer[v] = backend.View{Strides: view.Strides[:r-1], Offset: view.Offset}
 		e.strides[v] = view.Strides[r-1]
 	}
+	aliasOf := make([]int, len(ins))
+	for i, in := range ins {
+		aliasOf[i] = slices.Index(outs, in)
+	}
 	var err error
-	if e.p, err = compile(out.DType(), prog, stores, ins, e.strides); err != nil {
+	if e.p, err = compile(outs[0].DType(), prog, stores, ins, aliasOf, e.strides); err != nil {
 		return nil, err
 	}
-	switch out := out.(type) {
-	case *buffer[float32]:
-		e.outF = out.data
-	case *buffer[int32]:
-		e.outI = out.data
+	for _, out := range outs {
+		switch out := out.(type) {
+		case *buffer[float32]:
+			e.outF = append(e.outF, out.data)
+		case *buffer[int32]:
+			e.outI = append(e.outI, out.data)
+		default:
+			return nil, fmt.Errorf("foreign buffer %T: %w", out, backend.ErrDType)
+		}
 	}
 	return e, nil
 }
@@ -311,7 +355,7 @@ func (e *evaluator) run(s *scratch, lo, hi int) error {
 			for v := range s.offs {
 				s.offs[v] = c.offs[v] + (col+t)*e.strides[v]
 			}
-			if err := e.p.tile(s, e.strides, m, e.outF, e.outI, i+t, e.size); err != nil {
+			if err := e.p.tile(s, e.strides, m, e.outF, e.outI, i+t); err != nil {
 				return err
 			}
 		}
@@ -334,15 +378,15 @@ func (s *scratch) size(p *program, inputs int) {
 }
 
 // tile runs the program over the n elements at output index at, whose
-// inputs start at s.offs. Whichever of outF and outI is the output holds
-// parts of size elements: the result, then the stored values.
-func (p *program) tile(s *scratch, strides []int, n int, outF []float32, outI []int32, at, size int) error {
-	for j := range p.steps {
+// inputs start at s.offs. Whichever of outF and outI holds the outputs is
+// written.
+func (p *program) tile(s *scratch, strides []int, n int, outF [][]float32, outI [][]int32, at int) error {
+	for _, j := range p.order {
 		var err error
 		if p.steps[j].DType == backend.Float32 {
-			err = run1(p, j, s.f, s.i, p.inF, s.slotsF, s.offs, strides, n, outF, at, size)
+			err = run1(p, j, s.f, s.i, p.inF, s.slotsF, s.offs, strides, n, outF, at)
 		} else {
-			err = run1(p, j, s.i, s.f, p.inI, s.slotsI, s.offs, strides, n, outI, at, size)
+			err = run1(p, j, s.i, s.f, p.inI, s.slotsI, s.offs, strides, n, outI, at)
 		}
 		if err != nil {
 			return err
@@ -354,14 +398,13 @@ func (p *program) tile(s *scratch, strides []int, n int, outF []float32, outI []
 // run1 computes value j, of type T, into lanes[j], over the n elements
 // at output index at. other holds the values of the other dtype, which
 // casts and conditions may read. A value the kernel writes goes to its
-// part of out, each part holding size elements.
-func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][]T, slots [][]T, offs, strides []int, n int, out []T, at, size int) error {
+// output in outs.
+func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][]T, slots [][]T, offs, strides []int, n int, outs [][]T, at int) error {
 	st := &p.steps[j]
 	var buf []T // where a vector result goes
 	switch {
-	case st.part >= 0:
-		at += st.part * size
-		buf = out[at : at+n]
+	case st.out >= 0:
+		buf = outs[st.out][at : at+n]
 	case st.slot >= 0:
 		buf = slots[st.slot][:n]
 	}
@@ -374,7 +417,12 @@ func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][
 		case 0:
 			*dst = lane[T]{s: src[off]}
 		case 1:
-			*dst = lane[T]{vec: src[off : off+n]}
+			if buf == nil {
+				*dst = lane[T]{vec: src[off : off+n]}
+				break
+			}
+			copy(buf, src[off:off+n])
+			*dst = lane[T]{vec: buf}
 		default:
 			for i := range buf {
 				buf[i] = src[off]
@@ -414,7 +462,7 @@ func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][
 			whereLane(dst, buf, other[c], x, y)
 		}
 	}
-	if st.part >= 0 {
+	if st.out >= 0 {
 		switch {
 		case dst.vec == nil:
 			for i := range buf {

@@ -5,16 +5,22 @@
 package graph
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 )
 
+// ErrOverwritten reports a read of a realized node whose memory now holds
+// other values, such as a parameter's value from before an in-place
+// optimizer step.
+var ErrOverwritten = errors.New("tensor memory was overwritten")
+
 // Node is one primitive operation. Op, DType, Shape and Attrs never change
-// after construction. Buf, View and Inputs are owned by the scheduler: once a
-// node is realized it holds its result and drops its inputs, so a realized
-// tensor does not keep the graph that produced it alive.
+// after construction. Mem, Ver, View and Inputs are owned by the scheduler:
+// once a node is realized it holds its result and drops its inputs, so a
+// realized tensor does not keep the graph that produced it alive.
 type Node struct {
 	Op     backend.Op
 	DType  backend.DType
@@ -22,12 +28,29 @@ type Node struct {
 	Attrs  backend.Attrs
 	Inputs []*Node
 
-	Buf  backend.Buffer // set once realized
-	View backend.View   // how Shape is read from Buf
+	Mem  *Storage     // set once realized
+	Ver  int          // the version of Mem that holds the result
+	View backend.View // how Shape is read from Mem.Buf
+}
+
+// Storage is a buffer that realized nodes read, each through its own view.
+// Writing new values over the buffer, as an in-place update does, bumps
+// Version, which makes the nodes realized with earlier versions stale.
+type Storage struct {
+	Buf     backend.Buffer
+	Version int
+	Refs    int // the nodes realized into the storage since Version changed
 }
 
 // Realized reports whether the node holds its result.
-func (n *Node) Realized() bool { return n.Buf != nil }
+func (n *Node) Realized() bool { return n.Mem != nil }
+
+// Stale reports whether the node's memory has been overwritten since it
+// was realized.
+func (n *Node) Stale() bool { return n.Mem != nil && n.Ver != n.Mem.Version }
+
+// Buf returns the buffer that holds a realized node's result.
+func (n *Node) Buf() backend.Buffer { return n.Mem.Buf }
 
 // Size returns the number of elements.
 func (n *Node) Size() int {
@@ -61,7 +84,8 @@ func Load(buf backend.Buffer, shape []int) (*Node, error) {
 	if n, _ := backend.NumElements(shape); buf.Len() != n {
 		return nil, errorf(backend.OpLoad, backend.ErrShape, "%d elements for shape %v", buf.Len(), shape)
 	}
-	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Buf: buf, View: backend.Contiguous(shape)}, nil
+	mem := &Storage{Buf: buf, Refs: 1}
+	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Mem: mem, View: backend.Contiguous(shape)}, nil
 }
 
 // Const is a tensor whose elements all equal value. It costs one element of

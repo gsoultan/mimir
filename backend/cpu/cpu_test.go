@@ -15,18 +15,31 @@ func i32buf(v ...int32) backend.Buffer   { return &buffer[int32]{data: slices.Cl
 
 func run[T elem](t *testing.T, k *backend.Kernel, ins ...backend.Buffer) ([]T, error) {
 	t.Helper()
-	n, _ := k.OutputLen()
-	b := New()
-	out, err := b.Alloc(k.DType, n)
-	if err != nil {
-		t.Fatal(err)
+	return runWith[T](t, New(), k, ins...)
+}
+
+// runWith runs k on b and returns its outputs end to end, the result
+// first and then each stored value.
+func runWith[T elem](t *testing.T, b *Backend, k *backend.Kernel, ins ...backend.Buffer) ([]T, error) {
+	t.Helper()
+	n, _ := backend.NumElements(k.Shape)
+	outs := make([]backend.Buffer, 1+len(k.Attrs.Stores))
+	for i := range outs {
+		var err error
+		if outs[i], err = b.Alloc(k.DType, n); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := b.Run(t.Context(), k, out, ins); err != nil {
+	if err := b.Run(t.Context(), k, outs, ins); err != nil {
 		return nil, err
 	}
-	got, err := data[T](out)
-	if err != nil {
-		t.Fatal(err)
+	var got []T
+	for _, out := range outs {
+		d, err := data[T](out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, d...)
 	}
 	return got, nil
 }
@@ -326,7 +339,7 @@ func TestStridedBinarySplitsLongRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Run(t.Context(), k, out, []backend.Buffer{f32buf(x...), f32buf(y...)}); err != nil {
+	if err := b.Run(t.Context(), k, []backend.Buffer{out}, []backend.Buffer{f32buf(x...), f32buf(y...)}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := data[float32](out)
