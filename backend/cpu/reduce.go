@@ -12,8 +12,10 @@ import (
 // elements adjacent along it are computed together as a row: every reduced
 // position combines a strided run of the input into a row of accumulators,
 // so the input streams in order. Otherwise each output element combines
-// runs of the input along the innermost reduced dimension. Either way,
-// every output element visits its reduced positions in row-major order.
+// runs of the input along the innermost reduced dimension, unless the runs
+// are shorter than shortRun: rows along the innermost kept dimension then
+// cost less than starting a run per element. Either way, every output
+// element visits its reduced positions in row-major order.
 
 // reduction is the plan of a reduction.
 type reduction struct {
@@ -25,6 +27,10 @@ type reduction struct {
 
 // rowChunk bounds the accumulators of a row, which a worker keeps in cache.
 const rowChunk = 1024
+
+// shortRun is the length of reduced runs below which a reduction works in
+// rows.
+const shortRun = 16
 
 func planReduction(v backend.View, axes []int) reduction {
 	kept := backend.View{Offset: v.Offset}
@@ -45,11 +51,45 @@ func planReduction(v backend.View, axes []int) reduction {
 	_, kv := coalesce(kept.Shape, []backend.View{kept})
 	_, rv := coalesce(red.Shape, []backend.View{red})
 	p := reduction{rows: kv[0], rowLen: 1, red: rv[0]}
-	if r := len(p.rows.Shape) - 1; last >= 0 && !slices.Contains(axes, last) && r >= 0 {
+	short := len(p.red.Shape) > 0 && p.red.Shape[len(p.red.Shape)-1] < shortRun
+	if r := len(p.rows.Shape) - 1; r >= 0 && last >= 0 && (!slices.Contains(axes, last) || short) {
 		p.rowLen, p.rowStep = p.rows.Shape[r], p.rows.Strides[r]
 		p.rows.Shape, p.rows.Strides = p.rows.Shape[:r], p.rows.Strides[:r]
 	}
 	return p
+}
+
+// walker visits the elements of a view, which a reduction does for every
+// output element or row. A view of more dimensions than one is walked from
+// a list of its offsets if it is short enough, without setting up a
+// cursor each time.
+type walker struct {
+	v    backend.View
+	offs []int
+}
+
+// maxListed bounds the offsets a walker lists.
+const maxListed = 1 << 16
+
+func newWalker(v backend.View) walker {
+	w := walker{v: v}
+	if n, _ := backend.NumElements(v.Shape); len(v.Shape) > 1 && n <= maxListed {
+		w.offs = make([]int, 0, n)
+		walk(v, func(off int) { w.offs = append(w.offs, off) })
+	}
+	return w
+}
+
+// walk calls fn with the offset of every element of the view in row-major
+// order.
+func (w walker) walk(fn func(off int)) {
+	if w.offs == nil {
+		walk(w.v, fn)
+		return
+	}
+	for _, off := range w.offs {
+		fn(off)
+	}
 }
 
 // walk calls fn with the buffer offset of every element of v in row-major
@@ -118,9 +158,15 @@ func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, 
 		inner, step = p.red.Shape[r], p.red.Strides[r]
 		outer = backend.View{Shape: p.red.Shape[:r], Strides: p.red.Strides[:r]}
 	}
+	var runs, red walker
+	if p.rowLen == 1 {
+		runs = newWalker(outer)
+	} else {
+		red = newWalker(p.red)
+	}
 	element := func(i, off int) {
 		acc, first := T(0), true
-		walk(outer, func(o int) {
+		runs.walk(func(o int) {
 			src := off + o
 			if first {
 				acc, first = in[src], false
@@ -140,7 +186,7 @@ func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, 
 	}
 	row := func(i, off int, acc []T) {
 		first := true
-		walk(p.red, func(o int) {
+		red.walk(func(o int) {
 			src := off + o
 			switch {
 			case first:
@@ -182,9 +228,15 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 		inner, step = p.red.Shape[r], p.red.Strides[r]
 		outer = backend.View{Shape: p.red.Shape[:r], Strides: p.red.Strides[:r]}
 	}
+	var runs, red walker
+	if p.rowLen == 1 {
+		runs = newWalker(outer)
+	} else {
+		red = newWalker(p.red)
+	}
 	element := func(i, off int) {
 		var acc A
-		walk(outer, func(o int) {
+		runs.walk(func(o int) {
 			src := off + o
 			if step == 1 {
 				acc += sumRun[T, A](in[src : src+inner])
@@ -199,7 +251,7 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 	}
 	row := func(i, off int, acc []A) {
 		clear(acc)
-		walk(p.red, func(o int) {
+		red.walk(func(o int) {
 			src := off + o
 			if p.rowStep == 1 {
 				for j, x := range in[src : src+len(acc)] {

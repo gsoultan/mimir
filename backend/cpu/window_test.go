@@ -41,6 +41,12 @@ func stridedViews(shape []int) []stridedView {
 		m, _ := backend.NumElements(one)
 		views = append(views, stridedView{"broadcast", backend.Contiguous(one).Expand(shape), m})
 	}
+	if r > 1 && shape[r-1] > 1 {
+		one := slices.Clone(shape)
+		one[r-1] = 1
+		m, _ := backend.NumElements(one)
+		views = append(views, stridedView{"row broadcast", backend.Contiguous(one).Expand(shape), m})
+	}
 	return views
 }
 
