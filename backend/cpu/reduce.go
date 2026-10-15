@@ -187,9 +187,7 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 		walk(outer, func(o int) {
 			src := off + o
 			if step == 1 {
-				for _, x := range in[src : src+inner] {
-					acc += A(x)
-				}
+				acc += sumRun[T, A](in[src : src+inner])
 				return
 			}
 			for range inner {
@@ -219,4 +217,21 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 		}
 	}
 	return forReduction(ctx, b, p, len(out), element, row)
+}
+
+// sumRun returns the sum of x. Four running sums let the additions
+// overlap instead of each waiting for the one before.
+func sumRun[T elem, A float64 | elem](x []T) A {
+	var a0, a1, a2, a3 A
+	for len(x) >= 4 {
+		a0 += A(x[0])
+		a1 += A(x[1])
+		a2 += A(x[2])
+		a3 += A(x[3])
+		x = x[4:]
+	}
+	for _, v := range x {
+		a0 += A(v)
+	}
+	return (a0 + a1) + (a2 + a3)
 }
