@@ -3,6 +3,7 @@ package tensor_test
 import (
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/gsoultan/mimir/optim"
@@ -204,5 +205,30 @@ func TestLazyValuesKeepTheGradientsTheyRead(t *testing.T) {
 	w.ZeroGrad()
 	if got, err := last.Value().Data[float32](t.Context()); err != nil || !slices.Equal(got, []float32{2, 4}) {
 		t.Errorf("copy of a gradient zeroed after = %v, %v; want [2 4]", got, err)
+	}
+}
+
+func TestParamsTakeValuesThatOtherGoroutinesRealize(t *testing.T) {
+	// The race detector checks that Set looks at whether its value is
+	// computed only under the scheduler's lock.
+	p := tensor.NewBuffer(tensor.Zeros(tensor.Float32, 64))
+	x := tensor.Ones(tensor.Float32, 64)
+	for range 100 {
+		v := x.Neg()
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			if err := v.Realize(t.Context()); err != nil {
+				t.Error(err)
+			}
+		})
+		wg.Go(func() {
+			if err := p.Set(v); err != nil {
+				t.Error(err)
+			}
+		})
+		wg.Wait()
+	}
+	if got, err := p.Value().Data[float32](t.Context()); err != nil || got[0] != -1 {
+		t.Errorf("value = %v, %v; want -1s", got, err)
 	}
 }

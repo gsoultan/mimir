@@ -11,6 +11,7 @@ package sched
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
@@ -61,47 +62,48 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 	mu.Lock()
 	defer mu.Unlock()
 	if keep != nil {
-		// The errors are their readers' to see, when they read them.
-		if k := endangered(keep(), targets, dsts); len(k) > 0 && realize(ctx, be, k, nil) != nil {
+		if k := endangered(keep(), targets, dsts); len(k) > 0 {
+			// The errors are their readers' to see, when they read them.
+			if realize(ctx, be, k, nil) != nil {
+				for _, n := range k {
+					_ = realize(ctx, be, []*graph.Node{n}, nil)
+				}
+			}
+			// Those computed join the targets, which costs no kernels: one
+			// that is a view of a destination then keeps that memory from
+			// being written over or made stale, as a target would.
+			targets, dsts = slices.Clip(targets), slices.Clip(dsts)
 			for _, n := range k {
-				_ = realize(ctx, be, []*graph.Node{n}, nil)
+				if n.Realized() {
+					targets, dsts = append(targets, n), append(dsts, nil)
+				}
 			}
 		}
 	}
 	return realize(ctx, be, targets, dsts)
 }
 
-// endangered returns the nodes of keep that read the memory of a realized
-// destination in dsts, which the schedule makes stale, other than through
-// a target, and that are not targets, realized or stale already.
-func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
-	mems := map[*graph.Storage]bool{}
-	for _, d := range dsts {
-		if d != nil && d.Realized() && !d.Stale() {
-			mems[d.Mem] = true
-		}
-	}
-	if len(mems) == 0 {
-		return nil
-	}
-	isTarget := make(map[*graph.Node]bool, len(targets))
-	for _, t := range targets {
-		isTarget[t] = true
-	}
-	// Each unrealized node is classified once by what it is computed from.
-	// Targets are left out: the schedule computes them, and they stay
-	// valid after it.
-	type state uint8
-	const (
-		unseen state = iota
-		clean        // reads no destination
-		reads        // reads a destination's memory
-		broken       // reads a stale node, so cannot be computed
-	)
+// A node's state says what it is computed from.
+type state uint8
+
+const (
+	unseen state = iota
+	clean        // nothing below
+	reads        // memory of interest
+	broken       // a stale node, so it cannot be computed
+)
+
+// classifier returns a function that tells what unrealized nodes are
+// computed from: whether they read memory in mems or a stale node, through
+// unrealized nodes other than those in skip. It classifies each node once,
+// walking iteratively, like topoSort, so deep graphs cannot overflow the
+// stack.
+func classifier(mems map[*graph.Storage]bool, skip map[*graph.Node]bool) func(*graph.Node) state {
 	states := map[*graph.Node]state{}
-	// classify walks iteratively, like topoSort, so deep graphs cannot
-	// overflow the stack.
-	classify := func(root *graph.Node) state {
+	return func(root *graph.Node) state {
+		if s := states[root]; s != unseen {
+			return s
+		}
 		type frame struct {
 			n    *graph.Node
 			next int
@@ -120,7 +122,7 @@ func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 					if mems[in.Mem] {
 						f.s = max(f.s, reads)
 					}
-				case isTarget[in]:
+				case skip[in]:
 				case states[in] == unseen:
 					stack = append(stack, frame{n: in, s: clean})
 				default:
@@ -136,6 +138,28 @@ func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 			stack[len(stack)-1].s = max(stack[len(stack)-1].s, s)
 		}
 	}
+}
+
+// endangered returns the nodes of keep that read the memory of a realized
+// destination in dsts, which the schedule makes stale, other than through
+// a target, and that are not targets, realized or stale already. Targets
+// are left out because the schedule computes them, and they stay valid
+// after it.
+func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
+	mems := map[*graph.Storage]bool{}
+	for _, d := range dsts {
+		if d != nil && d.Realized() && !d.Stale() {
+			mems[d.Mem] = true
+		}
+	}
+	if len(mems) == 0 {
+		return nil
+	}
+	isTarget := make(map[*graph.Node]bool, len(targets))
+	for _, t := range targets {
+		isTarget[t] = true
+	}
+	classify := classifier(mems, isTarget)
 	var out []*graph.Node
 	for _, k := range keep {
 		if k.Realized() || isTarget[k] || slices.Contains(out, k) {
@@ -148,6 +172,56 @@ func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 	return out
 }
 
+// generation counts the schedules, which change what nodes are realized
+// or stale. A release does not count: it makes stale only memory that no
+// kept node reads.
+var generation uint64
+
+// kept caches keptMemory's answer for a generation and set of nodes.
+var kept struct {
+	generation uint64
+	nodes      map[*graph.Node]bool
+	mems       map[*graph.Storage]bool
+}
+
+// keptMemory returns the storages that the nodes of keep read, through
+// unrealized nodes, leaving out those that can no longer be computed. A
+// release of each gradient in turn asks the same question, so the answer
+// is kept until a schedule, or a different keep, changes it.
+func keptMemory(keep []*graph.Node) map[*graph.Storage]bool {
+	nodes := make(map[*graph.Node]bool, len(keep))
+	for _, k := range keep {
+		nodes[k] = true
+	}
+	if kept.mems != nil && kept.generation == generation && maps.Equal(kept.nodes, nodes) {
+		return kept.mems
+	}
+	classify := classifier(nil, nil)
+	mems := map[*graph.Storage]bool{}
+	seen := map[*graph.Node]bool{}
+	for _, k := range keep {
+		if k.Realized() || seen[k] || classify(k) == broken {
+			continue
+		}
+		seen[k] = true
+		for stack := []*graph.Node{k}; len(stack) > 0; {
+			n := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			for _, in := range n.Inputs {
+				switch {
+				case in.Realized():
+					mems[in.Mem] = true
+				case !seen[in]:
+					seen[in] = true
+					stack = append(stack, in)
+				}
+			}
+		}
+	}
+	kept.generation, kept.nodes, kept.mems = generation, nodes, mems
+	return mems
+}
+
 // Release gives the memory of the realized node n to be's pool for later
 // schedules and makes n stale, if n is the only node realized into that
 // memory and no node that keep lists, when it is not nil, reads it (see
@@ -158,7 +232,7 @@ func Release(be backend.Backend, n *graph.Node, keep func() []*graph.Node) {
 	if !n.Realized() || n.Stale() || n.Mem.Refs != 1 {
 		return
 	}
-	if keep != nil && len(endangered(keep(), nil, []*graph.Node{n})) > 0 {
+	if keep != nil && keptMemory(keep())[n.Mem] {
 		return
 	}
 	n.Mem.Version++
@@ -203,6 +277,7 @@ type result struct {
 }
 
 func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) error {
+	generation++
 	order, err := topoSort(targets)
 	if err != nil {
 		return err
