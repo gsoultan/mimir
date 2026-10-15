@@ -1,6 +1,7 @@
 package tensor_test
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -34,32 +35,41 @@ func TestTrainingStepsReuseTheirMemory(t *testing.T) {
 		"AdamW":        func(ps []*tensor.Param) *optim.Optimizer { return optim.AdamW(ps) },
 		"SGD momentum": func(ps []*tensor.Param) *optim.Optimizer { return optim.SGD(ps, optim.Momentum(0.9)) },
 	} {
-		t.Run(name, func(t *testing.T) {
-			be := &allocCounter{Backend: cpu.New()}
-			defer tensor.SetDevice(be)()
-			model := nn.NewSequential(
-				nn.NewConv2d(1, 4, 3, nn.Padding(1)), nn.ReLU(), nn.MaxPool2d(2),
-				nn.Flatten(), nn.NewLinear(4*4*4, 16), nn.ReLU(), nn.NewLinear(16, 3),
-			)
-			opt := newOpt(nn.Parameters(model))
-			x := tensor.Randn(1, 8, 1, 8, 8)
-			y := tensor.FromSlice([]int32{0, 1, 2, 0, 1, 2, 0, 1})
-			for i := range 6 {
-				before := be.elements
-				l := loss.CrossEntropy(model.Forward(x), y)
-				if err := l.Backward(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				if err := opt.Step(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				opt.ZeroGrad()
-				// After the first steps fill the pool, a step allocates only
-				// the loss it returns.
-				if n := be.elements - before; i >= 2 && n > 1 {
-					t.Errorf("step %d allocated %d elements, want at most 1", i, n)
-				}
+		// Several backward passes per step accumulate the gradients.
+		for _, backwards := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/%d backward", name, backwards), func(t *testing.T) {
+				trainingStepsReuseTheirMemory(t, newOpt, backwards)
+			})
+		}
+	}
+}
+
+func trainingStepsReuseTheirMemory(t *testing.T, newOpt func([]*tensor.Param) *optim.Optimizer, backwards int) {
+	be := &allocCounter{Backend: cpu.New()}
+	defer tensor.SetDevice(be)()
+	model := nn.NewSequential(
+		nn.NewConv2d(1, 4, 3, nn.Padding(1)), nn.ReLU(), nn.MaxPool2d(2),
+		nn.Flatten(), nn.NewLinear(4*4*4, 16), nn.ReLU(), nn.NewLinear(16, 3),
+	)
+	opt := newOpt(nn.Parameters(model))
+	x := tensor.Randn(1, 8, 1, 8, 8)
+	y := tensor.FromSlice([]int32{0, 1, 2, 0, 1, 2, 0, 1})
+	for i := range 6 {
+		before := be.elements
+		for range backwards {
+			l := loss.CrossEntropy(model.Forward(x), y)
+			if err := l.Backward(t.Context()); err != nil {
+				t.Fatal(err)
 			}
-		})
+		}
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		opt.ZeroGrad()
+		// After the first steps fill the pool, a step allocates only
+		// the losses it returns.
+		if n := be.elements - before; i >= 2 && n > backwards {
+			t.Errorf("step %d allocated %d elements, want at most %d", i, n, backwards)
+		}
 	}
 }

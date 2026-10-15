@@ -289,8 +289,9 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 // was being written over is stale.
 //
 // A parameter's value that is not computed yet, such as running
-// statistics a forward pass updated, is computed in the same schedule if
-// it reads the memory of a dsts[i], so the parameter keeps it.
+// statistics a forward pass updated, is computed first if it reads the
+// memory of a dsts[i], so the parameter keeps it. If computing it fails,
+// it is stale afterwards instead, and the error is left for its reader.
 func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 	if len(dsts) != len(srcs) {
 		return fmt.Errorf("tensor: RealizeInto: %d destinations for %d tensors: %w", len(dsts), len(srcs), ErrShape)
@@ -314,7 +315,7 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 		}
 		into[i] = d.node
 	}
-	return sched.RealizeInto(ctx, device, targets, into, lazy.values()...)
+	return sched.RealizeInto(ctx, device, targets, into, lazy.values)
 }
 
 // Data computes t and returns its elements in row-major order. T must match

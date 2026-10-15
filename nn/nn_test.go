@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/gsoultan/mimir/internal/goldentest"
@@ -238,6 +239,37 @@ func TestBatchNormRunningStatsSurviveAStepBeforeBackward(t *testing.T) {
 	if err := nn.Save(t.Context(), new(bytes.Buffer), b); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestBatchNormUpdatesAlongsideOtherSchedules(t *testing.T) {
+	// One goroutine updates running statistics while another realizes
+	// unrelated values. The race detector checks that whether statistics
+	// are computed yet is read only under the scheduler's lock.
+	b := nn.NewBatchNorm1d(8)
+	x := tensor.Randn(1, 16, 8)
+	y := tensor.Ones(tensor.Float32, 64)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 200 {
+			if err := b.Forward(x).Err(); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := tensor.Realize(t.Context(), b.RunningMean.Value(), b.RunningVar.Value()); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		for range 200 {
+			if err := tensor.RealizeInto(t.Context(), []*tensor.Tensor{nil}, []*tensor.Tensor{y.Neg()}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	wg.Wait()
 }
 
 func TestSaveLoadRoundTrips(t *testing.T) {

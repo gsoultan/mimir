@@ -1,6 +1,7 @@
 package cpu
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -145,20 +146,26 @@ func TestGEMMSumsAndSharedFactors(t *testing.T) {
 	for _, s := range []struct {
 		outputs, sums, m, n, k int
 		shared                 bool
+		bLayout                string
 	}{
-		{3, 4, 40, 50, 30, false},     // a sum for each output
-		{1, 20, 70, 300, 49, false},   // one output, many products in uneven groups
-		{2, 3, 150, 2100, 300, false}, // with several blocks of n and k
-		{6, 1, 300, 49, 70, true},     // narrow items side by side
-		{15, 1, 160, 150, 40, true},   // with several blocks of n, one cut within an item
-		{2, 1, 200, 40, 600, true},    // with several blocks of k
-		{2, 0, 5, 6, 7, false},        // nothing to sum
+		{3, 4, 40, 50, 30, false, ""},            // a sum for each output
+		{1, 20, 70, 300, 49, false, ""},          // one output, many products in uneven groups
+		{1, 2, 300, 200, 300, false, ""},         // groups of large products, split between workers
+		{2, 3, 150, 2100, 300, false, ""},        // too large for partial sums, with several blocks of n and k
+		{6, 1, 300, 49, 70, true, ""},            // narrow items side by side
+		{15, 1, 160, 150, 40, true, ""},          // with several blocks of n, one cut within an item
+		{2, 1, 200, 40, 600, true, ""},           // with several blocks of k
+		{9, 1, 90, 50, 30, true, "column-major"}, // transposed items whose last panel is partial
+		{2, 3, 120, 40, 30, true, ""},            // a shared factor in sums of products
+		{4096, 1, 16, 16, 8, true, ""},           // too small to share a between workers
+		{2, 0, 5, 6, 7, false, ""},               // nothing to sum
 	} {
 		items := s.outputs * s.sums
 		// Transposed weights against row-major columns, as in the input
 		// gradient of a convolution.
+		bLayout := cmp.Or(s.bLayout, "row-major")
 		a := layout(rng, "column-major", max(items, 1)*s.m, s.k)
-		b := layout(rng, "row-major", s.k, max(items, 1)*s.n)
+		b := layout(rng, bLayout, s.k, max(items, 1)*s.n)
 		offA, offB := make([]int, items), make([]int, items)
 		for i := range items {
 			offA[i], offB[i] = a.off+i*s.m*a.rs, b.off+i*s.n*b.cs
@@ -166,39 +173,48 @@ func TestGEMMSumsAndSharedFactors(t *testing.T) {
 				offA[i] = a.off
 			}
 		}
-		want, scale := make([]float64, s.outputs*s.m*s.n), make([]float64, s.outputs*s.m*s.n)
-		for i := range items {
-			ai, bi := a, b
-			ai.off, bi.off = offA[i], offB[i]
-			w, sc := refGEMM(ai, bi, s.m, s.n, s.k)
-			o := i / s.sums * s.m * s.n
-			for e := range w {
-				want[o+e] += w[e]
-				scale[o+e] += sc[e]
-			}
-		}
-		var first []float32
-		for _, workers := range []int{1, 2, 3, 4, 7, 16} {
-			be := New()
-			be.workers = workers
-			got := make([]float32, len(want))
-			for i := range got {
-				got[i] = float32(math.NaN()) // must be overwritten
-			}
-			if err := be.sgemm(t.Context(), gemmKernels[0], got, a, offA, b, offB, s.m, s.n, s.k, s.sums, nil); err != nil {
-				t.Fatal(err)
-			}
-			if first == nil {
-				first = got
-				for e, v := range got {
-					if diff := math.Abs(float64(v) - want[e]); !(diff <= 1e-5*scale[e]+1e-7) {
-						t.Fatalf("%+v: element %d = %v, want %v", s, e, v, want[e])
+		// The reference checks a sample of large outputs; the comparison
+		// between worker counts checks every element.
+		size := s.outputs * s.m * s.n
+		every := max(1, size/20000)
+		check := func(g *gemmKernel, got []float32) {
+			t.Helper()
+			for e := 0; e < size; e += every {
+				o, i, j := e/(s.m*s.n), e/s.n%s.m, e%s.n
+				var want, scale float64
+				for term := o * s.sums; term < (o+1)*s.sums; term++ {
+					for p := range s.k {
+						x := float64(a.data[offA[term]+i*a.rs+p*a.cs])
+						y := float64(b.data[offB[term]+p*b.rs+j*b.cs])
+						want += x * y
+						scale += math.Abs(x * y)
 					}
 				}
-				continue
+				if diff := math.Abs(float64(got[e]) - want); !(diff <= 1e-5*scale+1e-7) {
+					t.Fatalf("%+v, %s: element %d = %v, want %v", s, g.name, e, got[e], want)
+				}
 			}
-			if !slices.Equal(got, first) {
-				t.Fatalf("%+v: %d workers differ from one", s, workers)
+		}
+		for _, g := range gemmKernels {
+			var first []float32
+			for _, workers := range []int{1, 2, 3, 4, 7, 16} {
+				be := New()
+				be.workers = workers
+				got := make([]float32, size)
+				for i := range got {
+					got[i] = float32(math.NaN()) // must be overwritten
+				}
+				if err := be.sgemm(t.Context(), g, got, a, offA, b, offB, s.m, s.n, s.k, s.sums, nil); err != nil {
+					t.Fatal(err)
+				}
+				if first == nil {
+					first = got
+					check(g, got)
+					continue
+				}
+				if !slices.Equal(got, first) {
+					t.Fatalf("%+v, %s: %d workers differ from one", s, g.name, workers)
+				}
 			}
 		}
 	}
@@ -288,27 +304,42 @@ func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
 	for _, s := range []struct {
 		batch, m, n, k, workers int
 		wide                    bool // items share a, rather than b
+		sums                    int  // products each output sums over a batch axis, if not 1
 	}{
-		{6, 7, 33, 20, 3, false},     // an item per worker
-		{1, 150, 300, 600, 4, false}, // one item shared by every worker
-		{1, 6, 2100, 300, 4, false},  // shared, split by columns
-		{2, 4, 5, 0, 2, false},       // no inner dimension
-		{5, 90, 20, 30, 3, true},     // one wide product
-		{3, 300, 200, 300, 4, true},  // wide, with several blocks of k
+		{6, 7, 33, 20, 3, false, 1},     // an item per worker
+		{1, 150, 300, 600, 4, false, 1}, // one item shared by every worker
+		{1, 6, 2100, 300, 4, false, 1},  // shared, split by columns
+		{2, 4, 5, 0, 2, false, 1},       // no inner dimension
+		{5, 90, 20, 30, 3, true, 1},     // one wide product
+		{3, 300, 200, 300, 4, true, 1},  // wide, with several blocks of k
+		{15, 160, 150, 40, 4, true, 1},  // wide, with several blocks of n
+		{3, 6, 5, 0, 2, true, 1},        // shared, with no inner dimension
+		{2, 30, 25, 20, 3, false, 4},    // sums of groups of products
+		{1, 1100, 1000, 8, 4, false, 2}, // a sum too large for partial sums
+		{2, 4, 5, 6, 2, false, 0},       // nothing to sum
 	} {
 		name := fmt.Sprintf("%+v", s)
 		be := New()
 		be.workers = s.workers
-		a := layout(rng, "row-major", s.batch*s.m, s.k)
-		b := layout(rng, "column-major", s.k, s.batch*s.n)
-		sa, sb := s.m*a.rs, 0
+		items := s.batch * s.sums
+		a := layout(rng, "row-major", max(items, 1)*s.m, s.k)
+		b := layout(rng, "column-major", s.k, max(items, 1)*s.n)
+		sa, sb := s.m*a.rs, s.n*b.cs
 		if s.wide {
-			sa, sb = 0, s.n*b.cs
+			sa = 0
 		}
 		size := s.batch * s.m * s.n
+		// Item i of the batch sums matrices i*sums, ..., i*sums+sums-1.
 		in := []backend.View{
-			{Shape: []int{s.batch, s.m, s.k}, Strides: []int{sa, a.rs, a.cs}, Offset: a.off},
-			{Shape: []int{s.batch, s.k, s.n}, Strides: []int{sb, b.rs, b.cs}},
+			{Shape: []int{s.batch, s.sums, s.m, s.k}, Strides: []int{s.sums * sa, sa, a.rs, a.cs}, Offset: a.off},
+			{Shape: []int{s.batch, s.sums, s.k, s.n}, Strides: []int{s.sums * sb, sb, b.rs, b.cs}},
+		}
+		shape, axes := []int{s.batch, 1, s.m, s.n}, []int{1}
+		if s.sums == 1 {
+			for i, v := range in {
+				in[i] = backend.View{Shape: slices.Delete(v.Shape, 1, 2), Strides: slices.Delete(v.Strides, 1, 2), Offset: v.Offset}
+			}
+			shape, axes = []int{s.batch, s.m, s.n}, nil
 		}
 		ins := []backend.Buffer{&buffer[float32]{data: a.data}, &buffer[float32]{data: b.data}}
 		// The epilogue sees the product as [batch*m, n].
@@ -324,7 +355,7 @@ func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
 		bufs := []backend.Buffer{f32buf(bias...), f32buf(residual...)}
 
 		product, _ := be.Alloc(backend.Float32, size)
-		plain := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: []int{s.batch, s.m, s.n}, In: in}
+		plain := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: shape, In: in, Attrs: backend.Attrs{Axes: axes}}
 		if err := be.Run(t.Context(), plain, []backend.Buffer{product}, ins); err != nil {
 			t.Fatal(err)
 		}
@@ -335,7 +366,7 @@ func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
 		}
 
 		got, _ := be.Alloc(backend.Float32, size)
-		withEpilogue := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: plain.Shape, In: append(slices.Clone(in), views...), Attrs: backend.Attrs{Program: prog}}
+		withEpilogue := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: plain.Shape, In: append(slices.Clone(in), views...), Attrs: backend.Attrs{Program: prog, Axes: axes}}
 		if err := be.Run(t.Context(), withEpilogue, []backend.Buffer{got}, append(slices.Clone(ins), bufs...)); err != nil {
 			t.Fatal(err)
 		}
