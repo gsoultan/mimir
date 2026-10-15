@@ -13,7 +13,8 @@ import (
 )
 
 // The Objective-C runtime and Metal are called through purego, without
-// cgo: every message is objc_msgSend with integer and pointer arguments.
+// cgo: almost every message is objc_msgSend with integer and pointer
+// arguments; initMatMul is the one that passes doubles.
 // On arm64 a struct argument larger than 16 bytes, such as MTLSize, is
 // passed as a pointer to a copy, so no message needs more.
 
@@ -33,6 +34,16 @@ var (
 	poolPush   func() uintptr
 	poolPop    func(uintptr)
 	createDev  func() id
+
+	mpsOnce sync.Once
+	mpsErr  error
+	// mpsSupports reports whether Metal Performance Shaders runs on a
+	// device.
+	mpsSupports func(dev id) bool
+	// initMatMul sends initWithDevice:transposeLeft:transposeRight:
+	// resultRows:resultColumns:interiorColumns:alpha:beta:, whose alpha
+	// and beta are doubles, which send cannot pass.
+	initMatMul func(r id, s sel, dev id, transLeft, transRight bool, rows, cols, inner uint, alpha, beta float64) id
 )
 
 // loadObjC loads libobjc and Metal once.
@@ -66,6 +77,20 @@ func loadObjC() error {
 	return objcErr
 }
 
+// loadMPS loads Metal Performance Shaders once, after loadObjC.
+func loadMPS() error {
+	mpsOnce.Do(func() {
+		mps, err := purego.Dlopen("/System/Library/Frameworks/MetalPerformanceShaders.framework/MetalPerformanceShaders", purego.RTLD_GLOBAL|purego.RTLD_NOW)
+		if err != nil {
+			mpsErr = err
+			return
+		}
+		purego.RegisterLibFunc(&mpsSupports, mps, "MPSSupportsMTLDevice")
+		purego.RegisterFunc(&initMatMul, msgSend)
+	})
+	return mpsErr
+}
+
 // send sends the message s to receiver r and returns the result.
 //
 //go:uintptrescapes
@@ -86,6 +111,8 @@ var (
 	selCommandBuffer, selComputeEncoder, selSetPipeline, selSetBuffer, selSetBytes sel
 	selDispatch, selEndEncoding, selCommit, selWait, selStatus, selError           sel
 	selHasUnifiedMemory, selRecommendedWorkingSetSize, selSupportsFamily           sel
+	selMatrixDescriptor, selInitMatrix, selInitMatMul, selEncodeMatMul             sel
+	selSetBatchStart, selSetBatchSize                                              sel
 )
 
 func initSelectors() {
@@ -121,6 +148,12 @@ func initSelectors() {
 		&selHasUnifiedMemory:          "hasUnifiedMemory",
 		&selRecommendedWorkingSetSize: "recommendedMaxWorkingSetSize",
 		&selSupportsFamily:            "supportsFamily:",
+		&selMatrixDescriptor:          "matrixDescriptorWithRows:columns:matrices:rowBytes:matrixBytes:dataType:",
+		&selInitMatrix:                "initWithBuffer:offset:descriptor:",
+		&selInitMatMul:                "initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:",
+		&selEncodeMatMul:              "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:",
+		&selSetBatchStart:             "setBatchStart:",
+		&selSetBatchSize:              "setBatchSize:",
 	} {
 		*p = selRegName(name)
 	}

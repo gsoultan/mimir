@@ -74,6 +74,19 @@ jobs:
           else
             echo "::warning::this runner has no Metal device"
           fi
+      - name: benchmarks on the GPU
+        run: |
+          if go run ./tools/devices | grep -q metal; then
+            {
+              go run ./tools/devices
+              go test -run '^$' -bench MatMul ./backend/metal
+              for dev in cpu gpu; do
+                echo "MIMIR_DEVICE=$dev"
+                MIMIR_DEVICE=$dev go test -run '^$' -bench TrainStep -benchtime 3s ./train
+              done
+            } | tee "$RUNNER_TEMP/bench.txt"
+            { echo '### GPU benchmarks'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   lint:
     runs-on: ubuntu-latest

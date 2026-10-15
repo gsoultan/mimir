@@ -27,9 +27,28 @@ type Backend struct {
 
 	mu        sync.Mutex
 	pipelines map[string]id // by kernel source
-	cb, enc   id            // the open command buffer and its encoder, or 0
+	cb, enc   id            // the open command buffer and compute encoder, or 0
 	last      id            // the last committed command buffer, or 0
 	errWord   *buffer       // where kernels report errors
+
+	// hasMPS is whether Metal Performance Shaders runs on the device, and
+	// mpsMin the work from which float32 products run through it, or -1
+	// if they never do.
+	hasMPS bool
+	mpsMin int
+	gemms  map[gemmKey]id // MPSMatrixMultiplication kernels
+}
+
+// mpsMinWork is the number of multiply-adds, m·n·k per matrix times the
+// batch, from which a float32 product runs through Metal Performance
+// Shaders instead of the generated kernel. Below it, ending the compute
+// encoder for the MPS kernel costs more than it saves.
+const mpsMinWork = 1 << 18
+
+// gemmKey identifies an MPSMatrixMultiplication kernel.
+type gemmKey struct {
+	transLeft, transRight bool
+	m, n, k               int
 }
 
 // buffer is a shared MTLBuffer, which the CPU and GPU address alike.
@@ -55,7 +74,7 @@ func New() (*Backend, error) {
 	if err := loadObjC(); err != nil {
 		return nil, fmt.Errorf("metal: %v: %w", err, ErrUnavailable)
 	}
-	b := &Backend{pipelines: map[string]id{}}
+	b := &Backend{pipelines: map[string]id{}, gemms: map[gemmKey]id{}, mpsMin: -1}
 	autoreleased(func() {
 		b.dev = createDev()
 		if b.dev == 0 {
@@ -66,6 +85,9 @@ func New() (*Backend, error) {
 	})
 	if b.dev == 0 || b.queue == 0 {
 		return nil, fmt.Errorf("metal: no default device: %w", ErrUnavailable)
+	}
+	if b.hasMPS = loadMPS() == nil && mpsSupports(b.dev); b.hasMPS {
+		b.mpsMin = mpsMinWork
 	}
 	w, err := b.Alloc(backend.Int32, 1)
 	if err != nil {
@@ -196,15 +218,41 @@ func (b *Backend) commit() {
 	if b.cb == 0 {
 		return
 	}
-	autoreleased(func() {
-		send(b.enc, selEndEncoding)
-		send(b.cb, selCommit)
-	})
-	release(b.enc)
+	b.endCompute()
+	autoreleased(func() { send(b.cb, selCommit) })
 	if b.last != 0 {
 		release(b.last)
 	}
-	b.last, b.cb, b.enc = b.cb, 0, 0
+	b.last, b.cb = b.cb, 0
+}
+
+// commandBuffer returns the open command buffer, opening one if there is
+// none. b.mu is held, inside an autorelease pool.
+func (b *Backend) commandBuffer() id {
+	if b.cb == 0 {
+		b.cb = id(send(id(send(b.queue, selCommandBuffer)), selRetain))
+	}
+	return b.cb
+}
+
+// computeEncoder returns the open compute encoder, opening one if there is
+// none. b.mu is held, inside an autorelease pool.
+func (b *Backend) computeEncoder() id {
+	if b.enc == 0 {
+		b.enc = id(send(id(send(b.commandBuffer(), selComputeEncoder)), selRetain))
+	}
+	return b.enc
+}
+
+// endCompute ends the open compute encoder, if any, so that another kind
+// of work can be encoded after it. b.mu is held.
+func (b *Backend) endCompute() {
+	if b.enc == 0 {
+		return
+	}
+	autoreleased(func() { send(b.enc, selEndEncoding) })
+	release(b.enc)
+	b.enc = 0
 }
 
 // Run encodes k into the open command buffer.
@@ -223,6 +271,27 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		}
 		bufs = append(bufs, mb)
 	}
+	lens := make([]int, len(ins))
+	for i, buf := range ins {
+		lens[i] = buf.Len()
+	}
+	g, isGEMM := planGEMM(k, lens)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if isGEMM && b.mpsMin >= 0 && g.batch*g.m*g.n*g.k >= b.mpsMin {
+		var epilogue *launch
+		if k.Attrs.Program != nil {
+			var err error
+			if epilogue, err = planEpilogue(k, outs, ins); err != nil {
+				return fmt.Errorf("metal: %s: %w", k.Op, err)
+			}
+		}
+		b.encodeGEMM(g, bufs)
+		if epilogue == nil {
+			return nil
+		}
+		return b.encode(k, epilogue, bufs)
+	}
 	l, err := plan(k, outs, ins)
 	if err != nil {
 		return fmt.Errorf("metal: %s: %w", k.Op, err)
@@ -230,30 +299,62 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	if l == nil {
 		return nil
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	return b.encode(k, l, bufs)
+}
+
+// encode encodes the launch l of k over bufs, the outputs then the
+// inputs. b.mu is held.
+func (b *Backend) encode(k *backend.Kernel, l *launch, bufs []*buffer) error {
 	pso, err := b.pipeline(l.src)
 	if err != nil {
 		return fmt.Errorf("metal: %s: %w", k.Op, err)
 	}
 	autoreleased(func() {
-		if b.cb == 0 {
-			b.cb = id(send(id(send(b.queue, selCommandBuffer)), selRetain))
-			b.enc = id(send(id(send(b.cb, selComputeEncoder)), selRetain))
-		}
-		send(b.enc, selSetPipeline, uintptr(pso))
+		enc := b.computeEncoder()
+		send(enc, selSetPipeline, uintptr(pso))
 		for i, mb := range bufs {
-			send(b.enc, selSetBuffer, uintptr(mb.obj), 0, uintptr(i))
+			send(enc, selSetBuffer, uintptr(mb.obj), 0, uintptr(i))
 		}
-		send(b.enc, selSetBytes, uintptr(unsafe.Pointer(&l.params[0])), uintptr(4*len(l.params)), uintptr(len(bufs)))
-		send(b.enc, selSetBuffer, uintptr(b.errWord.obj), 0, uintptr(len(bufs)+1))
+		send(enc, selSetBytes, uintptr(unsafe.Pointer(&l.params[0])), uintptr(4*len(l.params)), uintptr(len(bufs)))
+		send(enc, selSetBuffer, uintptr(b.errWord.obj), 0, uintptr(len(bufs)+1))
 		groups := &[3]uint{uint(l.groups), 1, 1}
 		threads := &[3]uint{uint(l.threads), 1, 1}
-		send(b.enc, selDispatch, uintptr(unsafe.Pointer(groups)), uintptr(unsafe.Pointer(threads)))
+		send(enc, selDispatch, uintptr(unsafe.Pointer(groups)), uintptr(unsafe.Pointer(threads)))
 	})
 	runtime.KeepAlive(l)
 	runtime.KeepAlive(bufs)
 	return nil
+}
+
+// encodeGEMM encodes the product g with Metal Performance Shaders, from
+// bufs[1] and bufs[2] into bufs[0]. b.mu is held.
+func (b *Backend) encodeGEMM(g gemm, bufs []*buffer) {
+	const float32Type = 0x10000000 | 32 // MPSDataTypeFloat32
+	key := gemmKey{g.a.trans, g.b.trans, g.m, g.n, g.k}
+	autoreleased(func() {
+		kern := b.gemms[key]
+		if kern == 0 {
+			kern = initMatMul(id(send(id(getClass("MPSMatrixMultiplication")), selAlloc)), selInitMatMul,
+				b.dev, g.a.trans, g.b.trans, uint(g.m), uint(g.n), uint(g.k), 1, 0)
+			b.gemms[key] = kern
+		}
+		mat := func(buf *buffer, offset, rows, cols, ld, stride int) id {
+			desc := id(send(id(getClass("MPSMatrixDescriptor")), selMatrixDescriptor,
+				uintptr(rows), uintptr(cols), uintptr(g.batch), uintptr(4*ld), uintptr(4*stride), float32Type))
+			return id(send(id(send(id(getClass("MPSMatrix")), selAlloc)), selInitMatrix, uintptr(buf.obj), uintptr(4*offset), uintptr(desc)))
+		}
+		left := mat(bufs[1], g.a.offset, g.a.rows, g.a.cols, g.a.ld, g.a.stride)
+		defer release(left)
+		right := mat(bufs[2], g.b.offset, g.b.rows, g.b.cols, g.b.ld, g.b.stride)
+		defer release(right)
+		result := mat(bufs[0], 0, g.m, g.n, g.n, g.resultSize)
+		defer release(result)
+		b.endCompute()
+		send(kern, selSetBatchStart, 0)
+		send(kern, selSetBatchSize, uintptr(g.batch))
+		send(kern, selEncodeMatMul, uintptr(b.commandBuffer()), uintptr(left), uintptr(right), uintptr(result))
+	})
+	runtime.KeepAlive(bufs)
 }
 
 // pipeline returns the compiled pipeline of src, compiling it the first
