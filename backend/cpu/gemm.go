@@ -45,9 +45,12 @@ type operand struct {
 	rs, cs int
 }
 
-// gemmWorkspace holds a worker's packed panels.
+// gemmWorkspace holds a worker's packed panels and the tile it computes
+// at the ragged edges of the output. The tile lives here because a local
+// array passed to a kernel through a function value escapes to the heap.
 type gemmWorkspace struct {
 	a, b []float32
+	tile [maxTile]float32
 }
 
 var gemmWorkspaces = sync.Pool{New: func() any { return new(gemmWorkspace) }}
@@ -152,7 +155,7 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand,
 						mc := min(g.mc, i1-ic)
 						ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
 						packA(ws.a, a, ic, mc, pc, kc, g.mr)
-						macroKernel(g, ws.a, bp[j0*kc:], kc, mc, j1-j0, c[ic*n+jc+j0:], n, pc > 0)
+						macroKernel(g, ws.a, bp[j0*kc:], kc, mc, j1-j0, c[ic*n+jc+j0:], n, pc > 0, &ws.tile)
 					}
 				}
 				return nil
@@ -214,7 +217,7 @@ func gemmBlock(g *gemmKernel, ws *gemmWorkspace, a, b operand, k int, c []float3
 				mc := min(g.mc, i1-ic)
 				ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
 				packA(ws.a, a, ic, mc, pc, kc, g.mr)
-				macroKernel(g, ws.a, ws.b, kc, mc, nc, c[ic*ldc+jc:], ldc, pc > 0)
+				macroKernel(g, ws.a, ws.b, kc, mc, nc, c[ic*ldc+jc:], ldc, pc > 0, &ws.tile)
 			}
 		}
 	}
@@ -222,10 +225,9 @@ func gemmBlock(g *gemmKernel, ws *gemmWorkspace, a, b operand, k int, c []float3
 
 // macroKernel runs the micro-kernel over every tile of an mc×nc block of
 // c, kc deep, from the packed panels of a, mc rows, and b, nc columns. c
-// starts at the block's first element.
-func macroKernel(g *gemmKernel, a, b []float32, kc, mc, nc int, c []float32, ldc int, accumulate bool) {
+// starts at the block's first element. Edge tiles go through scratch.
+func macroKernel(g *gemmKernel, a, b []float32, kc, mc, nc int, c []float32, ldc int, accumulate bool, scratch *[maxTile]float32) {
 	mr, nr := g.mr, g.nr
-	var scratch [maxTile]float32
 	for jr := 0; jr < nc; jr += nr {
 		cols := min(nr, nc-jr)
 		bp := &b[jr*kc]
