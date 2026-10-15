@@ -10,7 +10,8 @@ import (
 
 // parallelFor runs fn over [0, n) split into contiguous chunks of at least
 // grain elements, using up to b.workers goroutines. Chunks never overlap, so
-// fn may write its own range of an output without synchronization.
+// fn may write its own range of an output without synchronization, and
+// their bounds depend only on n, grain and b.workers.
 //
 // It returns after every started chunk has finished. A panic in fn is
 // recovered and reported as backend.ErrInternal. Cancellation is checked
@@ -25,14 +26,17 @@ func (b *Backend) parallelFor(ctx context.Context, n, grain int, fn func(lo, hi 
 		return runChunk(ctx, fn, 0, n)
 	}
 	size := (n + chunks - 1) / chunks
-	errs := make([]error, chunks)
+	if t := defaultTeam(); t != nil && t.mu.TryLock() {
+		defer t.mu.Unlock()
+		return t.run(ctx, n, size, fn)
+	}
+	// Another loop holds the team, so every processor is likely busy; let
+	// the runtime share them between the loops.
+	errs := make([]error, (n+size-1)/size)
 	var wg sync.WaitGroup
-	for c := range chunks {
+	for c := range errs {
 		lo := c * size
 		hi := min(n, lo+size)
-		if lo >= hi {
-			break
-		}
 		wg.Go(func() { errs[c] = runChunk(ctx, fn, lo, hi) })
 	}
 	wg.Wait()

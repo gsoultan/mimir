@@ -1,8 +1,13 @@
-// Package cpu implements the mimir backend for the host CPU in pure Go.
+// Package cpu implements the mimir backend for the host CPU without cgo.
 //
 // Kernels read their inputs through strided views, write contiguous outputs
 // and split work across up to GOMAXPROCS goroutines. They are the reference
 // implementation that every other backend is tested against.
+//
+// Float32 matrix products run on assembly micro-kernels where the CPU
+// supports them, chosen at startup: AVX-512 or AVX2 with FMA on amd64.
+// Elsewhere, or when built with the purego tag, they run on a portable Go
+// kernel.
 package cpu
 
 import (

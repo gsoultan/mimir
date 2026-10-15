@@ -8,8 +8,9 @@ import (
 
 // matmul computes [..., M, K] x [..., K, N] -> [..., M, N]. Batch dimensions
 // are equal in shape but may have any strides, including 0 for broadcast.
-// Work is split by output rows; each row accumulates in i-k-j order so the
-// inner loop streams a row of B and a row of the output.
+// Float32 products run on the packed GEMM in gemm.go. Int32 products split
+// work by output rows; each row accumulates in i-k-j order so the inner
+// loop streams a row of B and a row of the output.
 func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, y []T) error {
 	if len(out) == 0 {
 		return nil
@@ -22,6 +23,11 @@ func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, 
 	offY := batchOffsets(batch, vy)
 	sxm, sxk := vx.Strides[r-2], vx.Strides[r-1]
 	syk, syn := vy.Strides[r-2], vy.Strides[r-1]
+	if out32, ok := any(out).([]float32); ok {
+		a := operand{data: any(x).([]float32), rs: sxm, cs: sxk}
+		bm := operand{data: any(y).([]float32), rs: syk, cs: syn}
+		return b.sgemm(ctx, gemmKernels[0], out32, a, offX, bm, offY, m, n, kk)
+	}
 
 	grain := max(1, elementGrain/max(1, kk*n))
 	return b.parallelFor(ctx, len(offX)*m, grain, func(lo, hi int) error {
