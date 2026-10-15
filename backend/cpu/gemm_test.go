@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"testing"
+
+	"github.com/gsoultan/mimir/backend"
 )
 
 // refGEMM computes a·b in float64, along with the sum of |a||b| over each
@@ -73,7 +76,7 @@ func TestGEMMKernelsMatchReference(t *testing.T) {
 					for i := range out {
 						out[i] = float32(math.NaN()) // must be overwritten
 					}
-					if err := be.sgemm(t.Context(), g, out, a, []int{a.off}, b, []int{b.off}, m, n, k); err != nil {
+					if err := be.sgemm(t.Context(), g, out, a, []int{a.off}, b, []int{b.off}, m, n, k, nil); err != nil {
 						t.Fatal(err)
 					}
 					want, scale := refGEMM(a, b, m, n, k)
@@ -111,7 +114,7 @@ func TestGEMMBatchesAndSplits(t *testing.T) {
 		whole.workers = 1
 		for _, g := range gemmKernels {
 			want := make([]float32, s.batch*s.m*s.n)
-			if err := whole.sgemm(t.Context(), g, want, a, offA, b, offB, s.m, s.n, s.k); err != nil {
+			if err := whole.sgemm(t.Context(), g, want, a, offA, b, offB, s.m, s.n, s.k, nil); err != nil {
 				t.Fatal(err)
 			}
 			for _, workers := range []int{2, 3, 4, 7, 16} {
@@ -121,7 +124,7 @@ func TestGEMMBatchesAndSplits(t *testing.T) {
 				for i := range got {
 					got[i] = float32(math.NaN()) // must be overwritten
 				}
-				if err := be.sgemm(t.Context(), g, got, a, offA, b, offB, s.m, s.n, s.k); err != nil {
+				if err := be.sgemm(t.Context(), g, got, a, offA, b, offB, s.m, s.n, s.k, nil); err != nil {
 					t.Fatal(err)
 				}
 				for i := range got {
@@ -194,12 +197,93 @@ func BenchmarkSGEMM(b *testing.B) {
 				out := make([]float32, size*size)
 				be := New()
 				for b.Loop() {
-					if err := be.sgemm(b.Context(), g, out, x, []int{x.off}, y, []int{y.off}, size, size, size); err != nil {
+					if err := be.sgemm(b.Context(), g, out, x, []int{x.off}, y, []int{y.off}, size, size, size, nil); err != nil {
 						b.Fatal(err)
 					}
 				}
 				b.ReportMetric(2*float64(size*size*size)*float64(b.N)/b.Elapsed().Seconds()/1e9, "GFLOP/s")
 			})
 		}
+	}
+}
+
+func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
+	prog := []backend.Instr{
+		{Op: backend.OpLoad, DType: backend.Float32, Args: []int{0}}, // the product
+		{Op: backend.OpLoad, DType: backend.Float32, Args: []int{1}}, // a bias, broadcast
+		{Op: backend.OpLoad, DType: backend.Float32, Args: []int{2}}, // a residual
+		{Op: backend.OpAdd, DType: backend.Float32, Args: []int{0, 1}},
+		{Op: backend.OpAdd, DType: backend.Float32, Args: []int{3, 2}},
+		{Op: backend.OpConst, DType: backend.Float32},
+		{Op: backend.OpMax, DType: backend.Float32, Args: []int{4, 5}},
+	}
+	rng := rand.New(rand.NewPCG(5, 6))
+	for _, s := range []struct{ batch, m, n, k, workers int }{
+		{6, 7, 33, 20, 3},     // an item per worker
+		{1, 150, 300, 600, 4}, // one item shared by every worker
+		{1, 6, 2100, 300, 4},  // shared, split by columns
+		{2, 4, 5, 0, 2},       // no inner dimension
+	} {
+		name := fmt.Sprintf("%+v", s)
+		be := New()
+		be.workers = s.workers
+		a := layout(rng, "row-major", s.batch*s.m, s.k)
+		b := layout(rng, "column-major", s.k, s.n)
+		size := s.batch * s.m * s.n
+		in := []backend.View{
+			{Shape: []int{s.batch, s.m, s.k}, Strides: []int{s.m * a.rs, a.rs, a.cs}, Offset: a.off},
+			{Shape: []int{s.batch, s.k, s.n}, Strides: []int{0, b.rs, b.cs}},
+		}
+		ins := []backend.Buffer{&buffer[float32]{data: a.data}, &buffer[float32]{data: b.data}}
+		// The epilogue sees the product as [batch*m, n].
+		eshape := []int{s.batch * s.m, s.n}
+		bias, residual := make([]float32, s.n), make([]float32, size)
+		for i := range bias {
+			bias[i] = rng.Float32() - 0.5
+		}
+		for i := range residual {
+			residual[i] = rng.Float32() - 0.5
+		}
+		views := []backend.View{{Shape: eshape, Strides: []int{0, 1}}, backend.Contiguous(eshape)}
+		bufs := []backend.Buffer{f32buf(bias...), f32buf(residual...)}
+
+		product, _ := be.Alloc(backend.Float32, size)
+		plain := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: []int{s.batch, s.m, s.n}, In: in}
+		if err := be.Run(t.Context(), plain, product, ins); err != nil {
+			t.Fatal(err)
+		}
+		want, _ := be.Alloc(backend.Float32, size)
+		fused := &backend.Kernel{Op: backend.OpFused, DType: backend.Float32, Shape: eshape, In: append([]backend.View{backend.Contiguous(eshape)}, views...), Attrs: backend.Attrs{Program: prog}}
+		if err := be.Run(t.Context(), fused, want, append([]backend.Buffer{product}, bufs...)); err != nil {
+			t.Fatal(err)
+		}
+
+		got, _ := be.Alloc(backend.Float32, size)
+		withEpilogue := &backend.Kernel{Op: backend.OpMatMul, DType: backend.Float32, Shape: plain.Shape, In: append(slices.Clone(in), views...), Attrs: backend.Attrs{Program: prog}}
+		if err := be.Run(t.Context(), withEpilogue, got, append(slices.Clone(ins), bufs...)); err != nil {
+			t.Fatal(err)
+		}
+		g, _ := data[float32](got)
+		w, _ := data[float32](want)
+		if !slices.Equal(g, w) {
+			t.Errorf("%s: product with epilogue differs from the separate kernels", name)
+		}
+	}
+}
+
+func TestInt32MatMulEpilogue(t *testing.T) {
+	prog := []backend.Instr{
+		{Op: backend.OpLoad, DType: backend.Int32, Args: []int{0}},
+		{Op: backend.OpConst, DType: backend.Int32, Value: 3},
+		{Op: backend.OpMul, DType: backend.Int32, Args: []int{0, 1}},
+	}
+	k := &backend.Kernel{
+		Op: backend.OpMatMul, DType: backend.Int32, Shape: []int{2, 2},
+		In:    []backend.View{backend.Contiguous([]int{2, 3}), backend.Contiguous([]int{3, 2})},
+		Attrs: backend.Attrs{Program: prog},
+	}
+	got, err := run[int32](t, k, i32buf(1, 2, 3, 4, 5, 6), i32buf(1, 0, 0, 1, 1, 1))
+	if want := []int32{12, 15, 30, 33}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("got %v, %v; want %v", got, err, want)
 	}
 }

@@ -204,3 +204,40 @@ func TestPoolFreesBuffersNoScheduleTakes(t *testing.T) {
 func float32frombytes(b []byte) float32 {
 	return math.Float32frombits(uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24)
 }
+
+func TestElementwiseConsumersOfAProductRunAsItsEpilogue(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := must(graph.Rand([]int{2, 64, 48}, 1, false))
+	w := must(graph.Rand([]int{2, 48, 30}, 2, false))
+	b := must(graph.Rand([]int{30}, 3, false))
+	if err := Realize(t.Context(), be, x, w, b); err != nil {
+		t.Fatal(err)
+	}
+	// relu(x·w + b), reading the product through a reshape.
+	layer := func(p *graph.Node) *graph.Node {
+		flat := must(graph.Reshape(p, []int{128, 30}))
+		bias := must(graph.Expand(must(graph.Reshape(b, []int{1, 30})), []int{128, 30}))
+		zero := must(graph.Const(backend.Float32, []int{128, 30}, 0))
+		return must(graph.Binary(backend.OpMax, must(graph.Binary(backend.OpAdd, flat, bias)), zero))
+	}
+	product := must(graph.MatMul(x, w))
+	if err := Realize(t.Context(), be, product); err != nil {
+		t.Fatal(err)
+	}
+	separate := layer(product) // the product is realized, so this fuses alone
+	fused := layer(must(graph.MatMul(x, w)))
+	be.ops = nil
+	want, got := make([]byte, 128*30*4), make([]byte, 128*30*4)
+	if err := Download(t.Context(), be, separate, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := Download(t.Context(), be, fused, got); err != nil {
+		t.Fatal(err)
+	}
+	if ops := []backend.Op{backend.OpFused, backend.OpMatMul}; !slices.Equal(be.ops, ops) {
+		t.Errorf("kernels %v, want %v", be.ops, ops)
+	}
+	if !slices.Equal(got, want) {
+		t.Error("product with epilogue differs from the separate kernels")
+	}
+}

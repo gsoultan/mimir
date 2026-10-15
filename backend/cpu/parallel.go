@@ -109,14 +109,20 @@ type cursor struct {
 
 // newCursor positions a cursor at linear element start of shape.
 func newCursor(shape []int, views []backend.View, start int) *cursor {
-	c := &cursor{
-		shape:   shape,
-		idx:     make([]int, len(shape)),
-		strides: make([][]int, len(views)),
-		offs:    make([]int, len(views)),
-	}
+	c := new(cursor)
+	c.reset(shape, views, start)
+	return c
+}
+
+// reset positions c at linear element start of shape, reusing its memory.
+func (c *cursor) reset(shape []int, views []backend.View, start int) {
+	c.shape = shape
+	c.idx = grow(c.idx, len(shape))
+	c.strides = grow(c.strides, len(views))
+	c.offs = grow(c.offs, len(views))
 	rem := start
 	for d := len(shape) - 1; d >= 0; d-- {
+		c.idx[d] = 0
 		if shape[d] > 0 {
 			c.idx[d] = rem % shape[d]
 			rem /= shape[d]
@@ -130,10 +136,9 @@ func newCursor(shape []int, views []backend.View, start int) *cursor {
 		}
 		c.offs[v] = off
 	}
-	return c
 }
 
-// next advances to the following element.
+// next advances the cursor by one element in row-major order.
 func (c *cursor) next() {
 	for d := len(c.shape) - 1; d >= 0; d-- {
 		c.idx[d]++

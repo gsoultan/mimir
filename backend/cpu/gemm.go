@@ -83,12 +83,13 @@ const packGrain = 1 << 15
 
 // sgemm computes the batched product out[i] = a[i]·b[i], where matrix i of
 // a starts at offset offA[i] and of b at offB[i], and out holds the m×n
-// results contiguously.
+// results contiguously. A non-nil epilogue rewrites each finished part of
+// out.
 //
 // A batch with an item for every worker computes its items in parallel.
 // Smaller batches compute one item at a time with every worker; see
 // sgemmShared.
-func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k int) error {
+func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k int, epi *evaluator) error {
 	batch := len(offA)
 	item := func(i int) (operand, operand, []float32) {
 		ai, bi := a, b
@@ -103,13 +104,16 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 			for i := lo; i < hi; i++ {
 				ai, bi, c := item(i)
 				gemmBlock(g, ws, ai, bi, k, c, n, 0, m, 0, n)
+				if err := epi.apply(i*m*n, (i+1)*m*n); err != nil {
+					return err
+				}
 			}
 			return nil
 		})
 	}
 	for i := range batch {
 		ai, bi, c := item(i)
-		if err := be.sgemmShared(ctx, g, ai, bi, c, m, n, k); err != nil {
+		if err := be.sgemmShared(ctx, g, ai, bi, c, m, n, k, epi, i*m*n); err != nil {
 			return err
 		}
 	}
@@ -119,11 +123,13 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 // sgemmShared computes the m×n product c = a·b with every worker. For each
 // block of B, the workers pack its panels together and then compute parts
 // of the output from them, each packing the rows of A that it needs.
-// Packing B separately for each part would repeat it for every part.
-func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand, c []float32, m, n, k int) error {
+// Packing B separately for each part would repeat it for every part. The
+// epilogue rewrites each part once its last block of A and B is done; c
+// starts at element base of the epilogue's output.
+func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand, c []float32, m, n, k int, epi *evaluator, base int) error {
 	if k == 0 {
 		clear(c)
-		return nil
+		return epi.apply(base, base+m*n)
 	}
 	shared := gemmWorkspaces.Get().(*gemmWorkspace)
 	defer gemmWorkspaces.Put(shared)
@@ -156,6 +162,15 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a, b operand,
 						ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
 						packA(ws.a, a, ic, mc, pc, kc, g.mr)
 						macroKernel(g, ws.a, bp[j0*kc:], kc, mc, j1-j0, c[ic*n+jc+j0:], n, pc > 0, &ws.tile)
+					}
+					if pc+kc < k {
+						continue
+					}
+					for i := i0; i < i1; i++ {
+						row := base + i*n + jc
+						if err := epi.apply(row+j0, row+j1); err != nil {
+							return err
+						}
 					}
 				}
 				return nil

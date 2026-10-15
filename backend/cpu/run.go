@@ -69,6 +69,17 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, out backend.Buffer
 		return runProgram(ctx, b, k, k.Attrs.Program, out, ins)
 	case k.Op.IsElementwise() || k.Op == backend.OpContiguous:
 		return runProgram(ctx, b, k, singleOp(k, ins), out, ins)
+	case k.Op == backend.OpMatMul:
+		epi, err := epilogue(k, out, ins)
+		if err != nil {
+			return err
+		}
+		switch k.DType {
+		case backend.Float32:
+			return runMatMul[float32](ctx, b, k, out, ins, epi)
+		case backend.Int32:
+			return runMatMul[int32](ctx, b, k, out, ins, epi)
+		}
 	}
 	switch k.DType {
 	case backend.Float32:
@@ -116,8 +127,6 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 		return reduceMax(ctx, b, k, out, in[0])
 	case op == backend.OpPad:
 		return pad(ctx, b, k, out, in[0])
-	case op == backend.OpMatMul:
-		return matmul(ctx, b, k, out, in[0], in[1])
 	case op == backend.OpGather:
 		idx, err := data[int32](ins[1])
 		if err != nil {
