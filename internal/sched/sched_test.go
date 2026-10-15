@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 
@@ -12,11 +13,13 @@ import (
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
-// counting wraps the CPU backend and tracks live allocations.
+// counting wraps the CPU backend and tracks allocations and kernels.
 type counting struct {
 	*cpu.Backend
 	mu         sync.Mutex
 	live, peak int
+	allocs     int
+	ops        []backend.Op
 	failOn     backend.Op
 }
 
@@ -26,6 +29,7 @@ func (c *counting) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 		c.mu.Lock()
 		c.live += n
 		c.peak = max(c.peak, c.live)
+		c.allocs++
 		c.mu.Unlock()
 	}
 	return b, err
@@ -38,10 +42,20 @@ func (c *counting) Free(b backend.Buffer) {
 }
 
 func (c *counting) Run(ctx context.Context, k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) error {
+	c.mu.Lock()
+	c.ops = append(c.ops, k.Op)
+	c.mu.Unlock()
 	if k.Op == c.failOn {
 		return backend.ErrIndex
 	}
 	return c.Backend.Run(ctx, k, out, ins)
+}
+
+// held returns the number of elements allocated and not in the pool.
+func (c *counting) held() int {
+	mu.Lock()
+	defer mu.Unlock()
+	return c.live - poolOf(c).pooledElements()
 }
 
 func must(n *graph.Node, err error) *graph.Node {
@@ -54,16 +68,17 @@ func must(n *graph.Node, err error) *graph.Node {
 func TestIntermediatesAreFreedAfterLastUse(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	const size = 1 << 16
-	x := must(graph.Rand([]int{size}, 1, false))
+	x := must(graph.Rand([]int{size, 1}, 1, false))
 	y := x
 	for range 50 {
-		y = must(graph.Unary(backend.OpSqrt, y))
+		// Reductions do not fuse, so each needs a buffer.
+		y = must(graph.Reduce(backend.OpReduceSum, y, []int{1}))
 	}
 	if err := Realize(t.Context(), be, y); err != nil {
 		t.Fatal(err)
 	}
-	if be.live != size {
-		t.Errorf("%d elements live after realize, want only the result's %d", be.live, size)
+	if held := be.held(); held != size {
+		t.Errorf("%d elements held after realize, want only the result's %d", held, size)
 	}
 	if be.peak > 2*size {
 		t.Errorf("peak %d elements for a chain, want at most two buffers of %d", be.peak, size)
@@ -97,17 +112,95 @@ func TestViewsShareBuffersAndConstantsTakeOneElement(t *testing.T) {
 }
 
 func TestFailedRealizeFreesEverythingAndChangesNothing(t *testing.T) {
-	be := &counting{Backend: cpu.New(), failOn: backend.OpMul}
+	be := &counting{Backend: cpu.New(), failOn: backend.OpFused}
 	x := must(graph.Rand([]int{100}, 1, false))
 	e := must(graph.Unary(backend.OpExp2, x))
 	y := must(graph.Binary(backend.OpMul, e, e))
 	if err := Realize(t.Context(), be, y); !errors.Is(err, backend.ErrIndex) {
 		t.Fatalf("got %v, want the kernel's error", err)
 	}
-	if be.live != 0 {
-		t.Errorf("%d elements still allocated after a failed realize", be.live)
+	if held := be.held(); held != 0 {
+		t.Errorf("%d elements still held after a failed realize", held)
 	}
 	if y.Realized() || x.Realized() || len(y.Inputs) != 2 {
 		t.Error("failed realize modified the graph")
 	}
+}
+
+func TestElementwiseChainsFuse(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := must(graph.Rand([]int{1000}, 1, false))
+	e := must(graph.Unary(backend.OpExp2, x)) // read twice, so it gets a buffer
+	two := must(graph.Expand(must(graph.Const(backend.Float32, []int{1}, 2)), []int{1000}))
+	sq := must(graph.Binary(backend.OpMul, e, e))
+	y := must(graph.Binary(backend.OpAdd, must(graph.Binary(backend.OpMul, sq, two)), e))
+	for range 50 {
+		y = must(graph.Unary(backend.OpSqrt, y))
+	}
+	xs := make([]byte, 4000)
+	if err := Download(t.Context(), be, x, xs); err != nil {
+		t.Fatal(err)
+	}
+	be.ops = nil
+	out := make([]byte, 4000)
+	if err := Download(t.Context(), be, y, out); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpExp2, backend.OpFused}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	for i := range 1000 {
+		xi := float32frombytes(xs[4*i:])
+		ei := float32(math.Exp2(float64(xi)))
+		want := ei*ei*2 + ei
+		for range 50 {
+			want = float32(math.Sqrt(float64(want)))
+		}
+		if got := float32frombytes(out[4*i:]); got != want {
+			t.Fatalf("element %d = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestRepeatedSchedulesReuseBuffers(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	step := func() {
+		x := must(graph.Rand([]int{64, 32}, 1, false))
+		w := must(graph.Rand([]int{32, 16}, 2, false))
+		h := must(graph.Unary(backend.OpExp2, must(graph.MatMul(x, w))))
+		y := must(graph.Reduce(backend.OpReduceSum, h, []int{0}))
+		if err := Realize(t.Context(), be, y); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step()
+	first := be.allocs
+	step()
+	if got := be.allocs - first; got != 1 {
+		t.Errorf("second schedule made %d allocations, want 1 for its result (the first made %d)", got, first)
+	}
+}
+
+func TestPoolFreesBuffersNoScheduleTakes(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := must(graph.Rand([]int{1000, 1}, 1, false))
+	y := must(graph.Reduce(backend.OpReduceSum, x, []int{1}))
+	if err := Realize(t.Context(), be, y); err != nil {
+		t.Fatal(err)
+	}
+	if be.live != 2000 {
+		t.Fatalf("%d elements live, want the result and the pooled input", be.live)
+	}
+	for i := range poolAge + 1 {
+		if err := Realize(t.Context(), be, must(graph.Rand([]int{1}, uint64(i), false))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if be.live != 1000+poolAge+1 {
+		t.Errorf("%d elements live, want the pooled input freed", be.live)
+	}
+}
+
+func float32frombytes(b []byte) float32 {
+	return math.Float32frombits(uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24)
 }
