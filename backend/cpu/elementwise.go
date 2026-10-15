@@ -319,7 +319,7 @@ type evaluator struct {
 // values stores lists into the other outputs, from ins read through views
 // of shape. It returns nil if shape is empty.
 func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, stores []int, outs, ins []backend.Buffer) (*evaluator, error) {
-	shape, views = coalesce(shape, views)
+	shape, views = backend.Coalesce(shape, views)
 	total, _ := backend.NumElements(shape)
 	if total == 0 {
 		return nil, nil
