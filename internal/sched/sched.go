@@ -320,8 +320,10 @@ func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result, no
 	k := &backend.Kernel{Op: n.Op, DType: n.DType, Shape: n.Shape, In: make([]backend.View, len(ins)), Attrs: n.Attrs}
 	switch {
 	case w.gemm != nil:
-		// The product, rewritten in place, holds n in row-major order.
-		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog}
+		// The product, rewritten in place by any epilogue, holds n in
+		// row-major order. A summed product's axes are the batch axes it
+		// sums.
+		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog, Axes: w.gemm.Attrs.Axes}
 	case w.prog != nil:
 		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: w.prog}
 		for _, s := range w.stores {

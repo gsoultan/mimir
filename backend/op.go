@@ -50,7 +50,9 @@ const (
 	OpShrink  // Attrs.Ranges
 	OpFlip    // Attrs.Axes
 
-	// Contraction: [..., M, K] x [..., K, N] -> [..., M, N] with equal batch dims.
+	// Contraction: [..., M, K] x [..., K, N] -> [..., M, N] with equal batch
+	// dims. A kernel sums the products over the batch axes Attrs.Axes, which
+	// its output keeps with size 1.
 	OpMatMul
 
 	// Indexing along Attrs.Axis with Int32 indices.
