@@ -1,8 +1,10 @@
 package safetensors
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"slices"
 	"testing"
@@ -84,4 +86,54 @@ func FuzzParse(f *testing.F) {
 			_, _ = tt.Int32s()
 		}
 	})
+}
+
+func TestWriteRoundTrips(t *testing.T) {
+	in := map[string]Tensor{
+		"w":      Float32Tensor([]int{2, 2}, []float32{1, -2, 3.5, 0}),
+		"step":   Int32Tensor(nil, []int32{7}),
+		"empty":  Float32Tensor([]int{0, 3}, nil),
+		"layers": Int32Tensor([]int{3}, []int32{-1, 0, 1 << 30}),
+	}
+	var buf bytes.Buffer
+	if err := Write(&buf, in, map[string]string{"epoch": "3"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := binary.LittleEndian.Uint64(buf.Bytes()); (8+n)%8 != 0 {
+		t.Errorf("data starts at byte %d, want 8-byte alignment", 8+n)
+	}
+	f, err := Parse(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Metadata["epoch"] != "3" {
+		t.Errorf("metadata = %v", f.Metadata)
+	}
+	if got := f.Names(); !slices.Equal(got, []string{"empty", "layers", "step", "w"}) {
+		t.Errorf("names = %v", got)
+	}
+	for name, want := range in {
+		got, _ := f.Tensor(name)
+		if got.DType != want.DType || !slices.Equal(got.Shape, want.Shape) && len(want.Shape) > 0 || !bytes.Equal(got.Data, want.Data) {
+			t.Errorf("%s = %+v, want %+v", name, got, want)
+		}
+	}
+	w, _ := f.Tensor("w")
+	if v, _ := w.Float32s(); !slices.Equal(v, []float32{1, -2, 3.5, 0}) {
+		t.Errorf("w = %v", v)
+	}
+
+	var again bytes.Buffer
+	if err := Write(&again, in, map[string]string{"epoch": "3"}); err != nil || !bytes.Equal(again.Bytes(), buf.Bytes()) {
+		t.Error("writing the same tensors twice gave different files")
+	}
+	for name, bad := range map[string]Tensor{
+		"unknown dtype": {DType: "F128", Shape: []int{1}, Data: make([]byte, 16)},
+		"short data":    {DType: "F32", Shape: []int{2}, Data: make([]byte, 4)},
+		"negative dim":  {DType: "F32", Shape: []int{-1}},
+	} {
+		if err := Write(io.Discard, map[string]Tensor{"x": bad}, nil); !errors.Is(err, ErrFormat) {
+			t.Errorf("%s: %v, want ErrFormat", name, err)
+		}
+	}
 }

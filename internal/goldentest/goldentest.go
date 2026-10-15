@@ -3,6 +3,7 @@
 package goldentest
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/gsoultan/mimir/io/safetensors"
+	"github.com/gsoultan/mimir/tensor"
 )
 
 // Case is one golden case.
@@ -173,4 +175,90 @@ func widen[T float32 | int32](v []T) []float64 {
 		out[i] = float64(x)
 	}
 	return out
+}
+
+// Tensor returns a golden F32 or I32 tensor as a tensor.
+func Tensor(tb testing.TB, g safetensors.Tensor) *tensor.Tensor {
+	tb.Helper()
+	switch g.DType {
+	case "F32":
+		v, err := g.Float32s()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return tensor.FromSlice(v, g.Shape...)
+	case "I32":
+		v, err := g.Int32s()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return tensor.FromSlice(v, g.Shape...)
+	}
+	tb.Fatalf("unsupported golden dtype %s", g.DType)
+	return nil
+}
+
+// Inputs returns c's inputs as tensors. Inputs with a golden gradient
+// require gradients.
+func Inputs(tb testing.TB, c Case) []*tensor.Tensor {
+	tb.Helper()
+	in := make([]*tensor.Tensor, len(c.Inputs))
+	for i, g := range c.Inputs {
+		in[i] = Tensor(tb, g)
+		if _, ok := c.Grads[i]; ok {
+			in[i] = in[i].RequiresGrad()
+		}
+	}
+	return in
+}
+
+// Grader has an accumulated gradient: a tensor from RequiresGrad, or a
+// Param.
+type Grader interface {
+	Grad() *tensor.Tensor
+}
+
+// CheckGradients compares out with c.Want, runs Backward on
+// sum(out * c.Gout), and compares the gradient for each input i that has
+// a golden gradient with grads[i].Grad().
+func CheckGradients(t *testing.T, c Case, out *tensor.Tensor, grads map[int]Grader, tol Tol) {
+	t.Helper()
+	ctx := t.Context()
+	if err := out.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Mul(Tensor(t, c.Gout)).Sum().Backward(ctx); err != nil {
+		t.Fatal(err)
+	}
+	CompareTensor(t, c.Want, out, tol)
+	for i, want := range c.Grads {
+		src, ok := grads[i]
+		if !ok {
+			t.Fatalf("no gradient source for input %d", i)
+		}
+		g := src.Grad()
+		if g == nil {
+			t.Fatalf("input %d has no gradient", i)
+		}
+		t.Run(fmt.Sprintf("grad%d", i), func(t *testing.T) { CompareTensor(t, want, g, tol) })
+	}
+}
+
+// CompareTensor computes got and compares it with want, like Compare.
+func CompareTensor(tb testing.TB, want safetensors.Tensor, got *tensor.Tensor, tol Tol) {
+	tb.Helper()
+	ctx := context.Background()
+	if want.DType == "I32" {
+		v, err := got.Data[int32](ctx)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		Compare(tb, want, v, got.Shape(), tol)
+		return
+	}
+	v, err := got.Data[float32](ctx)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	Compare(tb, want, v, got.Shape(), tol)
 }
