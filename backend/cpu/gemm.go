@@ -53,9 +53,9 @@ type gemmWorkspace struct {
 var gemmWorkspaces = sync.Pool{New: func() any { return new(gemmWorkspace) }}
 
 // grow returns s with length n, reusing its storage when large enough.
-func grow(s []float32, n int) []float32 {
+func grow[E any](s []E, n int) []E {
 	if cap(s) < n {
-		return make([]float32, n)
+		return make([]E, n)
 	}
 	return s[:n]
 }

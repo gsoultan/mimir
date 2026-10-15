@@ -68,6 +68,11 @@ const (
 	// scheduler inserts it; it is not part of the public IR.
 	OpContiguous
 
+	// OpFused evaluates the elementwise program Attrs.Program over inputs
+	// read through views of the output's shape. The scheduler inserts it
+	// for chains of elementwise ops; it is not part of the public IR.
+	OpFused
+
 	numOps
 )
 
@@ -105,6 +110,7 @@ var opNames = [numOps]string{
 	OpUnfold:      "unfold",
 	OpFold:        "fold",
 	OpContiguous:  "contiguous",
+	OpFused:       "fused",
 }
 
 func (o Op) String() string {
@@ -119,6 +125,10 @@ func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast }
 
 // IsBinary reports whether o takes two same-shaped inputs elementwise.
 func (o Op) IsBinary() bool { return o >= OpAdd && o <= OpMod }
+
+// IsElementwise reports whether o computes each output element from the
+// input elements at the same index, so that it can join a fused program.
+func (o Op) IsElementwise() bool { return o.IsUnary() || o.IsBinary() || o == OpWhere }
 
 // IsReduce reports whether o reduces over Attrs.Axes.
 func (o Op) IsReduce() bool { return o == OpReduceSum || o == OpReduceMax }

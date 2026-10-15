@@ -64,14 +64,11 @@ func checkViews(k *backend.Kernel, ins []backend.Buffer) error {
 }
 
 func (b *Backend) run(ctx context.Context, k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) error {
-	switch k.Op {
-	case backend.OpCast:
-		return b.runCast(ctx, k, out, ins[0])
-	case backend.OpWhere:
-		if k.DType == backend.Float32 {
-			return runWhere[float32](ctx, b, k, out, ins)
-		}
-		return runWhere[int32](ctx, b, k, out, ins)
+	switch {
+	case k.Op == backend.OpFused:
+		return runProgram(ctx, b, k, k.Attrs.Program, out, ins)
+	case k.Op.IsElementwise() || k.Op == backend.OpContiguous:
+		return runProgram(ctx, b, k, singleOp(k, ins), out, ins)
 	}
 	switch k.DType {
 	case backend.Float32:
@@ -113,21 +110,6 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 			return backend.ErrDType
 		}
 		return b.fillRand(ctx, f32, k.Attrs.Seed, op == backend.OpRandNormal)
-	case op == backend.OpContiguous:
-		return unary(ctx, b, k, out, in[0], func(x T) T { return x })
-	case op.IsUnary():
-		f, err := unaryFunc[T](op)
-		if err != nil {
-			return err
-		}
-		return unary(ctx, b, k, out, in[0], f)
-	case op.IsBinary():
-		if op == backend.OpMod {
-			if err := checkNonZero(k.Shape, k.In[1], in[1]); err != nil {
-				return err
-			}
-		}
-		return binary(ctx, b, k, out, in[0], in[1], binaryFunc[T](op))
 	case op == backend.OpReduceSum:
 		return reduceSum(ctx, b, k, out, in[0])
 	case op == backend.OpReduceMax:
@@ -154,64 +136,5 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 		return fold(ctx, b, k, out, in[0])
 	default:
 		return fmt.Errorf("no cpu kernel: %w", backend.ErrInternal)
-	}
-}
-
-func (b *Backend) runCast(ctx context.Context, k *backend.Kernel, outBuf, inBuf backend.Buffer) error {
-	switch inBuf.DType() {
-	case backend.Float32:
-		return runCastFrom[float32](ctx, b, k, outBuf, inBuf)
-	case backend.Int32:
-		return runCastFrom[int32](ctx, b, k, outBuf, inBuf)
-	default:
-		return backend.ErrDType
-	}
-}
-
-func runCastFrom[F elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf, inBuf backend.Buffer) error {
-	in, err := data[F](inBuf)
-	if err != nil {
-		return err
-	}
-	switch k.DType {
-	case backend.Float32:
-		return castTo[F, float32](ctx, b, k, outBuf, in)
-	case backend.Int32:
-		return castTo[F, int32](ctx, b, k, outBuf, in)
-	default:
-		return backend.ErrDType
-	}
-}
-
-func castTo[F, T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, in []F) error {
-	out, err := data[T](outBuf)
-	if err != nil {
-		return err
-	}
-	return mapStrided(ctx, b, k.Shape, k.In[0], len(out), func(i, off int) { out[i] = T(in[off]) })
-}
-
-func runWhere[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, ins []backend.Buffer) error {
-	out, err := data[T](outBuf)
-	if err != nil {
-		return err
-	}
-	x, err := data[T](ins[1])
-	if err != nil {
-		return err
-	}
-	y, err := data[T](ins[2])
-	if err != nil {
-		return err
-	}
-	switch ins[0].DType() {
-	case backend.Float32:
-		c, _ := data[float32](ins[0])
-		return where(ctx, b, k, out, c, x, y)
-	case backend.Int32:
-		c, _ := data[int32](ins[0])
-		return where(ctx, b, k, out, c, x, y)
-	default:
-		return backend.ErrDType
 	}
 }

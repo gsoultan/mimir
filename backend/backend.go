@@ -117,6 +117,23 @@ type Attrs struct {
 	// Unfold, Fold: the window size, step and spacing of its elements in
 	// each windowed dimension.
 	Kernel, Stride, Dilation []int
+
+	// Fused: the program; its last instruction computes the output.
+	Program []Instr
+}
+
+// Instr is one instruction of a fused program. Instruction i computes
+// value i, one element per index of the kernel's output, from the values
+// of earlier instructions. Values have the shape of the output, so
+// elementwise ops apply to them index by index.
+type Instr struct {
+	// Op is OpLoad, which reads input Args[0] of the kernel, OpConst,
+	// whose every element is Value, or an elementwise op (unary, binary,
+	// OpCast or OpWhere) applied to the values Args.
+	Op    Op
+	DType DType // element type of the value
+	Args  []int
+	Value float64
 }
 
 // NumElements returns the number of elements in shape. It reports false if
