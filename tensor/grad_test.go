@@ -272,8 +272,10 @@ func TestBackwardErrors(t *testing.T) {
 	}
 
 	bad := tensor.Func{
-		Forward:  func(in []*tensor.Tensor) *tensor.Tensor { return in[0].Sum() },
-		Backward: func(g *tensor.Tensor, _ []*tensor.Tensor, _ *tensor.Tensor) []*tensor.Tensor { return []*tensor.Tensor{g} },
+		Forward: func(in []*tensor.Tensor) *tensor.Tensor { return in[0].Sum() },
+		Backward: func(g *tensor.Tensor, _ []*tensor.Tensor, _ *tensor.Tensor) []*tensor.Tensor {
+			return []*tensor.Tensor{g}
+		},
 	}
 	if err := bad.Apply(w).Backward(ctx); !errors.Is(err, tensor.ErrShape) {
 		t.Errorf("gradient of the wrong shape: %v, want ErrShape", err)
