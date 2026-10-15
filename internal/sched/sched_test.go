@@ -41,14 +41,14 @@ func (c *counting) Free(b backend.Buffer) {
 	c.mu.Unlock()
 }
 
-func (c *counting) Run(ctx context.Context, k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) error {
+func (c *counting) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
 	c.mu.Lock()
 	c.ops = append(c.ops, k.Op)
 	c.mu.Unlock()
 	if k.Op == c.failOn {
 		return backend.ErrIndex
 	}
-	return c.Backend.Run(ctx, k, out, ins)
+	return c.Backend.Run(ctx, k, outs, ins)
 }
 
 // held returns the number of elements allocated and not in the pool.
@@ -318,5 +318,145 @@ func TestTransposedProductsAreComputedTransposed(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Error("transposed product differs from the product transposed")
+	}
+}
+
+// floats downloads n's elements.
+func floats(t *testing.T, be backend.Backend, n *graph.Node) []float32 {
+	t.Helper()
+	b := make([]byte, 4*n.Size())
+	if err := Download(t.Context(), be, n, b); err != nil {
+		t.Fatal(err)
+	}
+	f := make([]float32, n.Size())
+	for i := range f {
+		f[i] = float32frombytes(b[4*i:])
+	}
+	return f
+}
+
+// realized returns n random values, computed.
+func realized(t *testing.T, be backend.Backend, shape []int, seed uint64) *graph.Node {
+	t.Helper()
+	n := must(graph.Rand(shape, seed, false))
+	if err := Realize(t.Context(), be, n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestRealizeIntoWritesOverTheDestinations(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	const n = 3000
+	x, m, g := realized(t, be, []int{n}, 1), realized(t, be, []int{n}, 2), realized(t, be, []int{n}, 3)
+	xs, ms, gs := floats(t, be, x), floats(t, be, m), floats(t, be, g)
+	bin := func(op backend.Op, a, b *graph.Node) *graph.Node { return must(graph.Binary(op, a, b)) }
+	// The new x reads the old m after the new m is written over it.
+	nextM := bin(backend.OpAdd, m, g)
+	nextX := bin(backend.OpAdd, nextM, bin(backend.OpMul, x, m))
+	xbuf, mbuf := x.Buf(), m.Buf()
+	allocs := be.allocs
+	be.ops = nil
+	if err := RealizeInto(t.Context(), be, []*graph.Node{nextX, nextM}, []*graph.Node{x, m}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpFused}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	if be.allocs != allocs {
+		t.Errorf("%d buffers allocated, want none", be.allocs-allocs)
+	}
+	if nextX.Buf() != xbuf || nextM.Buf() != mbuf {
+		t.Error("results not written over their destinations")
+	}
+	gotX, gotM := floats(t, be, nextX), floats(t, be, nextM)
+	for i := range n {
+		wm := ms[i] + gs[i]
+		if wx := wm + xs[i]*ms[i]; gotX[i] != wx || gotM[i] != wm {
+			t.Fatalf("element %d = %v, %v, want %v, %v", i, gotX[i], gotM[i], wx, wm)
+		}
+	}
+	for _, old := range []*graph.Node{x, m} {
+		if err := Download(t.Context(), be, old, make([]byte, 4*n)); !errors.Is(err, graph.ErrOverwritten) {
+			t.Errorf("reading an overwritten value: got %v, want ErrOverwritten", err)
+		}
+		if err := Realize(t.Context(), be, must(graph.Unary(backend.OpNeg, old))); !errors.Is(err, graph.ErrOverwritten) {
+			t.Errorf("computing from an overwritten value: got %v, want ErrOverwritten", err)
+		}
+	}
+}
+
+func TestRealizeIntoKeepsValuesReadAfterTheWrite(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{8, 8}, 1)
+	xs := floats(t, be, x)
+	y := must(graph.Unary(backend.OpNeg, x))
+	// The product reads x after y is computed, so y cannot go over x.
+	p := must(graph.MatMul(y, x))
+	xbuf := x.Buf()
+	if err := RealizeInto(t.Context(), be, []*graph.Node{y, p}, []*graph.Node{x, nil}); err != nil {
+		t.Fatal(err)
+	}
+	if y.Buf() == xbuf {
+		t.Error("y written over x, which the product reads after")
+	}
+	ps := floats(t, be, p)
+	for i := range 8 {
+		for j := range 8 {
+			var want float32
+			for k := range 8 {
+				want += -xs[i*8+k] * xs[k*8+j]
+			}
+			if d := ps[i*8+j] - want; d > 1e-5 || d < -1e-5 {
+				t.Fatalf("product element %d,%d = %v, want %v", i, j, ps[i*8+j], want)
+			}
+		}
+	}
+	if !x.Stale() {
+		t.Error("destination still readable after its target was computed elsewhere")
+	}
+}
+
+func TestRealizeIntoLeavesSharedMemoryAlone(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4, 6}, 1)
+	// A transposed view is not the destination's own layout, and a target
+	// that is a view of the destination keeps reading its memory.
+	view := must(graph.Permute(x, []int{1, 0}))
+	if err := Realize(t.Context(), be, view); err != nil {
+		t.Fatal(err)
+	}
+	y := must(graph.Unary(backend.OpNeg, x))
+	if err := RealizeInto(t.Context(), be, []*graph.Node{must(graph.Unary(backend.OpNeg, view))}, []*graph.Node{view}); err != nil {
+		t.Fatal(err)
+	}
+	if !x.Stale() {
+		t.Error("memory of a consumed view still readable")
+	}
+	if err := Realize(t.Context(), be, y); !errors.Is(err, graph.ErrOverwritten) {
+		t.Errorf("got %v, want ErrOverwritten", err)
+	}
+
+	z := realized(t, be, []int{5}, 2)
+	same := must(graph.Reshape(z, []int{5}))
+	if err := RealizeInto(t.Context(), be, []*graph.Node{same}, []*graph.Node{z}); err != nil {
+		t.Fatal(err)
+	}
+	if z.Stale() || same.Stale() {
+		t.Error("a target sharing its destination's memory made it stale")
+	}
+}
+
+func TestRealizeIntoStopsOnlyBeforeWriting(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{10}, 1)
+	y := must(graph.Unary(backend.OpNeg, x))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := RealizeInto(ctx, be, []*graph.Node{y}, []*graph.Node{x}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if x.Stale() || y.Realized() {
+		t.Error("a cancelled schedule changed nodes")
 	}
 }

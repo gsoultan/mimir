@@ -201,6 +201,18 @@ func (t *Tensor) Cast(dt DType) *Tensor {
 	return wrap(graph.Cast(t.node, dt)) // to or from Int32, which has no gradients
 }
 
+// Clone returns a copy of t in memory of its own, like torch.Tensor.clone.
+// Computing the copy reads t, so realize it before writing over t's memory
+// (see RealizeInto) to keep t's values. Gradients flow through it
+// unchanged.
+func (t *Tensor) Clone() *Tensor {
+	if err := firstErr(t); err != nil {
+		return fail(err)
+	}
+	out := wrap(graph.Cast(t.node, t.node.DType))
+	return track(out, func(g *Tensor) []*Tensor { return grads(g) }, t)
+}
+
 // Neg returns -t.
 func (t *Tensor) Neg() *Tensor { return t.unary(backend.OpNeg) }
 

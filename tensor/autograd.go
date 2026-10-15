@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+
+	"github.com/gsoultan/mimir/internal/sched"
 )
 
 // ErrNoGrad reports a Backward with nothing to differentiate: the tensor
@@ -35,6 +37,7 @@ type tape struct {
 
 	leaf     bool
 	grad     *Tensor // accumulated gradient of a leaf
+	own      bool    // grad's memory is the tape's to reuse
 	released bool    // Backward has run through this node
 }
 
@@ -110,14 +113,19 @@ func (t *Tensor) Grad() *Tensor {
 	return t.tape.grad
 }
 
-// ZeroGrad discards t's accumulated gradient.
+// ZeroGrad discards t's accumulated gradient. The next Backward computes
+// the new gradient into the old one's memory, so the old gradient, if
+// kept, is stale: reading it returns ErrOverwritten.
 func (t *Tensor) ZeroGrad() {
 	if firstErr(t) != nil || t.tape == nil || !t.tape.leaf {
 		return
 	}
 	gradMu.Lock()
 	defer gradMu.Unlock()
-	t.tape.grad = nil
+	if g := t.tape.grad; g != nil && t.tape.own {
+		sched.Release(device, g.node)
+	}
+	t.tape.grad, t.tape.own = nil, false
 }
 
 // Backward computes the gradient of t, which has one element, with respect
@@ -127,7 +135,11 @@ func (t *Tensor) ZeroGrad() {
 // Backward computes t itself in the same schedule, so work shared by the
 // forward and backward passes runs once: call Backward before reading t.
 // On success the graph between t and its leaves is released, and a later
-// Backward through it returns ErrNoGrad. On error no gradient changes.
+// Backward through it returns ErrNoGrad. A gradient that Backward adds to
+// is updated in place, so a gradient read from Grad before it is stale
+// after it (see RealizeInto). If Backward fails before it starts updating
+// gradients no gradient changes; cancelling ctx after that does not stop
+// it.
 func (t *Tensor) Backward(ctx context.Context) error {
 	if err := firstErr(t); err != nil {
 		return err
@@ -181,20 +193,32 @@ func (t *Tensor) Backward(ctx context.Context) error {
 		}
 	}
 
+	// The sums go over the memory of the gradients they add to, where
+	// that memory is the tapes' own. A sum that Backward computes, rather
+	// than one that is already realized, is in memory of its own.
 	sums := make([]*Tensor, len(leaves))
+	own := make([]bool, len(leaves))
 	targets := append(make([]*Tensor, 0, 1+len(leaves)+len(effects)), t)
+	dsts := make([]*Tensor, 1, cap(targets))
 	for i, l := range leaves {
 		sums[i] = acc[l]
+		var dst *Tensor
 		if l.grad != nil {
 			sums[i] = l.grad.Add(sums[i])
+			if l.own {
+				dst = l.grad
+			}
 		}
-		targets = append(targets, sums[i])
+		own[i] = !sums[i].node.Realized()
+		targets, dsts = append(targets, sums[i]), append(dsts, dst)
 	}
-	if err := Realize(ctx, append(targets, effects...)...); err != nil {
+	targets = append(targets, effects...)
+	dsts = append(dsts, make([]*Tensor, len(effects))...)
+	if err := RealizeInto(ctx, dsts, targets); err != nil {
 		return err
 	}
 	for i, l := range leaves {
-		l.grad = sums[i]
+		l.grad, l.own = sums[i], own[i]
 	}
 	for _, n := range order {
 		if !n.leaf {
@@ -286,17 +310,19 @@ func (f Func) Apply(in ...*Tensor) *Tensor {
 
 // Param is a trainable tensor: a value that an optimizer replaces between
 // steps, and the gradient that Backward accumulates for it. Computations
-// use Value; the tensors they build keep the value they were built with,
-// even after Set replaces it. A Param is safe for concurrent use.
+// use Value. Set replaces the value, and the tensors built before keep the
+// value they were built with; an optimizer step instead writes the new
+// value over the old one's memory, after which the old value is stale (see
+// RealizeInto). A Param is safe for concurrent use.
 type Param struct {
 	mu        sync.Mutex
 	value     *Tensor
 	trainable bool
 }
 
-// NewParam returns a trainable parameter holding init's values. It
-// computes init now, so the parameter holds memory rather than a recipe.
-// If that fails, Value carries the error.
+// NewParam returns a trainable parameter holding a copy of init's values.
+// It computes them now, so the parameter holds memory of its own rather
+// than a recipe. If that fails, Value carries the error.
 func NewParam(init *Tensor) *Param { return newParam(init, true) }
 
 // NewBuffer returns a parameter that is saved and restored with a model
@@ -305,7 +331,7 @@ func NewParam(init *Tensor) *Param { return newParam(init, true) }
 func NewBuffer(init *Tensor) *Param { return newParam(init, false) }
 
 func newParam(init *Tensor, trainable bool) *Param {
-	v := init.Detach()
+	v := init.Detach().Clone()
 	if v.err == nil {
 		if err := v.Realize(context.Background()); err != nil {
 			v = fail(err)
@@ -336,7 +362,8 @@ func (p *Param) ZeroGrad() { p.Value().ZeroGrad() }
 // Set replaces the value with v, which must have the same shape and dtype.
 // The accumulated gradient is kept. Optimizers compute v first, so the
 // parameter never holds a growing recipe; a lazy v is allowed for buffers
-// updated with WithEffects.
+// updated with WithEffects. The parameter takes over v's memory, which
+// optimizer steps write over, so pass v.Clone() to keep using v.
 func (p *Param) Set(v *Tensor) error {
 	if err := firstErr(v); err != nil {
 		return err

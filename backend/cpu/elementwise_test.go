@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"testing"
 
 	"github.com/gsoultan/mimir/backend"
@@ -287,5 +288,111 @@ func TestFusedIntegerModByZeroIsAnError(t *testing.T) {
 	k := &backend.Kernel{Op: backend.OpFused, DType: backend.Int32, Shape: []int{3}, In: []backend.View{backend.Contiguous([]int{3})}, Attrs: backend.Attrs{Program: prog}}
 	if _, err := run[int32](t, k, i32buf(1, 2, 3)); !errors.Is(err, backend.ErrDivideByZero) {
 		t.Fatalf("got %v, want ErrDivideByZero", err)
+	}
+}
+
+func TestFusedProgramsUpdateTheirInputsInPlace(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	shape := []int{3, 1500}
+	size, _ := backend.NumElements(shape)
+	dtypes := []backend.DType{backend.Float32, backend.Float32, backend.Float32, backend.Int32}
+	for trial := range 60 {
+		prog := randomProgram(rng, dtypes, 6+trial%10, backend.Float32)
+		var stores []int
+		for j := len(prog) - 2; j >= 0 && len(stores) < 2; j-- {
+			if prog[j].DType == backend.Float32 && rng.IntN(3) == 0 {
+				stores = append(stores, j)
+			}
+		}
+		in := make([]backend.View, len(dtypes))
+		bufs := make([]backend.Buffer, len(dtypes))
+		elems := make([][]refScalar, len(dtypes))
+		for i, dt := range dtypes {
+			in[i] = backend.Contiguous(shape)
+			f := make([]float32, size)
+			n := make([]int32, size)
+			elems[i] = make([]refScalar, size)
+			for j := range f {
+				f[j] = float32(rng.IntN(13)-6) / 2
+				n[j] = int32(rng.IntN(9) - 4)
+				elems[i][j] = refScalar{f[j], n[j]}
+			}
+			bufs[i] = f32buf(f...)
+			if dt == backend.Int32 {
+				bufs[i] = i32buf(n...)
+			}
+		}
+		want := make([][]refScalar, 1+len(stores))
+		for o := range want {
+			want[o] = make([]refScalar, size)
+		}
+		vals := make([]refScalar, len(prog))
+		inputs := make([]refScalar, len(elems))
+		for e := range size {
+			for i := range elems {
+				inputs[i] = elems[i][e]
+			}
+			for j, instr := range prog {
+				vals[j] = refEval(instr, prog, vals, inputs)
+			}
+			want[0][e] = vals[len(prog)-1]
+			for i, j := range stores {
+				want[i+1][e] = vals[j]
+			}
+		}
+		// Each output goes over a different float input, or into a new buffer.
+		b := New()
+		b.workers = 1 + trial%3
+		outs := make([]backend.Buffer, 1+len(stores))
+		for o, i := range rng.Perm(4)[:len(outs)] {
+			if i < 3 {
+				outs[o] = bufs[i]
+				continue
+			}
+			var err error
+			if outs[o], err = b.Alloc(backend.Float32, size); err != nil {
+				t.Fatal(err)
+			}
+		}
+		k := &backend.Kernel{Op: backend.OpFused, DType: backend.Float32, Shape: shape, In: in, Attrs: backend.Attrs{Program: prog, Stores: stores}}
+		if err := b.Run(t.Context(), k, outs, bufs); err != nil {
+			t.Fatal(err)
+		}
+		for o, out := range outs {
+			got, _ := data[float32](out)
+			for e, w := range want[o] {
+				if g := got[e]; math.Float32bits(g) != math.Float32bits(w.f) && !(g != g && w.f != w.f) {
+					t.Fatalf("trial %d: output %d element %d = %v, want %v\nprogram %v, stores %v", trial, o, e, g, w.f, prog, stores)
+				}
+			}
+		}
+	}
+}
+
+func TestOnlyElementwiseKernelsUpdateInputsInPlace(t *testing.T) {
+	b := New()
+	x := f32buf(1, 2, 3, 4)
+	square := backend.Contiguous([]int{2, 2})
+	for name, k := range map[string]*backend.Kernel{
+		"product":    {Op: backend.OpMatMul, DType: backend.Float32, Shape: []int{2, 2}, In: []backend.View{square, square}},
+		"transposed": {Op: backend.OpNeg, DType: backend.Float32, Shape: []int{2, 2}, In: []backend.View{square.Permute([]int{1, 0})}},
+		"reduction":  {Op: backend.OpReduceSum, DType: backend.Float32, Shape: []int{2, 1}, In: []backend.View{square}, Attrs: backend.Attrs{Axes: []int{1}}},
+	} {
+		ins := []backend.Buffer{x, x}[:len(k.In)]
+		out := x
+		if k.Op == backend.OpReduceSum {
+			out = f32buf(0, 0)
+			ins = []backend.Buffer{out}
+		}
+		if err := b.Run(t.Context(), k, []backend.Buffer{out}, ins); !errors.Is(err, backend.ErrInternal) {
+			t.Errorf("%s: got %v, want ErrInternal", name, err)
+		}
+	}
+	neg := &backend.Kernel{Op: backend.OpNeg, DType: backend.Float32, Shape: []int{2, 2}, In: []backend.View{square}}
+	if err := b.Run(t.Context(), neg, []backend.Buffer{x}, []backend.Buffer{x}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := data[float32](x); !slices.Equal(got, []float32{-1, -2, -3, -4}) {
+		t.Errorf("negated in place: %v", got)
 	}
 }

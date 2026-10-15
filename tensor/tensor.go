@@ -68,6 +68,10 @@ var (
 	ErrOutOfMemory  = backend.ErrOutOfMemory
 	ErrInternal     = backend.ErrInternal
 	ErrNilTensor    = errors.New("nil tensor")
+	// ErrOverwritten reports a tensor whose memory now holds other values,
+	// such as a parameter's value from before an optimizer step (see
+	// RealizeInto).
+	ErrOverwritten = graph.ErrOverwritten
 )
 
 // device runs every tensor. Milestone 1 ships the CPU backend only.
@@ -264,6 +268,49 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 		nodes[i] = t.node
 	}
 	return sched.Realize(ctx, device, nodes...)
+}
+
+// RealizeInto computes every tensor of srcs in one schedule, like Realize,
+// and writes srcs[i] over the memory of dsts[i] where it can instead of
+// into new memory, as an optimizer writes a parameter's new value over the
+// old one. dsts[i] must have the shape and dtype of srcs[i], or be nil.
+//
+// The caller must be done with every dsts[i]: afterwards it is stale, and
+// so is every tensor that shares its memory, such as a view of it realized
+// earlier, unless srcs[i] does too. Reading a stale tensor, or computing a
+// tensor built from one, returns ErrOverwritten. Whether the memory is
+// reused depends on how srcs[i] is computed, but dsts[i] is stale either
+// way. Memory is reused when dsts[i] was computed into memory of its own
+// and nothing in the schedule reads its values after srcs[i] is written;
+// srcs[i] may itself be computed from them elementwise.
+//
+// Cancelling ctx stops the schedule only before it starts writing over
+// any dsts[i]. On error no srcs[i] is computed, and a dsts[i] whose memory
+// was being written over is stale.
+func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
+	if len(dsts) != len(srcs) {
+		return fmt.Errorf("tensor: RealizeInto: %d destinations for %d tensors: %w", len(dsts), len(srcs), ErrShape)
+	}
+	if err := firstErr(srcs...); err != nil {
+		return err
+	}
+	targets := make([]*graph.Node, len(srcs))
+	into := make([]*graph.Node, len(srcs))
+	for i, src := range srcs {
+		targets[i] = src.node
+		d := dsts[i]
+		if d == nil {
+			continue
+		}
+		if err := firstErr(d); err != nil {
+			return err
+		}
+		if !slices.Equal(d.node.Shape, src.node.Shape) || d.node.DType != src.node.DType {
+			return fmt.Errorf("tensor: RealizeInto: %s%v into %s%v: %w", src.node.DType, src.node.Shape, d.node.DType, d.node.Shape, ErrShape)
+		}
+		into[i] = d.node
+	}
+	return sched.RealizeInto(ctx, device, targets, into)
 }
 
 // Data computes t and returns its elements in row-major order. T must match

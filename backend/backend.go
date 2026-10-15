@@ -89,9 +89,16 @@ type Backend interface {
 	// equal the buffer size in bytes.
 	Download(ctx context.Context, dst []byte, src Buffer) error
 	// Run executes k, reading ins through k.In views and writing a
-	// contiguous result of k.Shape into out, which holds k.OutputLen()
-	// elements.
-	Run(ctx context.Context, k *Kernel, out Buffer, ins []Buffer) error
+	// contiguous result of k.Shape into outs[0], and the values k stores
+	// into the rest of outs. Each output holds exactly the elements of
+	// k.Shape.
+	//
+	// An elementwise kernel (OpFused, a unary or binary op, OpCast,
+	// OpWhere or OpContiguous) may write an output over an input it reads
+	// through Contiguous(k.Shape): it reads every element of that input
+	// before it writes any element of that output, as an in-place update
+	// needs. No other kernel shares memory between its inputs and outputs.
+	Run(ctx context.Context, k *Kernel, outs []Buffer, ins []Buffer) error
 	// Sync waits until all submitted work has finished.
 	Sync(ctx context.Context) error
 }
@@ -121,22 +128,9 @@ type Attrs struct {
 
 	// Fused: the program; its last instruction computes the output.
 	Program []Instr
-	// Fused: instructions whose values the kernel also writes, after its
-	// result: value Stores[i] fills elements [(i+1)·N, (i+2)·N) of the
-	// output buffer, where N is the size of the kernel's shape. Stored
-	// values have the output's dtype.
+	// Fused: instructions whose values the kernel also writes, value
+	// Stores[i] into output i+1. Stored values have the output's dtype.
 	Stores []int
-}
-
-// OutputLen returns the number of elements k writes: the size of its
-// shape, once more for each stored value. It reports false if that
-// overflows int.
-func (k *Kernel) OutputLen() (int, bool) {
-	n, ok := NumElements(k.Shape)
-	if !ok || (n != 0 && len(k.Attrs.Stores) >= maxInt/n) {
-		return 0, false
-	}
-	return n * (1 + len(k.Attrs.Stores)), true
 }
 
 // Instr is one instruction of a fused program. Instruction i computes

@@ -34,8 +34,9 @@ import (
 
 // plan lists the kernels that compute a schedule's targets.
 type plan struct {
-	order []*graph.Node         // nodes computed by kernels, inputs first
-	work  map[*graph.Node]*work // how each is computed
+	order  []*graph.Node               // nodes computed by kernels, inputs first
+	work   map[*graph.Node]*work       // how each is computed
+	storer map[*graph.Node]*graph.Node // the node whose kernel writes each stored target
 }
 
 // work is how a planned node is computed.
@@ -89,7 +90,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
 	}
 	member := func(n *graph.Node) bool { return inner(n) || stored(n) }
 
-	p := &plan{work: make(map[*graph.Node]*work, len(order))}
+	p := &plan{work: make(map[*graph.Node]*work, len(order)), storer: map[*graph.Node]*graph.Node{}}
 	for _, n := range order {
 		switch {
 		case member(n):
@@ -102,6 +103,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool) *plan {
 			for j, x := range nodes {
 				if x != n && stored(x) {
 					w.stores = append(w.stores, store{x, j})
+					p.storer[x] = n
 				}
 			}
 			for i, x := range ins {
