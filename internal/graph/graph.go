@@ -1,0 +1,302 @@
+// Package graph is mimir's lazy intermediate representation: a DAG of
+// primitive operations whose shapes and dtypes are checked when each node is
+// built, so errors surface at the line that caused them even though nothing
+// runs until the graph is realized.
+package graph
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/gsoultan/mimir/backend"
+)
+
+// Node is one primitive operation. Op, DType, Shape and Attrs never change
+// after construction. Buf, View and Inputs are owned by the scheduler: once a
+// node is realized it holds its result and drops its inputs, so a realized
+// tensor does not keep the graph that produced it alive.
+type Node struct {
+	Op     backend.Op
+	DType  backend.DType
+	Shape  []int
+	Attrs  backend.Attrs
+	Inputs []*Node
+
+	Buf  backend.Buffer // set once realized
+	View backend.View   // how Shape is read from Buf
+}
+
+// Realized reports whether the node holds its result.
+func (n *Node) Realized() bool { return n.Buf != nil }
+
+// Size returns the number of elements.
+func (n *Node) Size() int {
+	s, _ := backend.NumElements(n.Shape)
+	return s
+}
+
+func errorf(op backend.Op, kind error, format string, args ...any) error {
+	return fmt.Errorf("%s: %s: %w", op, fmt.Sprintf(format, args...), kind)
+}
+
+func checkShape(op backend.Op, shape []int) error {
+	if _, ok := backend.NumElements(shape); !ok {
+		return errorf(op, backend.ErrShape, "invalid shape %v", shape)
+	}
+	return nil
+}
+
+func checkDType(op backend.Op, dt backend.DType) error {
+	if dt.Size() == 0 {
+		return errorf(op, backend.ErrDType, "%s", dt)
+	}
+	return nil
+}
+
+// Load wraps a buffer that already holds data of the given shape.
+func Load(buf backend.Buffer, shape []int) (*Node, error) {
+	if err := checkShape(backend.OpLoad, shape); err != nil {
+		return nil, err
+	}
+	if n, _ := backend.NumElements(shape); buf.Len() != n {
+		return nil, errorf(backend.OpLoad, backend.ErrShape, "%d elements for shape %v", buf.Len(), shape)
+	}
+	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Buf: buf, View: backend.Contiguous(shape)}, nil
+}
+
+// Const is a tensor whose elements all equal value. It costs one element of
+// memory however large its shape.
+func Const(dt backend.DType, shape []int, value float64) (*Node, error) {
+	if err := checkDType(backend.OpConst, dt); err != nil {
+		return nil, err
+	}
+	if err := checkShape(backend.OpConst, shape); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpConst, DType: dt, Shape: slices.Clone(shape), Attrs: backend.Attrs{Value: value}}, nil
+}
+
+// Rand is a Float32 tensor of uniform [0, 1) or standard normal values
+// determined by seed.
+func Rand(shape []int, seed uint64, normal bool) (*Node, error) {
+	op := backend.OpRandUniform
+	if normal {
+		op = backend.OpRandNormal
+	}
+	if err := checkShape(op, shape); err != nil {
+		return nil, err
+	}
+	return &Node{Op: op, DType: backend.Float32, Shape: slices.Clone(shape), Attrs: backend.Attrs{Seed: seed}}, nil
+}
+
+// Unary applies an elementwise op. Exp2, Log2, Sin, Sqrt and Recip accept
+// only Float32.
+func Unary(op backend.Op, x *Node) (*Node, error) {
+	if !op.IsUnary() || op == backend.OpCast {
+		return nil, errorf(op, backend.ErrInternal, "not a unary op")
+	}
+	if op != backend.OpNeg && !x.DType.IsFloat() {
+		return nil, errorf(op, backend.ErrDType, "%s input", x.DType)
+	}
+	return &Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}}, nil
+}
+
+// Cast converts x to dt. Float to integer truncates toward zero.
+func Cast(x *Node, dt backend.DType) (*Node, error) {
+	if err := checkDType(backend.OpCast, dt); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpCast, DType: dt, Shape: x.Shape, Inputs: []*Node{x}}, nil
+}
+
+// Binary applies an elementwise op to two inputs of the same shape and dtype.
+func Binary(op backend.Op, x, y *Node) (*Node, error) {
+	if !op.IsBinary() {
+		return nil, errorf(op, backend.ErrInternal, "not a binary op")
+	}
+	if !slices.Equal(x.Shape, y.Shape) {
+		return nil, errorf(op, backend.ErrShape, "%v and %v", x.Shape, y.Shape)
+	}
+	if x.DType != y.DType {
+		return nil, errorf(op, backend.ErrDType, "%s and %s", x.DType, y.DType)
+	}
+	return &Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, y}}, nil
+}
+
+// Where selects x where cond is non-zero and y elsewhere. All three share a
+// shape; x and y share a dtype.
+func Where(cond, x, y *Node) (*Node, error) {
+	if !slices.Equal(cond.Shape, x.Shape) || !slices.Equal(x.Shape, y.Shape) {
+		return nil, errorf(backend.OpWhere, backend.ErrShape, "%v, %v and %v", cond.Shape, x.Shape, y.Shape)
+	}
+	if x.DType != y.DType {
+		return nil, errorf(backend.OpWhere, backend.ErrDType, "%s and %s", x.DType, y.DType)
+	}
+	return &Node{Op: backend.OpWhere, DType: x.DType, Shape: x.Shape, Inputs: []*Node{cond, x, y}}, nil
+}
+
+// Reduce reduces x over axes, keeping them with size 1. Axes must be valid,
+// distinct and sorted. ReduceMax rejects empty axes, which have no maximum.
+func Reduce(op backend.Op, x *Node, axes []int) (*Node, error) {
+	if !op.IsReduce() {
+		return nil, errorf(op, backend.ErrInternal, "not a reduction")
+	}
+	shape := slices.Clone(x.Shape)
+	for i, a := range axes {
+		if a < 0 || a >= len(shape) || (i > 0 && a <= axes[i-1]) {
+			return nil, errorf(op, backend.ErrShape, "axes %v for shape %v", axes, x.Shape)
+		}
+		if op == backend.OpReduceMax && shape[a] == 0 {
+			return nil, errorf(op, backend.ErrShape, "empty axis %d of %v", a, x.Shape)
+		}
+		shape[a] = 1
+	}
+	return &Node{Op: op, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}}, nil
+}
+
+// Reshape gives x a new shape with the same number of elements.
+func Reshape(x *Node, shape []int) (*Node, error) {
+	if err := checkShape(backend.OpReshape, shape); err != nil {
+		return nil, err
+	}
+	if n, _ := backend.NumElements(shape); n != x.Size() {
+		return nil, errorf(backend.OpReshape, backend.ErrShape, "%v to %v", x.Shape, shape)
+	}
+	return &Node{Op: backend.OpReshape, DType: x.DType, Shape: slices.Clone(shape), Inputs: []*Node{x}}, nil
+}
+
+// Permute reorders dimensions: output dimension i is input dimension perm[i].
+func Permute(x *Node, perm []int) (*Node, error) {
+	if len(perm) != len(x.Shape) {
+		return nil, errorf(backend.OpPermute, backend.ErrShape, "permutation %v for shape %v", perm, x.Shape)
+	}
+	seen := make([]bool, len(perm))
+	shape := make([]int, len(perm))
+	for i, p := range perm {
+		if p < 0 || p >= len(perm) || seen[p] {
+			return nil, errorf(backend.OpPermute, backend.ErrShape, "permutation %v for shape %v", perm, x.Shape)
+		}
+		seen[p] = true
+		shape[i] = x.Shape[p]
+	}
+	return &Node{Op: backend.OpPermute, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(perm)}}, nil
+}
+
+// Expand broadcasts size-1 dimensions of x to shape, which has the same rank.
+func Expand(x *Node, shape []int) (*Node, error) {
+	if err := checkShape(backend.OpExpand, shape); err != nil {
+		return nil, err
+	}
+	if len(shape) != len(x.Shape) {
+		return nil, errorf(backend.OpExpand, backend.ErrShape, "%v to %v", x.Shape, shape)
+	}
+	for i, d := range shape {
+		if x.Shape[i] != d && x.Shape[i] != 1 {
+			return nil, errorf(backend.OpExpand, backend.ErrShape, "%v to %v", x.Shape, shape)
+		}
+	}
+	return &Node{Op: backend.OpExpand, DType: x.DType, Shape: slices.Clone(shape), Inputs: []*Node{x}}, nil
+}
+
+// Pad adds pads[d][0] elements before and pads[d][1] after dimension d,
+// filled with value.
+func Pad(x *Node, pads [][2]int, value float64) (*Node, error) {
+	if len(pads) != len(x.Shape) {
+		return nil, errorf(backend.OpPad, backend.ErrShape, "pads %v for shape %v", pads, x.Shape)
+	}
+	shape := make([]int, len(pads))
+	for i, p := range pads {
+		if p[0] < 0 || p[1] < 0 {
+			return nil, errorf(backend.OpPad, backend.ErrShape, "negative pad %v", p)
+		}
+		shape[i] = x.Shape[i] + p[0] + p[1]
+	}
+	if err := checkShape(backend.OpPad, shape); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpPad, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Pads: slices.Clone(pads), Value: value}}, nil
+}
+
+// Shrink keeps the half-open range [r[0], r[1]) of each dimension.
+func Shrink(x *Node, ranges [][2]int) (*Node, error) {
+	if len(ranges) != len(x.Shape) {
+		return nil, errorf(backend.OpShrink, backend.ErrShape, "ranges %v for shape %v", ranges, x.Shape)
+	}
+	shape := make([]int, len(ranges))
+	for i, r := range ranges {
+		if r[0] < 0 || r[0] > r[1] || r[1] > x.Shape[i] {
+			return nil, errorf(backend.OpShrink, backend.ErrShape, "range %v for dimension %d of %v", r, i, x.Shape)
+		}
+		shape[i] = r[1] - r[0]
+	}
+	return &Node{Op: backend.OpShrink, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Ranges: slices.Clone(ranges)}}, nil
+}
+
+// Flip reverses x along distinct axes.
+func Flip(x *Node, axes []int) (*Node, error) {
+	seen := make([]bool, len(x.Shape))
+	for _, a := range axes {
+		if a < 0 || a >= len(x.Shape) || seen[a] {
+			return nil, errorf(backend.OpFlip, backend.ErrShape, "axes %v for shape %v", axes, x.Shape)
+		}
+		seen[a] = true
+	}
+	return &Node{Op: backend.OpFlip, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}}, nil
+}
+
+// MatMul multiplies [..., M, K] by [..., K, N] with equal batch dimensions.
+func MatMul(x, y *Node) (*Node, error) {
+	r := len(x.Shape)
+	if r < 2 || len(y.Shape) != r || !slices.Equal(x.Shape[:r-2], y.Shape[:r-2]) || x.Shape[r-1] != y.Shape[r-2] {
+		return nil, errorf(backend.OpMatMul, backend.ErrShape, "%v and %v", x.Shape, y.Shape)
+	}
+	if x.DType != y.DType {
+		return nil, errorf(backend.OpMatMul, backend.ErrDType, "%s and %s", x.DType, y.DType)
+	}
+	shape := slices.Concat(x.Shape[:r-1], y.Shape[r-1:])
+	if err := checkShape(backend.OpMatMul, shape); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpMatMul, DType: x.DType, Shape: shape, Inputs: []*Node{x, y}}, nil
+}
+
+// checkIndex validates an Int32 index of the same rank as x that fits x
+// outside axis.
+func checkIndex(op backend.Op, x, idx *Node, axis int) error {
+	if idx.DType != backend.Int32 {
+		return errorf(op, backend.ErrDType, "%s index", idx.DType)
+	}
+	if axis < 0 || axis >= len(x.Shape) || len(idx.Shape) != len(x.Shape) {
+		return errorf(op, backend.ErrShape, "axis %d, index %v for %v", axis, idx.Shape, x.Shape)
+	}
+	for d := range x.Shape {
+		if d != axis && idx.Shape[d] > x.Shape[d] {
+			return errorf(op, backend.ErrShape, "index %v does not fit %v outside axis %d", idx.Shape, x.Shape, axis)
+		}
+	}
+	return nil
+}
+
+// Gather reads x along axis at Int32 positions idx, like torch.gather. The
+// result has the shape of idx. Positions are checked when the graph runs.
+func Gather(x, idx *Node, axis int) (*Node, error) {
+	if err := checkIndex(backend.OpGather, x, idx, axis); err != nil {
+		return nil, err
+	}
+	return &Node{Op: backend.OpGather, DType: x.DType, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}}, nil
+}
+
+// ScatterAdd returns x with src added at Int32 positions idx along axis,
+// like torch.Tensor.scatter_add. idx and src share a shape.
+func ScatterAdd(x, idx, src *Node, axis int) (*Node, error) {
+	if err := checkIndex(backend.OpScatterAdd, x, idx, axis); err != nil {
+		return nil, err
+	}
+	if !slices.Equal(idx.Shape, src.Shape) {
+		return nil, errorf(backend.OpScatterAdd, backend.ErrShape, "index %v and source %v", idx.Shape, src.Shape)
+	}
+	if src.DType != x.DType {
+		return nil, errorf(backend.OpScatterAdd, backend.ErrDType, "%s and %s", x.DType, src.DType)
+	}
+	return &Node{Op: backend.OpScatterAdd, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, idx, src}, Attrs: backend.Attrs{Axis: axis}}, nil
+}

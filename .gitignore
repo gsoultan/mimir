@@ -1,0 +1,9 @@
+# Test and benchmark output
+*.test
+*.out
+*.prof
+bench-*.txt
+
+# Python caches from tools/golden
+__pycache__/
+.venv/

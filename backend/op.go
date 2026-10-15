@@ -1,0 +1,125 @@
+package backend
+
+import "fmt"
+
+// Op is a primitive operation. Every higher-level operation in mimir is
+// composed from these, so autograd, scheduling and every backend only need
+// to handle this set.
+type Op uint8
+
+// Primitive operations. Unless noted, binary operations require inputs of
+// identical shape and dtype; broadcasting is expressed with Expand.
+const (
+	OpInvalid Op = iota
+
+	// Sources.
+	OpLoad        // data uploaded from the host; never run as a kernel
+	OpConst       // every element is Attrs.Value
+	OpRandUniform // uniform [0, 1) from Philox4x32-10 keyed by Attrs.Seed; Float32
+	OpRandNormal  // standard normal via Box-Muller over Philox4x32-10; Float32
+
+	// Unary.
+	OpNeg
+	OpExp2  // Float32 only
+	OpLog2  // Float32 only
+	OpSin   // Float32 only
+	OpSqrt  // Float32 only
+	OpRecip // 1/x; Float32 only
+	OpCast  // convert to Kernel.DType
+
+	// Binary.
+	OpAdd
+	OpMul
+	OpMax   // elementwise maximum; NaN propagates
+	OpCmpLT // a < b as 1 or 0 in the input dtype
+	OpCmpEQ // a == b as 1 or 0 in the input dtype
+	OpMod   // truncated remainder with the sign of a, like C fmod
+
+	// Ternary.
+	OpWhere // In[0] != 0 ? In[1] : In[2]
+
+	// Reductions over Attrs.Axes; reduced axes keep size 1.
+	OpReduceSum
+	OpReduceMax // NaN propagates
+
+	// Movement. All but Pad are views over the input buffer.
+	OpReshape
+	OpPermute // Attrs.Axes is the permutation
+	OpExpand  // broadcast size-1 dimensions
+	OpPad     // Attrs.Pads with Attrs.Value as fill
+	OpShrink  // Attrs.Ranges
+	OpFlip    // Attrs.Axes
+
+	// Contraction: [..., M, K] x [..., K, N] -> [..., M, N] with equal batch dims.
+	OpMatMul
+
+	// Indexing along Attrs.Axis with Int32 indices.
+	OpGather     // out[m] = In[0][m with m[axis] = In[1][m]]
+	OpScatterAdd // out = In[0]; out[m with m[axis] = In[1][m]] += In[2][m]
+
+	// OpContiguous copies a strided view into a contiguous buffer. The
+	// scheduler inserts it; it is not part of the public IR.
+	OpContiguous
+
+	numOps
+)
+
+var opNames = [numOps]string{
+	OpInvalid:     "invalid",
+	OpLoad:        "load",
+	OpConst:       "const",
+	OpRandUniform: "rand_uniform",
+	OpRandNormal:  "rand_normal",
+	OpNeg:         "neg",
+	OpExp2:        "exp2",
+	OpLog2:        "log2",
+	OpSin:         "sin",
+	OpSqrt:        "sqrt",
+	OpRecip:       "recip",
+	OpCast:        "cast",
+	OpAdd:         "add",
+	OpMul:         "mul",
+	OpMax:         "max",
+	OpCmpLT:       "cmplt",
+	OpCmpEQ:       "cmpeq",
+	OpMod:         "mod",
+	OpWhere:       "where",
+	OpReduceSum:   "reduce_sum",
+	OpReduceMax:   "reduce_max",
+	OpReshape:     "reshape",
+	OpPermute:     "permute",
+	OpExpand:      "expand",
+	OpPad:         "pad",
+	OpShrink:      "shrink",
+	OpFlip:        "flip",
+	OpMatMul:      "matmul",
+	OpGather:      "gather",
+	OpScatterAdd:  "scatter_add",
+	OpContiguous:  "contiguous",
+}
+
+func (o Op) String() string {
+	if o < numOps {
+		return opNames[o]
+	}
+	return fmt.Sprintf("Op(%d)", uint8(o))
+}
+
+// IsUnary reports whether o takes one input and applies elementwise.
+func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast }
+
+// IsBinary reports whether o takes two same-shaped inputs elementwise.
+func (o Op) IsBinary() bool { return o >= OpAdd && o <= OpMod }
+
+// IsReduce reports whether o reduces over Attrs.Axes.
+func (o Op) IsReduce() bool { return o == OpReduceSum || o == OpReduceMax }
+
+// IsView reports whether o can be expressed as a strided view of its input.
+func (o Op) IsView() bool {
+	switch o {
+	case OpReshape, OpPermute, OpExpand, OpShrink, OpFlip:
+		return true
+	default:
+		return false
+	}
+}
