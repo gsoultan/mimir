@@ -1,9 +1,9 @@
 // Package sched realizes lazy graphs on a backend.
 //
-// This is the naive milestone-1 scheduler: it runs one kernel per node in
-// dependency order, turns movement ops into views of their input's buffer
-// where the layout allows, and frees every intermediate buffer right after
-// its last use. Kernel fusion comes later; the contract stays the same.
+// The scheduler runs kernels in dependency order: one per node, except
+// that chains of elementwise nodes fuse into one kernel (see newPlan). It
+// turns movement ops into views of their input's buffer where the layout
+// allows, and frees every intermediate buffer right after its last use.
 package sched
 
 import (
@@ -38,11 +38,12 @@ func Download(ctx context.Context, be backend.Backend, n *graph.Node, dst []byte
 	}
 	buf, v := n.Buf, n.View
 	if !v.IsContiguous() || v.Offset != 0 || buf.Len() != n.Size() {
-		tmp, err := run(ctx, be, &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: n.Shape, In: []backend.View{v}}, buf)
+		m := poolOf(be)
+		tmp, err := run(ctx, m, &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: n.Shape, In: []backend.View{v}}, buf)
 		if err != nil {
 			return err
 		}
-		defer be.Free(tmp)
+		defer m.release(tmp)
 		buf = tmp
 	}
 	return be.Download(ctx, dst, buf)
@@ -59,13 +60,16 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 	if len(order) == 0 {
 		return nil
 	}
+	m := poolOf(be)
+	defer m.tick()
 	isTarget := make(map[*graph.Node]bool, len(targets))
 	for _, t := range targets {
 		isTarget[t] = true
 	}
-	uses := make(map[*graph.Node]int, len(order))
-	for _, n := range order {
-		for _, in := range n.Inputs {
+	p := newPlan(order, isTarget)
+	uses := make(map[*graph.Node]int, len(p.order))
+	for _, n := range p.order {
+		for _, in := range p.deps[n] {
 			uses[in]++
 		}
 	}
@@ -90,23 +94,24 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 		if _, owned := refs[r.buf]; owned {
 			if refs[r.buf]--; refs[r.buf] == 0 {
 				delete(refs, r.buf)
-				be.Free(r.buf)
+				m.release(r.buf)
 			}
 		}
 	}
 
-	for _, n := range order {
-		ins := make([]result, len(n.Inputs))
-		for i, in := range n.Inputs {
+	for _, n := range p.order {
+		deps := p.deps[n]
+		ins := make([]result, len(deps))
+		for i, in := range deps {
 			ins[i] = lookup(in)
 		}
-		r, fresh, err := step(ctx, be, n, ins)
+		r, fresh, err := step(ctx, m, n, ins, p.progs[n])
 		if err != nil {
 			for buf := range refs {
-				be.Free(buf)
+				m.release(buf)
 			}
 			if fresh != nil {
-				be.Free(fresh)
+				m.release(fresh)
 			}
 			return err
 		}
@@ -117,7 +122,7 @@ func realize(ctx context.Context, be backend.Backend, targets []*graph.Node) err
 			refs[r.buf]++
 		}
 		results[n] = r
-		for _, in := range n.Inputs {
+		for _, in := range deps {
 			release(in)
 		}
 	}
@@ -166,9 +171,10 @@ func topoSort(targets []*graph.Node) []*graph.Node {
 	return order
 }
 
-// step computes one node. fresh is the buffer it allocated, if any; the
-// result may also be a view of an input's buffer.
-func step(ctx context.Context, be backend.Backend, n *graph.Node, ins []result) (r result, fresh backend.Buffer, err error) {
+// step computes one node, running prog over ins if it has a fused program.
+// fresh is the buffer it allocated, if any; the result may also be a view
+// of an input's buffer.
+func step(ctx context.Context, m *pool, n *graph.Node, ins []result, prog []backend.Instr) (r result, fresh backend.Buffer, err error) {
 	if err := ctx.Err(); err != nil {
 		return result{}, nil, err
 	}
@@ -177,7 +183,7 @@ func step(ctx context.Context, be backend.Backend, n *graph.Node, ins []result) 
 		return result{}, nil, fmt.Errorf("sched: load without data: %w", backend.ErrInternal)
 	case backend.OpConst:
 		// One element, broadcast to the full shape with zero strides.
-		buf, err := run(ctx, be, &backend.Kernel{Op: backend.OpConst, DType: n.DType, Attrs: n.Attrs})
+		buf, err := run(ctx, m, &backend.Kernel{Op: backend.OpConst, DType: n.DType, Attrs: n.Attrs})
 		return result{buf, broadcast(n.Shape)}, buf, err
 	case backend.OpPermute:
 		return result{ins[0].buf, ins[0].view.Permute(n.Attrs.Axes)}, nil, nil
@@ -198,32 +204,35 @@ func step(ctx context.Context, be backend.Backend, n *graph.Node, ins []result) 
 			return result{in.buf, v}, nil, nil
 		}
 		k := &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: in.view.Shape, In: []backend.View{in.view}}
-		buf, err := run(ctx, be, k, in.buf)
+		buf, err := run(ctx, m, k, in.buf)
 		return result{buf, backend.Contiguous(n.Shape)}, buf, err
 	}
 
 	k := &backend.Kernel{Op: n.Op, DType: n.DType, Shape: n.Shape, In: make([]backend.View, len(ins)), Attrs: n.Attrs}
+	if prog != nil {
+		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: prog}
+	}
 	bufs := make([]backend.Buffer, len(ins))
 	for i, in := range ins {
 		k.In[i], bufs[i] = in.view, in.buf
 	}
-	buf, err := run(ctx, be, k, bufs...)
+	buf, err := run(ctx, m, k, bufs...)
 	return result{buf, backend.Contiguous(n.Shape)}, buf, err
 }
 
-// run allocates the output of k and executes it. On error the output is
-// freed and nil is returned.
-func run(ctx context.Context, be backend.Backend, k *backend.Kernel, ins ...backend.Buffer) (backend.Buffer, error) {
+// run takes the output of k from m and executes it. On error the output
+// goes back to m and nil is returned.
+func run(ctx context.Context, m *pool, k *backend.Kernel, ins ...backend.Buffer) (backend.Buffer, error) {
 	n, ok := backend.NumElements(k.Shape)
 	if !ok {
 		return nil, fmt.Errorf("sched: %s: shape %v: %w", k.Op, k.Shape, backend.ErrShape)
 	}
-	out, err := be.Alloc(k.DType, n)
+	out, err := m.alloc(k.DType, n)
 	if err != nil {
 		return nil, err
 	}
-	if err := be.Run(ctx, k, out, ins); err != nil {
-		be.Free(out)
+	if err := m.be.Run(ctx, k, out, ins); err != nil {
+		m.release(out)
 		return nil, err
 	}
 	return out, nil
