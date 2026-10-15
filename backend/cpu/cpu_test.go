@@ -264,3 +264,78 @@ func TestAllocTooLargeIsAnError(t *testing.T) {
 		t.Fatalf("got %v, want ErrOutOfMemory", err)
 	}
 }
+
+func TestCoalesceKeepsElementOrder(t *testing.T) {
+	tests := map[string]struct {
+		shape    []int
+		views    []backend.View
+		wantRank int
+	}{
+		"contiguous": {[]int{2, 3, 4}, []backend.View{backend.Contiguous([]int{2, 3, 4})}, 1},
+		"broadcast row": {[]int{2, 3, 4}, []backend.View{
+			{Shape: []int{2, 3, 4}, Strides: []int{0, 4, 1}, Offset: 5},
+			backend.Contiguous([]int{2, 3, 4}),
+		}, 2},
+		"transposed": {[]int{3, 2}, []backend.View{{Shape: []int{3, 2}, Strides: []int{1, 3}}}, 2},
+		"unit dims":  {[]int{1, 3, 1, 2}, []backend.View{{Shape: []int{1, 3, 1, 2}, Strides: []int{9, 2, 7, 1}}}, 1},
+		"all ones":   {[]int{1, 1}, []backend.View{{Shape: []int{1, 1}, Strides: []int{4, 2}, Offset: 3}}, 0},
+		"empty":      {[]int{2, 0, 3}, []backend.View{backend.Contiguous([]int{2, 0, 3})}, 3},
+		"windows":    {[]int{2, 2, 3}, []backend.View{{Shape: []int{2, 2, 3}, Strides: []int{8, 1, 4}, Offset: 1}}, 3},
+	}
+	for name, tt := range tests {
+		shape, views := coalesce(tt.shape, tt.views)
+		if len(shape) != tt.wantRank {
+			t.Errorf("%s: coalesced %v to %v, want rank %d", name, tt.shape, shape, tt.wantRank)
+		}
+		n, _ := backend.NumElements(tt.shape)
+		a, b := newCursor(tt.shape, tt.views, 0), newCursor(shape, views, 0)
+		for i := range n {
+			if !slices.Equal(a.offs, b.offs) {
+				t.Errorf("%s: element %d at offsets %v, coalesced %v", name, i, a.offs, b.offs)
+				break
+			}
+			a.next()
+			b.next()
+		}
+	}
+}
+
+func TestStridedBinarySplitsLongRows(t *testing.T) {
+	// x is broadcast along the first axis, so the add takes the strided
+	// path. Its dimensions coalesce to [5, 21000], and the four chunks of
+	// work start partway through a row.
+	const rows, cols = 5, 3 * 7000
+	x := make([]float32, cols)
+	y := make([]float32, rows*cols)
+	for i := range x {
+		x[i] = float32(i)
+	}
+	for i := range y {
+		y[i] = float32(i % 7)
+	}
+	k := &backend.Kernel{
+		Op: backend.OpAdd, DType: backend.Float32, Shape: []int{rows, 3, cols / 3},
+		In: []backend.View{
+			{Shape: []int{rows, 3, cols / 3}, Strides: []int{0, cols / 3, 1}},
+			backend.Contiguous([]int{rows, 3, cols / 3}),
+		},
+	}
+	b := New()
+	b.workers = 7
+	out, err := b.Alloc(backend.Float32, rows*cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Run(t.Context(), k, out, []backend.Buffer{f32buf(x...), f32buf(y...)}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := data[float32](out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range got {
+		if want := x[i%cols] + y[i]; v != want {
+			t.Fatalf("element %d = %v, want %v", i, v, want)
+		}
+	}
+}
