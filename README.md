@@ -32,8 +32,10 @@ err = train.Fit(ctx, model, opt, trainSet,
 	train.Progress(os.Stdout))
 ```
 
-`go run ./examples/mnist -model cnn` runs it, downloading MNIST first. Or write
-the loop yourself:
+`go run ./examples/mnist -model cnn` runs it, downloading MNIST first. On four
+CPU cores this network reaches 97.9% test accuracy in two epochs of about 2m45s
+each, and `-model mlp` reaches 97.1% in three epochs of about 12s. Fast CPU
+kernels in milestone 3 will shorten both. Or write the loop yourself:
 
 ```go
 for batch, err := range trainSet.All(ctx) {
