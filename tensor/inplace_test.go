@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/gsoultan/mimir/optim"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -158,5 +159,50 @@ func TestLeavesWithTheSameGradientEachOwnIt(t *testing.T) {
 			t.Fatalf("b's gradient after a.ZeroGrad = %v, %v; want [1 1]", got, err)
 		}
 		b.ZeroGrad()
+	}
+}
+
+func TestStepsSurviveLazyValuesThatFail(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("eager mode computes the value when it is set")
+	}
+	w := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	u := tensor.NewParam(tensor.FromSlice([]float32{3, 4}))
+	buf := tensor.NewBuffer(tensor.Zeros(tensor.Float32, 2))
+	// Index 9 is out of range, which only computing the value finds.
+	if err := buf.Set(w.Value().Detach().Gather(0, tensor.FromSlice([]int32{0, 9}))); err != nil {
+		t.Fatal(err)
+	}
+	opt := optim.SGD([]*tensor.Param{w, u}, optim.LR(1))
+	for i := range 2 {
+		if err := w.Value().Mul(u.Value()).Sum().Backward(t.Context()); err != nil {
+			t.Fatalf("backward %d: %v", i, err)
+		}
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		opt.ZeroGrad()
+	}
+	// u -= w and w -= u, twice.
+	if got, err := u.Value().Data[float32](t.Context()); err != nil || !slices.Equal(got, []float32{4, 4}) {
+		t.Errorf("u = %v, %v; want [4 4]", got, err)
+	}
+	if _, err := buf.Value().Data[float32](t.Context()); !errors.Is(err, tensor.ErrOverwritten) {
+		t.Errorf("value that failed: got %v, want ErrOverwritten", err)
+	}
+}
+
+func TestLazyValuesKeepTheGradientsTheyRead(t *testing.T) {
+	w := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	last := tensor.NewBuffer(tensor.Zeros(tensor.Float32, 2))
+	if err := w.Value().Mul(w.Value()).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := last.Set(w.Grad().Clone()); err != nil {
+		t.Fatal(err)
+	}
+	w.ZeroGrad()
+	if got, err := last.Value().Data[float32](t.Context()); err != nil || !slices.Equal(got, []float32{2, 4}) {
+		t.Errorf("copy of a gradient zeroed after = %v, %v; want [2 4]", got, err)
 	}
 }

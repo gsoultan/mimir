@@ -117,7 +117,8 @@ func (t *Tensor) Grad() *Tensor {
 
 // ZeroGrad discards t's accumulated gradient. The next Backward computes
 // the new gradient into the old one's memory, so the old gradient, if
-// kept, is stale: reading it returns ErrOverwritten.
+// kept, is stale: reading it returns ErrOverwritten. A parameter's value
+// not computed yet that reads the gradient keeps it instead.
 func (t *Tensor) ZeroGrad() {
 	if firstErr(t) != nil || t.tape == nil || !t.tape.leaf {
 		return
@@ -125,7 +126,7 @@ func (t *Tensor) ZeroGrad() {
 	gradMu.Lock()
 	defer gradMu.Unlock()
 	if g := t.tape.grad; g != nil && t.tape.own {
-		sched.Release(device, g.node)
+		sched.Release(device, g.node, lazy.values)
 	}
 	t.tape.grad, t.tape.own = nil, false
 }
@@ -378,7 +379,8 @@ func (p *Param) ZeroGrad() { p.Value().ZeroGrad() }
 //
 // A lazy v stays computable: a RealizeInto that would write over memory
 // it reads, such as an optimizer step over the weights that running
-// statistics were computed from, computes it first.
+// statistics were computed from, computes it first, and a ZeroGrad of a
+// gradient it reads keeps the gradient's memory.
 func (p *Param) Set(v *Tensor) error {
 	if err := firstErr(v); err != nil {
 		return err
@@ -386,7 +388,7 @@ func (p *Param) Set(v *Tensor) error {
 	if err := p.set(v); err != nil {
 		return err
 	}
-	if !v.node.Realized() {
+	if !sched.Realized(v.node) {
 		lazy.add(p)
 	}
 	return nil
@@ -424,7 +426,8 @@ func (l *lazyParams) add(p *Param) {
 }
 
 // values returns the values of the parameters that are still not
-// computed, and forgets the others.
+// computed, and forgets the others. The scheduler calls it with its lock
+// held, which makes reading whether a value is computed safe.
 func (l *lazyParams) values() []*graph.Node {
 	l.mu.Lock()
 	defer l.mu.Unlock()

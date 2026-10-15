@@ -46,26 +46,34 @@ func Realize(ctx context.Context, be backend.Backend, targets ...*graph.Node) er
 // others not. If the backend fails after that, the targets are unchanged
 // and the destinations written over are stale.
 //
-// keep lists unrealized nodes that must stay computable, such as values
-// that parameters hold as recipes. Each of them that reads the memory of
-// a destination, and could still be computed before, is computed with the
-// targets.
-func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep ...*graph.Node) error {
+// keep, if not nil, lists unrealized nodes that must stay computable,
+// such as values that parameters hold as recipes. It is called with the
+// scheduler's lock held, so it may read the state of nodes. Each node it
+// lists that reads the memory of a destination, and could still be
+// computed, is computed first, in a schedule of its own, so that the
+// targets are written over their destinations as if it had been computed
+// before. A node that fails to compute stays uncomputed, and is stale
+// once the destinations it reads are written over.
+func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
 	if len(dsts) != len(targets) {
 		return fmt.Errorf("sched: %d destinations for %d targets: %w", len(dsts), len(targets), backend.ErrInternal)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if k := endangered(keep, targets, dsts); len(k) > 0 {
-		targets = append(slices.Clip(targets), k...)
-		dsts = append(slices.Clip(dsts), make([]*graph.Node, len(k))...)
+	if keep != nil {
+		// The errors are their readers' to see, when they read them.
+		if k := endangered(keep(), targets, dsts); len(k) > 0 && realize(ctx, be, k, nil) != nil {
+			for _, n := range k {
+				_ = realize(ctx, be, []*graph.Node{n}, nil)
+			}
+		}
 	}
 	return realize(ctx, be, targets, dsts)
 }
 
 // endangered returns the nodes of keep that read the memory of a realized
-// destination in dsts, which the schedule makes stale, and that are not
-// targets, realized or stale already.
+// destination in dsts, which the schedule makes stale, other than through
+// a target, and that are not targets, realized or stale already.
 func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 	mems := map[*graph.Storage]bool{}
 	for _, d := range dsts {
@@ -76,15 +84,64 @@ func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 	if len(mems) == 0 {
 		return nil
 	}
-	reads := func(n *graph.Node) bool {
-		return slices.ContainsFunc(n.Inputs, func(in *graph.Node) bool { return in.Realized() && mems[in.Mem] })
+	isTarget := make(map[*graph.Node]bool, len(targets))
+	for _, t := range targets {
+		isTarget[t] = true
+	}
+	// Each unrealized node is classified once by what it is computed from.
+	// Targets are left out: the schedule computes them, and they stay
+	// valid after it.
+	type state uint8
+	const (
+		unseen state = iota
+		clean        // reads no destination
+		reads        // reads a destination's memory
+		broken       // reads a stale node, so cannot be computed
+	)
+	states := map[*graph.Node]state{}
+	// classify walks iteratively, like topoSort, so deep graphs cannot
+	// overflow the stack.
+	classify := func(root *graph.Node) state {
+		type frame struct {
+			n    *graph.Node
+			next int
+			s    state
+		}
+		stack := []frame{{n: root, s: clean}}
+		for {
+			f := &stack[len(stack)-1]
+			if f.next < len(f.n.Inputs) {
+				in := f.n.Inputs[f.next]
+				f.next++
+				switch {
+				case in.Stale():
+					f.s = broken
+				case in.Realized():
+					if mems[in.Mem] {
+						f.s = max(f.s, reads)
+					}
+				case isTarget[in]:
+				case states[in] == unseen:
+					stack = append(stack, frame{n: in, s: clean})
+				default:
+					f.s = max(f.s, states[in])
+				}
+				continue
+			}
+			s := f.s
+			states[f.n] = s
+			if stack = stack[:len(stack)-1]; len(stack) == 0 {
+				return s
+			}
+			stack[len(stack)-1].s = max(stack[len(stack)-1].s, s)
+		}
 	}
 	var out []*graph.Node
 	for _, k := range keep {
-		if k.Realized() || slices.Contains(targets, k) || slices.Contains(out, k) {
+		if k.Realized() || isTarget[k] || slices.Contains(out, k) {
 			continue
 		}
-		if order, err := topoSort([]*graph.Node{k}); err == nil && slices.ContainsFunc(order, reads) {
+		if classify(k) == reads {
 			out = append(out, k)
 		}
 	}
@@ -93,16 +150,28 @@ func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 
 // Release gives the memory of the realized node n to be's pool for later
 // schedules and makes n stale, if n is the only node realized into that
-// memory. The caller must be done with n.
-func Release(be backend.Backend, n *graph.Node) {
+// memory and no node that keep lists, when it is not nil, reads it (see
+// RealizeInto). The caller must be done with n.
+func Release(be backend.Backend, n *graph.Node, keep func() []*graph.Node) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !n.Realized() || n.Stale() || n.Mem.Refs != 1 {
 		return
 	}
+	if keep != nil && len(endangered(keep(), nil, []*graph.Node{n})) > 0 {
+		return
+	}
 	n.Mem.Version++
 	n.Mem.Refs = 0
 	poolOf(be).release(n.Buf())
+}
+
+// Realized reports whether n holds its result. Unlike n.Realized, it is
+// safe while other goroutines realize graphs that n is part of.
+func Realized(n *graph.Node) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return n.Realized()
 }
 
 // Download realizes n and copies its elements into dst as row-major bytes.
@@ -148,7 +217,7 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 	for _, t := range targets {
 		isTarget[t] = true
 	}
-	p := newPlan(order, isTarget)
+	p := newPlan(order, isTarget, candidates(targets, dsts))
 	into := p.destinations(targets, dsts)
 	uses := make(map[*graph.Node]int, len(p.order))
 	for _, n := range p.order {
