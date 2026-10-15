@@ -151,7 +151,7 @@ func TestGEMMSumsAndSharedFactors(t *testing.T) {
 		{3, 4, 40, 50, 30, false, ""},            // a sum for each output
 		{1, 20, 70, 300, 49, false, ""},          // one output, many products in uneven groups
 		{1, 2, 300, 200, 300, false, ""},         // groups of large products, split between workers
-		{2, 3, 150, 2100, 300, false, ""},        // too large for partial sums, with several blocks of n and k
+		{1, 3, 260, 2100, 260, false, ""},        // too large for partial sums, with several blocks of n and k
 		{6, 1, 300, 49, 70, true, ""},            // narrow items side by side
 		{15, 1, 160, 150, 40, true, ""},          // with several blocks of n, one cut within an item
 		{2, 1, 200, 40, 600, true, ""},           // with several blocks of k
@@ -177,21 +177,26 @@ func TestGEMMSumsAndSharedFactors(t *testing.T) {
 		// between worker counts checks every element.
 		size := s.outputs * s.m * s.n
 		every := max(1, size/20000)
+		var sample []int
+		var want, scale []float64
+		for e := 0; e < size; e += every {
+			o, i, j := e/(s.m*s.n), e/s.n%s.m, e%s.n
+			var w, sc float64
+			for term := o * s.sums; term < (o+1)*s.sums; term++ {
+				for p := range s.k {
+					x := float64(a.data[offA[term]+i*a.rs+p*a.cs])
+					y := float64(b.data[offB[term]+p*b.rs+j*b.cs])
+					w += x * y
+					sc += math.Abs(x * y)
+				}
+			}
+			sample, want, scale = append(sample, e), append(want, w), append(scale, sc)
+		}
 		check := func(g *gemmKernel, got []float32) {
 			t.Helper()
-			for e := 0; e < size; e += every {
-				o, i, j := e/(s.m*s.n), e/s.n%s.m, e%s.n
-				var want, scale float64
-				for term := o * s.sums; term < (o+1)*s.sums; term++ {
-					for p := range s.k {
-						x := float64(a.data[offA[term]+i*a.rs+p*a.cs])
-						y := float64(b.data[offB[term]+p*b.rs+j*b.cs])
-						want += x * y
-						scale += math.Abs(x * y)
-					}
-				}
-				if diff := math.Abs(float64(got[e]) - want); !(diff <= 1e-5*scale+1e-7) {
-					t.Fatalf("%+v, %s: element %d = %v, want %v", s, g.name, e, got[e], want)
+			for i, e := range sample {
+				if diff := math.Abs(float64(got[e]) - want[i]); !(diff <= 1e-5*scale[i]+1e-7) {
+					t.Fatalf("%+v, %s: element %d = %v, want %v", s, g.name, e, got[e], want[i])
 				}
 			}
 		}
@@ -215,6 +220,30 @@ func TestGEMMSumsAndSharedFactors(t *testing.T) {
 				if !slices.Equal(got, first) {
 					t.Fatalf("%+v, %s: %d workers differ from one", s, g.name, workers)
 				}
+			}
+		}
+	}
+}
+
+func TestGEMMSplitsGiveEveryWorkerAShare(t *testing.T) {
+	g := &gemmKernel{mr: 8, nr: 32, nc: 2048}
+	wide := []struct {
+		m, n, k, outputs int
+		want             bool
+	}{
+		{4608, 49, 512, 16, true}, // the input gradient of a late ResNet layer
+		{1024, 1, 64, 2, true},    // narrow items, padded to a panel each
+		{16, 16, 8, 8192, false},  // too little work in a block to share
+	}
+	for _, w := range wide {
+		if got := wideEnough(g, w.m, w.n, w.k, w.outputs, 4); got != w.want {
+			t.Errorf("wideEnough(%d×%d×%d, %d items, 4 workers) = %v, want %v", w.m, w.n, w.k, w.outputs, got, w.want)
+		}
+	}
+	for workers := 1; workers <= 32; workers++ {
+		for groups := 1; groups < workers; groups++ {
+			if parts := groupWorkers(groups, workers); groups*parts%workers != 0 {
+				t.Errorf("%d groups split %d ways leave some of %d workers idle", groups, parts, workers)
 			}
 		}
 	}
@@ -310,9 +339,10 @@ func TestMatMulEpilogueMatchesSeparateKernels(t *testing.T) {
 		{1, 150, 300, 600, 4, false, 1}, // one item shared by every worker
 		{1, 6, 2100, 300, 4, false, 1},  // shared, split by columns
 		{2, 4, 5, 0, 2, false, 1},       // no inner dimension
-		{5, 90, 20, 30, 3, true, 1},     // one wide product
+		{5, 90, 20, 30, 1, true, 1},     // one wide product
 		{3, 300, 200, 300, 4, true, 1},  // wide, with several blocks of k
 		{15, 160, 150, 40, 4, true, 1},  // wide, with several blocks of n
+		{64, 24, 16, 600, 4, true, 1},   // wide, its blocks split by columns
 		{3, 6, 5, 0, 2, true, 1},        // shared, with no inner dimension
 		{2, 30, 25, 20, 3, false, 4},    // sums of groups of products
 		{1, 1100, 1000, 8, 4, false, 2}, // a sum too large for partial sums
