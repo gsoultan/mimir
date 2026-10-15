@@ -14,6 +14,22 @@
 // which makes runtime errors appear at the call that caused them.
 //
 // Tensors are immutable and safe to share between goroutines.
+//
+// # Gradients
+//
+// Tensors from RequiresGrad and Param.Value require gradients, and so does
+// every tensor computed from one. Backward on a one-element result, such as
+// a loss, computes the gradient with respect to each of them and adds it
+// to their Grad, like PyTorch's autograd:
+//
+//	w := tensor.Randn(1, 3, 2).RequiresGrad()
+//	loss := x.MatMul(w).Sum()
+//	if err := loss.Backward(ctx); err != nil { ... }
+//	dw := w.Grad() // d loss / d w, shaped like w
+//
+// Every operation has a gradient. Each is derived from about twenty
+// primitive rules, so composite operations such as Softmax need none of
+// their own; Func adds hand-written rules.
 package tensor
 
 import (
@@ -65,6 +81,7 @@ var eager = os.Getenv("MIMIR_EAGER") == "1"
 type Tensor struct {
 	node *graph.Node
 	err  error
+	tape *tape // nil unless the tensor requires gradients
 }
 
 func fail(err error) *Tensor { return &Tensor{err: err} }

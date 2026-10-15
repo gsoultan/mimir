@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -15,26 +16,36 @@ import (
 	"github.com/gsoultan/mimir/io/safetensors"
 )
 
-// Case is one golden case: inputs in argument order and the expected output.
+// Case is one golden case.
 type Case struct {
-	Inputs []safetensors.Tensor
-	Want   safetensors.Tensor
+	Inputs []safetensors.Tensor // in argument order
+	Want   safetensors.Tensor   // the expected output
+	// Gout is the gradient of a loss with respect to the output, and
+	// Grads[i] the expected gradient with respect to input i. Both are
+	// empty for cases without gradients.
+	Gout  safetensors.Tensor
+	Grads map[int]safetensors.Tensor
+	// Extra holds any other expected results by name.
+	Extra map[string]safetensors.Tensor
 }
 
 // Dir returns the golden directory: $MIMIR_GOLDEN_DIR if set, so CI can test
-// against freshly generated PyTorch goldens, else def.
-func Dir(def string) string {
+// against freshly generated PyTorch goldens, else testdata/golden at the
+// repository root.
+func Dir() string {
 	if dir := os.Getenv("MIMIR_GOLDEN_DIR"); dir != "" {
 		return dir
 	}
-	return def
+	_, file, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(file), "..", "..", "testdata", "golden")
 }
 
-// Load reads dir/name.safetensors and groups its tensors into cases. It also
-// returns the file metadata, which names the oracle.
-func Load(tb testing.TB, dir, name string) (map[string]Case, map[string]string) {
+// Load reads name.safetensors from Dir and groups its tensors, named
+// <case>/<part>, into cases. It also returns the file metadata, which names
+// the oracle.
+func Load(tb testing.TB, name string) (map[string]Case, map[string]string) {
 	tb.Helper()
-	b, err := os.ReadFile(filepath.Join(dir, name+".safetensors"))
+	b, err := os.ReadFile(filepath.Join(Dir(), name+".safetensors"))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -44,28 +55,41 @@ func Load(tb testing.TB, dir, name string) (map[string]Case, map[string]string) 
 	}
 	inputs := map[string]map[int]safetensors.Tensor{}
 	cases := map[string]Case{}
+	hasOut := map[string]bool{}
 	for _, full := range f.Names() {
 		c, part, ok := strings.Cut(full, "/")
 		if !ok {
 			tb.Fatalf("golden tensor %q is not named <case>/<part>", full)
 		}
 		t, _ := f.Tensor(full)
-		if part == "out" {
-			cs := cases[c]
-			cs.Want = t
-			cases[c] = cs
-			continue
+		cs := cases[c]
+		switch {
+		case part == "out":
+			cs.Want, hasOut[c] = t, true
+		case part == "gout":
+			cs.Gout = t
+		case index(part, "in") >= 0:
+			if inputs[c] == nil {
+				inputs[c] = map[int]safetensors.Tensor{}
+			}
+			inputs[c][index(part, "in")] = t
+		case index(part, "grad") >= 0:
+			if cs.Grads == nil {
+				cs.Grads = map[int]safetensors.Tensor{}
+			}
+			cs.Grads[index(part, "grad")] = t
+		default:
+			if cs.Extra == nil {
+				cs.Extra = map[string]safetensors.Tensor{}
+			}
+			cs.Extra[part] = t
 		}
-		i, err := strconv.Atoi(strings.TrimPrefix(part, "in"))
-		if err != nil || !strings.HasPrefix(part, "in") {
-			tb.Fatalf("golden tensor %q is not named <case>/in<N> or <case>/out", full)
-		}
-		if inputs[c] == nil {
-			inputs[c] = map[int]safetensors.Tensor{}
-		}
-		inputs[c][i] = t
+		cases[c] = cs
 	}
 	for c, cs := range cases {
+		if !hasOut[c] {
+			tb.Fatalf("golden case %q has no out", c)
+		}
 		for i := range len(inputs[c]) {
 			t, ok := inputs[c][i]
 			if !ok {
@@ -75,12 +99,16 @@ func Load(tb testing.TB, dir, name string) (map[string]Case, map[string]string) 
 		}
 		cases[c] = cs
 	}
-	for c := range inputs {
-		if _, ok := cases[c]; !ok {
-			tb.Fatalf("golden case %q has no out", c)
-		}
-	}
 	return cases, f.Metadata
+}
+
+// index returns N for a part named prefix<N>, or -1.
+func index(part, prefix string) int {
+	n, err := strconv.Atoi(strings.TrimPrefix(part, prefix))
+	if err != nil || !strings.HasPrefix(part, prefix) || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // Tol bounds the allowed error: |got - want| <= Atol + Rtol*|want|.

@@ -52,7 +52,31 @@ func (t *Tensor) reduceKeep(op backend.Op, axes []int) (*Tensor, []int) {
 	if err != nil {
 		return fail(err), nil
 	}
-	return wrap(graph.Reduce(op, t.node, ax)), ax
+	return t.reduce(op, ax), ax
+}
+
+// reduce is the reduction primitive over normalized axes, keeping them with
+// size 1. A maximum's gradient is split evenly between tied elements, like
+// torch.amax's.
+func (t *Tensor) reduce(op backend.Op, axes []int) *Tensor {
+	if err := firstErr(t); err != nil {
+		return fail(err)
+	}
+	if len(axes) == 0 {
+		return t
+	}
+	out := wrap(graph.Reduce(op, t.node, axes))
+	if !tracked(t) || out.err != nil {
+		return out
+	}
+	x, y, shape := t.detached(), out.detached(), t.node.Shape
+	if op == backend.OpReduceSum {
+		return track(out, func(g *Tensor) []*Tensor { return grads(g.expand(shape)) }, t)
+	}
+	return track(out, func(g *Tensor) []*Tensor {
+		hit := x.Equal(y)
+		return grads(hit.Mul(g.Div(hit.reduce(backend.OpReduceSum, axes))))
+	}, t)
 }
 
 // dropAxes removes the size-1 axes left by a keep-dims reduction.
@@ -66,7 +90,7 @@ func (t *Tensor) dropAxes(axes []int) *Tensor {
 			shape = append(shape, s)
 		}
 	}
-	return wrap(graph.Reshape(t.node, shape))
+	return t.reshape(shape)
 }
 
 // Sum adds the elements over axes, which are removed from the shape. With
@@ -136,8 +160,33 @@ func (t *Tensor) LogSoftmax(axis int) *Tensor {
 }
 
 // shiftedByMax subtracts the maximum along axis so exponentials cannot
-// overflow.
+// overflow. The result of softmax does not depend on the shift, so no
+// gradient flows through the maximum.
 func (t *Tensor) shiftedByMax(axis int) *Tensor {
-	m, _ := t.reduceKeep(backend.OpReduceMax, []int{axis})
+	m, _ := t.detached().reduceKeep(backend.OpReduceMax, []int{axis})
 	return t.Sub(m)
+}
+
+// Argmax returns the Int32 position of the largest element along axis,
+// which is removed from the shape. Ties return the first position and NaN
+// counts as largest, like torch.argmax. It has no gradient.
+func (t *Tensor) Argmax(axis int) *Tensor {
+	if err := firstErr(t); err != nil {
+		return fail(err)
+	}
+	a, err := normAxis(axis, len(t.node.Shape))
+	if err != nil {
+		return fail(err)
+	}
+	x := t.detached()
+	m, _ := x.reduceKeep(backend.OpReduceMax, []int{a})
+	hit := x.Equal(m)
+	if x.node.DType.IsFloat() {
+		hit = hit.Maximum(x.scalar(1).Sub(x.Equal(x))) // NaN != NaN
+	}
+	n := x.node.Shape[a]
+	shape := slices.Repeat([]int{1}, len(x.node.Shape))
+	shape[a] = n
+	pos := Arange[int32](0, int32(n), 1).reshape(shape)
+	return Where(hit, pos, Scalar(int32(n))).Min(a)
 }

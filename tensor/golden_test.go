@@ -1,6 +1,7 @@
 package tensor_test
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
@@ -143,7 +144,7 @@ func fromGolden(t *testing.T, g safetensors.Tensor) *tensor.Tensor {
 // TestGolden checks every operation against outputs computed by PyTorch or
 // NumPy (see tools/golden/gen.py).
 func TestGolden(t *testing.T) {
-	cases, meta := goldentest.Load(t, goldentest.Dir("testdata/golden"), "ops")
+	cases, meta := goldentest.Load(t, "ops")
 	t.Logf("golden oracle: %s", meta["oracle"])
 	for name := range goldenCases {
 		if _, ok := cases[name]; !ok {
@@ -179,5 +180,84 @@ func TestGolden(t *testing.T) {
 				goldentest.Compare(t, c.Want, got, out.Shape(), gc.tol)
 			}
 		})
+	}
+}
+
+// gradOnlyCases are the gradient goldens without a forward-only
+// counterpart in goldenCases.
+var gradOnlyCases = map[string]func(in ...*tensor.Tensor) *tensor.Tensor{
+	"log_softmax":    func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].LogSoftmax(-1) },
+	"unfold_overlap": func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].Unfold(1, 4, 2) },
+	"unfold_gapped":  func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].Unfold(1, 2, 3) },
+	"cat":            func(in ...*tensor.Tensor) *tensor.Tensor { return tensor.Cat(1, in[0], in[1]) },
+	"conv2d": func(in ...*tensor.Tensor) *tensor.Tensor {
+		return in[0].Conv2d(in[1], in[2], tensor.ConvOptions{Padding: 1})
+	},
+	"conv2d_grouped": func(in ...*tensor.Tensor) *tensor.Tensor {
+		return in[0].Conv2d(in[1], nil, tensor.ConvOptions{Stride: 2, Padding: 1, Dilation: 2, Groups: 2})
+	},
+	"max_pool2d": func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].MaxPool2d(2, tensor.ConvOptions{}) },
+	"max_pool2d_padded": func(in ...*tensor.Tensor) *tensor.Tensor {
+		return in[0].MaxPool2d(3, tensor.ConvOptions{Stride: 2, Padding: 1})
+	},
+	"avg_pool2d": func(in ...*tensor.Tensor) *tensor.Tensor {
+		return in[0].AvgPool2d(3, tensor.ConvOptions{Stride: 1, Padding: 1})
+	},
+}
+
+// TestGoldenGradients checks the output and input gradients of operations
+// against PyTorch's autograd or NumPy central differences in float64.
+func TestGoldenGradients(t *testing.T) {
+	cases, meta := goldentest.Load(t, "grads")
+	t.Logf("golden oracle: %s", meta["oracle"])
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			fn := gradOnlyCases[name]
+			if fn == nil {
+				gc, ok := goldenCases[name]
+				if !ok {
+					t.Fatalf("golden case %q has no Go counterpart", name)
+				}
+				fn = gc.fn
+			}
+			in := make([]*tensor.Tensor, len(c.Inputs))
+			for i, g := range c.Inputs {
+				in[i] = fromGolden(t, g)
+				if _, ok := c.Grads[i]; ok {
+					in[i] = in[i].RequiresGrad()
+				}
+			}
+			checkGradients(t, c, in, fn(in...), goldentest.Tol{Atol: 1e-5, Rtol: 1e-4})
+		})
+	}
+}
+
+// checkGradients compares out with the golden output, backpropagates the
+// golden output gradient and compares each input's gradient.
+func checkGradients(t *testing.T, c goldentest.Case, in []*tensor.Tensor, out *tensor.Tensor, tol goldentest.Tol) {
+	t.Helper()
+	ctx := t.Context()
+	if err := out.Err(); err != nil {
+		t.Fatal(err)
+	}
+	loss := out.Mul(fromGolden(t, c.Gout)).Sum()
+	if err := loss.Backward(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := out.Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goldentest.Compare(t, c.Want, got, out.Shape(), tol)
+	for i, want := range c.Grads {
+		g := in[i].Grad()
+		if g == nil {
+			t.Fatalf("input %d has no gradient", i)
+		}
+		v, err := g.Data[float32](ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Run(fmt.Sprintf("grad%d", i), func(t *testing.T) { goldentest.Compare(t, want, v, g.Shape(), tol) })
 	}
 }
