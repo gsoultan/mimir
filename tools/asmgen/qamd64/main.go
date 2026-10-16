@@ -1,14 +1,16 @@
 // Command qamd64 generates the amd64 assembly of backend/cpu's products by
 // quantized weights: the AVX2 dot products of Q8_0, Q4_K and Q6_K weights
-// with int8 activations, for one to four rows of activations.
+// with int8 activations, for one to four rows of activations, and the
+// tiles of Q4_K and Q6_K weights, two rows of them by sixteen rows of
+// activations, that products of many rows of activations run in.
 //
 //	go run ./qamd64 -out ../../backend/cpu/qdot_amd64.s -stubs ../../backend/cpu/qdot_stub_amd64.go -pkg cpu
 //
-// Each kernel has the contract of backend/cpu's qdot and computes what
-// the portable kernel of its dtype computes, bit for bit: the integer
-// dot products, which are exact in any order, then the float32
-// operations that apply the scales, in the order the portable kernel
-// applies them, one rounding each, with no fused multiply-add.
+// Each kernel has the contract of backend/cpu's qdot or qtile and
+// computes what the portable kernel of its dtype computes, bit for bit:
+// the integer dot products, which are exact in any order, then the
+// float32 operations that apply the scales, in the order the portable
+// kernel applies them, one rounding each, with no fused multiply-add.
 package main
 
 import (
@@ -35,6 +37,8 @@ func main() {
 	for rows := 1; rows <= maxRows; rows++ {
 		q6K(rows)
 	}
+	qtile(false)
+	qtile(true)
 	Generate()
 }
 
@@ -377,4 +381,145 @@ func q6K(rows int) {
 
 	Label(name + "_done")
 	store(acc)
+}
+
+// The layouts of backend/cpu's tiles: a super-block of a row of weights,
+// unpacked, and one of sixteen rows of activations, interleaved.
+const (
+	tileRowBytes = 336
+	tileScales   = 256 // [16]int16
+	tilePairs    = 288 // [8][2]int16
+	tileD        = 320 // float32, and dmin after it
+	tileActBytes = 4672
+	tileSums     = 4096 // [8][16][2]int16
+	tileXD       = 4608 // [16]float32
+)
+
+// qtile emits the tile kernel of Q4_K weights, or of Q6_K weights if q6,
+// for two rows of weights by sixteen of activations. A register holds a
+// lane for each of eight rows of activations: VPMADDUBSW multiplies four
+// quants of a row of weights, broadcast, by four of each row, and adds
+// them in pairs into int16, which sum over as many products as cannot
+// overflow, eight quads of quants of Q4_K, whose quants are at most 15,
+// and two of Q6_K, whose quants are at most 63; VPMADDWD then applies the
+// group's scale and adds the pairs into int32.
+func qtile(q6 bool) {
+	name, group, run := "qtileQ4KAVX2", 32, 8
+	if q6 {
+		name, group, run = "qtileQ6KAVX2", 16, 2
+	}
+	TEXT(name, NOSPLIT, "func(nb int, w, x *byte, acc *float32)")
+	Pragma("noescape")
+	Doc(name + " multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.")
+	nb, w, x, out := GP64(), GP64(), GP64(), GP64()
+	Load(Param("nb"), nb)
+	Load(Param("w"), w)
+	Load(Param("x"), x)
+	Load(Param("acc"), out)
+	TESTQ(nb, nb)
+	JZ(LabelRef(name + "_done"))
+
+	Label(name + "_loop")
+	var isum [2][2]VecVirtual
+	for s := range 256 / group {
+		var sc [2]VecVirtual
+		for t := range 2 {
+			sc[t] = YMM()
+			VPBROADCASTW(Mem{Base: w, Disp: tileRowBytes*t + tileScales + 2*s}, sc[t])
+		}
+		for r := 0; r < group/4; r += run {
+			var h [2][2]VecVirtual
+			for q := r; q < r+run; q++ {
+				quad := group/4*s + q
+				var a [2]VecVirtual
+				for c := range 2 {
+					a[c] = YMM()
+					VMOVDQU(Mem{Base: x, Disp: 64*quad + 32*c}, a[c])
+				}
+				for t := range 2 {
+					wb := YMM()
+					VPBROADCASTD(Mem{Base: w, Disp: tileRowBytes*t + 4*quad}, wb)
+					for c := range 2 {
+						if q == r {
+							h[t][c] = YMM()
+							VPMADDUBSW(a[c], wb, h[t][c])
+							continue
+						}
+						p := YMM()
+						VPMADDUBSW(a[c], wb, p)
+						VPADDW(p, h[t][c], h[t][c])
+					}
+				}
+			}
+			for t := range 2 {
+				for c := range 2 {
+					VPMADDWD(sc[t], h[t][c], h[t][c])
+					if s == 0 && r == 0 {
+						isum[t][c] = h[t][c]
+						continue
+					}
+					VPADDD(h[t][c], isum[t][c], isum[t][c])
+				}
+			}
+		}
+	}
+
+	// The sums of the activations' pairs of groups of 16, times the
+	// weights' mins or scales.
+	for t := range 2 {
+		var m [2]VecVirtual
+		for p := range 8 {
+			pb := YMM()
+			VPBROADCASTD(Mem{Base: w, Disp: tileRowBytes*t + tilePairs + 4*p}, pb)
+			for c := range 2 {
+				if p == 0 {
+					m[c] = YMM()
+					VPMADDWD(Mem{Base: x, Disp: tileSums + 64*p + 32*c}, pb, m[c])
+					continue
+				}
+				v := YMM()
+				VPMADDWD(Mem{Base: x, Disp: tileSums + 64*p + 32*c}, pb, v)
+				VPADDD(v, m[c], m[c])
+			}
+		}
+		wd := YMM()
+		VBROADCASTSS(Mem{Base: w, Disp: tileRowBytes*t + tileD}, wd)
+		var wm VecVirtual
+		if !q6 {
+			wm = YMM()
+			VBROADCASTSS(Mem{Base: w, Disp: tileRowBytes*t + tileD + 4}, wm)
+		}
+		for c := range 2 {
+			xd := YMM()
+			VMOVUPS(Mem{Base: x, Disp: tileXD + 32*c}, xd)
+			if q6 {
+				// sumi - 32·summ
+				VPSLLD(U8(5), m[c], m[c])
+				VPSUBD(m[c], isum[t][c], isum[t][c])
+			}
+			accumulate(wd, xd, isum[t][c], Mem{Base: out, Disp: 4 * (16*t + 8*c)})
+			if !q6 {
+				accumulate(wm, xd, m[c], Mem{Base: out, Disp: 4 * (32 + 16*t + 8*c)})
+			}
+		}
+	}
+	ADDQ(U32(2*tileRowBytes), w)
+	ADDQ(U32(tileActBytes), x)
+	DECQ(nb)
+	JNZ(LabelRef(name + "_loop"))
+
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
+}
+
+// accumulate adds float32(wd·xd)·float32(sum) to the eight float32 at m,
+// rounding each product, as the portable kernels do.
+func accumulate(wd, xd, sum VecVirtual, m Mem) {
+	dd, f := YMM(), YMM()
+	VMULPS(xd, wd, dd)
+	VCVTDQ2PS(sum, f)
+	VMULPS(dd, f, f)
+	VADDPS(m, f, f)
+	VMOVUPS(f, m)
 }

@@ -123,3 +123,13 @@ func qdotQ4_KNEONx4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int
 //
 //go:noescape
 func qdotQ6_KNEONx4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qtileQ4_KSDOT multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
+//
+//go:noescape
+func qtileQ4_KSDOT(nb int, w *byte, x *byte, acc *float32)
+
+// qtileQ6_KSDOT multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
+//
+//go:noescape
+func qtileQ6_KSDOT(nb int, w *byte, x *byte, acc *float32)

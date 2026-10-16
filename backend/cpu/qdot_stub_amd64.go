@@ -63,3 +63,13 @@ func qdotQ6KAVX2x3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
 //
 //go:noescape
 func qdotQ6KAVX2x4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qtileQ4KAVX2 multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
+//
+//go:noescape
+func qtileQ4KAVX2(nb int, w *byte, x *byte, acc *float32)
+
+// qtileQ6KAVX2 multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
+//
+//go:noescape
+func qtileQ6KAVX2(nb int, w *byte, x *byte, acc *float32)
