@@ -323,7 +323,7 @@ tools/parquet/       Parquet test-file generator (Python, development only)
 go test -race ./...
 MIMIR_EAGER=1 go test ./...
 MIMIR_DEVICE=gpu go test ./...   # on a Mac or an NVIDIA machine: every test on the GPU
-MIMIR_EMULATE=1 go test -run Kernels ./backend/...   # the GPU kernels on the CPU, with clang++
+MIMIR_EMULATE=1 go test -timeout=60m -run Kernels ./backend/...   # the GPU kernels on the CPU, with clang++
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
 MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train   # the billion-row run

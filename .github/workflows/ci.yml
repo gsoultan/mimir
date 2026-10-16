@@ -54,7 +54,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: emulate the Metal and CUDA kernels
-        run: go test -count=1 -run Kernels ./backend/...
+        run: go test -count=1 -timeout=60m -run Kernels ./backend/...
         env:
           MIMIR_EMULATE: '1'
       - name: compile the CUDA kernels with NVRTC
