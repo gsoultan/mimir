@@ -136,6 +136,33 @@ const (
 	OpConvWeight // In[0] [N, G, M, O] times Wᵀ, In[1]'s windows, summed over the pairs (n, o): [S, G, M, C*K] (see ConvParts)
 	OpConvInput  // In[0] [N, G, C*K, M] times In[1] [N, G, M, O], folded as OpFold folds windows: [N, G*C, D...]
 
+	// OpArgsort holds Int32 positions along Attrs.Axis: element j along
+	// the axis is the position of the j-th element of the stable sort of
+	// In[0]'s line, ascending, or descending when Attrs.Descending is set.
+	// NaN sorts as the largest value and ties keep their order. The
+	// output has In[0]'s shape but along the axis, where it holds every
+	// position or, for a top-k, the first K, with K at most MaxTopK.
+	OpArgsort
+
+	// OpFFT is the discrete Fourier transform along Attrs.Axis of the
+	// complex Float32 In[0], [..., 2], whose last dimension holds the real
+	// and imaginary parts and is not the axis: out[k] = Σ x[j]·e^(-2πijk/n)
+	// over the n positions j, or e^(+2πijk/n) when Attrs.Inverse is set.
+	// Neither direction scales its result.
+	OpFFT
+
+	// Linear algebra on Float32 matrices: the last two dimensions of
+	// In[0], [B..., m, n], batched over the leading ones. Factorizations
+	// other than OpCholesky write a one-dimensional output that holds
+	// their parts in turn, each contiguous and shaped as FactorParts
+	// returns.
+	OpCholesky        // the lower factor L of a positive definite [B..., n, n], read from its lower triangle, with zeros above the diagonal; ErrSingular unless positive definite
+	OpTriangularSolve // X of A·X = B for a triangular In[0] [B..., n, n], read from its lower triangle or, with Attrs.Upper, its upper, with ones on the diagonal if Attrs.Unit, and In[1] [B..., n, k]; ErrSingular on a zero diagonal
+	OpLU              // P·A = L·U with partial pivoting: L and U packed in [B..., n, n] with L's unit diagonal implied, the permutation [B..., n], whose element i is the row of A that row i of P·A is, and its sign [B...]; a zero pivot is kept
+	OpQR              // A = Q·R from Householder reflections, with min(m, n) columns of Q and rows of R: Q [B..., m, k], R [B..., k, n]; R's diagonal has LAPACK's signs
+	OpSVD             // A = U·diag(S)·Vh with k = min(m, n) singular values in descending order: U [B..., m, k], S [B..., k], Vh [B..., k, n]
+	OpEigh            // A = V·diag(W)·Vᵀ for a symmetric [B..., n, n], read from its lower triangle: W [B..., n] in ascending order, V [B..., n, n]
+
 	numOps
 )
 
@@ -163,6 +190,11 @@ func (c Combine) String() string {
 		return fmt.Sprintf("Combine(%d)", uint8(c))
 	}
 }
+
+// MaxTopK is the most positions an OpArgsort keeps along its axis when
+// it keeps fewer than all, so that a GPU group can hold them while it
+// scans the rest of a line.
+const MaxTopK = 1024
 
 // MaxCatInputs is the most inputs an OpCat kernel takes, so that the
 // buffers of a GPU kernel fit its argument table. Longer joins are trees
@@ -215,6 +247,15 @@ var opNames = [numOps]string{
 	OpConv:       "conv",
 	OpConvWeight: "conv_weight",
 	OpConvInput:  "conv_input",
+
+	OpArgsort:         "argsort",
+	OpFFT:             "fft",
+	OpCholesky:        "cholesky",
+	OpTriangularSolve: "triangular_solve",
+	OpLU:              "lu",
+	OpQR:              "qr",
+	OpSVD:             "svd",
+	OpEigh:            "eigh",
 }
 
 func (o Op) String() string {

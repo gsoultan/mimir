@@ -630,3 +630,85 @@ func SliceScatter(x, src *Node, ranges [][2]int) (*Node, error) {
 	}
 	return newNode(&Node{Op: backend.OpSliceScatter, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, src}, Attrs: backend.Attrs{Ranges: slices.Clone(ranges)}})
 }
+
+// Argsort is the Int32 positions along axis of the first k elements of
+// the stable sort of x along it, ascending or descending; see
+// backend.OpArgsort. k is x's length along axis, or at most
+// backend.MaxTopK of it.
+func Argsort(x *Node, axis, k int, descending bool) (*Node, error) {
+	if axis < 0 || axis >= len(x.Shape) {
+		return nil, errorf(backend.OpArgsort, backend.ErrShape, "axis %d for shape %v", axis, x.Shape)
+	}
+	if n := x.Shape[axis]; k < 0 || k > n || k < n && k > backend.MaxTopK {
+		return nil, errorf(backend.OpArgsort, backend.ErrShape, "%d of %d positions along axis %d", k, n, axis)
+	}
+	if err := checkDType(backend.OpArgsort, x.DType); err != nil {
+		return nil, err
+	}
+	shape := slices.Clone(x.Shape)
+	shape[axis] = k
+	return newNode(&Node{Op: backend.OpArgsort, DType: backend.Int32, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Descending: descending}})
+}
+
+// FFT is the discrete Fourier transform of the complex Float32 x,
+// [..., 2], along axis, which is not its last; see backend.OpFFT.
+func FFT(x *Node, axis int, inverse bool) (*Node, error) {
+	r := len(x.Shape)
+	if r < 2 || x.Shape[r-1] != 2 || axis < 0 || axis >= r-1 {
+		return nil, errorf(backend.OpFFT, backend.ErrShape, "axis %d of complex %v", axis, x.Shape)
+	}
+	if x.DType != backend.Float32 {
+		return nil, errorf(backend.OpFFT, backend.ErrDType, "%s input", x.DType)
+	}
+	return newNode(&Node{Op: backend.OpFFT, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Inverse: inverse}})
+}
+
+// checkMatrices validates Float32 matrices of shape [B..., m, n], square
+// if square is set.
+func checkMatrices(op backend.Op, x *Node, square bool) error {
+	r := len(x.Shape)
+	if r < 2 || square && x.Shape[r-2] != x.Shape[r-1] {
+		return errorf(op, backend.ErrShape, "matrices of shape %v", x.Shape)
+	}
+	if x.DType != backend.Float32 {
+		return errorf(op, backend.ErrDType, "%s input", x.DType)
+	}
+	return nil
+}
+
+// Factor factorizes the Float32 matrices x, [B..., m, n], by op:
+// OpCholesky, whose result is shaped like x, or OpLU, OpQR, OpSVD or
+// OpEigh, whose one-dimensional result holds the parts that
+// backend.FactorParts describes.
+func Factor(op backend.Op, x *Node) (*Node, error) {
+	if op == backend.OpCholesky {
+		if err := checkMatrices(op, x, true); err != nil {
+			return nil, err
+		}
+		return newNode(&Node{Op: op, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{x}})
+	}
+	if err := checkMatrices(op, x, op == backend.OpLU || op == backend.OpEigh); err != nil {
+		return nil, err
+	}
+	_, size, err := backend.FactorParts(op, x.Shape)
+	if err != nil {
+		return nil, err
+	}
+	return newNode(&Node{Op: op, DType: backend.Float32, Shape: []int{size}, Inputs: []*Node{x}})
+}
+
+// TriangularSolve is X of a·X = b for the triangular Float32 matrices a,
+// [B..., n, n], and b, [B..., n, k]; see backend.OpTriangularSolve.
+func TriangularSolve(a, b *Node, upper, unit bool) (*Node, error) {
+	if err := checkMatrices(backend.OpTriangularSolve, a, true); err != nil {
+		return nil, err
+	}
+	if err := checkMatrices(backend.OpTriangularSolve, b, false); err != nil {
+		return nil, err
+	}
+	r := len(a.Shape)
+	if len(b.Shape) != r || !slices.Equal(a.Shape[:r-1], b.Shape[:r-1]) {
+		return nil, errorf(backend.OpTriangularSolve, backend.ErrShape, "%v by %v", a.Shape, b.Shape)
+	}
+	return newNode(&Node{Op: backend.OpTriangularSolve, DType: backend.Float32, Shape: b.Shape, Inputs: []*Node{a, b}, Attrs: backend.Attrs{Upper: upper, Unit: unit}})
+}
