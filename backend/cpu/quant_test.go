@@ -3,6 +3,7 @@ package cpu
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -189,7 +190,9 @@ func saturated(dt backend.DType, rows, k int) (w, x []byte, xstride int) {
 }
 
 func TestQDotKernelsMatchPortable(t *testing.T) {
-	t.Logf("%s kernels", qdotISA)
+	all := map[string]map[backend.DType]*[maxRows]qdot{qdotISA: qdots}
+	maps.Copy(all, qdotSets)
+	t.Logf("kernels %v, %s selected", slices.Sorted(maps.Keys(all)), qdotISA)
 	rng := rand.New(rand.NewPCG(7, 8))
 	portableKernels := map[backend.DType]func(int, []byte, []byte) float32{
 		backend.Q8_0: qdotQ8_0Go, backend.Q4_K: qdotQ4KGo, backend.Q6_K: qdotQ6KGo,
@@ -213,20 +216,22 @@ func TestQDotKernelsMatchPortable(t *testing.T) {
 				if nb > 0 {
 					wp, xp = &c.w[0], &c.x[0]
 				}
-				for rows := 1; rows <= maxRows; rows++ {
-					const ldo = 3
-					got := make([]float32, maxRows*ldo)
-					qdots[dt][rows-1](nb, wp, xp, xstride, &got[0], ldo)
-					for r := range maxRows {
-						g := got[r*ldo]
-						if r >= rows {
-							if g != 0 {
-								t.Fatalf("%s, %s, %d blocks, %d rows: wrote row %d", dt, c.name, nb, rows, r)
+				for isa, kernels := range all {
+					for rows := 1; rows <= maxRows; rows++ {
+						const ldo = 3
+						got := make([]float32, maxRows*ldo)
+						kernels[dt][rows-1](nb, wp, xp, xstride, &got[0], ldo)
+						for r := range maxRows {
+							g := got[r*ldo]
+							if r >= rows {
+								if g != 0 {
+									t.Fatalf("%s %s, %s, %d blocks, %d rows: wrote row %d", isa, dt, c.name, nb, rows, r)
+								}
+								continue
 							}
-							continue
-						}
-						if math.Float32bits(g) != math.Float32bits(want[r]) && !(g != g && want[r] != want[r]) {
-							t.Fatalf("%s, %s, %d blocks, %d rows: row %d = %v, want %v", dt, c.name, nb, rows, r, g, want[r])
+							if math.Float32bits(g) != math.Float32bits(want[r]) && !(g != g && want[r] != want[r]) {
+								t.Fatalf("%s %s, %s, %d blocks, %d rows: row %d = %v, want %v", isa, dt, c.name, nb, rows, r, g, want[r])
+							}
 						}
 					}
 				}

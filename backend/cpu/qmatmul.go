@@ -56,6 +56,12 @@ var qdots = map[backend.DType]*[maxRows]qdot{
 // qdotISA names the instructions of the kernels in qdots.
 var qdotISA = "portable"
 
+// qdotSets holds the sets of kernels besides the portable ones that the
+// CPU can run, by the name of their instructions. Each architecture's
+// init adds its sets and puts the fastest in qdots; the tests check every
+// set.
+var qdotSets = map[string]map[backend.DType]*[maxRows]qdot{}
+
 // portable returns the kernels of each number of rows that apply dot,
 // the dot product of one row of weights of dt with one of activations,
 // row by row.
