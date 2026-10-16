@@ -218,6 +218,17 @@ func gradCases() []gradCase {
 		p := x[0].Split(1, 2, 1, 3)
 		return tensor.Cat(1, p[2].Exp(), p[0].Mul(p[0]))
 	}, u(-1, 1, 3, 6))
+
+	// Products and maxima by a sparse pattern, with repeated entries and
+	// a row without any.
+	pat, err := tensor.NewPattern(4, 5, []int32{0, 0, 2, 2, 2, 3, 3, 0}, []int32{1, 4, 0, 1, 3, 2, 2, 1})
+	if err != nil {
+		panic(err)
+	}
+	add("pattern matmul", func(x []*tensor.Tensor) *tensor.Tensor { return pat.MatMul(x[0]) }, u(-1, 1, 5, 3))
+	add("pattern transpose", func(x []*tensor.Tensor) *tensor.Tensor { return pat.T().MatMul(x[0].Mul(x[0])) }, u(-1, 1, 4, 2, 2))
+	add("pattern mean", func(x []*tensor.Tensor) *tensor.Tensor { return pat.Mean(x[0]) }, u(-1, 1, 5, 3))
+	add("pattern max", func(x []*tensor.Tensor) *tensor.Tensor { return pat.Max(x[0]) }, distinct(5, 3))
 	return cases
 }
 
