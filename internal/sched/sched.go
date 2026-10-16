@@ -97,8 +97,8 @@ const (
 // classifier returns a function that tells what unrealized nodes are
 // computed from: whether they read memory in mems or a stale node, through
 // unrealized nodes other than those in skip. It classifies each node once,
-// walking iteratively, like topoSort, so deep graphs cannot overflow the
-// stack.
+// walking iteratively, like the walker, so deep graphs cannot overflow
+// the stack.
 func classifier(mems map[*graph.Storage]bool, skip map[*graph.Node]bool) func(*graph.Node) state {
 	states := map[*graph.Node]state{}
 	return func(root *graph.Node) state {
@@ -298,38 +298,20 @@ func download(ctx context.Context, n *graph.Node, dst []byte) error {
 	return be.Download(ctx, dst, buf)
 }
 
-// transfer copies the realized node n, which lives on another device, into
-// a new buffer from m.
-func transfer(ctx context.Context, m *pool, n *graph.Node) (backend.Buffer, error) {
-	data := make([]byte, n.Size()*n.DType.Size())
-	if err := download(ctx, n, data); err != nil {
-		return nil, err
-	}
-	buf, err := m.alloc(n.DType, n.Size())
-	if err != nil {
-		return nil, err
-	}
-	if err := m.be.Upload(ctx, buf, data); err != nil {
-		m.release(buf)
-		return nil, err
-	}
-	return buf, nil
-}
-
 // result is where a computed node's elements live.
 type result struct {
-	buf  backend.Buffer
 	view backend.View
-	mem  *graph.Storage // the storage of buf, if realized nodes read it
+	mem  *graph.Storage
 }
 
 func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) (err error) {
 	generation++
-	order, err := topoSort(targets)
-	if err != nil {
+	w := &walker0
+	defer w.forget()
+	if err := w.run(be, targets, dsts); err != nil {
 		return err
 	}
-	if len(order) == 0 {
+	if len(w.order) == 0 {
 		consume(targets, dsts)
 		return nil
 	}
@@ -344,148 +326,44 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 			_ = be.Sync(context.WithoutCancel(ctx))
 		}
 	}()
+	prog, err := m.program(w, targets, dsts)
+	if err != nil {
+		return err
+	}
+	// The schedule is refused before it allocates anything if it would
+	// not fit in the budget.
+	if err := prog.reserve(m); err != nil {
+		return err
+	}
+	return prog.run(ctx, m, w, targets, dsts)
+}
+
+// program returns the program that computes targets, which w has walked,
+// from the cache if it has one for w's key, and otherwise plans and
+// compiles one, and caches it.
+func (m *pool) program(w *walker, targets, dsts []*graph.Node) (*program, error) {
+	cached := caching && keyAttrs != nil
+	var hash uint64
+	if cached {
+		hash = hashKey(w.key)
+		if prog := m.programs.lookup(hash, w.key); prog != nil {
+			return prog, nil
+		}
+	}
 	isTarget := make(map[*graph.Node]bool, len(targets))
 	for _, t := range targets {
 		isTarget[t] = true
 	}
-	p := newPlan(order, isTarget, candidates(be, targets, dsts))
-	p.be = be
-	into := p.destinations(targets, dsts)
-	uses := p.uses()
-	// The schedule is refused before it allocates anything if it would
-	// not fit in the budget.
-	s, err := p.forecast(m, uses, into, isTarget)
+	p := newPlan(w.order, isTarget, candidates(m.be, targets, dsts))
+	p.be = m.be
+	prog, err := compile(p, w, targets, dsts, p.destinations(targets, dsts), isTarget)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := m.reserve(s); err != nil {
-		return err
+	if cached {
+		m.programs.add(hash, w.key, prog)
 	}
-
-	results := make(map[*graph.Node]result, len(order))
-	// refs counts the live results that read each buffer allocated here, so
-	// a buffer shared by views is freed only after its last reader.
-	refs := make(map[backend.Buffer]int)
-	// A realized input on another device, such as a constant computed
-	// there, is copied to be first. Kernels read the copy until the end of
-	// the schedule, directly or through views, so the schedule holds a
-	// reference to it as well as the results that view it, and gives it
-	// back after the last kernel.
-	moved := make(map[*graph.Node]result)
-	for _, n := range p.order {
-		for _, in := range p.work[n].deps {
-			if _, ok := moved[in]; ok || !in.Realized() || in.Mem.Dev == be {
-				continue
-			}
-			buf, err := transfer(ctx, m, in)
-			if err != nil {
-				for buf := range refs {
-					m.release(buf)
-				}
-				return err
-			}
-			refs[buf] = 1
-			moved[in] = result{buf: buf, view: backend.Contiguous(in.Shape)}
-		}
-	}
-	lookup := func(n *graph.Node) result {
-		if r, ok := moved[n]; ok {
-			return r
-		}
-		if n.Realized() {
-			return result{n.Buf(), n.View, n.Mem}
-		}
-		return results[n]
-	}
-	release := func(n *graph.Node) {
-		uses[n]--
-		if uses[n] > 0 || isTarget[n] || n.Realized() {
-			return
-		}
-		r := results[n]
-		delete(results, n)
-		if _, owned := refs[r.buf]; owned {
-			if refs[r.buf]--; refs[r.buf] == 0 {
-				delete(refs, r.buf)
-				m.release(r.buf)
-			}
-		}
-	}
-
-	for _, n := range p.order {
-		w := p.work[n]
-		ins := make([]result, len(w.deps))
-		for i, in := range w.deps {
-			ins[i] = lookup(in)
-		}
-		nodes := w.nodes(n)
-		err := ctx.Err()
-		if err == nil && slices.ContainsFunc(nodes, func(x *graph.Node) bool { return into[x] != nil }) {
-			ctx = context.WithoutCancel(ctx)
-		}
-		var rs []result
-		var fresh []backend.Buffer
-		if err == nil {
-			rs, fresh, err = step(ctx, m, n, w, ins, into)
-		}
-		if err != nil {
-			for buf := range refs {
-				m.release(buf)
-			}
-			return err
-		}
-		for _, buf := range fresh {
-			refs[buf] = 0
-		}
-		for i, x := range nodes {
-			r := rs[i]
-			if _, owned := refs[r.buf]; owned {
-				refs[r.buf]++
-			}
-			results[x] = r
-		}
-		for _, in := range w.deps {
-			release(in)
-		}
-	}
-
-	for _, t := range targets {
-		if _, ok := results[t]; !ok && !t.Realized() {
-			for buf := range refs {
-				m.release(buf)
-			}
-			return fmt.Errorf("sched: no kernel computed a %s target: %w", t.Op, backend.ErrInternal)
-		}
-	}
-	if err := be.Sync(context.WithoutCancel(ctx)); err != nil {
-		for buf := range refs {
-			m.release(buf)
-		}
-		return err
-	}
-	for _, r := range moved {
-		// A target that views the copy keeps it.
-		if refs[r.buf]--; refs[r.buf] == 0 {
-			delete(refs, r.buf)
-			m.release(r.buf)
-		}
-	}
-	mems := make(map[backend.Buffer]*graph.Storage)
-	for _, t := range targets {
-		if t.Realized() {
-			continue
-		}
-		r := results[t]
-		if r.mem == nil {
-			if r.mem = mems[r.buf]; r.mem == nil {
-				r.mem = &graph.Storage{Buf: r.buf, Dev: be}
-				mems[r.buf] = r.mem
-			}
-		}
-		assign(t, r)
-	}
-	consume(targets, dsts)
-	return nil
+	return prog, nil
 }
 
 // assign makes t hold the result r, whose storage is set, and drop its
@@ -499,83 +377,22 @@ func assign(t *graph.Node, r result) {
 // consume makes stale every destination whose target was computed into
 // memory of its own: the caller is done with it, whether or not its memory
 // was reused. A destination already stale is left alone, since its memory
-// may hold a newer value.
+// may hold a newer value. It marks the storages it has seen, as a walk
+// does, so that it allocates nothing.
 func consume(targets, dsts []*graph.Node) {
-	held := make(map[*graph.Storage]bool, len(targets))
+	walks++
 	for _, t := range targets {
-		held[t.Mem] = true
+		if t.Mem != nil {
+			t.Mem.Mark.Walk = walks
+		}
 	}
 	for _, d := range dsts {
-		if d != nil && d.Realized() && !d.Stale() && !held[d.Mem] {
+		if d != nil && d.Realized() && !d.Stale() && d.Mem.Mark.Walk != walks {
 			d.Mem.Version++
 			d.Mem.Refs = 0
-			held[d.Mem] = true
+			d.Mem.Mark.Walk = walks
 		}
 	}
-}
-
-// topoSort returns the unrealized nodes reachable from targets, each after
-// its inputs, or ErrOverwritten if a realized node among them is stale. It
-// walks iteratively so deep graphs cannot overflow the stack.
-func topoSort(targets []*graph.Node) ([]*graph.Node, error) {
-	type frame struct {
-		n    *graph.Node
-		next int
-	}
-	stale := func(n *graph.Node) error {
-		return fmt.Errorf("sched: %s%v: %w", n.DType, n.Shape, graph.ErrOverwritten)
-	}
-	var order []*graph.Node
-	seen := make(map[*graph.Node]bool)
-	for _, t := range targets {
-		if t.Stale() {
-			return nil, stale(t)
-		}
-		if t.Realized() || seen[t] {
-			continue
-		}
-		seen[t] = true
-		stack := []frame{{n: t}}
-		for len(stack) > 0 {
-			f := &stack[len(stack)-1]
-			if f.next < len(f.n.Inputs) {
-				in := f.n.Inputs[f.next]
-				f.next++
-				switch {
-				case in.Stale():
-					return nil, stale(in)
-				case !in.Realized() && !seen[in]:
-					seen[in] = true
-					stack = append(stack, frame{n: in})
-				}
-				continue
-			}
-			order = append(order, f.n)
-			stack = stack[:len(stack)-1]
-		}
-	}
-	return order, nil
-}
-
-// step computes one node as w plans, from the results of w.deps, and the
-// targets its kernel stores (see work.nodes). It returns their results and
-// the buffers it allocated, which hold the results of the nodes not in
-// into. A node in into is written over the memory of its destination
-// instead; the result of a view may also be a view of an input's buffer.
-func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result, into map[*graph.Node]*graph.Node) ([]result, []backend.Buffer, error) {
-	views := make([]backend.View, len(ins))
-	bufs := make([]backend.Buffer, len(ins))
-	for i, in := range ins {
-		views[i], bufs[i] = in.view, in.buf
-	}
-	k, view, err := w.kernel(n, views)
-	if err != nil {
-		return nil, nil, err
-	}
-	if k == nil {
-		return []result{{ins[0].buf, view, ins[0].mem}}, nil, nil
-	}
-	return runInto(ctx, m, k, w.nodes(n), into, bufs...)
 }
 
 // elements returns the number of elements of k's output.
@@ -595,49 +412,6 @@ func resultView(k *backend.Kernel, x *graph.Node) backend.View {
 		return broadcast(x.Shape)
 	}
 	return backend.Contiguous(x.Shape)
-}
-
-// runInto executes k, which computes nodes (see resultView): into the
-// memory of its destination in into, whose old values it makes stale, or
-// into a new buffer from m, as forecast predicts. It returns their results
-// and the new buffers. On error the new buffers go back to m.
-func runInto(ctx context.Context, m *pool, k *backend.Kernel, nodes []*graph.Node, into map[*graph.Node]*graph.Node, ins ...backend.Buffer) ([]result, []backend.Buffer, error) {
-	n, err := elements(k)
-	if err != nil {
-		return nil, nil, err
-	}
-	rs := make([]result, len(nodes))
-	outs := make([]backend.Buffer, len(nodes))
-	var fresh []backend.Buffer
-	for i, x := range nodes {
-		rs[i].view = resultView(k, x)
-		if into[x] != nil {
-			continue
-		}
-		buf, err := m.alloc(k.DType, n)
-		if err != nil {
-			for _, buf := range fresh {
-				m.release(buf)
-			}
-			return nil, nil, err
-		}
-		outs[i], rs[i].buf = buf, buf
-		fresh = append(fresh, buf)
-	}
-	for i, x := range nodes {
-		if d := into[x]; d != nil {
-			outs[i], rs[i].buf, rs[i].mem = d.Buf(), d.Buf(), d.Mem
-			d.Mem.Version++
-			d.Mem.Refs = 0
-		}
-	}
-	if err := m.be.Run(ctx, k, outs, ins); err != nil {
-		for _, buf := range fresh {
-			m.release(buf)
-		}
-		return nil, nil, err
-	}
-	return rs, fresh, nil
 }
 
 // runNew executes k, which computes one value, into a new buffer from m.

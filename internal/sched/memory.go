@@ -48,6 +48,8 @@ type pool struct {
 	// prediction was exact.
 	obtained, predicted int64
 
+	programs cache // the programs of recent schedules (see cache.go)
+
 	acct      sync.Mutex
 	allocated int64                         // bytes obtained from be whose buffers are alive
 	owned     map[weak.Pointer[byte]]*entry // the alive buffers obtained from be
@@ -129,10 +131,13 @@ func (p *pool) evict(key poolKey, n int) {
 		p.untrack(b.buf)
 		p.be.Free(b.buf)
 	}
+	// A list that alloc emptied keeps its key and capacity, so that a
+	// buffer released to it in every schedule allocates nothing.
 	switch {
+	case n == 0:
 	case n == len(bufs):
 		delete(p.free, key)
-	case n > 0:
+	default:
 		p.free[key] = append(bufs[:0], bufs[n:]...)
 	}
 }
@@ -162,12 +167,13 @@ func (p *pool) track(buf backend.Buffer) {
 	if ptr == nil {
 		return
 	}
-	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), ref: weak.Make((*byte)(ptr))}
+	ref := weak.Make((*byte)(ptr))
 	p.acct.Lock()
 	defer p.acct.Unlock()
-	if p.owned[e.ref] != nil {
+	if p.owned[ref] != nil {
 		return
 	}
+	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), ref: ref}
 	p.allocated += e.bytes
 	p.owned[e.ref] = e
 	e.stop = runtime.AddCleanup((*byte)(ptr), p.settle, e)

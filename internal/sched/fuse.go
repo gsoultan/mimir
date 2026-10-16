@@ -63,6 +63,7 @@ type work struct {
 	gemm   *graph.Node     // a product its kernel computes, which prog, if any, reads as input 0
 	stores []store         // the targets prog also writes
 	swap   bool            // a transposed product, computed from deps transposed
+	src    []*graph.Node   // the node each instruction of prog computes
 }
 
 // store is a target that a fused kernel computes for its group and writes
@@ -87,7 +88,7 @@ func (w *work) nodes(n *graph.Node) []*graph.Node {
 // results of w.deps through views, with an output for each of w.nodes(n)
 // (see resultView); or nil, and the view of its input's buffer that holds
 // n, when n is a view that needs no kernel. It is the one decision that
-// step runs and forecast predicts.
+// compile makes for each step of the plan.
 func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, backend.View, error) {
 	if w.swap {
 		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
@@ -228,7 +229,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true}
 		case n.Op.IsElementwise():
 			prog, nodes, ins := fuse(n, member)
-			w := &work{deps: ins, prog: prog}
+			w := &work{deps: ins, prog: prog, src: nodes}
 			for j, x := range nodes {
 				if x != n && stored(x) {
 					w.stores = append(w.stores, store{x, j})
@@ -243,7 +244,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			if w.stores == nil && !slices.ContainsFunc(ins, overwritable) {
 				for i, x := range ins {
 					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType && n.DType == backend.Float32 {
-						w = epilogue(prog, ins, i, gemm)
+						w = epilogue(prog, nodes, ins, i, gemm)
 						break
 					}
 				}
@@ -305,12 +306,12 @@ func fuse(root *graph.Node, member func(*graph.Node) bool) (prog []backend.Instr
 	return prog, nodes, ins
 }
 
-// epilogue returns the work of a program over ins that runs as the
-// epilogue of gemm, whose product is ins[at]. The matmul reads its two
-// factors, and the program the product as input 0 and the other loads
-// after it.
-func epilogue(prog []backend.Instr, ins []*graph.Node, at int, gemm *graph.Node) *work {
-	w := &work{deps: factors(gemm), prog: slices.Clone(prog), gemm: gemm}
+// epilogue returns the work of a program over ins, whose instructions
+// compute nodes, that runs as the epilogue of gemm, whose product is
+// ins[at]. The matmul reads its two factors, and the program the product
+// as input 0 and the other loads after it.
+func epilogue(prog []backend.Instr, nodes, ins []*graph.Node, at int, gemm *graph.Node) *work {
+	w := &work{deps: factors(gemm), prog: slices.Clone(prog), gemm: gemm, src: nodes}
 	renumber := make([]int, len(ins))
 	for i, x := range ins {
 		if i == at {
@@ -429,11 +430,21 @@ func viewOf(v backend.View, n *graph.Node) (backend.View, bool) {
 // constOf reports the value of n if every element of it is that constant:
 // an unrealized constant, seen through any views.
 func constOf(n *graph.Node) (float64, bool) {
+	c := constNode(n)
+	if c == nil {
+		return 0, false
+	}
+	return c.Attrs.Value, true
+}
+
+// constNode returns the unrealized constant that n is, seen through any
+// views, or nil.
+func constNode(n *graph.Node) *graph.Node {
 	for !n.Realized() && n.Op.IsView() {
 		n = n.Inputs[0]
 	}
 	if n.Realized() || n.Op != backend.OpConst {
-		return 0, false
+		return nil
 	}
-	return n.Attrs.Value, true
+	return n
 }

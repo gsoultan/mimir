@@ -36,6 +36,18 @@ type Node struct {
 	Mem  *Storage     // set once realized
 	Ver  int          // the version of Mem that holds the result
 	View backend.View // how Shape is read from Mem.Buf
+
+	// Mark is the scheduler's scratch space, which it uses under its lock
+	// while it walks a graph.
+	Mark Mark
+}
+
+// Mark numbers a node or storage within one walk of the scheduler over a
+// graph: Num is meaningful only while Walk is the walk's number, so a new
+// walk starts with every mark cleared without touching them.
+type Mark struct {
+	Walk uint64
+	Num  int32
 }
 
 // Storage is a buffer that realized nodes read, each through its own view.
@@ -46,6 +58,8 @@ type Storage struct {
 	Dev     backend.Backend // the backend that owns Buf
 	Version int
 	Refs    int // the nodes realized into the storage since Version changed
+
+	Mark Mark // the scheduler's scratch space, like Node.Mark
 }
 
 // Realized reports whether the node holds its result.
