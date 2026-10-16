@@ -91,7 +91,7 @@ func TestLogCumSumExp(t *testing.T) {
 	}
 }
 
-func TestScanErrors(t *testing.T) {
+func TestCumulativeErrors(t *testing.T) {
 	x := tensor.Ones(tensor.Float32, 2, 3)
 	if err := x.CumSum(2).Err(); !errors.Is(err, tensor.ErrShape) {
 		t.Errorf("axis 2 of rank 2: %v, want ErrShape", err)
