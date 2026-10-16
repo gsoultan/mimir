@@ -37,6 +37,12 @@ type Backend struct {
 	hasMPS bool
 	mpsMin int
 	gemms  map[gemmKey]id // MPSMatrixMultiplication kernels
+
+	// hasTensor is whether the device runs Metal 4 tensor operations in
+	// hardware, and tensorMin the work from which float32 products run on
+	// them, or -1 if they never do. They take precedence over MPS.
+	hasTensor bool
+	tensorMin int
 }
 
 // mpsMinWork is the number of multiply-adds, m·n·k per matrix times the
@@ -74,7 +80,7 @@ func New() (*Backend, error) {
 	if err := loadObjC(); err != nil {
 		return nil, fmt.Errorf("metal: %v: %w", err, ErrUnavailable)
 	}
-	b := &Backend{pipelines: map[string]id{}, gemms: map[gemmKey]id{}, mpsMin: -1}
+	b := &Backend{pipelines: map[string]id{}, gemms: map[gemmKey]id{}, mpsMin: -1, tensorMin: -1}
 	autoreleased(func() {
 		b.dev = createDev()
 		if b.dev == 0 {
@@ -88,6 +94,9 @@ func New() (*Backend, error) {
 	}
 	if b.hasMPS = loadMPS() == nil && mpsSupports(b.dev); b.hasMPS {
 		b.mpsMin = mpsMinWork
+	}
+	if b.hasTensor = b.tensorOpsSupported(); b.hasTensor {
+		b.tensorMin = tensorMinWork
 	}
 	w, err := b.Alloc(backend.Int32, 1)
 	if err != nil {
@@ -278,19 +287,16 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	g, isGEMM := planGEMM(k, lens)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if isGEMM && b.mpsMin >= 0 && g.batch*g.m*g.n*g.k >= b.mpsMin {
-		var epilogue *launch
-		if k.Attrs.Program != nil {
-			var err error
-			if epilogue, err = planEpilogue(k, outs, ins); err != nil {
-				return fmt.Errorf("metal: %s: %w", k.Op, err)
-			}
+	work := g.batch * g.m * g.n * g.k
+	switch {
+	case isGEMM && b.tensorMin >= 0 && work >= b.tensorMin:
+		l, err := planTensorGEMM(g, len(ins))
+		if err != nil {
+			return fmt.Errorf("metal: %s: %w", k.Op, err)
 		}
-		b.encodeGEMM(g, bufs)
-		if epilogue == nil {
-			return nil
-		}
-		return b.encode(k, epilogue, bufs)
+		return b.encodeProduct(k, outs, ins, bufs, func() error { return b.encode(k, l, bufs) })
+	case isGEMM && b.mpsMin >= 0 && work >= b.mpsMin && g.packed():
+		return b.encodeProduct(k, outs, ins, bufs, func() error { b.encodeGEMM(g, bufs); return nil })
 	}
 	l, err := plan(k, outs, ins)
 	if err != nil {
@@ -302,10 +308,49 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	return b.encode(k, l, bufs)
 }
 
+// encodeProduct encodes a product of k with encodeGEMM, then its
+// epilogue, if it has one. b.mu is held.
+func (b *Backend) encodeProduct(k *backend.Kernel, outs, ins []backend.Buffer, bufs []*buffer, encodeGEMM func() error) error {
+	var epilogue *launch
+	if k.Attrs.Program != nil {
+		var err error
+		if epilogue, err = planEpilogue(k, outs, ins); err != nil {
+			return fmt.Errorf("metal: %s: %w", k.Op, err)
+		}
+	}
+	if err := encodeGEMM(); err != nil || epilogue == nil {
+		return err
+	}
+	return b.encode(k, epilogue, bufs)
+}
+
+// tensorOpsSupported reports whether the device runs Metal 4 tensor
+// operations in hardware, as the neural accelerators of Apple10 GPUs
+// (M5) do, and the system compiles the tensor product kernel, as macOS 26
+// does. Elsewhere products keep running through MPS.
+func (b *Backend) tensorOpsSupported() bool {
+	const (
+		familyApple10 = 1010 // MTLGPUFamilyApple10
+		familyMetal4  = 5002 // MTLGPUFamilyMetal4
+	)
+	var ok bool
+	autoreleased(func() {
+		ok = send(b.dev, selSupportsFamily, familyApple10)&0xff != 0 &&
+			send(b.dev, selSupportsFamily, familyMetal4)&0xff != 0
+	})
+	if !ok {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, err := b.pipeline(tensorSource(false, false, 2), true, tensorSIMDGroups*simdWidth)
+	return err == nil
+}
+
 // encode encodes the launch l of k over bufs, the outputs then the
 // inputs. b.mu is held.
 func (b *Backend) encode(k *backend.Kernel, l *launch, bufs []*buffer) error {
-	pso, err := b.pipeline(l.src)
+	pso, err := b.pipeline(l.src, l.metal4, l.threads)
 	if err != nil {
 		return fmt.Errorf("metal: %s: %w", k.Op, err)
 	}
@@ -358,8 +403,9 @@ func (b *Backend) encodeGEMM(g gemm, bufs []*buffer) {
 }
 
 // pipeline returns the compiled pipeline of src, compiling it the first
-// time. b.mu is held.
-func (b *Backend) pipeline(src string) (id, error) {
+// time as Metal Shading Language 4 if metal4 is set, and checking it runs
+// threads threads per threadgroup. b.mu is held.
+func (b *Backend) pipeline(src string, metal4 bool, threads int) (id, error) {
 	if pso, ok := b.pipelines[src]; ok {
 		return pso, nil
 	}
@@ -369,6 +415,10 @@ func (b *Backend) pipeline(src string) (id, error) {
 		opts := id(send(id(getClass("MTLCompileOptions")), selNew))
 		defer release(opts)
 		send(opts, selSetFastMath, 0)
+		if metal4 {
+			const languageVersion4 = 4 << 16 // MTLLanguageVersion4_0
+			send(opts, selSetLanguageVersion, languageVersion4)
+		}
 		source := nsString(src)
 		defer release(source)
 		var nsErr id
@@ -392,10 +442,10 @@ func (b *Backend) pipeline(src string) (id, error) {
 			err = fmt.Errorf("%w: %w", nsError("create pipeline", nsErr), backend.ErrInternal)
 			return
 		}
-		if max := int(send(pso, selMaxThreads)); max < groupSize {
+		if max := int(send(pso, selMaxThreads)); max < threads {
 			release(pso)
 			pso = 0
-			err = fmt.Errorf("pipeline runs %d threads per threadgroup, want %d: %w", max, groupSize, backend.ErrInternal)
+			err = fmt.Errorf("pipeline runs %d threads per threadgroup, want %d: %w", max, threads, backend.ErrInternal)
 		}
 	})
 	if err != nil {

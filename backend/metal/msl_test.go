@@ -257,7 +257,7 @@ type emulatedMPS struct{ *emulator }
 func (e emulatedMPS) run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buffer) ([][]byte, bool) {
 	t.Helper()
 	g, ok := planGEMM(k, []int{ins[0].Len(), ins[1].Len()})
-	if !ok {
+	if !ok || !g.packed() {
 		return e.emulator.run(t, k, outs, ins)
 	}
 	x, y := floats(t, ins[0]), floats(t, ins[1])
@@ -416,7 +416,8 @@ func show(dt backend.DType, w uint32) string {
 func run(t *testing.T, cases []kernelCase) { runOn(t, cases, false) }
 
 // runOn checks cases like run and, if mps is set, also running every
-// product it can through Metal Performance Shaders.
+// product it can through Metal Performance Shaders and on Metal 4 tensor
+// operations.
 func runOn(t *testing.T, cases []kernelCase, mps bool) {
 	targets := map[string]target{}
 	if e := newEmulator(t); e != nil {
@@ -425,10 +426,15 @@ func runOn(t *testing.T, cases []kernelCase, mps bool) {
 			targets["emulator-mps"] = emulatedMPS{e}
 		}
 	}
-	if g := newGPU(t, -1); g != nil {
+	if g := newGPU(t, -1, -1); g != nil {
 		targets["gpu"] = g
-		if mps {
-			targets["gpu-mps"] = newGPU(t, 0)
+	}
+	if mps {
+		if g := newGPU(t, 0, -1); g != nil {
+			targets["gpu-mps"] = g
+		}
+		if g := newGPU(t, -1, 0); g != nil {
+			targets["gpu-tensor"] = g
 		}
 	}
 	if len(targets) == 0 {
@@ -690,6 +696,7 @@ func TestMatMulKernels(t *testing.T) {
 		{[]int{2}, 3, 0, 4, nil},
 		{nil, 1, 9, 6, nil},
 		{[]int{3}, 33, 70, 17, nil},
+		{[]int{2}, 130, 70, 75, nil}, // several tensor tiles each way, the last ones partial
 	} {
 		xs := slices.Concat(s.batch, []int{s.m, s.k})
 		ys := slices.Concat(s.batch, []int{s.k, s.n})

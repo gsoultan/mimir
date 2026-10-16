@@ -39,6 +39,7 @@ type launch struct {
 	threads  int
 	params   []int32
 	barriers bool // threads of a threadgroup synchronize
+	metal4   bool // the source is Metal Shading Language 4
 }
 
 // maxElems bounds the elements of a buffer and the offsets kernels
