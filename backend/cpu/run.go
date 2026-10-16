@@ -121,6 +121,8 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 		return unfold(ctx, b, k, out, in[0])
 	case op == backend.OpFold:
 		return fold(ctx, b, k, out, in[0])
+	case op == backend.OpCat:
+		return cat(ctx, b, k, out, in)
 	default:
 		return fmt.Errorf("no cpu kernel: %w", backend.ErrInternal)
 	}

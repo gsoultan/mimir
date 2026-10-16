@@ -82,6 +82,12 @@ const (
 	// of their dtype.
 	OpScan
 
+	// Joining. OpCat concatenates its inputs along Attrs.Axis, each after
+	// the ones before it, like torch.cat: they share the output's dtype,
+	// rank and every dimension but the axis. It takes at least one input
+	// and at most MaxCatInputs.
+	OpCat
+
 	numOps
 )
 
@@ -109,6 +115,11 @@ func (c Combine) String() string {
 		return fmt.Sprintf("Combine(%d)", uint8(c))
 	}
 }
+
+// MaxCatInputs is the most inputs an OpCat kernel takes, so that the
+// buffers of a GPU kernel fit its argument table. Longer joins are trees
+// of OpCat.
+const MaxCatInputs = 16
 
 var opNames = [numOps]string{
 	OpInvalid:     "invalid",
@@ -146,6 +157,7 @@ var opNames = [numOps]string{
 	OpContiguous:  "contiguous",
 	OpFused:       "fused",
 	OpScan:        "scan",
+	OpCat:         "cat",
 }
 
 func (o Op) String() string {

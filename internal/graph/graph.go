@@ -452,3 +452,31 @@ func Scan(x *Node, axis int, combine backend.Combine) (*Node, error) {
 	}
 	return newNode(&Node{Op: backend.OpScan, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Combine: combine}})
 }
+
+// Cat joins xs along axis, each after the ones before it. They share a
+// dtype, a rank and every dimension but axis; there are 1 to
+// backend.MaxCatInputs of them.
+func Cat(xs []*Node, axis int) (*Node, error) {
+	if len(xs) == 0 || len(xs) > backend.MaxCatInputs {
+		return nil, errorf(backend.OpCat, backend.ErrInternal, "%d inputs", len(xs))
+	}
+	first := xs[0]
+	if axis < 0 || axis >= len(first.Shape) {
+		return nil, errorf(backend.OpCat, backend.ErrShape, "axis %d of %v", axis, first.Shape)
+	}
+	shape := slices.Clone(first.Shape)
+	shape[axis] = 0
+	for _, x := range xs {
+		if x.DType != first.DType {
+			return nil, errorf(backend.OpCat, backend.ErrDType, "%s and %s", first.DType, x.DType)
+		}
+		if len(x.Shape) != len(shape) || !slices.Equal(x.Shape[:axis], shape[:axis]) || !slices.Equal(x.Shape[axis+1:], shape[axis+1:]) {
+			return nil, errorf(backend.OpCat, backend.ErrShape, "%v and %v along axis %d", first.Shape, x.Shape, axis)
+		}
+		shape[axis] += x.Shape[axis]
+	}
+	if err := checkShape(backend.OpCat, shape); err != nil {
+		return nil, err
+	}
+	return newNode(&Node{Op: backend.OpCat, DType: first.DType, Shape: shape, Inputs: slices.Clone(xs), Attrs: backend.Attrs{Axis: axis}})
+}
