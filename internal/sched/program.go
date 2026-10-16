@@ -449,9 +449,13 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 		p.giveBack(m)
 		return err
 	}
-	if err := m.be.Sync(uncancelled(ctx)); err != nil {
-		p.giveBack(m)
-		return err
+	// An asynchronous backend reports the errors of these kernels at its
+	// next Sync, Upload or Download instead (see backend.Asynchronous).
+	if a, ok := m.be.(backend.Asynchronous); !ok || !a.Asynchronous() {
+		if err := m.be.Sync(uncancelled(ctx)); err != nil {
+			p.giveBack(m)
+			return err
+		}
 	}
 	for i, t := range targets {
 		slot := p.results[i]

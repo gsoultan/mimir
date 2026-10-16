@@ -30,7 +30,11 @@ func (b *Backend) parallelFor(ctx context.Context, n, grain int, fn func(lo, hi 
 		return runChunk(ctx, fn, 0, n)
 	}
 	size := (n + chunks - 1) / chunks
-	if t := defaultTeam(); t != nil && t.mu.TryLock() {
+	t := b.team
+	if t == nil {
+		t = defaultTeam()
+	}
+	if t != nil && t.mu.TryLock() {
 		defer t.mu.Unlock()
 		return t.run(ctx, n, size, fn)
 	}
