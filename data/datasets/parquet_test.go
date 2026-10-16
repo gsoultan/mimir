@@ -372,6 +372,10 @@ func TestParquetShardsShareOpenFiles(t *testing.T) {
 
 	// Shards opened, read and closed at random from several goroutines
 	// share files and leave at most 4 open.
+	if err := src.(io.Closer).Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkIdle(t, ps, []string{})
 	paths = append(paths, parquetFixture("reg_0"), parquetFixture("reg_0")) // a path twice
 	src, _, err = ParquetShards(paths, "y")
 	if err != nil {
