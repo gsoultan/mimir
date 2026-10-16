@@ -128,6 +128,7 @@ func TestKernelsCompileWithNVRTC(t *testing.T) {
 		kerneltest.Conv,
 		kerneltest.Sort,
 		kerneltest.FFT,
+		kerneltest.Segment,
 	} {
 		cases = append(cases, f(t)...)
 	}

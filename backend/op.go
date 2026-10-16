@@ -186,6 +186,17 @@ const (
 	// reparameterization gradient: -(∂P(α, x)/∂α) / p(x; α).
 	OpGammaGrad
 
+	// OpSegment combines rows of In[0], [R, D...], in segments, as the
+	// product of a sparse matrix in compressed rows: In[1], Int32 [S+1],
+	// holds the offsets of S segments into In[2], Int32 [J], which lists
+	// rows of In[0]. Row s of the output, [S, D...], combines the rows
+	// In[2][j] for j from In[1][s] up to In[1][s+1], in that order, by
+	// Attrs.Combine, CombineSum or CombineMax, and is zero for an empty
+	// segment. Offsets that fall or leave [0, J], and rows outside
+	// [0, R), fail with ErrIndex. Half rows are combined in float32 and
+	// rounded once.
+	OpSegment
+
 	numOps
 )
 
@@ -290,6 +301,7 @@ var opNames = [numOps]string{
 	OpRandGamma:   "rand_gamma",
 	OpRandPoisson: "rand_poisson",
 	OpGammaGrad:   "gamma_grad",
+	OpSegment:     "segment",
 }
 
 func (o Op) String() string {
