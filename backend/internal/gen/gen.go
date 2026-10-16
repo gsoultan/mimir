@@ -447,6 +447,13 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return planScan(d, k, outs, ins, n)
 	case op == backend.OpCat:
 		return g.cat(n)
+
+	case op == backend.OpAttention:
+		return planAttention(d, k, outs, ins)
+	case op == backend.OpAttentionGrad:
+		return planAttentionGrad(d, k, outs, ins)
+	case op == backend.OpSliceScatter:
+		return planSliceScatter(d, k, outs, ins, n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }

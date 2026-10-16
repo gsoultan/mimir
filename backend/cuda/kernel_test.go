@@ -57,3 +57,6 @@ func TestWindowKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Window(t), t
 func TestMatMulKernels(t *testing.T) { kerneltest.Run(t, kerneltest.MatMul(t), targets(t, true)) }
 func TestScanKernels(t *testing.T)   { kerneltest.Run(t, kerneltest.Scan(t), targets(t, false)) }
 func TestQuantKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.Quant(t), targets(t, false)) }
+func TestAttentionKernels(t *testing.T) {
+	kerneltest.Run(t, kerneltest.Attention(t), targets(t, false))
+}

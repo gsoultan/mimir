@@ -479,3 +479,115 @@ func MatMul(t *testing.T) []Case {
 	})
 	return cases
 }
+
+// Attention returns cases of the attention kernels, forward and backward,
+// whose result and logsumexp inputs the CPU backend computes, and of
+// slice scatters.
+func Attention(t *testing.T) []Case {
+	rng := rand.New(rand.NewPCG(11, 12))
+	f := backend.Float32
+	var cases []Case
+	for _, c := range []struct {
+		name        string
+		batch       []int
+		h, hk, q, k int
+		d, dv       int
+		causal      bool
+		offset      int
+		mask        bool
+		qv, kv, vv  string // views of the queries, keys and values
+		dt          backend.DType
+	}{
+		{name: "small", batch: []int{2}, h: 2, hk: 2, q: 5, k: 7, d: 8, dv: 4},
+		{name: "grouped causal", batch: []int{1}, h: 4, hk: 2, q: 9, k: 9, d: 16, dv: 16, causal: true},
+		{name: "decoding", batch: []int{2}, h: 4, hk: 1, q: 1, k: 37, d: 8, dv: 8, causal: true, offset: 36},
+		{name: "masked", batch: []int{2}, h: 2, hk: 2, q: 6, k: 10, d: 8, dv: 8, mask: true},
+		{name: "tiles and blocks", batch: []int{1}, h: 1, hk: 1, q: 70, k: 150, d: 64, dv: 64, causal: true, offset: 80},
+		{name: "strided", batch: []int{2}, h: 2, hk: 2, q: 5, k: 6, d: 4, dv: 4, qv: "transposed", kv: "padded", vv: "flipped"},
+		{name: "broadcast", batch: []int{3}, h: 2, hk: 1, q: 4, k: 6, d: 4, dv: 4, kv: "broadcast", vv: "broadcast", mask: true},
+		{name: "no visible keys", h: 3, hk: 3, q: 4, k: 4, d: 4, dv: 4, causal: true, offset: -2},
+		{name: "no keys", batch: []int{1}, h: 1, hk: 1, q: 3, k: 0, d: 4, dv: 4},
+		{name: "bfloat16", batch: []int{1}, h: 2, hk: 2, q: 6, k: 6, d: 8, dv: 8, causal: true, dt: backend.BFloat16},
+		{name: "float16 masked", batch: []int{1}, h: 2, hk: 1, q: 6, k: 6, d: 8, dv: 8, mask: true, dt: backend.Float16},
+		{name: "head size 128", batch: []int{1}, h: 2, hk: 1, q: 20, k: 40, d: 128, dv: 128, causal: true, offset: 20},
+	} {
+		dt := c.dt
+		if dt == 0 {
+			dt = f
+		}
+		s := backend.AttentionShape{Batch: c.batch, Heads: c.h, KVHeads: c.hk, Q: c.q, K: c.k, D: c.d, DV: c.dv}
+		view := func(shape []int, name string) View {
+			if name == "" {
+				name = "contiguous"
+			}
+			return Views(shape)[name]
+		}
+		qv, kv, vv := view(s.QShape(), c.qv), view(s.KShape(), c.kv), view(s.VShape(), c.vv)
+		in := []backend.View{qv.V, kv.V, vv.V}
+		bufs := []backend.Buffer{HostBuffer(t, rng, dt, qv.N, 0, 0), HostBuffer(t, rng, dt, kv.N, 0, 0), HostBuffer(t, rng, dt, vv.N, 0, 0)}
+		var maskView backend.View
+		var maskBuf backend.Buffer
+		if c.mask {
+			// One mask for every batch item and head, hiding some keys.
+			scores := slices.Concat(c.batch, []int{c.h, c.q, c.k})
+			one := slices.Clone(scores)
+			for d := range len(one) - 2 {
+				one[d] = 1
+			}
+			vals := make([]float32, c.q*c.k)
+			for i := range vals {
+				vals[i] = rng.Float32()*2 - 1
+				if i%5 == 3 {
+					vals[i] = float32(math.Inf(-1))
+				}
+			}
+			mb, err := Host.Alloc(f, len(vals))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Host.Upload(t.Context(), mb, Bytes(vals)); err != nil {
+				t.Fatal(err)
+			}
+			maskView, maskBuf = backend.Contiguous(one).Expand(scores), cast(t, mb, dt)
+		}
+		attrs := backend.Attrs{Scale: 1 / math.Sqrt(float64(c.d)), Causal: c.causal, CausalOffset: c.offset}
+		fwd := backend.Kernel{Op: backend.OpAttention, DType: f, Shape: []int{s.Size()}, In: in, Attrs: attrs}
+		fwdIns := bufs
+		if c.mask {
+			fwd.In = append(slices.Clone(in), maskView)
+			fwdIns = append(slices.Clone(bufs), maskBuf)
+		}
+		cases = append(cases, Case{Name: "attention/" + c.name, K: fwd, Ins: fwdIns, Tol: 1e-4})
+
+		res := HostBuffer(t, nil, f, s.Size(), 0, 0)
+		if err := Host.Run(t.Context(), &fwd, []backend.Buffer{res}, fwdIns); err != nil {
+			t.Fatal(err)
+		}
+		no, _ := backend.NumElements(s.OutShape())
+		lse := backend.Contiguous(s.LSEShape())
+		lse.Offset = no
+		gin := append(slices.Clone(in), backend.Contiguous(s.OutShape()), lse, backend.Contiguous(s.OutShape()))
+		gbufs := append(slices.Clone(bufs), res, res, HostBuffer(t, rng, f, no, 0, 0))
+		if c.mask {
+			gin, gbufs = append(gin, maskView), append(gbufs, maskBuf)
+		}
+		cases = append(cases, Case{
+			Name: "attention gradient/" + c.name,
+			K:    backend.Kernel{Op: backend.OpAttentionGrad, DType: f, Shape: []int{s.GradSize()}, In: gin, Attrs: attrs},
+			Ins:  gbufs,
+			Tol:  1e-4,
+		})
+	}
+	for _, dt := range []backend.DType{f, backend.BFloat16} {
+		shape := []int{3, 8, 4}
+		src := Views([]int{3, 2, 4})["transposed"]
+		cases = append(cases, Case{
+			Name: fmt.Sprintf("slice scatter/%s", dt),
+			K: backend.Kernel{Op: backend.OpSliceScatter, DType: dt, Shape: shape,
+				In:    []backend.View{Views(shape)["flipped"].V, src.V},
+				Attrs: backend.Attrs{Ranges: [][2]int{{0, 3}, {5, 7}, {0, 4}}}},
+			Ins: []backend.Buffer{HostBuffer(t, rng, dt, 96, 0, 0), HostBuffer(t, rng, dt, src.N, 0, 0)},
+		})
+	}
+	return cases
+}
