@@ -2,9 +2,9 @@
 """Generate the Parquet files that io/parquet's tests read.
 
     pip install pyarrow
-    python tools/parquet/gen.py --out io/parquet/testdata
+    python tools/parquet/gen.py --out io/parquet/testdata --shards data/datasets/testdata
 
-Every file holds the same table of n rows, whose row i is
+Every file under --out holds the same table of n rows, whose row i is
 
     i32   int32    7*i - 100
     i64   int64    i * 10_000_000_000 - 5
@@ -29,10 +29,35 @@ files differ in how the table is stored:
     empty                 the schema with no rows
 
 The format version ("v1" or "v2" in the names) decides which encodings
-pyarrow may use. Every file holds data pages V1, pyarrow's default;
-data_page_version="2.0" would be needed for data pages V2. Every column
-is optional, so every page carries definition levels, though only opt
-has nulls. The row count n is 1000, except pages_v2_snappy and empty.
+pyarrow may use. The v1 files hold data pages V1, pyarrow's default, and
+the v2 files data pages V2 (data_page_version="2.0"), whose levels stay
+uncompressed before the compressed values. Every column is optional, so
+every page carries definition levels, though only opt has nulls. The
+row count n is 1000, except pages_v2_snappy and empty.
+
+The files under --shards are what datasets.ParquetShards's tests read:
+shards of a regression table, whose row i (counted over all its files) is
+
+    x1  float    i / 4
+    x2  int32    i % 7 - 3
+    x3  boolean  i % 2 == 0
+    x4  int64    i * 1_000_000_007
+    y   double   i / 2 + 0.5
+
+and of a classification table, whose row i is
+
+    x1     float   i / 4
+    x2     int32   i % 7 - 3
+    label  string  "abc"[i % 3]
+
+    reg_0        rows 0 to 99 of the regression table, two row groups
+    reg_1        rows 100 to 129, one row group
+    cls_0        rows 0 to 99 of the classification table, two row groups,
+                 dictionary encoded, data pages V2
+    cls_1        rows 100 to 129, one row group, plain
+    nulls        rows 0 to 9 of the regression table with x2 null at row 3
+    mismatch     rows 0 to 9 of the regression table with x2 as int64
+    single       rows 0 to 9 of y alone
 """
 
 import argparse
@@ -61,10 +86,10 @@ def table(n: int) -> pa.Table:
 FILES = {
     "plain_v1": dict(n=1000, version="1.0", use_dictionary=False, compression="none"),
     "dict_v1_snappy": dict(n=1000, version="1.0", use_dictionary=True, compression="snappy"),
-    "dict_v2_gzip": dict(n=1000, version="2.6", use_dictionary=True, compression="gzip"),
-    "dict_v2_zstd": dict(n=1000, version="2.6", use_dictionary=True, compression="zstd"),
+    "dict_v2_gzip": dict(n=1000, version="2.6", use_dictionary=True, compression="gzip", data_page_version="2.0"),
+    "dict_v2_zstd": dict(n=1000, version="2.6", use_dictionary=True, compression="zstd", data_page_version="2.0"),
     "delta_v2": dict(
-        n=1000, version="2.6", use_dictionary=False, compression="none",
+        n=1000, version="2.6", use_dictionary=False, compression="none", data_page_version="2.0",
         column_encoding={
             "i32": "DELTA_BINARY_PACKED", "i64": "DELTA_BINARY_PACKED",
             "f32": "BYTE_STREAM_SPLIT", "f64": "BYTE_STREAM_SPLIT",
@@ -72,32 +97,76 @@ FILES = {
         },
     ),
     "delta_byte_array_v2": dict(
-        n=1000, version="2.6", use_dictionary=False, compression="none",
+        n=1000, version="2.6", use_dictionary=False, compression="none", data_page_version="2.0",
         column_encoding={"name": "DELTA_BYTE_ARRAY"},
     ),
     "pages_v2_snappy": dict(
-        n=10000, version="2.6", use_dictionary=True, compression="snappy",
+        n=10000, version="2.6", use_dictionary=True, compression="snappy", data_page_version="2.0",
         row_group_size=4000, data_page_size=2048,
     ),
     "empty": dict(n=0, version="2.6", use_dictionary=True, compression="snappy"),
 }
 
 
+def regression(start: int, n: int, x2: pa.DataType = pa.int32(), x2_null: int = -1) -> pa.Table:
+    rows = range(start, start + n)
+    return pa.table(
+        {
+            "x1": pa.array([i / 4 for i in rows], pa.float32()),
+            "x2": pa.array([None if i == x2_null else i % 7 - 3 for i in rows], x2),
+            "x3": pa.array([i % 2 == 0 for i in rows], pa.bool_()),
+            "x4": pa.array([i * 1_000_000_007 for i in rows], pa.int64()),
+            "y": pa.array([i / 2 + 0.5 for i in rows], pa.float64()),
+        }
+    )
+
+
+def classification(start: int, n: int) -> pa.Table:
+    rows = range(start, start + n)
+    return pa.table(
+        {
+            "x1": pa.array([i / 4 for i in rows], pa.float32()),
+            "x2": pa.array([i % 7 - 3 for i in rows], pa.int32()),
+            "label": pa.array(["abc"[i % 3] for i in rows], pa.string()),
+        }
+    )
+
+
+SHARDS = {
+    "reg_0": (regression(0, 100), dict(row_group_size=50, use_dictionary=False)),
+    "reg_1": (regression(100, 30), dict(use_dictionary=False)),
+    "cls_0": (classification(0, 100), dict(row_group_size=50, use_dictionary=True, data_page_version="2.0")),
+    "cls_1": (classification(100, 30), dict(use_dictionary=False, version="1.0")),
+    "nulls": (regression(0, 10, x2_null=3), dict(use_dictionary=False)),
+    "mismatch": (regression(0, 10, x2=pa.int64()), dict(use_dictionary=False)),
+    "single": (regression(0, 10).select(["y"]), dict(use_dictionary=False)),
+}
+
+
+def write(path: str, t: pa.Table, opts: dict) -> None:
+    opts = dict(opts)
+    row_group_size = opts.pop("row_group_size", None)
+    pq.write_table(t, path, row_group_size=row_group_size, write_statistics=False, **opts)
+    meta = pq.read_metadata(path)
+    encodings = sorted({e for g in range(meta.num_row_groups) for c in range(meta.num_columns)
+                        for e in meta.row_group(g).column(c).encodings})
+    name = os.path.splitext(os.path.basename(path))[0]
+    print(f"{name}: {meta.num_rows} rows, {meta.num_row_groups} row groups, {os.path.getsize(path)} bytes, {encodings}")
+
+
 def main() -> None:
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "..", "io", "parquet", "testdata"))
+    p.add_argument("--out", default=os.path.join(root, "io", "parquet", "testdata"))
+    p.add_argument("--shards", default=os.path.join(root, "data", "datasets", "testdata"))
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     for name, opts in FILES.items():
         opts = dict(opts)
-        n = opts.pop("n")
-        row_group_size = opts.pop("row_group_size", None)
-        path = os.path.join(args.out, name + ".parquet")
-        pq.write_table(table(n), path, row_group_size=row_group_size, write_statistics=False, **opts)
-        meta = pq.read_metadata(path)
-        encodings = sorted({e for g in range(meta.num_row_groups) for c in range(meta.num_columns)
-                            for e in meta.row_group(g).column(c).encodings})
-        print(f"{name}: {meta.num_rows} rows, {meta.num_row_groups} row groups, {os.path.getsize(path)} bytes, {encodings}")
+        write(os.path.join(args.out, name + ".parquet"), table(opts.pop("n")), opts)
+    os.makedirs(args.shards, exist_ok=True)
+    for name, (t, opts) in SHARDS.items():
+        write(os.path.join(args.shards, name + ".parquet"), t, opts)
 
 
 if __name__ == "__main__":

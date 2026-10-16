@@ -865,10 +865,10 @@ func TestMalformedPages(t *testing.T) {
 	}
 }
 
-// TestDataPageV2 covers data pages V2, which pyarrow writes only with
-// data_page_version="2.0": the levels stay uncompressed with their lengths
-// in the header, and the values are compressed on their own, or not at all
-// when is_compressed is false.
+// TestDataPageV2 covers the ways a data page V2 may be laid out, beyond
+// the v2 fixtures: the levels stay uncompressed with their lengths in the
+// header, and the values are compressed on their own, or not at all when
+// is_compressed is false.
 func TestDataPageV2(t *testing.T) {
 	cases := map[string]tchunk{
 		"uncompressed":   {v2: true},

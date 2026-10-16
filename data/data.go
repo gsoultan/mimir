@@ -11,7 +11,8 @@
 //	}
 //
 // A training set larger than memory streams from a Source of shards, such
-// as the CSV files of datasets.CSVShards, through a Stream, which reads a
+// as the CSV files of datasets.CSVShards or the row groups of the Parquet
+// files of datasets.ParquetShards, through a Stream, which reads a
 // few shards ahead of the batches it yields and shuffles the shard order
 // and a buffer of examples every epoch, so resident memory stays flat
 // however many rows there are: a Stream holds 2×Prefetch+1 chunks of
