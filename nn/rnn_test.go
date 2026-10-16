@@ -238,14 +238,14 @@ func TestRecurrentShapesAndErrors(t *testing.T) {
 }
 
 // near fails t at the first element of got further than tol from want,
-// relative to the larger of 1 and want.
+// relative to the larger of 1 and want, or at the first NaN.
 func near(t *testing.T, what string, got, want []float32, tol float64) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("%s: %d values, want %d", what, len(got), len(want))
 	}
 	for i := range got {
-		if d := math.Abs(float64(got[i] - want[i])); d > tol*max(1, math.Abs(float64(want[i]))) {
+		if d := math.Abs(float64(got[i] - want[i])); !(d <= tol*max(1, math.Abs(float64(want[i])))) {
 			t.Fatalf("%s[%d] = %v, want %v", what, i, got[i], want[i])
 		}
 	}
