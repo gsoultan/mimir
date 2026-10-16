@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/backend/cpu"
@@ -258,6 +259,116 @@ func TestCheckpointErrors(t *testing.T) {
 			t.Errorf("values %v", got)
 		}
 	})
+}
+
+// within returns what fn returns, or fails the test if fn has not
+// returned after a minute: a Backward that deadlocks would otherwise hang
+// until the test binary times out. The goroutine of a deadlocked fn is
+// left behind, blocked, which a failed test can afford.
+func within(t *testing.T, fn func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Minute):
+		t.Fatal("still running after a minute: deadlocked")
+		return nil
+	}
+}
+
+func TestCheckpointedFunctionMayUseGradients(t *testing.T) {
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name string
+		use  func(t *testing.T, w, other *tensor.Param)
+	}{
+		{"Grad", func(_ *testing.T, w, _ *tensor.Param) { _ = w.Grad() }},
+		{"ZeroGrad", func(_ *testing.T, _, other *tensor.Param) { other.ZeroGrad() }},
+		{"Param.To", func(t *testing.T, _, other *tensor.Param) {
+			if err := other.To(tensor.CPU()); err != nil {
+				t.Error(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tensor.NewParam(tensor.FromSlice([]float32{1, 2, 3}))
+			other := tensor.NewParam(tensor.FromSlice([]float32{7, 8}))
+			if err := other.Value().Sum().Backward(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// f does what a module's forward pass may: here in the
+			// forward call and again in the recompute, under Backward.
+			f := func(in ...*tensor.Tensor) *tensor.Tensor {
+				tc.use(t, w, other)
+				return in[0].Mul(w.Value())
+			}
+			x := tensor.FromSlice([]float32{4, 5, 6}).RequiresGrad()
+			if err := within(t, func() error { return tensor.Checkpoint(f, x).Sum().Backward(ctx) }); err != nil {
+				t.Fatal(err)
+			}
+			if got := data[float32](t, x.Grad()); !slices.Equal(got, []float32{1, 2, 3}) {
+				t.Errorf("x gradient %v, want w = [1 2 3]", got)
+			}
+			if got := data[float32](t, w.Grad()); !slices.Equal(got, []float32{4, 5, 6}) {
+				t.Errorf("w gradient %v, want x = [4 5 6]", got)
+			}
+		})
+	}
+}
+
+func TestCheckpointedFunctionCallingBackwardFails(t *testing.T) {
+	ctx := t.Context()
+	w := tensor.NewParam(tensor.FromSlice([]float32{1, 2, 3}))
+	calls := 0
+	var nested error
+	f := func(in ...*tensor.Tensor) *tensor.Tensor {
+		if calls++; calls == 2 { // the recompute
+			nested = in[0].Mul(w.Value()).Sum().Backward(ctx)
+		}
+		return in[0].Mul(w.Value())
+	}
+	x := tensor.FromSlice([]float32{4, 5, 6}).RequiresGrad()
+	if err := within(t, func() error { return tensor.Checkpoint(f, x).Sum().Backward(ctx) }); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("f ran %d times, want 2", calls)
+	}
+	if !errors.Is(nested, tensor.ErrCheckpoint) {
+		t.Errorf("Backward inside the recompute: %v, want ErrCheckpoint", nested)
+	}
+	// The nested Backward added nothing.
+	if got := data[float32](t, w.Grad()); !slices.Equal(got, []float32{4, 5, 6}) {
+		t.Errorf("w gradient %v, want x = [4 5 6]", got)
+	}
+}
+
+func TestCheckpointBackwardsOnManyGoroutinesTakeTurns(t *testing.T) {
+	// Backward on another goroutine while one recomputes a checkpoint is
+	// not a Backward inside the recompute: it waits its turn.
+	ctx := t.Context()
+	w := tensor.NewParam(tensor.Ones(tensor.Float32, 3))
+	f := func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].Mul(w.Value()) }
+	const goroutines, rounds = 4, 25
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			for range rounds {
+				x := tensor.FromSlice([]float32{1, 2, 3})
+				if err := tensor.Checkpoint(f, x).Sum().Backward(ctx); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	const n = goroutines * rounds
+	if got := data[float32](t, w.Grad()); !slices.Equal(got, []float32{n, 2 * n, 3 * n}) {
+		t.Errorf("w gradient %v, want %d x = [%d %d %d]", got, n, n, 2*n, 3*n)
+	}
 }
 
 // peakMeter is a backend that records the most memory its buffers held
