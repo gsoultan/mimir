@@ -217,6 +217,21 @@ func (d *decoder) readList(typ, elem byte) (int, error) {
 	return n, nil
 }
 
+// readStructList reads the header of a list field of structs, each of
+// which takes at least minSize bytes with its required fields, and checks
+// that the rest of the message can hold them, so that a count alone does
+// not allocate more than the message's bytes can fill.
+func (d *decoder) readStructList(typ byte, minSize int) (int, error) {
+	n, err := d.readList(typ, ttStruct)
+	if err != nil {
+		return 0, err
+	}
+	if n > (len(d.buf)-d.pos)/minSize {
+		return 0, fmt.Errorf("list of %d structs of %d bytes or more in %d bytes", n, minSize, len(d.buf)-d.pos)
+	}
+	return n, nil
+}
+
 // readStruct reads a struct field.
 func (d *decoder) readStruct(typ byte, fn func(id int16, typ byte) error) error {
 	if typ != ttStruct {

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 )
 
 // unsigned is the set of types bit-packed values are unpacked into.
@@ -157,6 +158,62 @@ func (d *rleDecoder[T]) next(dst []T) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// count decodes up to n values without keeping them and returns how many
+// it decoded, fewer only when the data ends, and how many of those equal
+// v. A repeated run is counted without being expanded, and bit-packed
+// groups of width 1, the levels of an optional column, by their bits.
+func (d *rleDecoder[T]) count(n int, v T) (decoded, equal int, err error) {
+	var buf [256]T
+	for decoded < n {
+		switch groups := min(d.bpLeft, n-decoded) / 8; {
+		case d.rleLeft > 0:
+			k := min(d.rleLeft, n-decoded)
+			if d.rleVal == v {
+				equal += k
+			}
+			d.rleLeft -= k
+			decoded += k
+		case d.groupLeft == 0 && groups > 0 && d.width == 1 && v <= 1:
+			ones := 0
+			b := d.data[d.pos : d.pos+groups]
+			for len(b) >= 8 {
+				ones += bits.OnesCount64(binary.LittleEndian.Uint64(b))
+				b = b[8:]
+			}
+			for _, x := range b {
+				ones += bits.OnesCount8(x)
+			}
+			if v == 1 {
+				equal += ones
+			} else {
+				equal += 8*groups - ones
+			}
+			d.pos += groups
+			d.bpLeft -= 8 * groups
+			decoded += 8 * groups
+		case d.groupLeft > 0 || d.bpLeft > 0:
+			// The values of the current run, through buf.
+			k, err := d.next(buf[:min(len(buf), n-decoded, d.groupLeft+d.bpLeft)])
+			for _, x := range buf[:k] {
+				if x == v {
+					equal++
+				}
+			}
+			decoded += k
+			if err != nil {
+				return decoded, equal, err
+			}
+		case d.pos >= len(d.data):
+			return decoded, equal, nil
+		default:
+			if err := d.run(); err != nil {
+				return decoded, equal, err
+			}
+		}
+	}
+	return decoded, equal, nil
 }
 
 // run reads the header of the next run.
