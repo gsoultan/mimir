@@ -357,6 +357,9 @@ func batchMatMul(l uint64, x, y *Tensor) *Tensor {
 		d, n, m := s[1:r-2], s[0], s[r-2]
 		rows := p.moveAxis(0, r-3).reshape(slices.Concat(d, []int{n * m, s[r-1]}))
 		prod := matmulPrim(rows, y)
+		if prod.err != nil {
+			return prod
+		}
 		nc := prod.node.Shape[len(prod.node.Shape)-1]
 		return newBatched(prod.reshape(slices.Concat(d, []int{n, m, nc})).moveAxis(r-3, 0), l)
 	default:
@@ -367,6 +370,9 @@ func batchMatMul(l uint64, x, y *Tensor) *Tensor {
 		d, n, k, nc := s[1:r-2], s[0], s[r-2], s[r-1]
 		cols := p.moveAxis(0, r-2).reshape(slices.Concat(d, []int{k, n * nc}))
 		prod := matmulPrim(x, cols)
+		if prod.err != nil {
+			return prod
+		}
 		m := prod.node.Shape[len(prod.node.Shape)-2]
 		return newBatched(prod.reshape(slices.Concat(d, []int{m, n, nc})).moveAxis(r-2, 0), l)
 	}
