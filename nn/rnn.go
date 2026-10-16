@@ -473,6 +473,7 @@ var tanhFunc = tensor.Func{
 		one := tensor.Full(y.DType(), 1)
 		return []*tensor.Tensor{g.Mul(one.Sub(y.Mul(y)))}
 	},
+	Differentiable: true,
 }
 
 // reluFunc is ReLU with a gradient computed from its result alone.
@@ -481,6 +482,7 @@ var reluFunc = tensor.Func{
 	Backward: func(g *tensor.Tensor, _ []*tensor.Tensor, y *tensor.Tensor) []*tensor.Tensor {
 		return []*tensor.Tensor{g.Mul(y.Greater(tensor.Full(y.DType(), 0)))}
 	},
+	Differentiable: true,
 }
 
 // lstmFuncs are the parts of an LSTM step over a batch of batch states
@@ -517,6 +519,7 @@ func newLSTMFuncs(dt tensor.DType, batch, hidden int) lstmFuncs {
 			Backward: func(g *tensor.Tensor, _ []*tensor.Tensor, y *tensor.Tensor) []*tensor.Tensor {
 				return []*tensor.Tensor{g.Mul(y.Add(unshift)).Mul(one.Sub(y))}
 			},
+			Differentiable: true,
 		},
 		cell: tensor.Func{
 			Forward: func(in []*tensor.Tensor) *tensor.Tensor {
@@ -540,6 +543,7 @@ func newLSTMFuncs(dt tensor.DType, batch, hidden int) lstmFuncs {
 				ds := tensor.Where(isH, zero, dc(two).Mul(two(slot(act, 1))))
 				return []*tensor.Tensor{dact, ds}
 			},
+			Differentiable: true,
 		},
 		pick: tensor.Func{
 			Forward: func(in []*tensor.Tensor) *tensor.Tensor {
@@ -548,6 +552,7 @@ func newLSTMFuncs(dt tensor.DType, batch, hidden int) lstmFuncs {
 			Backward: func(g *tensor.Tensor, _ []*tensor.Tensor, _ *tensor.Tensor) []*tensor.Tensor {
 				return []*tensor.Tensor{tensor.Where(isH, g.Reshape(batch, 1, hidden), zero)}
 			},
+			Differentiable: true,
 		},
 	}
 }
@@ -587,5 +592,6 @@ func newGRUFunc(dt tensor.DType, batch, hidden int) tensor.Func {
 			dhp := tensor.Where(isR, dr, tensor.Where(isZ, dz, dn.Mul(r)))
 			return []*tensor.Tensor{dx.Reshape(batch, 3*hidden), dhp.Reshape(batch, 3*hidden), g.Mul(z).Reshape(batch, hidden)}
 		},
+		Differentiable: true,
 	}
 }
