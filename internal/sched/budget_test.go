@@ -519,3 +519,21 @@ func TestBudgetCountsMemoryGivenToThePool(t *testing.T) {
 		t.Errorf("after the schedule %d bytes are held and %d elements pooled, want 6000 and the given buffer freed", m.Allocated, poolOf(be).pooledElements())
 	}
 }
+
+func TestBudgetCollectsDroppedResultsBeforeRefusing(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	const n = 1 << 18 // a mebibyte of float32
+	if err := Realize(t.Context(), be, must(graph.Rand([]int{n}, 1, false))); err != nil {
+		t.Fatal(err)
+	}
+	// The result is dropped, but its memory is held until the garbage
+	// collector gets to it, which a refusal does not wait for.
+	SetBudget(be, n*4+4)
+	y := must(graph.Rand([]int{n}, 2, false))
+	if err := Realize(t.Context(), be, y); err != nil {
+		t.Fatalf("schedule with no live result on the device: %v", err)
+	}
+	if m := MemoryOf(be); m.Allocated != n*4 {
+		t.Errorf("%d bytes held after the schedule, want the result's %d", m.Allocated, n*4)
+	}
+}
