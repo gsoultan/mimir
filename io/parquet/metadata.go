@@ -250,7 +250,8 @@ func parseFileMetaData(b []byte) (fileMetaData, error) {
 		case 1:
 			m.version, err = d.readI32(typ)
 		case 2:
-			n, err := d.readList(typ, ttStruct)
+			// A SchemaElement holds its name, a field of 2 bytes or more.
+			n, err := d.readStructList(typ, 3)
 			if err != nil {
 				return err
 			}
@@ -263,13 +264,26 @@ func parseFileMetaData(b []byte) (fileMetaData, error) {
 		case 3:
 			m.numRows, err = d.readI64(typ)
 		case 4:
-			n, err := d.readList(typ, ttStruct)
+			// A RowGroup holds its columns, total_byte_size and num_rows,
+			// fields of 2 bytes or more each.
+			n, err := d.readStructList(typ, 7)
 			if err != nil {
 				return err
 			}
+			// Writers put the schema first; a row group of more column
+			// chunks than it has leaves fails before they are allocated.
+			columns := -1
+			if len(m.schema) > 0 {
+				columns = 0
+				for i := 1; i < len(m.schema); i++ {
+					if m.schema[i].numChildren <= 0 {
+						columns++
+					}
+				}
+			}
 			m.rowGroups = make([]rowGroup, n)
 			for i := range m.rowGroups {
-				if err := d.strct(m.rowGroups[i].parse(d)); err != nil {
+				if err := d.strct(m.rowGroups[i].parse(d, columns)); err != nil {
 					return err
 				}
 			}
@@ -295,7 +309,8 @@ func parseFileMetaData(b []byte) (fileMetaData, error) {
 }
 
 func parseKeyValues(d *decoder, typ byte) (map[string]string, error) {
-	n, err := d.readList(typ, ttStruct)
+	// A KeyValue holds its key, a field of 2 bytes or more.
+	n, err := d.readStructList(typ, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -415,13 +430,20 @@ func (e *schemaElement) logicalType() (name string, precision, scale int32) {
 	return "", 0, 0
 }
 
-func (g *rowGroup) parse(d *decoder) func(id int16, typ byte) error {
+// parse reads a RowGroup of at most columns column chunks, or of any
+// number when columns is negative.
+func (g *rowGroup) parse(d *decoder, columns int) func(id int16, typ byte) error {
 	return func(id int16, typ byte) (err error) {
 		switch id {
 		case 1:
-			n, err := d.readList(typ, ttStruct)
+			// A ColumnChunk holds its file_offset, a field of 2 bytes or
+			// more.
+			n, err := d.readStructList(typ, 3)
 			if err != nil {
 				return err
+			}
+			if columns >= 0 && n > columns {
+				return fmt.Errorf("row group of %d column chunks for %d columns", n, columns)
 			}
 			g.columns = make([]columnChunk, n)
 			for i := range g.columns {
@@ -487,6 +509,9 @@ func (m *columnMetaData) parse(d *decoder) func(id int16, typ byte) error {
 			n, err := d.readList(typ, ttBinary)
 			if err != nil {
 				return err
+			}
+			if n > maxSchemaDepth+1 {
+				return fmt.Errorf("path of %d names", n)
 			}
 			m.path = make([]string, n)
 			for i := range m.path {

@@ -15,11 +15,14 @@ import (
 type kind uint8
 
 const (
-	kindNone       kind = iota
-	kindPlain           // fixed-width PLAIN values, decoded from values as they are read
-	kindDict            // dictionary indices, decoded from rle as they are read
-	kindDecoded         // decoded when the page was loaded, into u8s, u32s, u64s or bytes and spans
-	kindDeltaBytes      // DELTA_BYTE_ARRAY values, materialized from prefixes, lens and suffixes as they are read
+	kindNone        kind = iota
+	kindPlain            // fixed-width PLAIN values, decoded from values as they are read
+	kindDict             // dictionary indices, decoded from rle as they are read
+	kindDecoded          // decoded when the page was loaded, into u8s, u32s, u64s or bytes and spans
+	kindBools            // RLE booleans, decoded from bools as they are read
+	kindDelta            // DELTA_BINARY_PACKED integers, decoded from d32 or d64 as they are read
+	kindDeltaLength      // DELTA_LENGTH_BYTE_ARRAY values, their lengths decoded from lenStream as they are read
+	kindDeltaBytes       // DELTA_BYTE_ARRAY values, materialized from prefixStream, lenStream and suffixes as they are read
 )
 
 // dictionary holds the decoded dictionary page of a column chunk, in the
@@ -68,27 +71,33 @@ type Reader struct {
 	hasDict bool
 
 	// The current page.
-	kind      kind
-	remaining int     // values, nulls included, not yet read
-	defs      []uint8 // the definition levels, when the column is optional
-	defPos    int
-	pageNulls int
-	valPos    int    // non-null values read so far
-	values    []byte // kindPlain
-	rle       rleDecoder[uint32]
-	idx       []uint32 // kindDict
-	u8s       []uint8
-	u32s      []uint32
-	u64s      []uint64
-	bytes     []byte
-	spans     []uint32 // the start and end in bytes of each value
-	bytesBuf  []byte
-	lens      []uint32
-	prefixes  []uint32
-	suffixes  []byte // kindDeltaBytes: the suffix bytes, read from suffixOff on
-	suffixOff int
-	prev      []byte   // kindDeltaBytes: the last value materialized
-	sel       []uint32 // the spans of the dictionary entries read
+	kind         kind
+	remaining    int               // values, nulls included, not yet read
+	levels       rleDecoder[uint8] // the definition levels not yet read, when the page has nulls
+	defs         []uint8           // the definition levels of the values being read
+	pageNulls    int
+	valPos       int    // non-null values read so far
+	values       []byte // kindPlain
+	rle          rleDecoder[uint32]
+	idx          []uint32 // kindDict
+	bools        rleDecoder[uint8]
+	d32          deltaStream[uint32]
+	d64          deltaStream[uint64]
+	u8s          []uint8
+	u32s         []uint32
+	u64s         []uint64
+	bytes        []byte
+	bytesOff     int      // kindDeltaLength: the offset in bytes of the next value
+	spans        []uint32 // the start and end in bytes of each value
+	bytesBuf     []byte
+	lenStream    deltaStream[uint32]
+	prefixStream deltaStream[uint32]
+	lens         []uint32
+	prefixes     []uint32
+	suffixes     []byte // kindDeltaBytes: the suffix bytes, read from suffixOff on
+	suffixOff    int
+	prev         []byte   // kindDeltaBytes: the last value materialized
+	sel          []uint32 // the spans of the dictionary entries read
 }
 
 // Reader returns a reader of one column chunk. Readers of different
@@ -285,7 +294,13 @@ func read[T any](r *Reader, dst []T, nulls []bool, null T, nilNull bool, decode 
 		var defs []uint8
 		maxDef := uint8(r.col.maxDef)
 		if r.pageNulls > 0 {
-			defs = r.defs[r.defPos : r.defPos+n]
+			r.defs = grow(r.defs, n)
+			defs = r.defs
+			// decodeLevels counted them, so they are all there.
+			if m, err := r.levels.next(defs); err != nil || m < n {
+				r.err = fmt.Errorf("%w: column %q: %d of %d definition levels", ErrFormat, r.name, m, n)
+				return total, r.err
+			}
 			valid = 0
 			for _, d := range defs {
 				if d == maxDef {
@@ -311,7 +326,6 @@ func read[T any](r *Reader, dst []T, nulls []bool, null T, nilNull bool, decode 
 			clear(nulls[:n])
 		}
 		r.remaining -= n
-		r.defPos += n
 		r.row += int64(n)
 		total += n
 		dst = dst[n:]
@@ -370,6 +384,36 @@ func decodeNumeric[T number](r *Reader, dst []T, narrow bool) error {
 					return narrowErr(v, r.name)
 				}
 			}
+		}
+	case kindBools:
+		r.u8s = grow(r.u8s, n)
+		if m, err := r.bools.next(r.u8s); err != nil {
+			return fmt.Errorf("column %q: %w", r.name, err)
+		} else if m < n {
+			return r.short("page", n)
+		}
+		for i, b := range r.u8s {
+			dst[i] = T(b)
+		}
+	case kindDelta:
+		var m int
+		var err error
+		if t == Int32 {
+			r.u32s = grow(r.u32s, n)
+			if m, err = r.d32.next(r.u32s); err == nil && m == n {
+				convU32(dst, r.u32s, t)
+			}
+		} else {
+			r.u64s = grow(r.u64s, n)
+			if m, err = r.d64.next(r.u64s); err == nil && m == n {
+				err = convU64(dst, r.u64s, t, narrow, r.name)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("column %q: %w", r.name, err)
+		}
+		if m < n {
+			return r.short("page", n)
 		}
 	case kindDecoded:
 		switch t {
@@ -542,6 +586,8 @@ func (r *Reader) byteValues(n int) ([]byte, []uint32, error) {
 			r.sel[2*i], r.sel[2*i+1] = spans[2*k], spans[2*k+1]
 		}
 		return r.dict.bytes, r.sel, nil
+	case kindDeltaLength:
+		return r.deltaLengthValues(n)
 	case kindDeltaBytes:
 		return r.deltaBytes(n)
 	}

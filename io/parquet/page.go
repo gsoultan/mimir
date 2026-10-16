@@ -165,9 +165,36 @@ func (r *Reader) readHeader() error {
 	}
 }
 
+// The most each codec expands its input, which bounds the size a page of
+// compressed bytes may declare before its buffer is allocated: Snappy's
+// longest copy, 64 bytes, takes 3 bytes, DEFLATE's best ratio is 1032 to
+// 1, and a Zstandard block of 128 KiB takes 4 bytes as a run of one byte.
+const (
+	snappyExpansion  = 22
+	deflateExpansion = 1032
+	zstdExpansion    = 32 << 10
+)
+
+// expansion returns the most the chunk's codec expands its input.
+func (r *Reader) expansion() int {
+	switch r.meta.codec {
+	case codecSnappy:
+		return snappyExpansion
+	case codecGzip:
+		return deflateExpansion
+	case codecZstd:
+		return zstdExpansion
+	}
+	return 1
+}
+
 // decompress returns the size bytes that src holds, decoded with the
-// chunk's codec into a buffer that the next page reuses.
+// chunk's codec into a buffer that the next page reuses. A size larger
+// than the codec can expand src to fails before anything is allocated.
 func (r *Reader) decompress(src []byte, size int) ([]byte, error) {
+	if limit := int64(r.expansion())*int64(len(src)) + 64; r.meta.codec != codecUncompressed && int64(size) > limit {
+		return nil, fmt.Errorf("%w: column %q: %v page of %d bytes declares %d", ErrFormat, r.name, r.meta.codec, len(src), size)
+	}
 	switch r.meta.codec {
 	case codecUncompressed:
 		if len(src) != size {
@@ -199,10 +226,27 @@ func (r *Reader) decompress(src []byte, size int) ([]byte, error) {
 			return nil, fmt.Errorf("%w: column %q: gzip: %v", ErrFormat, r.name, err)
 		}
 		r.gz.Multistream(false)
-		r.page = fit(r.page, size)
-		if _, err := io.ReadFull(r.gz, r.page); err != nil {
-			return nil, fmt.Errorf("%w: column %q: gzip: %v", ErrFormat, r.name, err)
+		// Into a buffer grown as the stream yields bytes, so a page that
+		// declares more than it holds costs no more than it holds.
+		page := r.page[:0]
+		if cap(page) > 4*max(size, chunkWindow) { // as refit drops a buffer
+			page = nil
 		}
+		for len(page) < size {
+			if len(page) == cap(page) {
+				page = slices.Grow(page, min(size-len(page), max(len(page), chunkWindow)))
+			}
+			m, err := r.gz.Read(page[len(page):min(cap(page), size)])
+			page = page[:len(page)+m]
+			if err == io.EOF && len(page) < size {
+				err = io.ErrUnexpectedEOF
+			}
+			if err != nil && err != io.EOF {
+				r.page = page
+				return nil, fmt.Errorf("%w: column %q: gzip: %v", ErrFormat, r.name, err)
+			}
+		}
+		r.page = page
 		var extra [1]byte
 		if n, err := r.gz.Read(extra[:]); n != 0 || err != io.EOF {
 			return nil, fmt.Errorf("%w: column %q: gzip page longer than %d bytes", ErrFormat, r.name, size)
@@ -308,9 +352,11 @@ func (r *Reader) loadV2(data []byte) error {
 	return r.setValues(h.encoding, values, n)
 }
 
-// decodeLevels decodes the n definition levels of a page and counts its
-// nulls. A page without nulls, whose levels are one run of maxDef, is
-// recognized without decoding them.
+// decodeLevels starts decoding the n definition levels of a page, which
+// are read with its values, and counts its nulls. A page without nulls,
+// whose levels are one run of maxDef, is recognized without decoding them;
+// otherwise counting them takes a pass over their bytes that expands no
+// run, so a page cannot make the reader hold more levels than are read.
 func (r *Reader) decodeLevels(levels []byte, n int) error {
 	width := uint(bits.Len(uint(r.col.maxDef)))
 	if h, m := binary.Uvarint(levels); m > 0 && h&1 == 0 && h>>1 >= uint64(n) {
@@ -321,29 +367,21 @@ func (r *Reader) decodeLevels(levels []byte, n int) error {
 				v |= uint64(levels[m+i]) << (8 * i)
 			}
 			if v == uint64(r.col.maxDef) {
-				r.pageNulls, r.defPos = 0, 0
+				r.pageNulls = 0
 				return nil
 			}
 		}
 	}
-	r.defs = grow(r.defs, n)
-	dec := rleDecoder[uint8]{data: levels, width: width}
-	m, err := dec.next(r.defs)
+	r.levels = rleDecoder[uint8]{data: levels, width: width}
+	count := r.levels
+	m, defined, err := count.count(n, uint8(r.col.maxDef))
 	if err != nil {
 		return fmt.Errorf("column %q: definition levels: %w", r.name, err)
 	}
 	if m < n {
 		return fmt.Errorf("%w: column %q: %d of %d definition levels", ErrFormat, r.name, m, n)
 	}
-	maxDef := uint8(r.col.maxDef)
-	defined := 0
-	for _, d := range r.defs {
-		if d == maxDef {
-			defined++
-		}
-	}
 	r.pageNulls = n - defined
-	r.defPos = 0
 	return nil
 }
 
@@ -499,16 +537,8 @@ func (r *Reader) setValues(enc encoding, values []byte, n int) error {
 		if uint64(size) > uint64(len(values)-4) {
 			return r.short("page", valid)
 		}
-		dec := rleDecoder[uint8]{data: values[4 : 4+size], width: 1}
-		r.u8s = grow(r.u8s, valid)
-		m, err := dec.next(r.u8s)
-		if err != nil {
-			return fmt.Errorf("column %q: %w", r.name, err)
-		}
-		if m < valid {
-			return r.short("page", valid)
-		}
-		r.kind = kindDecoded
+		r.bools = rleDecoder[uint8]{data: values[4 : 4+size], width: 1}
+		r.kind = kindBools
 	case encPlainDictionary, encRLEDictionary:
 		if !r.hasDict {
 			return fmt.Errorf("%w: column %q: dictionary-encoded page before the dictionary page", ErrFormat, r.name)
@@ -529,18 +559,16 @@ func (r *Reader) setValues(enc encoding, values []byte, n int) error {
 		var err error
 		switch t {
 		case Int32:
-			r.u32s = grow(r.u32s, valid)
-			_, err = deltaDecode(values, r.u32s)
+			err = r.d32.init(values, valid)
 		case Int64:
-			r.u64s = grow(r.u64s, valid)
-			_, err = deltaDecode(values, r.u64s)
+			err = r.d64.init(values, valid)
 		default:
 			return fmt.Errorf("%w: column %q: DELTA_BINARY_PACKED values in a %v column", ErrFormat, r.name, t)
 		}
 		if err != nil {
 			return fmt.Errorf("column %q: %w", r.name, err)
 		}
-		r.kind = kindDecoded
+		r.kind = kindDelta
 	case encDeltaLengthByteArray:
 		if t != ByteArray {
 			return fmt.Errorf("%w: column %q: DELTA_LENGTH_BYTE_ARRAY values in a %v column", ErrFormat, r.name, t)

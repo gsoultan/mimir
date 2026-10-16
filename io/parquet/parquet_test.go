@@ -2,6 +2,7 @@ package parquet
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,11 +10,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/snappy"
 )
@@ -435,10 +438,12 @@ type tchunk struct {
 	codec     codec
 	levels    []byte // definition levels, without a length prefix
 	values    []byte
-	v2        bool  // a data page V2 rather than V1
-	compress  bool  // with Snappy, which sets the codec
-	sizeFix   int32 // added to the page's declared sizes
-	pages     int   // the page written this many times, when more than once
+	v2        bool   // a data page V2 rather than V1
+	compress  bool   // with Snappy, which sets the codec
+	sizeFix   int32  // added to the page's declared sizes
+	pages     int    // the page written this many times, when more than once
+	raw       []byte // the stored bytes of a data page V1, if set, in place of levels and values
+	declared  int32  // the uncompressed size a raw page declares
 }
 
 type tfile struct {
@@ -489,8 +494,12 @@ func (tf tfile) bytes() []byte {
 			if c.compress {
 				page = snappy.Encode(nil, raw)
 			}
+			size := int32(len(raw))
+			if c.raw != nil {
+				page, size = c.raw, c.declared
+			}
 			h.i32(1, int32(dataPage))
-			h.i32(2, int32(len(raw))+c.sizeFix)
+			h.i32(2, size+c.sizeFix)
 			h.i32(3, int32(len(page))+c.sizeFix)
 			h.strct(5, func() {
 				h.i32(1, c.numValues)
@@ -1063,10 +1072,19 @@ func BenchmarkReadStrings(b *testing.B) {
 	benchRead(b, "name", func(r *Reader, buf []string) (int, error) { return r.ReadStrings(buf, nil) })
 }
 
+// BenchmarkReadNulls reads the column with nulls, whose definition levels
+// are decoded as the values are.
+func BenchmarkReadNulls(b *testing.B) {
+	nulls := make([]bool, 4096)
+	benchRead(b, "opt", func(r *Reader, buf []float32) (int, error) { return r.ReadFloat32(buf, nulls) })
+}
+
 // benchRead reads a column of each fixture repeatedly with one reader,
-// counting the column's uncompressed bytes.
+// counting the column's uncompressed bytes. The delta fixtures hold the
+// i32 column as DELTA_BINARY_PACKED and the name column as
+// DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY.
 func benchRead[T any](b *testing.B, column string, read func(*Reader, []T) (int, error)) {
-	for _, name := range []string{"pages_v2_snappy", "plain_v1"} {
+	for _, name := range []string{"pages_v2_snappy", "plain_v1", "delta_v2", "delta_byte_array_v2"} {
 		b.Run(name, func(b *testing.B) {
 			f, err := OpenFile(filepath.Join("testdata", name+".parquet"))
 			if err != nil {
@@ -1155,15 +1173,11 @@ func FuzzOpen(f *testing.F) {
 			}
 			return
 		}
-		// Read what a mutated footer still points at, bounded so that a
-		// hostile value count cannot ask for a huge page or a long read.
+		// Read what a mutated footer still points at, whatever the values
+		// and sizes it declares, a budget of values at most per chunk.
 		columns := pf.Columns()
 		for g := range min(pf.RowGroups(), 4) {
 			for c := range columns {
-				ch := &pf.meta.rowGroups[g].columns[c]
-				if ch.meta.numValues > 1<<16 || ch.meta.totalUncompressedSize > 1<<20 {
-					continue
-				}
 				r, err := pf.Reader(g, c)
 				if err != nil {
 					continue
@@ -1370,6 +1384,194 @@ func TestReaderBuffersFitAPage(t *testing.T) {
 		readAll(t, r.ReadInt32, 500_000, 4096, true)
 		if got := r.bufferBytes(); got > 256<<10 {
 			t.Errorf("%s: a reader of 4 KB pages holds %d bytes of buffers", name, got)
+		}
+	}
+}
+
+// bounded runs fn, which must take less than a few seconds, and fails the
+// test when it allocates more than limit bytes.
+func bounded(t *testing.T, what string, limit uint64, fn func()) {
+	t.Helper()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	start := time.Now()
+	fn()
+	elapsed := time.Since(start)
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > limit {
+		t.Errorf("%s allocated %d bytes, want at most %d", what, got, limit)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("%s took %v", what, elapsed)
+	}
+}
+
+// deltaHeader returns the header of DELTA_BINARY_PACKED values.
+func deltaHeader(blockSize, miniblocks, total uint64, first int64) []byte {
+	b := binary.AppendUvarint(nil, blockSize)
+	b = binary.AppendUvarint(b, miniblocks)
+	b = binary.AppendUvarint(b, total)
+	return binary.AppendUvarint(b, zz(first))
+}
+
+// TestHostilePageValueCounts reads pages that declare the most values a
+// chunk may hold, 2^31-1, in a few bytes. Their values are decoded as
+// they are read, so a reader holds what a Read asks for, not what the
+// page declares.
+func TestHostilePageValueCounts(t *testing.T) {
+	const most = math.MaxInt32
+	zeroWidthBlocks := deltaHeader(1<<20, 1, most, 0)
+	for range 4 {
+		zeroWidthBlocks = append(zeroWidthBlocks, 0, 0) // a min delta of 0 and a miniblock of width 0
+	}
+	for name, tc := range map[string]struct {
+		col     schemaElement
+		chunk   tchunk
+		read    int // values read before the error, when there is one
+		failure bool
+	}{
+		"delta int64 without data":   {required("n", Int64), tchunk{typ: Int64, enc: encDeltaBinaryPacked}, 0, true},
+		"delta int32 without data":   {required("n", Int32), tchunk{typ: Int32, enc: encDeltaBinaryPacked}, 0, true},
+		"delta int64 of width 0":     {required("n", Int64), tchunk{typ: Int64, enc: encDeltaBinaryPacked, values: zeroWidthBlocks}, 4 << 20, true},
+		"delta lengths without data": {required("n", ByteArray), tchunk{typ: ByteArray, enc: encDeltaLengthByteArray}, 0, true},
+		"delta lengths of width 0":   {required("n", ByteArray), tchunk{typ: ByteArray, enc: encDeltaLengthByteArray, values: zeroWidthBlocks}, 0, true},
+		"delta prefixes of width 0":  {required("n", ByteArray), tchunk{typ: ByteArray, enc: encDeltaByteArray, values: zeroWidthBlocks}, 0, true},
+		// One run of 2^31-1 nulls, and of as many true values.
+		"null levels":  {optional("n", Int32), tchunk{typ: Int32, levels: append(binary.AppendUvarint(nil, most<<1), 0)}, 0, false},
+		"rle booleans": {required("n", Boolean), tchunk{typ: Boolean, enc: encRLE, values: prefixed(append(binary.AppendUvarint(nil, most<<1), 1))}, 0, false},
+	} {
+		tc.chunk.path, tc.chunk.numValues = "n", most
+		f := openBytes(t, tfile{schema: []schemaElement{root(1), tc.col}, chunks: []tchunk{tc.chunk}, numRows: most}.bytes())
+		r := reader(t, f, 0, "n")
+		vals, strs, nulls := make([]float64, 4096), make([]string, 4096), make([]bool, 4096)
+		read, reads := 0, 0
+		var err error
+		bounded(t, name, 1<<20, func() {
+			for err == nil && reads < 2000 {
+				var n int
+				if tc.col.typ == ByteArray {
+					n, err = r.ReadStrings(strs, nulls)
+				} else {
+					n, err = r.ReadFloat64(vals, nulls)
+				}
+				read += n
+				reads++
+			}
+		})
+		if !tc.failure {
+			if err != nil || read != 2000*4096 {
+				t.Errorf("%s: read %d values, %v", name, read, err)
+			}
+			if want := tc.col.repetition == repOptional; nulls[0] != want || vals[0] != b2i[float64](!want) {
+				t.Errorf("%s: read %v, null %v", name, vals[0], nulls[0])
+			}
+			continue
+		}
+		if !errors.Is(err, ErrFormat) || read != tc.read {
+			t.Errorf("%s: read %d values, then %v", name, read, err)
+		}
+	}
+}
+
+// TestHostilePageSizes reads pages that declare far more bytes than their
+// codec can expand them to, or than they hold, which fail with ErrFormat
+// before allocating what they declare.
+func TestHostilePageSizes(t *testing.T) {
+	zstdFrame := []byte{0x28, 0xb5, 0x2f, 0xfd, 0x80, 0x00} // a frame header of a 4-byte content size
+	zstdFrame = binary.LittleEndian.AppendUint32(zstdFrame, 1<<30)
+	zstdFrame = append(zstdFrame, 3<<3|1, 0, 0, 'a', 'b', 'c') // the last block, raw, of 3 bytes
+	var zeros bytes.Buffer
+	zw := gzip.NewWriter(&zeros)
+	zw.Write(make([]byte, 100<<10))
+	zw.Close()
+	for name, tc := range map[string]struct {
+		codec    codec
+		raw      []byte
+		declared int32
+	}{
+		"snappy":                    {codecSnappy, append(binary.AppendUvarint(nil, 1<<30), 0), 1 << 30},
+		"zstd magic":                {codecZstd, []byte{0x28, 0xb5, 0x2f, 0xfd}, 1 << 30},
+		"zstd content size":         {codecZstd, zstdFrame, 1000},
+		"gzip header":               {codecGzip, zeros.Bytes()[:10], 1 << 30},
+		"gzip shorter than it says": {codecGzip, zeros.Bytes(), int32(deflateExpansion * zeros.Len())},
+	} {
+		c := tchunk{typ: Int32, path: "n", numValues: 10, codec: tc.codec, raw: tc.raw, declared: tc.declared}
+		f := openBytes(t, tfile{schema: []schemaElement{root(1), required("n", Int32)}, chunks: []tchunk{c}, numRows: 10}.bytes())
+		r := reader(t, f, 0, "n")
+		buf := make([]int32, 10)
+		var err error
+		bounded(t, name, 1<<20, func() { _, err = r.ReadInt32(buf, nil) })
+		if !errors.Is(err, ErrFormat) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// footer returns a file of no pages whose footer w writes.
+func footer(body func(w *tw)) []byte {
+	w := &tw{}
+	body(w)
+	w.b = append(w.b, ttStop)
+	b := append([]byte(magic), w.b...)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(w.b)))
+	return append(b, magic...)
+}
+
+// TestHostileFooters opens footers whose lists, schemas and names would
+// cost far more than their bytes to hold, which fail with ErrFormat before
+// they are allocated.
+func TestHostileFooters(t *testing.T) {
+	const many = 10_000_000
+	schema := func(w *tw) {
+		w.list(2, ttStruct, 2)
+		w.elem(func() { w.bin(4, "schema"); w.i32(5, 1) })
+		w.elem(func() { w.i32(1, int32(Int32)); w.i32(3, 0); w.bin(4, "n") })
+	}
+	emptyStructs := func(w *tw, id int16, n int) {
+		w.list(id, ttStruct, n)
+		w.b = append(w.b, make([]byte, n)...) // each a stop field alone
+	}
+	rowGroupOf := func(chunks int, size int) func(w *tw) {
+		return func(w *tw) {
+			w.list(4, ttStruct, 1)
+			w.elem(func() {
+				if size == 1 {
+					emptyStructs(w, 1, chunks)
+				} else { // each with its file_offset, 0
+					w.list(1, ttStruct, chunks)
+					w.b = append(w.b, bytes.Repeat([]byte{2<<4 | ttI64, 0, ttStop}, chunks)...)
+				}
+				w.i64(2, 0)
+				w.i64(3, 0)
+			})
+		}
+	}
+	// A chain of groups, and a group of a long name over many leaves.
+	deep := []schemaElement{root(1)}
+	for range 40000 {
+		deep = append(deep, schemaElement{name: "g", numChildren: 1})
+	}
+	deep = append(deep, required("x", Int32))
+	wide := []schemaElement{root(1), {name: strings.Repeat("g", 100<<10), numChildren: 100000}}
+	for range 100000 {
+		wide = append(wide, required("a", Int32))
+	}
+	for name, tc := range map[string]struct {
+		b     []byte
+		limit uint64 // bytes allocated beyond those of the file
+		want  string
+	}{
+		"column chunks beyond the leaves": {footer(func(w *tw) { schema(w); w.i64(3, 0); rowGroupOf(many/3, 3)(w) }), 1 << 20, "column chunks"},
+		"column chunks before the schema": {footer(func(w *tw) { rowGroupOf(many, 1)(w); schema(w) }), 1 << 20, "structs"},
+		"empty row groups":                {footer(func(w *tw) { schema(w); emptyStructs(w, 4, many) }), 1 << 20, "structs"},
+		"empty schema elements":           {footer(func(w *tw) { emptyStructs(w, 2, many) }), 1 << 20, "structs"},
+		"deep schema":                     {tfile{schema: deep, chunks: []tchunk{{typ: Int32, path: "x"}}}.bytes(), 4 << 20, "deeper than 64"},
+		"long names":                      {tfile{schema: wide}.bytes(), 32 << 20, "schema names"},
+	} {
+		var err error
+		bounded(t, name, uint64(len(tc.b))+tc.limit, func() { _, err = Open(bytes.NewReader(tc.b), int64(len(tc.b))) })
+		if !errors.Is(err, ErrFormat) || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 }

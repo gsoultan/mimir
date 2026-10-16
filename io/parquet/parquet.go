@@ -28,8 +28,12 @@
 // Nested columns (repeated fields and fields inside groups) and INT96
 // columns are listed but cannot be read, and neither can encrypted files or
 // the LZ4, LZ4_RAW, BROTLI and LZO codecs; these fail with ErrUnsupported.
-// A malformed file fails with ErrFormat, never a panic, whatever its bytes.
-// There is no writer.
+// A malformed file fails with ErrFormat, never a panic, whatever its bytes,
+// and so does a schema nested deeper than 64 groups. What the package
+// allocates follows the bytes of the file and the slices given to the
+// Read methods, not the counts and sizes the file declares: a page that
+// declares more values or bytes than its own could hold fails before they
+// are allocated, or is decoded as it is read. There is no writer.
 //
 // A File holds only the file's metadata and its io.ReaderAt, so readers of
 // different columns may run in separate goroutines.
@@ -294,7 +298,9 @@ func (f *File) readAt(b []byte, off int64) error {
 // zstd returns the file's shared Zstandard decoder.
 func (f *File) zstd() (*zstd.Decoder, error) {
 	f.zstdOnce.Do(func() {
-		f.zstdDec, f.zstdErr = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxPageSize))
+		// Capped at the page's buffer, sized to what the page declares, so
+		// that a frame claiming more fails rather than allocating it.
+		f.zstdDec, f.zstdErr = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxPageSize), zstd.WithDecodeAllCapLimit(true))
 	})
 	return f.zstdDec, f.zstdErr
 }
@@ -307,25 +313,43 @@ func formatErr(what string, err error) error {
 	return fmt.Errorf("%w: %s: %v", ErrFormat, what, err)
 }
 
+// maxSchemaDepth bounds the nesting of groups in a schema, which real
+// schemas keep to a few levels, so that a chain of groups costs neither a
+// deep recursion nor names that grow with it.
+const maxSchemaDepth = 64
+
+// minNameBudget is the bytes of leaf names that buildSchema allows
+// whatever the size of the schema; beyond it, the names may take at most
+// maxSchemaDepth times the bytes of the schema's own names.
+const minNameBudget = 16 << 20
+
 // buildSchema walks the flat, depth-first schema list and returns its
-// leaves, named by their dotted paths.
+// leaves, named by their dotted paths. Each name is joined once, at its
+// leaf, and their total size is bounded, since a group with a long name
+// over many leaves would otherwise copy that name into every one.
 func buildSchema(elems []schemaElement) ([]leaf, error) {
 	if len(elems) == 0 {
 		return nil, fmt.Errorf("%w: empty schema", ErrFormat)
 	}
+	names := 0
+	for i := range elems {
+		names += len(elems[i].name) + 1
+	}
+	budget := max(minNameBudget, maxSchemaDepth*names)
 	var leaves []leaf
+	var path []string
+	pathBytes := 0 // the length of path joined with dots, plus one
 	pos := 1
-	var visit func(prefix string, depth, def, rep int) error
-	visit = func(prefix string, depth, def, rep int) error {
+	var visit func(depth, def, rep int) error
+	visit = func(depth, def, rep int) error {
+		if depth >= maxSchemaDepth {
+			return fmt.Errorf("%w: schema nested deeper than %d groups", ErrFormat, maxSchemaDepth)
+		}
 		if pos >= len(elems) {
 			return fmt.Errorf("%w: schema element %d is missing", ErrFormat, pos)
 		}
 		e := &elems[pos]
 		pos++
-		name := e.name
-		if prefix != "" {
-			name = prefix + "." + name
-		}
 		switch e.repetition {
 		case repOptional:
 			def++
@@ -333,14 +357,24 @@ func buildSchema(elems []schemaElement) ([]leaf, error) {
 			def++
 			rep++
 		}
+		path = append(path, e.name)
+		pathBytes += len(e.name) + 1
+		defer func() {
+			path = path[:len(path)-1]
+			pathBytes -= len(e.name) + 1
+		}()
 		if e.numChildren > 0 {
 			for range e.numChildren {
-				if err := visit(name, depth+1, def, rep); err != nil {
+				if err := visit(depth+1, def, rep); err != nil {
 					return err
 				}
 			}
 			return nil
 		}
+		if budget -= pathBytes; budget < 0 {
+			return fmt.Errorf("%w: schema names of more than %d bytes", ErrFormat, max(minNameBudget, maxSchemaDepth*names))
+		}
+		name := strings.Join(path, ".")
 		if !e.hasType {
 			return fmt.Errorf("%w: column %q has no type", ErrFormat, name)
 		}
@@ -360,7 +394,7 @@ func buildSchema(elems []schemaElement) ([]leaf, error) {
 		return nil
 	}
 	for range elems[0].numChildren {
-		if err := visit("", 0, 0, 0); err != nil {
+		if err := visit(0, 0, 0); err != nil {
 			return nil, err
 		}
 	}
