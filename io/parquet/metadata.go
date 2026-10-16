@@ -110,12 +110,74 @@ type fileMetaData struct {
 }
 
 type schemaElement struct {
-	typ         Type
-	hasType     bool
-	typeLength  int32
-	repetition  repetition
-	name        string
-	numChildren int32
+	typ          Type
+	hasType      bool
+	typeLength   int32
+	repetition   repetition
+	name         string
+	numChildren  int32
+	converted    convertedType
+	hasConverted bool
+	scale        int32 // of a DECIMAL converted type
+	precision    int32
+	logical      logicalType
+}
+
+// convertedType is the ConvertedType enum of parquet.thrift, the logical
+// type annotation of older writers, which newer ones still write next to
+// the LogicalType.
+type convertedType int32
+
+// convertedNames maps each converted type to the name of the logical type
+// it stands for.
+var convertedNames = [...]string{
+	0:  "STRING", // UTF8
+	1:  "MAP",
+	2:  "MAP", // MAP_KEY_VALUE
+	3:  "LIST",
+	4:  "ENUM",
+	5:  "DECIMAL",
+	6:  "DATE",
+	7:  "TIME", // TIME_MILLIS
+	8:  "TIME", // TIME_MICROS
+	9:  "TIMESTAMP",
+	10: "TIMESTAMP",
+	11: "UINT", // UINT_8 to UINT_64
+	12: "UINT",
+	13: "UINT",
+	14: "UINT",
+	15: "INT", // INT_8 to INT_64
+	16: "INT",
+	17: "INT",
+	18: "INT",
+	19: "JSON",
+	20: "BSON",
+	21: "INTERVAL",
+}
+
+// logicalType is the LogicalType union of parquet.thrift, reduced to the
+// name of the member that is set and the parameters of a DECIMAL.
+type logicalType struct {
+	name             string
+	scale, precision int32
+}
+
+// logicalNames maps the field ids of the LogicalType union to their names.
+// INTEGER (10) is "INT" or "UINT" by its sign; UNKNOWN (11), the type of
+// a column of nulls only, and members newer than FLOAT16 have no name.
+var logicalNames = map[int16]string{
+	1:  "STRING",
+	2:  "MAP",
+	3:  "LIST",
+	4:  "ENUM",
+	5:  "DECIMAL",
+	6:  "DATE",
+	7:  "TIME",
+	8:  "TIMESTAMP",
+	12: "JSON",
+	13: "BSON",
+	14: "UUID",
+	15: "FLOAT16",
 }
 
 type rowGroup struct {
@@ -286,11 +348,71 @@ func (e *schemaElement) parse(d *decoder) func(id int16, typ byte) error {
 			e.name, err = d.readString(typ)
 		case 5:
 			e.numChildren, err = d.readI32(typ)
+		case 6:
+			v, err := d.readI32(typ)
+			if err != nil {
+				return err
+			}
+			e.converted, e.hasConverted = convertedType(v), true
+		case 7:
+			e.scale, err = d.readI32(typ)
+		case 8:
+			e.precision, err = d.readI32(typ)
+		case 10:
+			err = d.readStruct(typ, e.logical.parse(d))
 		default:
 			err = d.skip(typ)
 		}
 		return err
 	}
+}
+
+// parse reads the member of the LogicalType union that is set.
+func (l *logicalType) parse(d *decoder) func(id int16, typ byte) error {
+	return func(id int16, typ byte) error {
+		switch id {
+		case 5: // DecimalType
+			l.name = "DECIMAL"
+			return d.readStruct(typ, func(id int16, typ byte) (err error) {
+				switch id {
+				case 1:
+					l.scale, err = d.readI32(typ)
+				case 2:
+					l.precision, err = d.readI32(typ)
+				default:
+					err = d.skip(typ)
+				}
+				return err
+			})
+		case 10: // IntType
+			l.name = "INT"
+			return d.readStruct(typ, func(id int16, typ byte) error {
+				if id != 2 {
+					return d.skip(typ)
+				}
+				signed, err := d.readBool(typ)
+				if err == nil && !signed {
+					l.name = "UINT"
+				}
+				return err
+			})
+		}
+		l.name = logicalNames[id]
+		return d.skip(typ)
+	}
+}
+
+// logicalType returns the name of the element's logical type, from the
+// LogicalType when it names one and from the converted type otherwise,
+// with the precision and scale of a DECIMAL.
+func (e *schemaElement) logicalType() (name string, precision, scale int32) {
+	switch {
+	case e.logical.name != "":
+		return e.logical.name, e.logical.precision, e.logical.scale
+	case e.hasConverted && e.converted >= 0 && int(e.converted) < len(convertedNames):
+		return convertedNames[e.converted], e.precision, e.scale
+	}
+	return "", 0, 0
 }
 
 func (g *rowGroup) parse(d *decoder) func(id int16, typ byte) error {

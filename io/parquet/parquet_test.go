@@ -40,7 +40,7 @@ var fixtureColumns = []Column{
 	{Name: "f32", Type: Float, Nullable: true},
 	{Name: "f64", Type: Double, Nullable: true},
 	{Name: "flag", Type: Boolean, Nullable: true},
-	{Name: "name", Type: ByteArray, Nullable: true},
+	{Name: "name", Type: ByteArray, Nullable: true, Logical: "STRING"},
 	{Name: "opt", Type: Float, Nullable: true},
 }
 
@@ -438,6 +438,7 @@ type tchunk struct {
 	v2        bool  // a data page V2 rather than V1
 	compress  bool  // with Snappy, which sets the codec
 	sizeFix   int32 // added to the page's declared sizes
+	pages     int   // the page written this many times, when more than once
 }
 
 type tfile struct {
@@ -499,7 +500,9 @@ func (tf tfile) bytes() []byte {
 			})
 		}
 		h.b = append(h.b, ttStop)
-		b = append(append(b, h.b...), page...)
+		for range max(c.pages, 1) {
+			b = append(append(b, h.b...), page...)
+		}
 		locs[i] = loc{int64(off), int64(len(b) - off)}
 	}
 	w := &tw{}
@@ -517,6 +520,18 @@ func (tf tfile) bytes() []byte {
 			w.bin(4, e.name)
 			if e.numChildren != 0 {
 				w.i32(5, e.numChildren)
+			}
+			if e.hasConverted {
+				w.i32(6, int32(e.converted))
+			}
+			if e.scale != 0 {
+				w.i32(7, e.scale)
+			}
+			if e.precision != 0 {
+				w.i32(8, e.precision)
+			}
+			if e.logical.name != "" {
+				w.strct(10, func() { writeLogical(w, e.logical) })
 			}
 		})
 	}
@@ -538,7 +553,7 @@ func (tf tfile) bytes() []byte {
 						w.str(p)
 					}
 					w.i32(4, int32(c.codec))
-					w.i64(5, int64(c.numValues))
+					w.i64(5, int64(c.numValues)*int64(max(c.pages, 1)))
 					w.i64(6, locs[i].size)
 					w.i64(7, locs[i].size)
 					w.i64(9, locs[i].off)
@@ -556,6 +571,42 @@ func (tf tfile) bytes() []byte {
 	b = append(b, w.b...)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(w.b)))
 	return append(b, magic...)
+}
+
+// writeLogical writes the member of the LogicalType union that l names,
+// or, for a name of the form "#id", an empty struct of that field id.
+func writeLogical(w *tw, l logicalType) {
+	switch l.name {
+	case "DECIMAL":
+		w.strct(5, func() { w.i32(1, l.scale); w.i32(2, l.precision) })
+		return
+	case "INT", "UINT":
+		w.strct(10, func() {
+			w.field(1, ttByte)
+			w.b = append(w.b, 16)
+			if l.name == "INT" {
+				w.field(2, ttTrue)
+			} else {
+				w.field(2, ttFalse)
+			}
+		})
+		return
+	case "TIMESTAMP":
+		// isAdjustedToUTC and the unit, MICROS.
+		w.strct(8, func() { w.field(1, ttTrue); w.strct(2, func() { w.strct(2, func() {}) }) })
+		return
+	}
+	if id, err := strconv.Atoi(strings.TrimPrefix(l.name, "#")); err == nil {
+		w.strct(int16(id), func() {})
+		return
+	}
+	for id, name := range logicalNames {
+		if name == l.name {
+			w.strct(id, func() {})
+			return
+		}
+	}
+	panic("no logical type " + l.name)
 }
 
 func openBytes(t *testing.T, b []byte) *File {
@@ -683,12 +734,12 @@ func TestSchemas(t *testing.T) {
 		numRows: 2,
 	}.bytes())
 	want := []Column{
-		{Name: "g.x", Type: Int32, Nullable: true},
+		{Name: "g.x", Type: Int32, Nullable: true, Nested: true},
 		{Name: "y", Type: Int32},
 		{Name: "t", Type: Int96},
 		{Name: "fix", Type: FixedLenByteArray, Length: 3},
 		{Name: "b", Type: Boolean},
-		{Name: "many", Type: Int32, Nullable: true},
+		{Name: "many", Type: Int32, Nullable: true, Nested: true},
 	}
 	if got := f.Columns(); !slices.Equal(got, want) {
 		t.Fatalf("Columns() = %v, want %v", got, want)
@@ -1136,4 +1187,189 @@ func FuzzOpen(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestLogicalTypes(t *testing.T) {
+	conv := func(e schemaElement, c convertedType) schemaElement {
+		e.converted, e.hasConverted = c, true
+		return e
+	}
+	logical := func(e schemaElement, name string) schemaElement {
+		e.logical.name = name
+		return e
+	}
+	fixed := func(name string, length int32) schemaElement {
+		return schemaElement{typ: FixedLenByteArray, hasType: true, typeLength: length, name: name}
+	}
+	// An old writer's DECIMAL, with the converted type only.
+	d32 := conv(required("d32", Int32), 5)
+	d32.scale, d32.precision = 2, 5
+	// A new writer's, with both, which take the LogicalType's parameters.
+	d64 := conv(required("d64", Int64), 5)
+	d64.scale, d64.precision = 1, 1
+	d64.logical = logicalType{name: "DECIMAL", scale: 3, precision: 12}
+	elems := []schemaElement{
+		d32,
+		d64,
+		logical(required("ts", Int64), "TIMESTAMP"),
+		conv(required("ms", Int64), 9),
+		logical(required("day", Int32), "DATE"),
+		conv(required("tm", Int32), 7),
+		logical(required("u16", Int32), "UINT"),
+		logical(required("i16", Int32), "INT"),
+		conv(required("u8", Int32), 11),
+		conv(required("i8", Int32), 15),
+		conv(required("s", ByteArray), 0),
+		logical(required("str", ByteArray), "STRING"),
+		logical(required("e", ByteArray), "ENUM"),
+		logical(required("j", ByteArray), "JSON"),
+		conv(required("b", ByteArray), 20),
+		logical(fixed("id", 16), "UUID"),
+		logical(fixed("half", 2), "FLOAT16"),
+		conv(fixed("iv", 12), 21),
+		logical(optional("none", Int32), "#11"),              // UNKNOWN: no name
+		conv(logical(required("variant", Int32), "#16"), 17), // a newer member: the converted type
+		conv(required("bad", Int32), 99),                     // an unknown converted type
+		required("plain", Double),
+	}
+	want := []Column{
+		{Name: "d32", Type: Int32, Logical: "DECIMAL", Precision: 5, Scale: 2},
+		{Name: "d64", Type: Int64, Logical: "DECIMAL", Precision: 12, Scale: 3},
+		{Name: "ts", Type: Int64, Logical: "TIMESTAMP"},
+		{Name: "ms", Type: Int64, Logical: "TIMESTAMP"},
+		{Name: "day", Type: Int32, Logical: "DATE"},
+		{Name: "tm", Type: Int32, Logical: "TIME"},
+		{Name: "u16", Type: Int32, Logical: "UINT"},
+		{Name: "i16", Type: Int32, Logical: "INT"},
+		{Name: "u8", Type: Int32, Logical: "UINT"},
+		{Name: "i8", Type: Int32, Logical: "INT"},
+		{Name: "s", Type: ByteArray, Logical: "STRING"},
+		{Name: "str", Type: ByteArray, Logical: "STRING"},
+		{Name: "e", Type: ByteArray, Logical: "ENUM"},
+		{Name: "j", Type: ByteArray, Logical: "JSON"},
+		{Name: "b", Type: ByteArray, Logical: "BSON"},
+		{Name: "id", Type: FixedLenByteArray, Length: 16, Logical: "UUID"},
+		{Name: "half", Type: FixedLenByteArray, Length: 2, Logical: "FLOAT16"},
+		{Name: "iv", Type: FixedLenByteArray, Length: 12, Logical: "INTERVAL"},
+		{Name: "none", Type: Int32, Nullable: true},
+		{Name: "variant", Type: Int32, Logical: "INT"},
+		{Name: "bad", Type: Int32},
+		{Name: "plain", Type: Double},
+	}
+	file := func(elems ...schemaElement) []byte {
+		tf := tfile{schema: append([]schemaElement{root(int32(len(elems)))}, elems...)}
+		for _, e := range elems {
+			tf.chunks = append(tf.chunks, tchunk{typ: e.typ, path: e.name})
+		}
+		return tf.bytes()
+	}
+	f := openBytes(t, file(elems...))
+	if got := f.Columns(); !slices.Equal(got, want) {
+		for i := range max(len(got), len(want)) {
+			if i >= len(got) || i >= len(want) || got[i] != want[i] {
+				t.Errorf("column %d: %+v, want %+v", i, got[min(i, len(got)-1)], want[min(i, len(want)-1)])
+			}
+		}
+	}
+	// The values are the physical type's.
+	b := tfile{
+		schema:  []schemaElement{root(1), d64},
+		chunks:  []tchunk{{typ: Int64, path: "d64", numValues: 2, values: plainInt64(12345, -7)}},
+		numRows: 2,
+	}.bytes()
+	v, _ := readAll(t, reader(t, openBytes(t, b), 0, "d64").ReadInt64, 2, 2, false)
+	if !slices.Equal(v, []int64{12345, -7}) {
+		t.Errorf("d64 = %v", v)
+	}
+
+	for name, e := range map[string]schemaElement{
+		"scale above precision": logical(required("d", Int64), "DECIMAL"),
+		"negative scale":        {typ: Int32, hasType: true, name: "d", converted: 5, hasConverted: true, scale: -1, precision: 4},
+		"no precision":          {typ: Int32, hasType: true, name: "d", converted: 5, hasConverted: true, scale: 2},
+	} {
+		if e.logical.name == "DECIMAL" {
+			e.logical.scale, e.logical.precision = 5, 4
+		}
+		b := file(e)
+		_, err := Open(bytes.NewReader(b), int64(len(b)))
+		if !errors.Is(err, ErrFormat) || !strings.Contains(err.Error(), "DECIMAL") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// countingReaderAt counts the bytes read through it.
+type countingReaderAt struct {
+	r     io.ReaderAt
+	bytes int64
+	calls int
+}
+
+func (c *countingReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	n, err := c.r.ReadAt(b, off)
+	c.bytes += int64(n)
+	c.calls++
+	return n, err
+}
+
+// TestReaderReadsPagesOnce reads chunks of pages from a little smaller
+// than the window to near a megabyte, and checks that no byte of the
+// chunk is read twice: a page that does not fit what is left of the
+// window is completed, not read again from its start.
+func TestReaderReadsPagesOnce(t *testing.T) {
+	for _, values := range []int{15000, 75000, 250000} { // 60 KB to 1 MB a page
+		t.Run(fmt.Sprint(values), func(t *testing.T) {
+			vals := make([]int32, values)
+			for i := range vals {
+				vals[i] = int32(i)
+			}
+			b := tfile{
+				schema:  []schemaElement{root(1), required("n", Int32)},
+				chunks:  []tchunk{{typ: Int32, path: "n", numValues: int32(values), values: plainInt32(vals...), pages: 5}},
+				numRows: 5 * int64(values),
+			}.bytes()
+			cr := &countingReaderAt{r: bytes.NewReader(b)}
+			f, err := Open(cr, int64(len(b)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cr.bytes, cr.calls = 0, 0
+			got, _ := readAll(t, reader(t, f, 0, "n").ReadInt32, 5*int64(values), 4096, false)
+			for i, v := range got {
+				if v != int32(i%values) {
+					t.Fatalf("row %d = %d", i, v)
+				}
+			}
+			chunk := f.meta.rowGroups[0].columns[0].meta.totalCompressedSize
+			if float64(cr.bytes) > 1.05*float64(chunk) {
+				t.Errorf("read %d bytes in %d calls for a chunk of %d", cr.bytes, cr.calls, chunk)
+			}
+		})
+	}
+}
+
+// TestReaderBuffersFitAPage reads a chunk of 2 MB in pages of 4 KB and
+// checks that the reader holds about a page's bytes, not a window over
+// the chunk.
+func TestReaderBuffersFitAPage(t *testing.T) {
+	vals := make([]int32, 1000)
+	for i := range vals {
+		vals[i] = int32(i)
+	}
+	b := tfile{
+		schema: []schemaElement{root(2), required("n", Int32), optional("o", Int32)},
+		chunks: []tchunk{
+			{typ: Int32, path: "n", numValues: 1000, values: plainInt32(vals...), pages: 500},
+			{typ: Int32, path: "o", numValues: 1000, levels: rleBits(slices.Repeat([]uint8{1, 0}, 500)...), values: plainInt32(vals[:500]...), pages: 500, compress: true},
+		},
+		numRows: 500_000,
+	}.bytes()
+	f := openBytes(t, b)
+	for _, name := range []string{"n", "o"} {
+		r := reader(t, f, 0, name)
+		readAll(t, r.ReadInt32, 500_000, 4096, true)
+		if got := r.bufferBytes(); got > 256<<10 {
+			t.Errorf("%s: a reader of 4 KB pages holds %d bytes of buffers", name, got)
+		}
+	}
 }

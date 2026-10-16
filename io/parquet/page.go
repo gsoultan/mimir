@@ -16,9 +16,12 @@ import (
 // about a megabyte.
 const maxPageSize = 1 << 30
 
-// chunkWindow is how much of a column chunk one read fetches, so that small
-// pages share reads.
-const chunkWindow = 1 << 20
+// chunkWindow is how much of a column chunk one read fetches at least, so
+// that small pages and the page headers share reads. A page larger than
+// the window is read at its own size, so a Reader holds about one page's
+// compressed bytes, plus its decompressed bytes, whatever the size of the
+// chunk.
+const chunkWindow = 64 << 10
 
 // chunk reads the bytes of one column chunk through a window.
 type chunk struct {
@@ -43,24 +46,49 @@ func (c *chunk) next(n int) ([]byte, error) {
 }
 
 // peek returns the next n bytes of the chunk without consuming them, or
-// fewer at the end of the chunk.
+// fewer at the end of the chunk. When the window holds only part of them,
+// it keeps that part, moved to the front, and reads the rest after it, to
+// fill a window of max(n, chunkWindow) bytes, so no byte of the chunk is
+// read twice.
 func (c *chunk) peek(n int) ([]byte, error) {
 	if left := c.end - c.pos; int64(n) > left {
 		n = int(left)
 	}
-	if c.pos >= c.bufStart {
-		if off := c.pos - c.bufStart; off+int64(n) <= int64(len(c.buf)) {
+	kept := 0
+	if off := c.pos - c.bufStart; off >= 0 && off <= int64(len(c.buf)) {
+		if int64(n) <= int64(len(c.buf))-off {
 			return c.buf[off : off+int64(n)], nil
 		}
+		kept = copy(c.buf, c.buf[off:])
 	}
-	size := min(int64(max(n, chunkWindow)), c.end-c.pos)
-	c.buf = grow(c.buf, int(size))
-	if err := c.f.readAt(c.buf, c.pos); err != nil {
+	size := int(min(int64(max(n, chunkWindow)), c.end-c.pos))
+	if refit(cap(c.buf), size) {
+		buf := make([]byte, size)
+		copy(buf, c.buf[:kept])
+		c.buf = buf
+	} else {
+		c.buf = c.buf[:size]
+	}
+	if err := c.f.readAt(c.buf[kept:], c.pos+int64(kept)); err != nil {
 		c.buf = c.buf[:0]
 		return nil, err
 	}
 	c.bufStart = c.pos
 	return c.buf[:n], nil
+}
+
+// refit reports whether a buffer of capacity c is reallocated to hold n
+// bytes: when it is too small, or more than four times larger than n and
+// the window, so that a Reader does not keep the buffers of one large
+// page, such as a dictionary, for the smaller pages after it.
+func refit(c, n int) bool { return c < n || c > 4*max(n, chunkWindow) }
+
+// fit returns b resized to n bytes, reallocated as refit says.
+func fit(b []byte, n int) []byte {
+	if refit(cap(b), n) {
+		return make([]byte, n)
+	}
+	return b[:n]
 }
 
 // grow returns b resized to n elements, reallocating only when it must.
@@ -150,7 +178,7 @@ func (r *Reader) decompress(src []byte, size int) ([]byte, error) {
 		if n, err := snappy.DecodedLen(src); err != nil || n != size {
 			return nil, fmt.Errorf("%w: column %q: snappy page of %d bytes declares %d", ErrFormat, r.name, n, size)
 		}
-		r.page = grow(r.page, size)
+		r.page = fit(r.page, size)
 		out, err := snappy.Decode(r.page, src)
 		if err != nil {
 			return nil, fmt.Errorf("%w: column %q: snappy: %v", ErrFormat, r.name, err)
@@ -171,7 +199,7 @@ func (r *Reader) decompress(src []byte, size int) ([]byte, error) {
 			return nil, fmt.Errorf("%w: column %q: gzip: %v", ErrFormat, r.name, err)
 		}
 		r.gz.Multistream(false)
-		r.page = grow(r.page, size)
+		r.page = fit(r.page, size)
 		if _, err := io.ReadFull(r.gz, r.page); err != nil {
 			return nil, fmt.Errorf("%w: column %q: gzip: %v", ErrFormat, r.name, err)
 		}
@@ -185,7 +213,7 @@ func (r *Reader) decompress(src []byte, size int) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.page = grow(r.page, size)
+		r.page = fit(r.page, size)
 		out, err := dec.DecodeAll(src, r.page[:0])
 		if err != nil {
 			return nil, fmt.Errorf("%w: column %q: zstd: %v", ErrFormat, r.name, err)
