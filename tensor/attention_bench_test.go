@@ -27,13 +27,19 @@ func BenchmarkAttention(b *testing.B) {
 					}
 					return composedAttention(q, k, v, nil, 1/math.Sqrt(dim), true, 0)
 				}
-				for b.Loop() {
+				step := func() {
 					if err := attend().Mul(w).Sum().Backward(b.Context()); err != nil {
 						b.Fatal(err)
 					}
 					q.ZeroGrad()
 					k.ZeroGrad()
 					v.ZeroGrad()
+				}
+				for range warmup {
+					step()
+				}
+				for b.Loop() {
+					step()
 				}
 				// The causal forward pass multiplies half the scores twice;
 				// the backward pass recomputes them and multiplies four

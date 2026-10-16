@@ -78,13 +78,19 @@ func BenchmarkConv2d(b *testing.B) {
 				if !c.first {
 					passes++
 				}
-				for b.Loop() {
+				step := func() {
 					y := x.Conv2d(w, nil, c.opts)
 					if err := y.Mul(y).Sum().Backward(b.Context()); err != nil {
 						b.Fatal(err)
 					}
 					x.ZeroGrad()
 					w.ZeroGrad()
+				}
+				for range warmup {
+					step()
+				}
+				for b.Loop() {
+					step()
 				}
 				b.ReportMetric(passes*flops*float64(b.N)/b.Elapsed().Seconds()/1e9, "GFLOP/s")
 			})

@@ -18,12 +18,27 @@ func realized(b *testing.B, seed uint64, shape ...int) *tensor.Tensor {
 	return x
 }
 
+// warmup is the number of times a benchmark runs its operation before it
+// starts timing: the first run compiles the GPU kernels, plans the
+// schedule and autotunes, the second replays the cached schedule and, on
+// CUDA, captures its graph, and the third replays it as the rest will.
+// Each of these happens once per program, so timing them would report a
+// step's speed wrong by seconds when b.N is small.
+const warmup = 3
+
+// run times the realization of f's result, after warmup untimed ones.
 func run(b *testing.B, f func() *tensor.Tensor) {
 	b.Helper()
-	for b.Loop() {
+	realize := func() {
 		if err := f().Realize(b.Context()); err != nil {
 			b.Fatal(err)
 		}
+	}
+	for range warmup {
+		realize()
+	}
+	for b.Loop() {
+		realize()
 	}
 }
 
