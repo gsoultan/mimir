@@ -183,6 +183,11 @@ func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Val
 			}
 		}
 	case reflect.Slice, reflect.Array:
+		// Numbers hold no parameters, and a model may hold many, such as
+		// the edges of a graph.
+		if k := v.Type().Elem().Kind(); k <= reflect.Complex128 || k == reflect.String {
+			return true
+		}
 		for i := range v.Len() {
 			if !w.visit(v.Index(i), join(path, strconv.Itoa(i)), fn) {
 				return false
