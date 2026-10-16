@@ -229,6 +229,7 @@ func TestParquetShardsErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeSource(t, src)
 	copyFile(t, reg1, changed) // one row group instead of two
 	if _, err := src.Open(t.Context(), 1); !errors.Is(err, data.ErrSource) || !strings.Contains(err.Error(), "1 row groups, had 2") {
 		t.Errorf("fewer row groups: %v", err)
@@ -339,6 +340,7 @@ func TestParquetShardsShareOpenFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeSource(t, src)
 	ps = src.(*parquetSource)
 	if ys, _ := readAll(t, src, data.Prefetch(1)); len(ys) != 180 {
 		t.Fatalf("%d rows", len(ys))
@@ -375,6 +377,7 @@ func TestParquetShardsShareOpenFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeSource(t, src)
 	ps = src.(*parquetSource)
 	var wg sync.WaitGroup
 	for g := range 8 {
@@ -411,6 +414,45 @@ func TestParquetShardsShareOpenFiles(t *testing.T) {
 	}
 	wg.Wait()
 	checkIdle(t, ps, nil)
+
+	// Close closes the idle files, and a shard closed after it closes its
+	// file at once, so that the files can be deleted.
+	rows, err := src.Open(t.Context(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.(io.Closer).Close(); err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	if len(ps.idle) != 0 || len(ps.open) != 1 {
+		t.Errorf("after Close, %d files open, %d of them idle", len(ps.open), len(ps.idle))
+	}
+	ps.mu.Unlock()
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	if len(ps.open) != 0 || len(ps.idle) != 0 {
+		t.Errorf("%d files open after the last shard closed", len(ps.open))
+	}
+	ps.mu.Unlock()
+	for _, path := range paths[:6] {
+		if err := os.Remove(path); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// closeSource closes src, a source of ParquetShards, when the test ends,
+// before its temporary directory is removed.
+func closeSource(t *testing.T, src data.Source) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := src.(io.Closer).Close(); err != nil {
+			t.Error(err)
+		}
+	})
 }
 
 // checkIdle checks that every file ps keeps open is idle, at most 4 of
