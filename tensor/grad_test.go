@@ -157,6 +157,24 @@ func gradCases() []gradCase {
 	add("max_pool2d_gapped", func(x []*tensor.Tensor) *tensor.Tensor {
 		return x[0].MaxPool2d(2, tensor.ConvOptions{Stride: 3})
 	}, u(-2, 2, 1, 2, 7, 8))
+
+	// Scans. Running maxima take distinct values, so that no step of the
+	// finite differences changes which element is the maximum.
+	distinct := func(shape ...int) func() ([]float32, []int) {
+		return func() ([]float32, []int) {
+			v := make([]float32, n(shape...))
+			for i, p := range r.Perm(len(v)) {
+				v[i] = -2 + 0.2*float32(p)
+			}
+			return v, shape
+		}
+	}
+	mov("cumsum", func(x *tensor.Tensor) *tensor.Tensor { return x.CumSum(1) })
+	mov("cumsum_last_of_transposed", func(x *tensor.Tensor) *tensor.Tensor { return x.Transpose(0, 2).CumSum(-1) })
+	add("cummax", func(x []*tensor.Tensor) *tensor.Tensor { v, _ := x[0].CumMax(2); return v }, distinct(2, 3, 4))
+	add("cummax_outer", func(x []*tensor.Tensor) *tensor.Tensor { v, _ := x[0].CumMax(0); return v }, distinct(5, 3))
+	add("logcumsumexp", func(x []*tensor.Tensor) *tensor.Tensor { return x[0].LogCumSumExp(-1) }, u(-3, 3, 2, 3, 5))
+	add("logcumsumexp_outer", func(x []*tensor.Tensor) *tensor.Tensor { return x[0].LogCumSumExp(0) }, u(-3, 3, 4, 3))
 	return cases
 }
 
