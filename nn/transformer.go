@@ -304,9 +304,14 @@ func (c *KVCache) Len() int { return c.n }
 func (c *KVCache) Cap() int { return c.shape[2] }
 
 // Reset empties the cache for a new sequence.
-func (c *KVCache) Reset() {
-	c.n = 0
+func (c *KVCache) Reset() { c.Truncate(0) }
+
+// Truncate keeps the first n positions the cache holds and drops the
+// rest, as rejecting speculated tokens or reusing a prompt's prefix does.
+func (c *KVCache) Truncate(n int) {
+	c.n = min(max(n, 0), c.n)
 	if c.err != nil {
+		c.n = 0
 		c.alloc()
 	}
 }
