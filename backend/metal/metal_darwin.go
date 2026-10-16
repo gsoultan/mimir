@@ -426,7 +426,7 @@ func (b *Backend) pipeline(src string, metal4 bool, threads int) (id, error) {
 		var nsErr id
 		lib := id(send(b.dev, selNewLibrary, uintptr(source), uintptr(opts), uintptr(unsafe.Pointer(&nsErr))))
 		if lib == 0 {
-			err = fmt.Errorf("%w: %w\n%s", nsError("compile kernel", nsErr), backend.ErrInternal, numberedSource(src))
+			err = fmt.Errorf("%w: %w\n%s", nsError("compile kernel", nsErr), backend.ErrInternal, gen.Numbered(src))
 			return
 		}
 		defer release(lib)

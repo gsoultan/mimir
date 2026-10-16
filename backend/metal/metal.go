@@ -10,20 +10,7 @@
 // ErrUnavailable.
 package metal
 
-import (
-	"errors"
-	"fmt"
-	"strings"
-)
+import "errors"
 
 // ErrUnavailable reports that no Metal device can be used.
 var ErrUnavailable = errors.New("metal unavailable")
-
-// numberedSource returns src with line numbers, for compiler errors.
-func numberedSource(src string) string {
-	var b strings.Builder
-	for i, l := range strings.Split(src, "\n") {
-		fmt.Fprintf(&b, "%4d %s\n", i+1, l)
-	}
-	return b.String()
-}
