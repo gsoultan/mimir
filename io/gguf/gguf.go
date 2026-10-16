@@ -4,15 +4,15 @@
 // https://github.com/ggml-org/ggml/blob/master/docs/gguf.md.
 //
 // Open maps a file and its tensors alias the mapping, so a model larger
-// than memory opens at once and tensor.FromBytes reads its weights in
-// place:
+// than memory opens at once and Load reads its weights in place, as
+// quantized tensors where the file quantizes them:
 //
 //	f, err := gguf.Open("model.gguf")
 //	...
-//	t, _ := f.Tensor("blk.0.attn_q.weight")
-//	dt, ok := t.Type.DType()
-//	if !ok { ... } // a type mimir does not read; see Tensor.DType
-//	w := tensor.FromBytesFunc(dt, t.Data, f.Hold(), t.Shape...)
+//	n, _ := f.Metadata("llama.block_count")
+//	vocab, _ := f.Metadata("tokenizer.ggml.tokens")
+//	w, err := f.Load("blk.0.attn_q.weight") // [out, in] of Q4_K, say
+//	y := x.MatMulT(w)
 //
 // Parse validates the whole header before returning, bounding every
 // count, length and offset it reads by the size of the file, so a corrupt
@@ -25,12 +25,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"runtime"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/filemap"
+	"github.com/gsoultan/mimir/tensor"
 )
 
 // ErrFormat reports a malformed or unsupported file.
@@ -483,6 +485,25 @@ func Open(path string) (*File, error) {
 		f.cleanup = runtime.AddCleanup(f, func(m *filemap.Mapping) { _ = m.Close() }, m)
 	}
 	return f, nil
+}
+
+// Load returns the named tensor as a mimir tensor of its type (see
+// Type.DType) that reads the file's bytes in place, keeping the mapping
+// (see Hold) for as long as it reads them. It fails with an error that
+// matches fs.ErrNotExist if the file has no such tensor, and with a
+// *TypeError, which matches tensor.ErrDType, if mimir does not read its
+// type.
+func (f *File) Load(name string) (*tensor.Tensor, error) {
+	t, ok := f.Tensor(name)
+	if !ok {
+		return nil, fmt.Errorf("gguf: tensor %q: %w", name, fs.ErrNotExist)
+	}
+	dt, err := t.DType()
+	if err != nil {
+		return nil, err
+	}
+	x := tensor.FromBytesFunc(dt, t.Data, f.Hold(), t.Shape...)
+	return x, x.Err()
 }
 
 // Mapped reports whether the tensors alias a mapping of the file.

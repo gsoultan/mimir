@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -84,12 +85,19 @@ func TestFixture(t *testing.T) {
 			if !errors.As(err, &te) || te.Tensor != w.Name || !errors.Is(err, tensor.ErrDType) {
 				t.Errorf("%s: DType error %v", w.Name, err)
 			}
+			if _, err := f.Load(w.Name); !errors.Is(err, tensor.ErrDType) {
+				t.Errorf("%s: Load error %v", w.Name, err)
+			}
 			continue
 		}
 		if err != nil {
 			t.Fatalf("%s: %v", w.Name, err)
 		}
-		got, err := tensor.FromBytesFunc(dt, w.Data, f.Hold(), w.Shape...).Cast(tensor.Float32).Data[float32](ctx)
+		x, err := f.Load(w.Name)
+		if err != nil || x.DType() != dt || !slices.Equal(x.Shape(), w.Shape) {
+			t.Fatalf("%s: loaded %v, %v", w.Name, x, err)
+		}
+		got, err := x.Cast(tensor.Float32).Data[float32](ctx)
 		if err != nil {
 			t.Fatalf("%s: %v", w.Name, err)
 		}
@@ -109,6 +117,9 @@ func TestFixture(t *testing.T) {
 	}
 	if checked != 7 {
 		t.Errorf("checked %d tensors, want 7", checked)
+	}
+	if _, err := f.Load("missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("missing tensor: %v", err)
 	}
 	if w, _ := f.Tensor("blk.0.ffn_up.weight"); !slices.Equal(w.Shape, []int{2, 1, 2, 32}) || len(w.Data) != 4*34 {
 		t.Errorf("4-D tensor of shape %v and %d bytes", w.Shape, len(w.Data))
