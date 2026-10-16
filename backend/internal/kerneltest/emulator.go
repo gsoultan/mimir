@@ -252,7 +252,7 @@ func (e *Emulator) binary(t *testing.T, l *gen.Launch, types []backend.DType) st
 	}
 	cmd := exec.Command("clang++", append(clangFlags, "-I", emuDir, "-o", bin, cpp)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("compile kernel: %v\n%s\n%s", err, out, Numbered(l.Src))
+		t.Fatalf("compile kernel: %v\n%s\n%s", err, out, gen.Numbered(l.Src))
 	}
 	e.bins[key] = bin
 	return bin
@@ -308,7 +308,7 @@ func (e *Emulator) Exec(t *testing.T, l *gen.Launch, outs, ins []backend.Buffer)
 		t.Fatal(err)
 	}
 	if out, err := exec.Command(bin, inPath, outPath).CombinedOutput(); err != nil {
-		t.Fatalf("run kernel: %v\n%s\n%s", err, out, Numbered(l.Src))
+		t.Fatalf("run kernel: %v\n%s\n%s", err, out, gen.Numbered(l.Src))
 	}
 	res, err := os.ReadFile(outPath)
 	if err != nil {
@@ -370,13 +370,4 @@ func GEMM(g gen.GEMM, x, y []float32) []float32 {
 		}
 	}
 	return z
-}
-
-// Numbered returns src with line numbers, for compiler errors.
-func Numbered(src string) string {
-	var b strings.Builder
-	for i, l := range strings.Split(src, "\n") {
-		fmt.Fprintf(&b, "%4d %s\n", i+1, l)
-	}
-	return b.String()
 }

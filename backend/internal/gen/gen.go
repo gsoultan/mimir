@@ -773,3 +773,12 @@ func (g *gen) epilogue(n int, acc string) (*Launch, error) {
 	g.line("o0[i] = %s;", vals[len(vals)-1])
 	return g.perElement(n)
 }
+
+// Numbered returns src with line numbers, for compiler errors.
+func Numbered(src string) string {
+	var b strings.Builder
+	for i, l := range strings.Split(src, "\n") {
+		fmt.Fprintf(&b, "%4d %s\n", i+1, l)
+	}
+	return b.String()
+}
