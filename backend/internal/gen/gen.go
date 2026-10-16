@@ -454,6 +454,12 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return planAttentionGrad(d, k, outs, ins)
 	case op == backend.OpSliceScatter:
 		return planSliceScatter(d, k, outs, ins, n)
+	case op == backend.OpConv:
+		return planConv(d, k, outs, ins)
+	case op == backend.OpConvWeight:
+		return planConvWeight(d, k, outs, ins)
+	case op == backend.OpConvInput:
+		return planConvInput(d, k, outs, ins)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
@@ -837,43 +843,14 @@ func (g *gen) matmul(n int) (*Launch, error) {
 	return g.epilogue(n, "acc")
 }
 
-// epilogue writes the product acc, after the epilogue program of the
-// product g.k if it has one. The epilogue reads the product as input 0 and
-// inputs 2 on as inputs 1 on, through views of a shape that lists the
-// output's elements in row-major order.
+// epilogue writes the product acc into element i, after the epilogue
+// program of the product g.k if it has one (see epilogueViews).
 func (g *gen) epilogue(n int, acc string) (*Launch, error) {
-	k := g.k
-	if k.Attrs.Program == nil {
-		g.line("o0[i] = %s;", acc)
-		return g.perElement(n)
-	}
-	// The epilogue's inputs: the product, then ins[2:].
-	shape := k.Shape
-	if len(k.In) > 2 {
-		shape = k.In[2].Shape
-	}
-	views := k.In[2:]
-	for _, v := range views {
-		if !slices.Equal(v.Shape, shape) {
-			return nil, fmt.Errorf("epilogue inputs of shapes %v and %v: %w", shape, v.Shape, backend.ErrInternal)
-		}
-	}
-	if e, _ := backend.NumElements(shape); e != n {
-		return nil, fmt.Errorf("epilogue of shape %v for %d elements: %w", shape, n, backend.ErrInternal)
-	}
-	types := append([]backend.DType{k.DType}, g.ins[2:]...)
-	if err := checkProgram(k.Attrs.Program, nil, k.DType, types); err != nil {
+	ep, err := g.epilogueViews()
+	if err != nil {
 		return nil, err
 	}
-	cshape, cviews := backend.Coalesce(shape, views)
-	offs := g.offsets("i", cshape, cviews)
-	vals := g.program(k.Attrs.Program, func(a int) string {
-		if a == 0 {
-			return acc
-		}
-		return fmt.Sprintf("i%d[%s]", a+1, offs[a-1])
-	})
-	g.line("o0[i] = %s;", vals[len(vals)-1])
+	g.store(ep, "i", acc)
 	return g.perElement(n)
 }
 

@@ -73,6 +73,8 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 			return attention(ctx, b, k, o, ins)
 		}
 		return attentionGrad(ctx, b, k, o, ins)
+	case k.Op == backend.OpConv || k.Op == backend.OpConvWeight || k.Op == backend.OpConvInput:
+		return runConv(ctx, b, k, outs, ins)
 	}
 	switch k.DType {
 	case backend.Float32:

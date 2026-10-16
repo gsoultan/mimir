@@ -64,3 +64,4 @@ func TestQuantKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.Quant(t), ta
 func TestAttentionKernels(t *testing.T) {
 	kerneltest.Run(t, kerneltest.Attention(t), targets(t, false))
 }
+func TestConvKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Conv(t), targets(t, false)) }
