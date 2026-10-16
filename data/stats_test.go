@@ -3,10 +3,12 @@ package data_test
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"math/rand/v2"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/data"
 )
@@ -165,5 +167,36 @@ func TestStatisticsErrors(t *testing.T) {
 	}
 	if o, c := failing.opened.Load(), failing.closed.Load(); o != c {
 		t.Errorf("%d opened, %d closed", o, c)
+	}
+}
+
+func TestStatisticsReportsTheLowestFailedShard(t *testing.T) {
+	// Shard 2 fails first, and shard 1 once it has. Shard 0 reads one
+	// example once the failure has cancelled the context, so it is cut
+	// short by the cancellation, which the failures outrank.
+	boom := errors.New("boom")
+	failed := make(chan struct{})
+	src := &funcSource{features: 1, shards: 4, open: func(ctx context.Context, shard int) (data.Rows, error) {
+		return readFunc(func(x, y []float32) (int, error) {
+			switch shard {
+			case 0:
+				<-ctx.Done()
+				x[0], y[0] = 1, 1
+				return 1, nil
+			case 1:
+				<-failed
+				return 0, boom
+			case 2:
+				close(failed)
+				return 0, boom
+			}
+			return 0, io.EOF
+		}), nil
+	}}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := data.Statistics(ctx, src, data.Prefetch(3))
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "data: shard 1:") {
+		t.Errorf("two failed shards: %v, want shard 1's", err)
 	}
 }

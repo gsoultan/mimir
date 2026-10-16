@@ -40,10 +40,11 @@ func (s *Stats) affine(features int) (scale, shift []float32, err error) {
 }
 
 // Statistics reads every shard of src once, Prefetch shards at a time,
-// and returns the per-feature statistics of its examples, accumulated in
-// float64. A cancelled ctx returns its error; a shard that fails returns
-// its error, which names the shard; a source without examples is
-// ErrSource.
+// through a chunk of about 4 MiB per shard being read, and returns the
+// per-feature statistics of its examples, accumulated in float64. A
+// cancelled ctx returns its error; a shard that fails returns its error,
+// which names the shard, the lowest when several fail; a source without
+// examples is ErrSource.
 func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error) {
 	if src == nil {
 		return nil, fmt.Errorf("data: nil source: %w", ErrSource)
@@ -66,27 +67,23 @@ func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	accs := make([]moments, shards)
+	errs := make([]error, shards) // each set by the reader of its shard, before Wait returns
 	var (
-		next     atomic.Int64
-		mu       sync.Mutex
-		firstErr error
-		readers  sync.WaitGroup
+		next    atomic.Int64
+		readers sync.WaitGroup
 	)
+	rows := chunkRows(features)
 	for range min(cfg.prefetch, shards) {
 		readers.Go(func() {
-			x := make([]float32, minChunk*features)
-			y := make([]float32, minChunk)
+			x := make([]float32, rows*features)
+			y := make([]float32, rows)
 			for ctx.Err() == nil {
 				i := int(next.Add(1) - 1)
 				if i >= shards {
 					return
 				}
 				if err := accumulate(ctx, src, i, &accs[i], x, y); err != nil {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("data: shard %d: %w", i, err)
-					}
-					mu.Unlock()
+					errs[i] = fmt.Errorf("data: shard %d: %w", i, err)
 					cancel()
 					return
 				}
@@ -97,8 +94,8 @@ func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error)
 	if err := parent.Err(); err != nil {
 		return nil, err
 	}
-	if firstErr != nil {
-		return nil, firstErr
+	if err := firstFailure(errs); err != nil {
+		return nil, err
 	}
 	// Merging in shard order makes the result independent of timing.
 	total := newMoments(features)
@@ -124,6 +121,25 @@ func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error)
 	return st, nil
 }
 
+// firstFailure returns the error of the lowest failed shard, so what
+// Statistics reports does not depend on timing. A shard cut short by the
+// cancellation that another shard's failure triggered reports that
+// cancellation, which the failure outranks.
+func firstFailure(errs []error) error {
+	var failed error
+	for _, err := range errs {
+		if err != nil && (failed == nil || cancelled(failed) && !cancelled(err)) {
+			failed = err
+		}
+	}
+	return failed
+}
+
+// cancelled reports whether err is a context's end.
+func cancelled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // accumulate reads shard i of src into acc, through the buffers x and y.
 func accumulate(ctx context.Context, src Source, i int, acc *moments, x, y []float32) (err error) {
 	rows, err := src.Open(ctx, i)
@@ -136,6 +152,7 @@ func accumulate(ctx context.Context, src Source, i int, acc *moments, x, y []flo
 		}
 	}()
 	features := len(x) / len(y)
+	idle := 0 // consecutive reads of no examples
 	for ctx.Err() == nil {
 		n, rerr := rows.Read(x, y)
 		if n < 0 || n > len(y) {
@@ -143,6 +160,11 @@ func accumulate(ctx context.Context, src Source, i int, acc *moments, x, y []flo
 		}
 		if n > 0 {
 			acc.add(x[:n*features], n)
+			idle = 0
+		} else if rerr == nil {
+			if idle++; idle >= noProgressLimit {
+				return fmt.Errorf("%w after %d reads of no examples in a row: %w", io.ErrNoProgress, idle, ErrSource)
+			}
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {

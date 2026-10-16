@@ -15,9 +15,25 @@ import (
 	"github.com/gsoultan/mimir/tensor"
 )
 
-// minChunk is the fewest examples a chunk, the unit of work between a
-// shard reader and the batches, holds.
-const minChunk = 8192
+// chunkBytes is the memory budget of a chunk, the unit of work between a
+// shard reader and the batches: its examples and targets as float32.
+const chunkBytes = 4 << 20
+
+// maxChunkRows is the most examples a chunk holds, however narrow they
+// are.
+const maxChunkRows = 8192
+
+// chunkRows returns the examples per chunk of features values each: as
+// many as fit chunkBytes, at least 1 and at most maxChunkRows. It does
+// not depend on the batch size; the collector spans chunks.
+func chunkRows(features int) int {
+	return max(1, min(maxChunkRows, chunkBytes/(4*(features+1))))
+}
+
+// noProgressLimit is how many consecutive reads of no examples and no
+// error fail a shard, as bufio gives up on a reader that makes no
+// progress.
+const noProgressLimit = 100
 
 // defaultShuffleBuffer is the number of examples ShuffleBuffer holds by
 // default.
@@ -30,20 +46,22 @@ func defaultPrefetch() int { return max(1, min(4, runtime.GOMAXPROCS(0))) }
 // Prefetch sets how many shards a Stream, or Statistics, reads at once,
 // ahead of the batches it yields; it is at least 1. The default is
 // min(4, GOMAXPROCS). Memory grows with it: a Stream holds up to
-// 2×shards+1 chunks of max(batch size, 8192) examples.
+// 2×shards+1 chunks of about 4 MiB each (at most 8192 examples), which
+// it keeps from one epoch to the next, and Statistics one such chunk per
+// shard being read.
 func Prefetch(shards int) Option { return func(c *config) { c.prefetch = shards } }
 
 // ShuffleBuffer sets how many examples a shuffling Stream holds to
 // reorder them as they stream by: each example yielded is drawn at random
 // from the buffer and the next example read takes its place. The default
 // is 10000; 0 shuffles the order of the shards only. A larger buffer
-// mixes examples from more shards, at the cost of rows×Features floats
+// mixes examples from more shards, at the cost of rows×Features×4 bytes
 // of memory.
 func ShuffleBuffer(rows int) Option { return func(c *config) { c.shuffleBuf = rows } }
 
 // ClassTargets makes a Stream's Y Int32 class indices: each target is
 // rounded to the nearest integer, and a target further than 1e-3 from a
-// non-negative integer ends the epoch with ErrTarget.
+// non-negative integer, or not a number, ends the epoch with ErrTarget.
 func ClassTargets() Option { return func(c *config) { c.classes = true } }
 
 // Normalize standardizes each feature a Stream yields to (x-Mean)/Std
@@ -62,8 +80,11 @@ func Normalize(s *Stats) Option { return func(c *config) { c.normalize, c.stats 
 // and whatever the Prefetch. Without Shuffle, shards are read in order
 // and examples in order.
 //
-// Memory is bounded by the chunks in flight (see Prefetch), the shuffle
-// buffer and one batch, however many examples the source holds.
+// Memory is bounded however many examples the source holds: 2×Prefetch+1
+// chunks of about 4 MiB each, the shuffle buffer of
+// ShuffleBuffer×Features×4 bytes and one batch of BatchSize×Features×4
+// bytes, which the Stream keeps from one epoch to the next, plus the
+// tensors of the batch being yielded.
 type Stream struct {
 	src          Source
 	shards       int
@@ -72,6 +93,14 @@ type Stream struct {
 	chunkRows    int
 	scale, shift []float32 // x*scale+shift standardizes, per feature; nil without Normalize
 	epoch        atomic.Int64
+
+	// The buffers of past epochs, for the next: an epoch takes chunks
+	// and a collector at its start and puts them back at its end, so a
+	// Stream allocates them once however many epochs it runs, and
+	// concurrent epochs each have their own.
+	mu         sync.Mutex
+	chunks     []*chunk
+	collectors []*collector
 }
 
 // NewStream returns a dataset streaming from src. It applies BatchSize,
@@ -98,7 +127,7 @@ func NewStream(src Source, opts ...Option) (*Stream, error) {
 	case cfg.shuffleBuf < 0:
 		return nil, fmt.Errorf("data: shuffle buffer of %d examples: %w", cfg.shuffleBuf, ErrOption)
 	}
-	s := &Stream{src: src, shards: shards, features: features, cfg: cfg, chunkRows: max(cfg.batch, minChunk)}
+	s := &Stream{src: src, shards: shards, features: features, cfg: cfg, chunkRows: chunkRows(features)}
 	if cfg.normalize {
 		var err error
 		if s.scale, s.shift, err = cfg.stats.affine(features); err != nil {
@@ -124,10 +153,6 @@ func (s *Stream) All(ctx context.Context) iter.Seq2[Batch, error] {
 	return func(yield func(Batch, error) bool) {
 		ctx, cancel := context.WithCancel(ctx)
 		var readers sync.WaitGroup
-		defer func() {
-			cancel()
-			readers.Wait()
-		}()
 
 		var rng *rand.Rand
 		var order []int
@@ -141,7 +166,14 @@ func (s *Stream) All(ctx context.Context) iter.Seq2[Batch, error] {
 			}
 		}
 		p := s.startReaders(ctx, &readers, order)
-		c := s.newCollector(ctx, rng, yield)
+		c := s.takeCollector(ctx, rng, yield)
+		defer func() {
+			cancel()
+			// Once every reader has finished, every chunk of the epoch is
+			// in free or in an out channel, so the next epoch gets them all.
+			readers.Wait()
+			s.keep(p.collect(), c)
+		}()
 		for pos, shard := range order {
 			sh := &p.shards[pos]
 			for {
@@ -156,10 +188,11 @@ func (s *Stream) All(ctx context.Context) iter.Seq2[Batch, error] {
 				if !ok {
 					break
 				}
-				if !c.add(ch) {
+				ok = c.add(ch)
+				p.free <- ch
+				if !ok {
 					return
 				}
-				p.free <- ch
 			}
 			if sh.err != nil {
 				if err := ctx.Err(); err != nil {
@@ -192,14 +225,16 @@ type shardStream struct {
 // pipeline is the reader side of an epoch: the readers decode the shards
 // of the planned order into chunks, prefetch of them at a time.
 //
-// Chunks come from free, which holds every chunk of the epoch (a nil
-// entry stands for one not allocated yet), so their number is fixed. A
-// reader takes a slot before claiming the next shard and the consumer
-// returns the slot once it has drained that shard, so at most prefetch
-// shards are open ahead of the consumer, each holding at most one chunk
-// in flight and one in its channel. Readers claim shards in the planned
-// order, so with slots taken first a reader never waits on a slot for a
-// shard the consumer is waiting for.
+// Chunks come from free, which holds a token for every chunk of the
+// epoch (a nil stands for one not allocated yet), so their number is
+// fixed. Every chunk is in exactly one place, free, an out channel, a
+// reader's hands or the consumer's, so whoever holds one can return it
+// to free without blocking. A reader takes a slot before claiming the
+// next shard and the consumer returns the slot once it has drained that
+// shard, so at most prefetch shards are open ahead of the consumer, each
+// holding at most one chunk in flight and one in its channel. Readers
+// claim shards in the planned order, so with slots taken first a reader
+// never waits on a slot for a shard the consumer is waiting for.
 type pipeline struct {
 	shards []shardStream // by position in the planned order
 	free   chan *chunk
@@ -216,9 +251,17 @@ func (s *Stream) startReaders(ctx context.Context, wg *sync.WaitGroup, order []i
 	for i := range p.shards {
 		p.shards[i].out = make(chan *chunk, 1)
 	}
+	// The chunks kept from earlier epochs come first; a reader allocates
+	// a chunk when it draws a nil.
+	s.mu.Lock()
 	for range cap(p.free) {
-		p.free <- nil
+		var c *chunk
+		if n := len(s.chunks); n > 0 {
+			c, s.chunks = s.chunks[n-1], s.chunks[:n-1]
+		}
+		p.free <- c
 	}
+	s.mu.Unlock()
 	for range workers {
 		p.slots <- struct{}{}
 	}
@@ -244,9 +287,47 @@ func (s *Stream) startReaders(ctx context.Context, wg *sync.WaitGroup, order []i
 	return p
 }
 
+// collect returns the chunks of the epoch, to call once every reader has
+// finished: those in free and those sent on an out channel that the
+// consumer did not drain. The nils of chunks never allocated are dropped.
+func (p *pipeline) collect() []*chunk {
+	var chunks []*chunk
+	drain := func(ch <-chan *chunk) {
+		for {
+			select {
+			case c, ok := <-ch:
+				if !ok {
+					return
+				}
+				if c != nil {
+					chunks = append(chunks, c)
+				}
+			default:
+				return
+			}
+		}
+	}
+	drain(p.free)
+	for i := range p.shards {
+		drain(p.shards[i].out)
+	}
+	return chunks
+}
+
+// keep stores the chunks and the collector of a finished epoch for the
+// next.
+func (s *Stream) keep(chunks []*chunk, c *collector) {
+	c.ctx, c.yield, c.rng = nil, nil, nil
+	s.mu.Lock()
+	s.chunks = append(s.chunks, chunks...)
+	s.collectors = append(s.collectors, c)
+	s.mu.Unlock()
+}
+
 // readShard decodes one shard into chunks sent on out, in order. It
 // returns once the shard is exhausted, fails or ctx ends, with the Rows
-// closed.
+// closed and every chunk it took from free sent on out or returned to
+// free.
 func (s *Stream) readShard(ctx context.Context, shard int, out chan<- *chunk, free chan *chunk) (err error) {
 	rows, err := s.src.Open(ctx, shard)
 	if err != nil {
@@ -258,7 +339,7 @@ func (s *Stream) readShard(ctx context.Context, shard int, out chan<- *chunk, fr
 		}
 	}()
 	f := s.features
-	row := 0
+	row, idle := 0, 0
 	for {
 		var c *chunk
 		select {
@@ -270,20 +351,32 @@ func (s *Stream) readShard(ctx context.Context, shard int, out chan<- *chunk, fr
 			c = &chunk{x: make([]float32, s.chunkRows*f), y: make([]float32, s.chunkRows)}
 		}
 		n, rerr := rows.Read(c.x, c.y)
+		// From here on c goes back to free, or on to out, before any
+		// return. The reader holds it, so free has room and the send
+		// never blocks.
 		if n < 0 || n > s.chunkRows {
+			free <- c
 			return fmt.Errorf("read %d examples into room for %d: %w", n, s.chunkRows, ErrSource)
 		}
 		c.n = n
 		if n == 0 {
 			free <- c
+			if rerr == nil {
+				if idle++; idle >= noProgressLimit {
+					return fmt.Errorf("%w after %d reads of no examples in a row: %w", io.ErrNoProgress, idle, ErrSource)
+				}
+			}
 		} else {
+			idle = 0
 			if err := s.prepare(c, row); err != nil {
+				free <- c
 				return err
 			}
 			row += n
 			select {
 			case out <- c:
 			case <-ctx.Done():
+				free <- c
 				return ctx.Err()
 			}
 		}
@@ -311,19 +404,33 @@ func (s *Stream) prepare(c *chunk, row int) error {
 	}
 	if s.cfg.classes {
 		for i, y := range c.y[:c.n] {
-			r := math.Round(float64(y))
-			if r < 0 || r >= 1<<31 || math.Abs(float64(y)-r) > 1e-3 {
+			r, ok := classIndex(y)
+			if !ok {
 				return fmt.Errorf("row %d: target %v is not a class index: %w", row+i, y, ErrTarget)
 			}
-			c.y[i] = float32(r)
+			c.y[i] = r
 		}
 	}
 	return nil
 }
 
+// classIndex returns the class index y rounds to and whether it is one:
+// a non-negative integer below 2^31 within 1e-3 of y. The test is
+// written as what passes, so a NaN, which fails every comparison, is
+// rejected rather than converted.
+func classIndex(y float32) (float32, bool) {
+	r := math.Round(float64(y))
+	if r >= 0 && r < 1<<31 && math.Abs(float64(y)-r) <= 1e-3 {
+		return float32(r), true
+	}
+	return 0, false
+}
+
 // collector turns chunks into batches: it feeds examples through the
 // shuffle buffer, if any, into the batch buffer and yields each batch as
-// tensors, which copy the buffer, so one buffer serves the epoch.
+// tensors, which copy the buffer, so one buffer serves the epoch. A
+// Stream keeps its collectors across epochs; ctx, yield and rng are those
+// of the epoch using it.
 type collector struct {
 	ctx      context.Context
 	yield    func(Batch, error) bool
@@ -346,23 +453,37 @@ type collector struct {
 	bufY   []float32
 }
 
-func (s *Stream) newCollector(ctx context.Context, rng *rand.Rand, yield func(Batch, error) bool) *collector {
+// takeCollector returns a collector for an epoch, one kept from an
+// earlier epoch when there is one, emptied.
+func (s *Stream) takeCollector(ctx context.Context, rng *rand.Rand, yield func(Batch, error) bool) *collector {
+	var c *collector
+	s.mu.Lock()
+	if n := len(s.collectors); n > 0 {
+		c, s.collectors = s.collectors[n-1], s.collectors[:n-1]
+	}
+	s.mu.Unlock()
+	if c == nil {
+		c = s.newCollector()
+	}
+	c.ctx, c.yield, c.rng, c.n, c.filled = ctx, yield, rng, 0, 0
+	return c
+}
+
+// newCollector returns a collector with the buffers an epoch of s needs.
+func (s *Stream) newCollector() *collector {
 	c := &collector{
-		ctx:      ctx,
-		yield:    yield,
 		features: s.features,
 		batch:    s.cfg.batch,
 		classes:  s.cfg.classes,
 		dropLast: s.cfg.dropLast,
 		x:        make([]float32, s.cfg.batch*s.features),
-		rng:      rng,
 	}
 	if c.classes {
 		c.yi = make([]int32, s.cfg.batch)
 	} else {
 		c.y = make([]float32, s.cfg.batch)
 	}
-	if rng != nil && s.cfg.shuffleBuf > 0 {
+	if s.cfg.shuffle && s.cfg.shuffleBuf > 0 {
 		c.size = s.cfg.shuffleBuf
 		c.bufX = make([]float32, c.size*s.features)
 		c.bufY = make([]float32, c.size)
