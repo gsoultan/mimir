@@ -158,9 +158,10 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	}
 	// joins reports whether n could be computed inside its consumers'
 	// kernel: an unrealized elementwise node read by elementwise nodes
-	// only.
+	// only, other than a cast that dequantizes, whose kernel reads whole
+	// blocks, which programs do not load.
 	joins := func(n *graph.Node) bool {
-		return n.Op.IsElementwise() && !n.Realized() && len(users[n]) > 0 &&
+		return n.Op.IsElementwise() && !n.Realized() && len(users[n]) > 0 && !dequantizes(n) &&
 			!slices.ContainsFunc(users[n], func(u *graph.Node) bool { return !u.Op.IsElementwise() })
 	}
 	// A group stops growing at maxProgram instructions, counting each load
@@ -275,6 +276,11 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	}
 	slices.Reverse(p.order)
 	return p
+}
+
+// dequantizes reports whether n is a cast of a block-quantized value.
+func dequantizes(n *graph.Node) bool {
+	return n.Op == backend.OpCast && n.Inputs[0].DType.IsQuantized()
 }
 
 // fuse returns the program that computes root with the members of its

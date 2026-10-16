@@ -61,7 +61,13 @@ type poolKey struct {
 }
 
 // bytes returns the size of a buffer of key.
-func (k poolKey) bytes() int64 { return int64(k.n) * int64(k.dt.Size()) }
+func (k poolKey) bytes() int64 { return bufferBytes(k.dt, k.n) }
+
+// bufferBytes returns the size of a buffer of n elements of dt.
+func bufferBytes(dt backend.DType, n int) int64 {
+	size, _ := dt.Bytes(n)
+	return int64(size)
+}
 
 type pooled struct {
 	buf   backend.Buffer
@@ -173,7 +179,7 @@ func (p *pool) track(buf backend.Buffer) {
 	if p.owned[ref] != nil {
 		return
 	}
-	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), ref: ref}
+	e := &entry{bytes: bufferBytes(buf.DType(), buf.Len()), ref: ref}
 	p.allocated += e.bytes
 	p.owned[e.ref] = e
 	e.stop = runtime.AddCleanup((*byte)(ptr), p.settle, e)

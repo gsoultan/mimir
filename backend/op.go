@@ -25,7 +25,7 @@ const (
 	OpSin   // Float32 only
 	OpSqrt  // Float32 only
 	OpRecip // 1/x; Float32 only
-	OpCast  // convert to Kernel.DType
+	OpCast  // convert to Kernel.DType; a block-quantized input is dequantized
 
 	// Binary.
 	OpAdd
@@ -55,7 +55,9 @@ const (
 	// its output keeps with size 1.
 	OpMatMul
 
-	// Indexing along Attrs.Axis with Int32 indices.
+	// Indexing along Attrs.Axis with Int32 indices. A gather from a
+	// block-quantized In[0] dequantizes the elements it reads into a float
+	// output.
 	OpGather     // out[m] = In[0][m with m[axis] = In[1][m]]
 	OpScatterAdd // out = In[0]; out[m with m[axis] = In[1][m]] += In[2][m]
 
@@ -87,6 +89,16 @@ const (
 	// rank and every dimension but the axis. It takes at least one input
 	// and at most MaxCatInputs.
 	OpCat
+
+	// OpQMatMul multiplies by the transpose of a block-quantized matrix,
+	// like a linear layer: In[0] is Float32 [..., K], In[1] a
+	// block-quantized [N, K] read contiguously from a block boundary, and
+	// the Float32 output [..., N] holds x·Wᵀ. Backends may round x to the
+	// precision of the weights first, as the CPU backend rounds each block
+	// of a row of x to int8 with a float32 scale, so results differ from
+	// the product of the dequantized weights by about the weights'
+	// quantization error.
+	OpQMatMul
 
 	numOps
 )
@@ -158,6 +170,7 @@ var opNames = [numOps]string{
 	OpFused:       "fused",
 	OpScan:        "scan",
 	OpCat:         "cat",
+	OpQMatMul:     "qmatmul",
 }
 
 func (o Op) String() string {

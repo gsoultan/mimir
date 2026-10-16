@@ -97,8 +97,14 @@ func checkDType(op backend.Op, dt backend.DType) error {
 }
 
 // newNode completes n, whose inputs must share a device, with that
-// device.
+// device. Block-quantized inputs are refused except where n dequantizes
+// them (see readsQuantized).
 func newNode(n *Node) (*Node, error) {
+	for i, in := range n.Inputs {
+		if in.DType.IsQuantized() && !readsQuantized(n.Op, i) {
+			return nil, errorf(n.Op, backend.ErrDType, "%s input %d", in.DType, i)
+		}
+	}
 	for _, in := range n.Inputs {
 		switch d := in.Dev; {
 		case d == nil:
@@ -111,13 +117,31 @@ func newNode(n *Node) (*Node, error) {
 	return n, nil
 }
 
+// readsQuantized reports whether input i of an op may be block-quantized:
+// the input of a cast, which dequantizes it, the source of a gather, which
+// dequantizes what it reads, and the weights of a quantized product.
+func readsQuantized(op backend.Op, i int) bool {
+	switch op {
+	case backend.OpCast, backend.OpGather:
+		return i == 0
+	case backend.OpQMatMul:
+		return i == 1
+	}
+	return false
+}
+
 // Load wraps a buffer of dev that already holds data of the given shape.
+// A buffer of a block-quantized type holds whole blocks along the last
+// dimension.
 func Load(dev backend.Backend, buf backend.Buffer, shape []int) (*Node, error) {
 	if err := checkShape(backend.OpLoad, shape); err != nil {
 		return nil, err
 	}
 	if n, _ := backend.NumElements(shape); buf.Len() != n {
 		return nil, errorf(backend.OpLoad, backend.ErrShape, "%d elements for shape %v", buf.Len(), shape)
+	}
+	if dt := buf.DType(); dt.IsQuantized() && (len(shape) == 0 || shape[len(shape)-1]%dt.BlockSize() != 0) {
+		return nil, errorf(backend.OpLoad, backend.ErrShape, "%s of shape %v: rows of whole blocks of %d", dt, shape, dt.BlockSize())
 	}
 	mem := &Storage{Buf: buf, Dev: dev, Refs: 1}
 	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Dev: dev, Mem: mem, View: backend.Contiguous(shape)}, nil
@@ -161,10 +185,14 @@ func Unary(op backend.Op, x *Node) (*Node, error) {
 }
 
 // Cast converts x to dt. Float to integer truncates toward zero; float to
-// a narrower float rounds to nearest even.
+// a narrower float rounds to nearest even. A block-quantized x is
+// dequantized, to a float dt only.
 func Cast(x *Node, dt backend.DType) (*Node, error) {
 	if err := checkDType(backend.OpCast, dt); err != nil {
 		return nil, err
+	}
+	if x.DType.IsQuantized() && !dt.IsFloat() {
+		return nil, errorf(backend.OpCast, backend.ErrDType, "%s to %s", x.DType, dt)
 	}
 	return newNode(&Node{Op: backend.OpCast, DType: dt, Shape: x.Shape, Inputs: []*Node{x}})
 }
@@ -346,11 +374,31 @@ func checkIndex(op backend.Op, x, idx *Node, axis int) error {
 
 // Gather reads x along axis at Int32 positions idx, like torch.gather. The
 // result has the shape of idx. Positions are checked when the graph runs.
+// A gather from a block-quantized x dequantizes what it reads into a
+// Float32 result.
 func Gather(x, idx *Node, axis int) (*Node, error) {
 	if err := checkIndex(backend.OpGather, x, idx, axis); err != nil {
 		return nil, err
 	}
-	return newNode(&Node{Op: backend.OpGather, DType: x.DType, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}})
+	dt := x.DType
+	if dt.IsQuantized() {
+		dt = backend.Float32
+	}
+	return newNode(&Node{Op: backend.OpGather, DType: dt, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}})
+}
+
+// QMatMul multiplies x, Float32 [..., K], by the transpose of w, a
+// block-quantized [N, K], into a Float32 [..., N]; see backend.OpQMatMul.
+func QMatMul(x, w *Node) (*Node, error) {
+	if x.DType != backend.Float32 || !w.DType.IsQuantized() {
+		return nil, errorf(backend.OpQMatMul, backend.ErrDType, "%s by %s", x.DType, w.DType)
+	}
+	r := len(x.Shape)
+	if r == 0 || len(w.Shape) != 2 || x.Shape[r-1] != w.Shape[1] {
+		return nil, errorf(backend.OpQMatMul, backend.ErrShape, "%v by the transpose of %v", x.Shape, w.Shape)
+	}
+	shape := append(slices.Clone(x.Shape[:r-1]), w.Shape[0])
+	return newNode(&Node{Op: backend.OpQMatMul, DType: backend.Float32, Shape: shape, Inputs: []*Node{x, w}})
 }
 
 // ScatterAdd returns x with src added at Int32 positions idx along axis,
