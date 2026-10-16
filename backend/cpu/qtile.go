@@ -20,7 +20,7 @@ import (
 // rows of activations quantizeRow writes. A panel of rows of weights is
 // unpacked, one super-block of each of two rows after the other, into
 //
-//	q [256]uint8 | scales [16]int16 | pairs [8][2]int16 | d, dmin float32 | pad    336 bytes
+//	q [256]uint8 | scales [16]int32 | pairs [8][2]int16 | d, dmin float32 | pad    368 bytes
 //
 // the quants as unsigned bytes in the order of their values, the scale of
 // each group of the super-block, and for each pair of groups of 16 values
@@ -48,13 +48,13 @@ type qtile func(nb int, w, x *byte, acc *float32)
 const (
 	qtileRows       = 16  // rows of activations a qtile multiplies
 	qtileWeights    = 2   // rows of weights a qtile multiplies
-	qtileRowBytes   = 336 // an unpacked super-block of one row of weights
+	qtileRowBytes   = 368 // an unpacked super-block of one row of weights
 	qtileBlockBytes = qtileWeights * qtileRowBytes
 	qtileActBytes   = 4672 // a super-block of sixteen interleaved rows of activations
 
 	// qtilePanel is the most rows of weights unpacked at a time, and
 	// qtileSlab the super-blocks of them multiplied by each tile of
-	// activations at a time: a slab of the panel, 64·4·336 bytes, stays
+	// activations at a time: a slab of the panel, 64·4·368 bytes, stays
 	// in L2 while the activations stream past it, and one of a tile of
 	// activations, 4·4672 bytes, in L1 while it meets each pair of rows of
 	// the panel.
@@ -71,6 +71,14 @@ const (
 // the architecture's init fills it, and products by other dtypes, or on
 // other CPUs, run in qdots alone.
 var qtiles = map[backend.DType]qtile{}
+
+// qtileUnpacks holds the unpackings of rows of weights of each dtype of
+// qtiles; the architecture's init replaces them with faster ones where
+// it has them.
+var qtileUnpacks = map[backend.DType]func(dst, w []byte, nb int){
+	backend.Q4_K: unpackQ4KRow,
+	backend.Q6_K: unpackQ6KRow,
+}
 
 // qtileSets holds the sets of tile kernels the CPU can run, by the name of
 // their instructions, for the tests.
@@ -117,10 +125,7 @@ func runQTiles(ctx context.Context, b *Backend, tile qtile, dt backend.DType, w 
 		return 0, err
 	}
 
-	unpack := unpackQ4KRow
-	if dt == backend.Q6_K {
-		unpack = unpackQ6KRow
-	}
+	unpack := qtileUnpacks[dt]
 	// Panels as large as leave each worker four or more.
 	rows := min(qtilePanel, max(qtileWeights, n/(4*b.workers)/qtileWeights*qtileWeights))
 	panels := (n + rows - 1) / rows
@@ -151,17 +156,20 @@ func runQTiles(ctx context.Context, b *Backend, tile qtile, dt backend.DType, w 
 				}
 			}
 		}
-		for pr := range pairs {
-			for g := range groups {
-				acc := accs[(pr*groups+g)*accLen:]
-				for t := range min(qtileWeights, prows-2*pr) {
-					j := j0 + 2*pr + t
-					for c := range qtileRows {
-						v := acc[qtileRows*t+c]
-						if dt == backend.Q4_K {
-							v -= acc[qtileWeights*qtileRows+qtileRows*t+c]
-						}
-						out[(g*qtileRows+c)*n+j] = v
+		// Row by row of out, so that its writes run along a row.
+		for g := range groups {
+			for c := range qtileRows {
+				o := out[(g*qtileRows+c)*n+j0:][:prows]
+				for pr := range pairs {
+					acc := (*[accLen]float32)(accs[(pr*groups+g)*accLen:])
+					v0, v1 := acc[c], acc[qtileRows+c]
+					if dt == backend.Q4_K {
+						v0 -= acc[2*qtileRows+c]
+						v1 -= acc[3*qtileRows+c]
+					}
+					o[2*pr] = v0
+					if 2*pr+1 < prows {
+						o[2*pr+1] = v1
 					}
 				}
 			}
@@ -174,17 +182,18 @@ func runQTiles(ctx context.Context, b *Backend, tile qtile, dt backend.DType, w 
 // packActTile interleaves sixteen rows of nb quantized super-blocks of
 // activations, xstride bytes apart from x, into dst.
 func packActTile(dst, x []byte, xstride, nb int) {
+	le := binary.LittleEndian
 	for b := range nb {
-		d := dst[b*qtileActBytes : (b+1)*qtileActBytes]
+		d := (*[qtileActBytes]byte)(dst[b*qtileActBytes:])
 		for c := range qtileRows {
-			src := x[c*xstride+b*292 : c*xstride+(b+1)*292]
+			src := (*[292]byte)(x[c*xstride+b*292:])
 			for q := range 64 {
-				copy(d[64*q+4*c:64*q+4*c+4], src[4+4*q:8+4*q])
+				le.PutUint32(d[64*q+4*c:], le.Uint32(src[4+4*q:]))
 			}
 			for p := range 8 {
-				copy(d[4096+64*p+4*c:4096+64*p+4*c+4], src[260+4*p:264+4*p])
+				le.PutUint32(d[4096+64*p+4*c:], le.Uint32(src[260+4*p:]))
 			}
-			copy(d[4608+4*c:4612+4*c], src[:4])
+			le.PutUint32(d[4608+4*c:], le.Uint32(src[:]))
 		}
 	}
 }
@@ -209,13 +218,13 @@ func unpackQ4KRow(dst, w []byte, nb int) {
 		mn := uint64(u1&0x3f3f3f3f) | uint64(u2>>4&0x0f0f0f0f|(u1>>6&0x03030303)<<4)<<32
 		for g := range 8 {
 			c, m := uint16(sc>>(8*g)&0xff), uint32(mn>>(8*g)&0xff)
-			le.PutUint16(d[256+2*g:], c)
-			le.PutUint32(d[288+4*g:], m|m<<16)
+			le.PutUint32(d[256+4*g:], uint32(c))
+			le.PutUint32(d[320+4*g:], m|m<<16)
 		}
-		clear(d[272:288])
-		le.PutUint32(d[320:], math.Float32bits(f16ToF32(le.Uint16(wb[0:]))))
-		le.PutUint32(d[324:], math.Float32bits(f16ToF32(le.Uint16(wb[2:]))))
-		clear(d[328:])
+		clear(d[288:320])
+		le.PutUint32(d[352:], math.Float32bits(f16ToF32(le.Uint16(wb[0:]))))
+		le.PutUint32(d[356:], math.Float32bits(f16ToF32(le.Uint16(wb[2:]))))
+		clear(d[360:])
 	}
 }
 
@@ -238,10 +247,11 @@ func unpackQ6KRow(dst, w []byte, nb int) {
 			}
 		}
 		for g := range 16 {
-			le.PutUint16(d[256+2*g:], uint16(int16(int8(wb[192+g]))))
+			sc := int32(int8(wb[192+g]))
+			le.PutUint32(d[256+4*g:], uint32(sc))
+			le.PutUint16(d[320+2*g:], uint16(sc))
 		}
-		copy(d[288:320], d[256:288])
-		le.PutUint32(d[320:], math.Float32bits(f16ToF32(le.Uint16(wb[208:]))))
-		clear(d[324:])
+		le.PutUint32(d[352:], math.Float32bits(f16ToF32(le.Uint16(wb[208:]))))
+		clear(d[356:])
 	}
 }

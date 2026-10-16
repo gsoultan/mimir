@@ -421,10 +421,10 @@ func q6K(w *bytes.Buffer, rows int, sdot bool) {
 // The layouts of backend/cpu's tiles: a super-block of a row of weights,
 // unpacked, and one of sixteen rows of activations, interleaved.
 const (
-	tileRowBytes = 336
-	tileScales   = 256 // [16]int16
-	tilePairs    = 288 // [8][2]int16
-	tileD        = 320 // float32, and dmin after it
+	tileRowBytes = 368
+	tileScales   = 256 // [16]int32
+	tilePairs    = 320 // [8][2]int16
+	tileD        = 352 // float32, and dmin after it
 	tileActBytes = 4672
 	tileSums     = 4096 // [8][16][2]int16
 	tileXD       = 4608 // [16]float32
@@ -471,14 +471,10 @@ func qtile(w *bytes.Buffer, q6 bool) {
 		b := 22 + nsc*t
 		a.emit("ADD $%d, R1, R6", tileRowBytes*t+tileScales)
 		if q6 {
-			a.emit("VLD1 (R6), [V%d.B16, V%d.B16]", b, b+1)
-			a.word(0x4f10a400|enc3(b+3, b+1, 0), "SXTL2 V%d.4S, V%d.8H", b+3, b+1)
-			a.word(0x0f10a400|enc3(b+2, b+1, 0), "SXTL V%d.4S, V%d.4H", b+2, b+1)
+			a.emit("VLD1 (R6), [V%d.B16, V%d.B16, V%d.B16, V%d.B16]", b, b+1, b+2, b+3)
 		} else {
-			a.emit("VLD1 (R6), [V%d.B16]", b)
+			a.emit("VLD1 (R6), [V%d.B16, V%d.B16]", b, b+1)
 		}
-		a.word(0x4f10a400|enc3(b+1, b, 0), "SXTL2 V%d.4S, V%d.8H", b+1, b)
-		a.word(0x0f10a400|enc3(b, b, 0), "SXTL V%d.4S, V%d.4H", b, b)
 	}
 	for v := range 8 {
 		a.zero(v)

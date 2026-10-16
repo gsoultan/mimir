@@ -1,6 +1,7 @@
 package cpu
 
 import (
+	"encoding/binary"
 	"fmt"
 	"maps"
 	"math"
@@ -126,23 +127,67 @@ func qtileGo(dt backend.DType) qtile {
 						if dt == backend.Q6_K {
 							s = v / 16
 						}
-						sc := i16At(wb[256+2*s:])
+						sc := int32(binary.LittleEndian.Uint32(wb[256+4*s:]))
 						sumi += sc * int32(wb[v]) * int32(int8(xb[64*(v/4)+4*c+v%4]))
 					}
 					for p := range 8 {
 						for h := range 2 {
-							summ += i16At(wb[288+4*p+2*h:]) * i16At(xb[4096+64*p+4*c+2*h:])
+							summ += i16At(wb[320+4*p+2*h:]) * i16At(xb[4096+64*p+4*c+2*h:])
 						}
 					}
 					xd := f32At(xb[4608+4*c:])
-					dd := f32At(wb[320:]) * xd
+					dd := f32At(wb[352:]) * xd
 					if dt == backend.Q6_K {
 						a[qtileRows*t+c] += float32(dd * float32(sumi-32*summ))
 						continue
 					}
-					dm := f32At(wb[324:]) * xd
+					dm := f32At(wb[356:]) * xd
 					a[qtileRows*t+c] += float32(dd * float32(sumi))
 					a[qtileWeights*qtileRows+qtileRows*t+c] += float32(dm * float32(summ))
+				}
+			}
+		}
+	}
+}
+
+func TestQTileUnpacksMatchGo(t *testing.T) {
+	rng := rand.New(rand.NewPCG(17, 18))
+	ref := map[backend.DType]func(dst, w []byte, nb int){backend.Q4_K: unpackQ4KRow, backend.Q6_K: unpackQ6KRow}
+	// Scales of every kind: infinities, NaNs quiet and signaling, zeros
+	// and subnormals of both signs.
+	special := []uint16{0x7c00, 0xfc00, 0x7e00, 0x7d01, 0x0000, 0x8000, 0x0001, 0x83ff, 0x3c00}
+	for dt, unpack := range qtileUnpacks {
+		bb := dt.BlockBytes()
+		dpos := []int{0, 2}
+		if dt == backend.Q6_K {
+			dpos = []int{208}
+		}
+		for _, nb := range []int{1, 2, 7, 16} {
+			w := quanttest.Random(rng, dt, nb*256)
+			if nb == 7 {
+				// Every bit of the quants and scales set.
+				for i := range w {
+					w[i] = 0xff
+				}
+			}
+			for b := range nb {
+				for _, p := range dpos {
+					binary.LittleEndian.PutUint16(w[b*bb+p:], special[rng.IntN(len(special))])
+				}
+			}
+			got, want := make([]byte, nb*qtileBlockBytes), make([]byte, nb*qtileBlockBytes)
+			for i := range got {
+				got[i] = byte(rng.Uint32())
+			}
+			copy(want, got)
+			unpack(got, w, nb)
+			ref[dt](want, w, nb)
+			for i := 0; i < len(got); i += 4 {
+				g, v := binary.LittleEndian.Uint32(got[i:]), binary.LittleEndian.Uint32(want[i:])
+				// A signaling NaN may come out quiet.
+				inD := i%qtileRowBytes >= qtileRowBytes-16 && i%qtileRowBytes < qtileRowBytes-8
+				if g != v && !(inD && math.IsNaN(float64(math.Float32frombits(g))) && math.IsNaN(float64(math.Float32frombits(v)))) {
+					t.Fatalf("%s nb %d: bytes %d..%d = %#08x, want %#08x", dt, nb, i, i+4, g, v)
 				}
 			}
 		}

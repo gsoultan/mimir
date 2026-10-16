@@ -28,6 +28,7 @@ func init() {
 type x86 struct {
 	avx, avx2, fma, avx512 bool
 	f16c                   bool // VCVTPH2PS, converting float16
+	avx512vnni             bool // VPDPBUSD and VPDPWSSD, on ZMM registers too
 }
 
 // x86Features reports the vector extensions that both the CPU and the
@@ -49,13 +50,15 @@ func x86Features() x86 {
 	if xcr0&ymmState != ymmState {
 		return x86{}
 	}
-	_, ebx7, _, _ := cpuid(7, 0)
-	const avx2, avx512f = 1 << 5, 1 << 16
+	_, ebx7, ecx7, _ := cpuid(7, 0)
+	const avx2, avx512f, avx512vnni = 1 << 5, 1 << 16, 1 << 11
+	avx512 := ebx7&avx512f != 0 && xcr0&zmmState == zmmState
 	return x86{
-		avx:    true,
-		avx2:   ebx7&avx2 != 0,
-		fma:    ecx1&fma != 0,
-		f16c:   ecx1&f16c != 0,
-		avx512: ebx7&avx512f != 0 && xcr0&zmmState == zmmState,
+		avx:        true,
+		avx2:       ebx7&avx2 != 0,
+		fma:        ecx1&fma != 0,
+		f16c:       ecx1&f16c != 0,
+		avx512:     avx512,
+		avx512vnni: avx512 && ecx7&avx512vnni != 0,
 	}
 }

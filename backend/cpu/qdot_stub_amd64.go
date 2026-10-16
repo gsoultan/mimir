@@ -73,3 +73,23 @@ func qtileQ4KAVX2(nb int, w *byte, x *byte, acc *float32)
 //
 //go:noescape
 func qtileQ6KAVX2(nb int, w *byte, x *byte, acc *float32)
+
+// qtileQ4KAVX512 multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
+//
+//go:noescape
+func qtileQ4KAVX512(nb int, w *byte, x *byte, acc *float32)
+
+// qtileQ6KAVX512 multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
+//
+//go:noescape
+func qtileQ6KAVX512(nb int, w *byte, x *byte, acc *float32)
+
+// unpackQ4KAVX2 unpacks nb Q4_K super-blocks at w to dst, one every qtileBlockBytes; see unpackQ4KRow.
+//
+//go:noescape
+func unpackQ4KAVX2(nb int, dst *byte, w *byte)
+
+// unpackQ6KAVX2 unpacks nb Q6_K super-blocks at w to dst, one every qtileBlockBytes; see unpackQ6KRow.
+//
+//go:noescape
+func unpackQ6KAVX2(nb int, dst *byte, w *byte)
