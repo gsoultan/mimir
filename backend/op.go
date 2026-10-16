@@ -123,6 +123,19 @@ const (
 	// by In[1], which has the block's shape.
 	OpSliceScatter
 
+	// Convolutions. The scheduler inserts them, in place of products
+	// of the windows of OpUnfold, for a backend that runs them (see
+	// Convolver); they are not part of the public IR. The windows never
+	// take a buffer: a kernel reads them from the image, an input X
+	// shaped [N, G*C, D...], as W[n, g, j, o] = X[n, g*C + c, i] with
+	// j = (c, k...) and o = (o...) in row-major order and i = o*stride -
+	// pad + k*dilation along each windowed dimension as for OpUnfold, or
+	// 0 in the padding: OpUnfold of X reshaped to [N, G, C*K, O]. Float32
+	// only.
+	OpConv       // In[0] [N, G, M, C*K] times W, In[1]'s windows: [N, G, M, O], with an epilogue as OpMatMul has
+	OpConvWeight // In[0] [N, G, M, O] times Wᵀ, In[1]'s windows, summed over the pairs (n, o): [S, G, M, C*K] (see ConvParts)
+	OpConvInput  // In[0] [N, G, C*K, M] times In[1] [N, G, M, O], folded as OpFold folds windows: [N, G*C, D...]
+
 	numOps
 )
 
@@ -198,6 +211,10 @@ var opNames = [numOps]string{
 	OpAttention:     "attention",
 	OpAttentionGrad: "attention_grad",
 	OpSliceScatter:  "slice_scatter",
+
+	OpConv:       "conv",
+	OpConvWeight: "conv_weight",
+	OpConvInput:  "conv_input",
 }
 
 func (o Op) String() string {
