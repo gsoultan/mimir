@@ -41,8 +41,8 @@ jobs:
         env:
           MIMIR_EAGER: '1'
 
-  metal-kernels:
-    name: Metal kernels on the CPU
+  gpu-kernels:
+    name: GPU kernels on the CPU
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -50,9 +50,42 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go test -count=1 -run Kernels ./backend/metal
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: emulate the Metal and CUDA kernels
+        run: go test -count=1 -run Kernels ./backend/...
         env:
           MIMIR_EMULATE: '1'
+      - name: compile the CUDA kernels with NVRTC
+        run: |
+          pip install nvidia-cuda-nvrtc-cu12
+          export LD_LIBRARY_PATH=$(python -c "import site, os; print(os.path.join(site.getsitepackages()[0], 'nvidia', 'cuda_nvrtc', 'lib'))")
+          go test -count=1 -v -run NVRTC ./backend/cuda
+
+  cuda:
+    name: GPU (CUDA on a Modal T4)
+    runs-on: ubuntu-latest
+    # Secrets are not available to pull requests from forks.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: tests and benchmarks on the GPU
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ]; then
+            echo "::warning::no MODAL_TOKEN_ID and MODAL_TOKEN_SECRET secrets, so the CUDA tests did not run"
+            exit 0
+          fi
+          pip install modal
+          set -o pipefail
+          modal run ci/cuda/modal_test.py 2>&1 | tee "$RUNNER_TEMP/cuda.txt"
+          { echo '### CUDA tests and benchmarks'; echo '```'; cat "$RUNNER_TEMP/cuda.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   gpu:
     name: GPU (Metal on Apple silicon)

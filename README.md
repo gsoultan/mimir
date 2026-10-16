@@ -4,11 +4,12 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestone 4.** mimir trains neural networks on the CPU with
+> **Status: milestone 4b.** mimir trains neural networks on the CPU with
 > SIMD matrix kernels, fused elementwise kernels and in-place updates, and
-> runs the same code on Apple GPUs through Metal: autograd, layers, losses,
-> optimizers, data loading and a training loop, each checked against
-> PyTorch. The API may change between 0.x releases.
+> runs the same code on Apple GPUs through Metal and on NVIDIA GPUs through
+> CUDA: autograd, layers, losses, optimizers, data loading and a training
+> loop, each checked against PyTorch. The API may change between 0.x
+> releases.
 
 ## Example
 
@@ -99,14 +100,25 @@ default device, which `MIMIR_DEVICE` sets to `cpu`, `gpu` or `auto`; combining
 tensors on different devices returns `tensor.ErrDevice`. `go run
 ./examples/mnist -device auto` trains on the GPU when there is one.
 
-On Apple silicon the GPU runs through Metal, called from Go with
+On Apple silicon the GPU runs through Metal, and on Linux an NVIDIA GPU runs
+through CUDA, both called from Go with
 [purego](https://github.com/ebitengine/purego), so there is still no cgo and
-the binary cross-compiles. CPU and GPU share memory, so moving a tensor is a
-copy within RAM. Fused elementwise chains, reductions and matrix epilogues
-compile to Metal Shading Language kernels once each, and large float32
-matrix products run on Metal Performance Shaders, or on Metal 4 tensor
-operations on M5 GPUs under macOS 26. Every operation runs the same
-conformance tests on both devices.
+the binary cross-compiles. One generator writes every kernel in Metal Shading
+Language or CUDA C++, compiled at run time once per kernel structure (CUDA
+kernels are cached on disk), and float32 matrix products run on Metal
+Performance Shaders, on Metal 4 tensor operations on M5 GPUs under macOS 26,
+or on cuBLAS. On a Mac, CPU and GPU share memory, so moving a tensor is a
+copy within RAM; on CUDA, device memory comes from a pool that keeps freed
+buffers, so a training step allocates nothing from the driver once it has
+run. Every operation runs the same conformance tests on every device, and
+the generated kernels of both dialects are also compiled and run on the CPU
+in CI.
+
+CUDA needs the NVIDIA driver and `libcuda.so.1`, `libnvrtc.so.12` and
+`libcublas.so.12`, as the `nvidia/cuda` runtime images and the CUDA toolkit
+install them. Loading them needs the C library, so on Linux a program that
+uses the `tensor` package is linked dynamically even with `CGO_ENABLED=0`;
+`go build -tags nocuda` leaves the backend out and keeps the binary static.
 
 ## Gradients
 
@@ -146,13 +158,15 @@ PyTorch still trains 1.4 to 2.1 times faster: see
 [tools/bench](tools/bench/README.md) for the measurements and how to
 repeat them.
 
-On the GPU, Metal Performance Shaders multiplies 2048 × 2048 float32
+On an Apple GPU, Metal Performance Shaders multiplies 2048 × 2048 float32
 matrices at about 1,380 GFLOP/s on the M1 virtual machine GitHub's macOS
 runners provide, against about 100 GFLOP/s on its three CPU cores. Training
 the small MNIST networks is still slower there than on the CPU: a step of
 the MLP takes 4.4 ms on the GPU and 3.4 ms on the CPU, and the CNN 128 ms
 against 80 ms, because each step runs many small kernels and waits for the
-GPU to finish. The CI job `gpu` prints these numbers for every change.
+GPU to finish. The CI job `gpu` prints these numbers for every change, and
+the job `cuda` prints the same numbers for an NVIDIA T4 when the repository
+has Modal credentials (see Testing).
 
 On an M5 Pro under macOS 26, the GPU's neural accelerators run float32
 products through Metal 4 tensor operations at 5,790 GFLOP/s for 2048 × 2048
@@ -167,7 +181,7 @@ Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
 ## Goals
 
 - **Fast on CPU and GPU.** One graph, one set of kernels per device, chosen at
-  run time. Apple Metal first, then CUDA.
+  run time: Apple Metal and NVIDIA CUDA today.
 - **Never panic, never run out of memory.** Shape and dtype errors are
   values; kernels recover internal faults as `ErrInternal`; requests larger
   than the runtime can address return `ErrOutOfMemory`; intermediate buffers
@@ -225,7 +239,10 @@ train/               Fit, evaluation, checkpoints
 metrics/             accuracy
 backend/             Backend interface, DType, Op, View, Kernel
 backend/cpu/         pure-Go kernels and worker pool
-backend/metal/       Metal kernels and Metal Performance Shaders, through purego
+backend/metal/       Metal backend: Metal Performance Shaders and tensor operations, through purego
+backend/cuda/        CUDA backend: driver API, NVRTC and cuBLAS, through purego
+backend/internal/gen/        generates the kernels, in Metal Shading Language or CUDA C++
+backend/internal/kerneltest/ kernel cases for every device, and a CPU emulator for both dialects
 internal/graph/      lazy IR with shape and dtype checks
 internal/sched/      runs graphs: views, buffer reuse, freeing
 internal/goldentest/ golden-file loading and comparison
@@ -242,7 +259,8 @@ tools/golden/        golden-file generator (Python, development only)
 ```sh
 go test -race ./...
 MIMIR_EAGER=1 go test ./...
-MIMIR_DEVICE=gpu go test ./...   # on a Mac: every test on the GPU
+MIMIR_DEVICE=gpu go test ./...   # on a Mac or an NVIDIA machine: every test on the GPU
+MIMIR_EMULATE=1 go test -run Kernels ./backend/...   # the GPU kernels on the CPU, with clang++
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 ```
 
@@ -262,6 +280,16 @@ MIMIR_GOLDEN_DIR=/tmp/golden go test -run TestGolden ./...
 `TestGradientsMatchFiniteDifferences` also checks every operation's gradient
 against finite differences in Go.
 
+GitHub has Apple silicon runners but no free NVIDIA ones, so the CUDA tests
+run on a [Modal](https://modal.com) T4 through `ci/cuda/modal_test.py`, which
+copies the checkout into a CUDA runtime container and runs `ci/cuda/test.sh`
+there. The CI job `cuda` runs it when the repository has the secrets
+`MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, and skips with a warning
+otherwise. `pip install modal && modal run ci/cuda/modal_test.py` runs it
+from a laptop, and `sh ci/cuda/test.sh` runs the same tests on any Linux
+machine with an NVIDIA GPU. The CUDA kernels are also compiled with the real
+NVRTC on every change, which needs no GPU.
+
 ## Roadmap
 
 | Milestone | Delivers |
@@ -271,7 +299,7 @@ against finite differences in Go.
 | M2 Train MNIST | autograd, `nn` layers, losses, optimizers, data loading, `Fit`; first release v0.1.0 (done) |
 | M3 Fast on CPU | SIMD GEMM microkernels with fused epilogues, fused elementwise kernels, convolution as GEMM, in-place optimizer updates with no allocations per step (done) |
 | M4 Same code on GPU | Metal backend without cgo, unified memory, MPS matrix products, fused kernels, automatic device choice with CPU fallback and Metal 4 tensor operations on M5 GPUs (done) |
-| M4b CUDA | cuBLASLt, cuDNN and NVRTC through purego |
+| M4b CUDA | CUDA driver, NVRTC and cuBLAS through purego, stream-ordered memory pool, on-disk kernel cache, conformance tests on a Modal T4 (done; convolution runs through unfold and GEMM, not cuDNN) |
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, memory-mapped data, bf16 and f16 |
 | M6 Transformers and LLMs | attention and KV cache, RNN, LSTM and GRU, GGUF quantized matmul |
 | M7 Full coverage | distributions, linear algebra, function transforms, ONNX import |

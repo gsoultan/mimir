@@ -2,12 +2,15 @@ package tensor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/backend/cpu"
+	"github.com/gsoultan/mimir/backend/cuda"
 	"github.com/gsoultan/mimir/backend/metal"
 	"github.com/gsoultan/mimir/internal/graph"
 	"github.com/gsoultan/mimir/internal/sched"
@@ -42,12 +45,24 @@ var (
 func CPU() Device { return Device{cpuBackend} }
 
 // GPU returns the GPU, or an error saying why there is none that mimir can
-// use. mimir uses Metal on Apple silicon Macs.
+// use. mimir uses Metal on Apple silicon Macs and CUDA on NVIDIA GPUs
+// under Linux.
 func GPU() (Device, error) {
 	gpuOnce.Do(func() {
-		var b *metal.Backend
-		if b, gpuErr = metal.New(); gpuErr == nil {
-			gpu = b
+		m, metalErr := metal.New()
+		if metalErr == nil {
+			gpu = m
+			return
+		}
+		c, cudaErr := cuda.New()
+		if cudaErr == nil {
+			gpu = c
+			return
+		}
+		// Report the error of the GPU this platform could have.
+		gpuErr = cudaErr
+		if runtime.GOOS == "darwin" || !errors.Is(metalErr, metal.ErrUnavailable) {
+			gpuErr = metalErr
 		}
 	})
 	if gpu == nil {
@@ -83,7 +98,7 @@ func (d Device) backend() backend.Backend {
 	return d.be
 }
 
-// Name returns the device's kind: "cpu" or "metal".
+// Name returns the device's kind: "cpu", "metal" or "cuda".
 func (d Device) Name() string { return d.backend().Name() }
 
 // String returns the device's name and, for a GPU, its model, such as
@@ -111,12 +126,15 @@ func init() {
 	defaultDev = CPU()
 	switch name := os.Getenv("MIMIR_DEVICE"); name {
 	case "", "cpu":
-	case "gpu", "metal":
+	case "gpu", "metal", "cuda":
 		defaultDev, defaultErr = GPU()
+		if defaultErr == nil && name != "gpu" && defaultDev.Name() != name {
+			defaultDev, defaultErr = CPU(), fmt.Errorf("tensor: MIMIR_DEVICE=%s, but the GPU is %s", name, defaultDev)
+		}
 	case "auto":
 		defaultDev = Auto()
 	default:
-		defaultErr = fmt.Errorf("tensor: MIMIR_DEVICE=%q, want cpu, gpu, metal or auto", name)
+		defaultErr = fmt.Errorf("tensor: MIMIR_DEVICE=%q, want cpu, gpu, metal, cuda or auto", name)
 	}
 }
 
@@ -128,8 +146,8 @@ func defaultDevice() Device {
 
 // DefaultDevice returns the device that FromSlice uploads to and that
 // computes tensors made of constants alone. It is the CPU unless
-// SetDefaultDevice or the MIMIR_DEVICE environment variable (cpu, gpu or
-// auto) changes it.
+// SetDefaultDevice or the MIMIR_DEVICE environment variable (cpu, gpu,
+// metal, cuda or auto) changes it.
 func DefaultDevice() Device { return defaultDevice() }
 
 // SetDefaultDevice makes d the default device and returns the previous
