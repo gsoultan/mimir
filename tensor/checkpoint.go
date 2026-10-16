@@ -8,10 +8,9 @@ import (
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
-// ErrCheckpoint reports a checkpointed function that breaks a rule of
-// Checkpoint: it reads a tracked tensor it captured from its surroundings
-// instead of receiving it as an input, or it calls Backward while Backward
-// recomputes it.
+// ErrCheckpoint reports a checkpointed function that reads a tracked
+// tensor it captured from its surroundings instead of receiving it as an
+// input.
 var ErrCheckpoint = errors.New("tensor: checkpointed function breaks a rule of Checkpoint")
 
 // Checkpoint computes f(in...) like calling f, but trades compute for
@@ -23,8 +22,7 @@ var ErrCheckpoint = errors.New("tensor: checkpointed function breaks a rule of C
 // other way fails with ErrCheckpoint, at the call or in Backward. Random
 // tensors inside f are deterministic in mimir (counter-based), so a
 // dropout mask drawn from a seed is recomputed the same. f may read
-// gradients, but calling Backward from the recompute fails with
-// ErrCheckpoint.
+// gradients, but must not call Backward (see Backward).
 //
 // The recompute reads the parameters as they are when Backward runs. If
 // one of them has changed since the call, as an optimizer step changes it,
