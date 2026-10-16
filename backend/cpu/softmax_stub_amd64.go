@@ -24,15 +24,40 @@ func scaleRowAVX512(x *float32, n int, a float32)
 //go:noescape
 func softmaxGradAVX512(p *float32, dp *float32, n int, d float32)
 
-// dotAVX512 returns the sum of the products of the n elements at x and y, a multiple of 16.
+// dot4AVX512 sets out[r], for r < 4, to the sum of the products of the n elements at x, a multiple of 16, and those of row r of y, which starts stride elements after row r-1.
 //
 //go:noescape
-func dotAVX512(x *float32, y *float32, n int) float32
+func dot4AVX512(x *float32, y *float32, stride int, n int, out *float32)
 
 // exp2AVX512 sets the n elements at dst, a multiple of 16, to 2 to the power of those at src, which it clamps to [-126, 127].
 //
 //go:noescape
 func exp2AVX512(dst *float32, src *float32, n int)
+
+// addVVAVX512 sets the n elements at dst, a multiple of 16, to the sums of those at a and b.
+//
+//go:noescape
+func addVVAVX512(dst *float32, a *float32, b *float32, n int)
+
+// addVSAVX512 sets the n elements at dst, a multiple of 16, to the sums of those at a and s.
+//
+//go:noescape
+func addVSAVX512(dst *float32, a *float32, s float32, n int)
+
+// mulVVAVX512 sets the n elements at dst, a multiple of 16, to the products of those at a and b.
+//
+//go:noescape
+func mulVVAVX512(dst *float32, a *float32, b *float32, n int)
+
+// mulVSAVX512 sets the n elements at dst, a multiple of 16, to the products of those at a and s.
+//
+//go:noescape
+func mulVSAVX512(dst *float32, a *float32, s float32, n int)
+
+// recipAVX512 sets the n elements at dst, a multiple of 16, to the reciprocals of those at a, correctly rounded.
+//
+//go:noescape
+func recipAVX512(dst *float32, a *float32, n int)
 
 // rowMaxAVX2 returns the largest of the n elements at x, a positive multiple of 8.
 //
@@ -54,12 +79,37 @@ func scaleRowAVX2(x *float32, n int, a float32)
 //go:noescape
 func softmaxGradAVX2(p *float32, dp *float32, n int, d float32)
 
-// dotAVX2 returns the sum of the products of the n elements at x and y, a multiple of 8.
+// dot4AVX2 sets out[r], for r < 4, to the sum of the products of the n elements at x, a multiple of 8, and those of row r of y, which starts stride elements after row r-1.
 //
 //go:noescape
-func dotAVX2(x *float32, y *float32, n int) float32
+func dot4AVX2(x *float32, y *float32, stride int, n int, out *float32)
 
 // exp2AVX2 sets the n elements at dst, a multiple of 8, to 2 to the power of those at src, which it clamps to [-126, 127].
 //
 //go:noescape
 func exp2AVX2(dst *float32, src *float32, n int)
+
+// addVVAVX2 sets the n elements at dst, a multiple of 8, to the sums of those at a and b.
+//
+//go:noescape
+func addVVAVX2(dst *float32, a *float32, b *float32, n int)
+
+// addVSAVX2 sets the n elements at dst, a multiple of 8, to the sums of those at a and s.
+//
+//go:noescape
+func addVSAVX2(dst *float32, a *float32, s float32, n int)
+
+// mulVVAVX2 sets the n elements at dst, a multiple of 8, to the products of those at a and b.
+//
+//go:noescape
+func mulVVAVX2(dst *float32, a *float32, b *float32, n int)
+
+// mulVSAVX2 sets the n elements at dst, a multiple of 8, to the products of those at a and s.
+//
+//go:noescape
+func mulVSAVX2(dst *float32, a *float32, s float32, n int)
+
+// recipAVX2 sets the n elements at dst, a multiple of 8, to the reciprocals of those at a, correctly rounded.
+//
+//go:noescape
+func recipAVX2(dst *float32, a *float32, n int)

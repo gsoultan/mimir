@@ -801,6 +801,13 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 			dst[i] = -x
 		}
 	case backend.OpRecip:
+		if d, ok := any(dst).([]float32); ok && rowVector != nil {
+			n := vectorPart(len(d))
+			if n > 0 {
+				rowVector.recip(&d[0], &any(a).([]float32)[0], n)
+			}
+			dst, a = dst[n:], a[n:]
+		}
 		for i, x := range a {
 			dst[i] = 1 / x
 		}
@@ -852,6 +859,17 @@ func binaryLane[T number](op backend.Op, dst *lane[T], buf []T, x, y lane[T]) er
 // binaryVV sets dst[i] = a[i] op b[i].
 func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 	a, b = a[:len(dst)], b[:len(dst)]
+	if d, ok := any(dst).([]float32); ok && rowVector != nil && (op == backend.OpAdd || op == backend.OpMul) {
+		if n := vectorPart(len(d)); n > 0 {
+			x, y := any(a).([]float32), any(b).([]float32)
+			if op == backend.OpAdd {
+				rowVector.addVV(&d[0], &x[0], &y[0], n)
+			} else {
+				rowVector.mulVV(&d[0], &x[0], &y[0], n)
+			}
+			dst, a, b = dst[n:], a[n:], b[n:]
+		}
+	}
 	switch op {
 	case backend.OpAdd:
 		for i := range dst {
@@ -888,6 +906,17 @@ func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 // binaryVS sets dst[i] = a[i] op s.
 func binaryVS[T number](op backend.Op, dst, a []T, s T) error {
 	a = a[:len(dst)]
+	if d, ok := any(dst).([]float32); ok && rowVector != nil && (op == backend.OpAdd || op == backend.OpMul) {
+		if n := vectorPart(len(d)); n > 0 {
+			x, v := any(a).([]float32), float32(s)
+			if op == backend.OpAdd {
+				rowVector.addVS(&d[0], &x[0], v, n)
+			} else {
+				rowVector.mulVS(&d[0], &x[0], v, n)
+			}
+			dst, a = dst[n:], a[n:]
+		}
+	}
 	switch op {
 	case backend.OpAdd:
 		for i, x := range a {

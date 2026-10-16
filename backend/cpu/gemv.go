@@ -19,14 +19,29 @@ func (b *Backend) sgemv(ctx context.Context, out []float32, x operand, offX []in
 	if rows > gemvRows || sums != 1 || x.cs != 1 || y.rs != 1 || k < 16 {
 		return false, nil
 	}
-	grain := max(1, elementGrain/(k*rows))
-	err := b.parallelFor(ctx, n, grain, func(lo, hi int) error {
+	// Workers take groups of four columns, whose dot products stream the
+	// four together, and each group runs every row of x while its columns
+	// are in cache.
+	groups := (n + 3) / 4
+	grain := max(1, elementGrain/(4*k*rows))
+	err := b.parallelFor(ctx, groups, grain, func(lo, hi int) error {
+		var d [4]float32
 		for o, ox := range offX {
 			oy := offY[o]
-			for j := lo; j < hi; j++ {
-				col := y.data[oy+j*y.cs:][:k]
+			for g := lo; g < hi; g++ {
+				j := 4 * g
 				for i := range m {
-					out[(o*m+i)*n+j] = dot(x.data[ox+i*x.rs:][:k], col)
+					xi := x.data[ox+i*x.rs:][:k]
+					row := out[(o*m+i)*n:][:n]
+					if j+4 <= n {
+						dots4(&d, xi, y.data[oy+j*y.cs:], y.cs)
+						copy(row[j:], d[:])
+						continue
+					}
+					for c := j; c < n; c++ {
+						dots4(&d, xi, y.data[oy+c*y.cs:], 0)
+						row[c] = d[0]
+					}
 				}
 			}
 		}
@@ -38,16 +53,30 @@ func (b *Backend) sgemv(ctx context.Context, out []float32, x operand, offX []in
 	return true, epi.apply(0, len(out))
 }
 
+// dots4 sets d[r] to the dot product of x with the row of y at r·stride,
+// for r < 4: y holds len(x) elements from each. A row's sum is the same
+// whatever the other rows are, so stride 0 computes one row.
+func dots4(d *[4]float32, x, y []float32, stride int) {
+	k := len(x)
+	n := vectorPart(k)
+	if n == 0 {
+		for r := range d {
+			d[r] = dot(x, y[r*stride:])
+		}
+		return
+	}
+	_ = y[3*stride+k-1]
+	rowVector.dot4(&x[0], &y[0], stride, n, &d[0])
+	for r := range d {
+		row := y[r*stride:][:k]
+		for i := n; i < k; i++ {
+			d[r] += x[i] * row[i]
+		}
+	}
+}
+
 // dot returns Σ a[i]·b[i] over the length of a, which b must have.
 func dot(a, b []float32) float32 {
-	if rowVector != nil && len(a) >= 16 {
-		n := vectorPart(len(a))
-		s := rowVector.dot(&a[0], &b[0], n)
-		for i := n; i < len(a); i++ {
-			s += a[i] * b[i]
-		}
-		return s
-	}
 	b = b[:len(a)]
 	var s0, s1, s2, s3, s4, s5, s6, s7 float32
 	i := 0

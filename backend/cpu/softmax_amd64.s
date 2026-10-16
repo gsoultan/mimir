@@ -511,50 +511,60 @@ softmaxGradAVX512_done:
 	VZEROUPPER
 	RET
 
-// func dotAVX512(x *float32, y *float32, n int) float32
+// func dot4AVX512(x *float32, y *float32, stride int, n int, out *float32)
 // Requires: AVX, AVX512DQ, AVX512F, SSE
-TEXT ·dotAVX512(SB), NOSPLIT, $0-28
+TEXT ·dot4AVX512(SB), NOSPLIT, $0-40
 	MOVQ   x+0(FP), AX
-	MOVQ   y+8(FP), CX
-	MOVQ   n+16(FP), DX
+	MOVQ   stride+16(FP), CX
+	MOVQ   n+24(FP), DX
+	SHLQ   $0x02, CX
+	MOVQ   y+8(FP), BX
+	LEAQ   (BX)(CX*1), SI
+	LEAQ   (SI)(CX*1), DI
+	LEAQ   (DI)(CX*1), CX
 	VXORPS Z0, Z0, Z0
 	VXORPS Z1, Z1, Z1
 	VXORPS Z2, Z2, Z2
 	VXORPS Z3, Z3, Z3
-	CMPQ   DX, $0x00000040
-	JL     dotAVX512_tail
+	VXORPS Z4, Z4, Z4
+	VXORPS Z5, Z5, Z5
+	VXORPS Z6, Z6, Z6
+	VXORPS Z7, Z7, Z7
+	CMPQ   DX, $0x00000020
+	JL     dot4AVX512_tail
 
-dotAVX512_wide:
-	VMOVUPS     (AX), Z4
-	VFMADD231PS (CX), Z4, Z0
-	VMOVUPS     64(AX), Z4
-	VFMADD231PS 64(CX), Z4, Z1
-	VMOVUPS     128(AX), Z4
-	VFMADD231PS 128(CX), Z4, Z2
-	VMOVUPS     192(AX), Z4
-	VFMADD231PS 192(CX), Z4, Z3
-	ADDQ        $0x00000100, AX
-	ADDQ        $0x00000100, CX
-	SUBQ        $0x00000040, DX
-	CMPQ        DX, $0x00000040
-	JGE         dotAVX512_wide
+dot4AVX512_wide:
+	VMOVUPS     (AX), Z8
+	VMOVUPS     64(AX), Z9
+	VFMADD231PS (BX), Z8, Z0
+	VFMADD231PS 64(BX), Z9, Z1
+	ADDQ        $0x00000080, BX
+	VFMADD231PS (SI), Z8, Z2
+	VFMADD231PS 64(SI), Z9, Z3
+	ADDQ        $0x00000080, SI
+	VFMADD231PS (DI), Z8, Z4
+	VFMADD231PS 64(DI), Z9, Z5
+	ADDQ        $0x00000080, DI
+	VFMADD231PS (CX), Z8, Z6
+	VFMADD231PS 64(CX), Z9, Z7
+	ADDQ        $0x00000080, CX
+	ADDQ        $0x00000080, AX
+	SUBQ        $0x00000020, DX
+	CMPQ        DX, $0x00000020
+	JGE         dot4AVX512_wide
 
-dotAVX512_tail:
-	TESTQ DX, DX
-	JZ    dotAVX512_done
+dot4AVX512_tail:
+	TESTQ       DX, DX
+	JZ          dot4AVX512_done
+	VMOVUPS     (AX), Z8
+	VFMADD231PS (BX), Z8, Z0
+	VFMADD231PS (SI), Z8, Z2
+	VFMADD231PS (DI), Z8, Z4
+	VFMADD231PS (CX), Z8, Z6
 
-dotAVX512_loop:
-	VMOVUPS     (AX), Z4
-	VFMADD231PS (CX), Z4, Z0
-	ADDQ        $0x00000040, AX
-	ADDQ        $0x00000040, CX
-	SUBQ        $0x00000010, DX
-	JNZ         dotAVX512_loop
-
-dotAVX512_done:
+dot4AVX512_done:
+	MOVQ          out+32(FP), AX
 	VADDPS        Z1, Z0, Z0
-	VADDPS        Z3, Z2, Z2
-	VADDPS        Z2, Z0, Z0
 	VEXTRACTF64X4 $0x01, Z0, Y1
 	VADDPS        Y1, Y0, Y0
 	VEXTRACTF128  $0x01, Y0, X1
@@ -563,7 +573,37 @@ dotAVX512_done:
 	VADDPS        X1, X0, X0
 	VPERMILPS     $0xb1, X0, X1
 	VADDPS        X1, X0, X0
-	MOVSS         X0, ret+24(FP)
+	MOVSS         X0, (AX)
+	VADDPS        Z3, Z2, Z2
+	VEXTRACTF64X4 $0x01, Z2, Y0
+	VADDPS        Y0, Y2, Y2
+	VEXTRACTF128  $0x01, Y2, X0
+	VADDPS        X0, X2, X2
+	VPERMILPS     $0x4e, X2, X0
+	VADDPS        X0, X2, X2
+	VPERMILPS     $0xb1, X2, X0
+	VADDPS        X0, X2, X2
+	MOVSS         X2, 4(AX)
+	VADDPS        Z5, Z4, Z4
+	VEXTRACTF64X4 $0x01, Z4, Y0
+	VADDPS        Y0, Y4, Y4
+	VEXTRACTF128  $0x01, Y4, X0
+	VADDPS        X0, X4, X4
+	VPERMILPS     $0x4e, X4, X0
+	VADDPS        X0, X4, X4
+	VPERMILPS     $0xb1, X4, X0
+	VADDPS        X0, X4, X4
+	MOVSS         X4, 8(AX)
+	VADDPS        Z7, Z6, Z6
+	VEXTRACTF64X4 $0x01, Z6, Y0
+	VADDPS        Y0, Y6, Y6
+	VEXTRACTF128  $0x01, Y6, X0
+	VADDPS        X0, X6, X6
+	VPERMILPS     $0x4e, X6, X0
+	VADDPS        X0, X6, X6
+	VPERMILPS     $0xb1, X6, X0
+	VADDPS        X0, X6, X6
+	MOVSS         X6, 12(AX)
 	VZEROUPPER
 	RET
 
@@ -600,6 +640,217 @@ exp2AVX512_loop:
 	JNZ         exp2AVX512_loop
 
 exp2AVX512_done:
+	VZEROUPPER
+	RET
+
+// func addVVAVX512(dst *float32, a *float32, b *float32, n int)
+// Requires: AVX, AVX512F
+TEXT ·addVVAVX512(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), AX
+	MOVQ a+8(FP), CX
+	MOVQ b+16(FP), DX
+	MOVQ n+24(FP), BX
+	CMPQ BX, $0x00000040
+	JL   addVVAVX512_one
+
+addVVAVX512_wide:
+	VMOVUPS (CX), Z0
+	VADDPS  (DX), Z0, Z0
+	VMOVUPS Z0, (AX)
+	VMOVUPS 64(CX), Z0
+	VADDPS  64(DX), Z0, Z0
+	VMOVUPS Z0, 64(AX)
+	VMOVUPS 128(CX), Z0
+	VADDPS  128(DX), Z0, Z0
+	VMOVUPS Z0, 128(AX)
+	VMOVUPS 192(CX), Z0
+	VADDPS  192(DX), Z0, Z0
+	VMOVUPS Z0, 192(AX)
+	ADDQ    $0x00000100, AX
+	ADDQ    $0x00000100, CX
+	ADDQ    $0x00000100, DX
+	SUBQ    $0x00000040, BX
+	CMPQ    BX, $0x00000040
+	JGE     addVVAVX512_wide
+
+addVVAVX512_one:
+	TESTQ   BX, BX
+	JZ      addVVAVX512_done
+	VMOVUPS (CX), Z0
+	VADDPS  (DX), Z0, Z0
+	VMOVUPS Z0, (AX)
+	ADDQ    $0x00000040, AX
+	ADDQ    $0x00000040, CX
+	ADDQ    $0x00000040, DX
+	SUBQ    $0x00000010, BX
+	JMP     addVVAVX512_one
+
+addVVAVX512_done:
+	VZEROUPPER
+	RET
+
+// func addVSAVX512(dst *float32, a *float32, s float32, n int)
+// Requires: AVX, AVX512F, SSE
+TEXT ·addVSAVX512(SB), NOSPLIT, $0-32
+	MOVQ         dst+0(FP), AX
+	MOVQ         a+8(FP), CX
+	MOVSS        s+16(FP), X0
+	VBROADCASTSS X0, Z0
+	MOVQ         n+24(FP), DX
+	CMPQ         DX, $0x00000040
+	JL           addVSAVX512_one
+
+addVSAVX512_wide:
+	VADDPS  (CX), Z0, Z1
+	VMOVUPS Z1, (AX)
+	VADDPS  64(CX), Z0, Z1
+	VMOVUPS Z1, 64(AX)
+	VADDPS  128(CX), Z0, Z1
+	VMOVUPS Z1, 128(AX)
+	VADDPS  192(CX), Z0, Z1
+	VMOVUPS Z1, 192(AX)
+	ADDQ    $0x00000100, AX
+	ADDQ    $0x00000100, CX
+	SUBQ    $0x00000040, DX
+	CMPQ    DX, $0x00000040
+	JGE     addVSAVX512_wide
+
+addVSAVX512_one:
+	TESTQ   DX, DX
+	JZ      addVSAVX512_done
+	VADDPS  (CX), Z0, Z1
+	VMOVUPS Z1, (AX)
+	ADDQ    $0x00000040, AX
+	ADDQ    $0x00000040, CX
+	SUBQ    $0x00000010, DX
+	JMP     addVSAVX512_one
+
+addVSAVX512_done:
+	VZEROUPPER
+	RET
+
+// func mulVVAVX512(dst *float32, a *float32, b *float32, n int)
+// Requires: AVX, AVX512F
+TEXT ·mulVVAVX512(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), AX
+	MOVQ a+8(FP), CX
+	MOVQ b+16(FP), DX
+	MOVQ n+24(FP), BX
+	CMPQ BX, $0x00000040
+	JL   mulVVAVX512_one
+
+mulVVAVX512_wide:
+	VMOVUPS (CX), Z0
+	VMULPS  (DX), Z0, Z0
+	VMOVUPS Z0, (AX)
+	VMOVUPS 64(CX), Z0
+	VMULPS  64(DX), Z0, Z0
+	VMOVUPS Z0, 64(AX)
+	VMOVUPS 128(CX), Z0
+	VMULPS  128(DX), Z0, Z0
+	VMOVUPS Z0, 128(AX)
+	VMOVUPS 192(CX), Z0
+	VMULPS  192(DX), Z0, Z0
+	VMOVUPS Z0, 192(AX)
+	ADDQ    $0x00000100, AX
+	ADDQ    $0x00000100, CX
+	ADDQ    $0x00000100, DX
+	SUBQ    $0x00000040, BX
+	CMPQ    BX, $0x00000040
+	JGE     mulVVAVX512_wide
+
+mulVVAVX512_one:
+	TESTQ   BX, BX
+	JZ      mulVVAVX512_done
+	VMOVUPS (CX), Z0
+	VMULPS  (DX), Z0, Z0
+	VMOVUPS Z0, (AX)
+	ADDQ    $0x00000040, AX
+	ADDQ    $0x00000040, CX
+	ADDQ    $0x00000040, DX
+	SUBQ    $0x00000010, BX
+	JMP     mulVVAVX512_one
+
+mulVVAVX512_done:
+	VZEROUPPER
+	RET
+
+// func mulVSAVX512(dst *float32, a *float32, s float32, n int)
+// Requires: AVX, AVX512F, SSE
+TEXT ·mulVSAVX512(SB), NOSPLIT, $0-32
+	MOVQ         dst+0(FP), AX
+	MOVQ         a+8(FP), CX
+	MOVSS        s+16(FP), X0
+	VBROADCASTSS X0, Z0
+	MOVQ         n+24(FP), DX
+	CMPQ         DX, $0x00000040
+	JL           mulVSAVX512_one
+
+mulVSAVX512_wide:
+	VMULPS  (CX), Z0, Z1
+	VMOVUPS Z1, (AX)
+	VMULPS  64(CX), Z0, Z1
+	VMOVUPS Z1, 64(AX)
+	VMULPS  128(CX), Z0, Z1
+	VMOVUPS Z1, 128(AX)
+	VMULPS  192(CX), Z0, Z1
+	VMOVUPS Z1, 192(AX)
+	ADDQ    $0x00000100, AX
+	ADDQ    $0x00000100, CX
+	SUBQ    $0x00000040, DX
+	CMPQ    DX, $0x00000040
+	JGE     mulVSAVX512_wide
+
+mulVSAVX512_one:
+	TESTQ   DX, DX
+	JZ      mulVSAVX512_done
+	VMULPS  (CX), Z0, Z1
+	VMOVUPS Z1, (AX)
+	ADDQ    $0x00000040, AX
+	ADDQ    $0x00000040, CX
+	SUBQ    $0x00000010, DX
+	JMP     mulVSAVX512_one
+
+mulVSAVX512_done:
+	VZEROUPPER
+	RET
+
+// func recipAVX512(dst *float32, a *float32, n int)
+// Requires: AVX, AVX512F
+TEXT ·recipAVX512(SB), NOSPLIT, $0-24
+	MOVQ    dst+0(FP), AX
+	MOVQ    a+8(FP), CX
+	MOVQ    n+16(FP), DX
+	VMOVUPS exp_one<>+0(SB), Z0
+	CMPQ    DX, $0x00000040
+	JL      recipAVX512_one
+
+recipAVX512_wide:
+	VDIVPS  (CX), Z0, Z1
+	VMOVUPS Z1, (AX)
+	VDIVPS  64(CX), Z0, Z1
+	VMOVUPS Z1, 64(AX)
+	VDIVPS  128(CX), Z0, Z1
+	VMOVUPS Z1, 128(AX)
+	VDIVPS  192(CX), Z0, Z1
+	VMOVUPS Z1, 192(AX)
+	ADDQ    $0x00000100, AX
+	ADDQ    $0x00000100, CX
+	SUBQ    $0x00000040, DX
+	CMPQ    DX, $0x00000040
+	JGE     recipAVX512_wide
+
+recipAVX512_one:
+	TESTQ   DX, DX
+	JZ      recipAVX512_done
+	VDIVPS  (CX), Z0, Z1
+	VMOVUPS Z1, (AX)
+	ADDQ    $0x00000040, AX
+	ADDQ    $0x00000040, CX
+	SUBQ    $0x00000010, DX
+	JMP     recipAVX512_one
+
+recipAVX512_done:
 	VZEROUPPER
 	RET
 
@@ -727,57 +978,91 @@ softmaxGradAVX2_done:
 	VZEROUPPER
 	RET
 
-// func dotAVX2(x *float32, y *float32, n int) float32
+// func dot4AVX2(x *float32, y *float32, stride int, n int, out *float32)
 // Requires: AVX, FMA3, SSE
-TEXT ·dotAVX2(SB), NOSPLIT, $0-28
+TEXT ·dot4AVX2(SB), NOSPLIT, $0-40
 	MOVQ   x+0(FP), AX
-	MOVQ   y+8(FP), CX
-	MOVQ   n+16(FP), DX
+	MOVQ   stride+16(FP), CX
+	MOVQ   n+24(FP), DX
+	SHLQ   $0x02, CX
+	MOVQ   y+8(FP), BX
+	LEAQ   (BX)(CX*1), SI
+	LEAQ   (SI)(CX*1), DI
+	LEAQ   (DI)(CX*1), CX
 	VXORPS Y0, Y0, Y0
 	VXORPS Y1, Y1, Y1
 	VXORPS Y2, Y2, Y2
 	VXORPS Y3, Y3, Y3
-	CMPQ   DX, $0x00000020
-	JL     dotAVX2_tail
+	VXORPS Y4, Y4, Y4
+	VXORPS Y5, Y5, Y5
+	VXORPS Y6, Y6, Y6
+	VXORPS Y7, Y7, Y7
+	CMPQ   DX, $0x00000010
+	JL     dot4AVX2_tail
 
-dotAVX2_wide:
-	VMOVUPS     (AX), Y4
-	VFMADD231PS (CX), Y4, Y0
-	VMOVUPS     32(AX), Y4
-	VFMADD231PS 32(CX), Y4, Y1
-	VMOVUPS     64(AX), Y4
-	VFMADD231PS 64(CX), Y4, Y2
-	VMOVUPS     96(AX), Y4
-	VFMADD231PS 96(CX), Y4, Y3
-	ADDQ        $0x00000080, AX
-	ADDQ        $0x00000080, CX
-	SUBQ        $0x00000020, DX
-	CMPQ        DX, $0x00000020
-	JGE         dotAVX2_wide
+dot4AVX2_wide:
+	VMOVUPS     (AX), Y8
+	VMOVUPS     32(AX), Y9
+	VFMADD231PS (BX), Y8, Y0
+	VFMADD231PS 32(BX), Y9, Y1
+	ADDQ        $0x00000040, BX
+	VFMADD231PS (SI), Y8, Y2
+	VFMADD231PS 32(SI), Y9, Y3
+	ADDQ        $0x00000040, SI
+	VFMADD231PS (DI), Y8, Y4
+	VFMADD231PS 32(DI), Y9, Y5
+	ADDQ        $0x00000040, DI
+	VFMADD231PS (CX), Y8, Y6
+	VFMADD231PS 32(CX), Y9, Y7
+	ADDQ        $0x00000040, CX
+	ADDQ        $0x00000040, AX
+	SUBQ        $0x00000010, DX
+	CMPQ        DX, $0x00000010
+	JGE         dot4AVX2_wide
 
-dotAVX2_tail:
-	TESTQ DX, DX
-	JZ    dotAVX2_done
+dot4AVX2_tail:
+	TESTQ       DX, DX
+	JZ          dot4AVX2_done
+	VMOVUPS     (AX), Y8
+	VFMADD231PS (BX), Y8, Y0
+	VFMADD231PS (SI), Y8, Y2
+	VFMADD231PS (DI), Y8, Y4
+	VFMADD231PS (CX), Y8, Y6
 
-dotAVX2_loop:
-	VMOVUPS     (AX), Y4
-	VFMADD231PS (CX), Y4, Y0
-	ADDQ        $0x00000020, AX
-	ADDQ        $0x00000020, CX
-	SUBQ        $0x00000008, DX
-	JNZ         dotAVX2_loop
-
-dotAVX2_done:
+dot4AVX2_done:
+	MOVQ         out+32(FP), AX
 	VADDPS       Y1, Y0, Y0
-	VADDPS       Y3, Y2, Y2
-	VADDPS       Y2, Y0, Y0
 	VEXTRACTF128 $0x01, Y0, X1
 	VADDPS       X1, X0, X0
 	VPERMILPS    $0x4e, X0, X1
 	VADDPS       X1, X0, X0
 	VPERMILPS    $0xb1, X0, X1
 	VADDPS       X1, X0, X0
-	MOVSS        X0, ret+24(FP)
+	MOVSS        X0, (AX)
+	VADDPS       Y3, Y2, Y2
+	VEXTRACTF128 $0x01, Y2, X0
+	VADDPS       X0, X2, X2
+	VPERMILPS    $0x4e, X2, X0
+	VADDPS       X0, X2, X2
+	VPERMILPS    $0xb1, X2, X0
+	VADDPS       X0, X2, X2
+	MOVSS        X2, 4(AX)
+	VADDPS       Y5, Y4, Y4
+	VEXTRACTF128 $0x01, Y4, X0
+	VADDPS       X0, X4, X4
+	VPERMILPS    $0x4e, X4, X0
+	VADDPS       X0, X4, X4
+	VPERMILPS    $0xb1, X4, X0
+	VADDPS       X0, X4, X4
+	MOVSS        X4, 8(AX)
+	VADDPS       Y7, Y6, Y6
+	VEXTRACTF128 $0x01, Y6, X0
+	VADDPS       X0, X6, X6
+	VPERMILPS    $0x4e, X6, X0
+	VADDPS       X0, X6, X6
+	VPERMILPS    $0xb1, X6, X0
+	VADDPS       X0, X6, X6
+	MOVSS        X6, 12(AX)
 	VZEROUPPER
 	RET
 
@@ -814,5 +1099,216 @@ exp2AVX2_loop:
 	JNZ         exp2AVX2_loop
 
 exp2AVX2_done:
+	VZEROUPPER
+	RET
+
+// func addVVAVX2(dst *float32, a *float32, b *float32, n int)
+// Requires: AVX
+TEXT ·addVVAVX2(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), AX
+	MOVQ a+8(FP), CX
+	MOVQ b+16(FP), DX
+	MOVQ n+24(FP), BX
+	CMPQ BX, $0x00000020
+	JL   addVVAVX2_one
+
+addVVAVX2_wide:
+	VMOVUPS (CX), Y0
+	VADDPS  (DX), Y0, Y0
+	VMOVUPS Y0, (AX)
+	VMOVUPS 32(CX), Y0
+	VADDPS  32(DX), Y0, Y0
+	VMOVUPS Y0, 32(AX)
+	VMOVUPS 64(CX), Y0
+	VADDPS  64(DX), Y0, Y0
+	VMOVUPS Y0, 64(AX)
+	VMOVUPS 96(CX), Y0
+	VADDPS  96(DX), Y0, Y0
+	VMOVUPS Y0, 96(AX)
+	ADDQ    $0x00000080, AX
+	ADDQ    $0x00000080, CX
+	ADDQ    $0x00000080, DX
+	SUBQ    $0x00000020, BX
+	CMPQ    BX, $0x00000020
+	JGE     addVVAVX2_wide
+
+addVVAVX2_one:
+	TESTQ   BX, BX
+	JZ      addVVAVX2_done
+	VMOVUPS (CX), Y0
+	VADDPS  (DX), Y0, Y0
+	VMOVUPS Y0, (AX)
+	ADDQ    $0x00000020, AX
+	ADDQ    $0x00000020, CX
+	ADDQ    $0x00000020, DX
+	SUBQ    $0x00000008, BX
+	JMP     addVVAVX2_one
+
+addVVAVX2_done:
+	VZEROUPPER
+	RET
+
+// func addVSAVX2(dst *float32, a *float32, s float32, n int)
+// Requires: AVX, AVX2, SSE
+TEXT ·addVSAVX2(SB), NOSPLIT, $0-32
+	MOVQ         dst+0(FP), AX
+	MOVQ         a+8(FP), CX
+	MOVSS        s+16(FP), X0
+	VBROADCASTSS X0, Y0
+	MOVQ         n+24(FP), DX
+	CMPQ         DX, $0x00000020
+	JL           addVSAVX2_one
+
+addVSAVX2_wide:
+	VADDPS  (CX), Y0, Y1
+	VMOVUPS Y1, (AX)
+	VADDPS  32(CX), Y0, Y1
+	VMOVUPS Y1, 32(AX)
+	VADDPS  64(CX), Y0, Y1
+	VMOVUPS Y1, 64(AX)
+	VADDPS  96(CX), Y0, Y1
+	VMOVUPS Y1, 96(AX)
+	ADDQ    $0x00000080, AX
+	ADDQ    $0x00000080, CX
+	SUBQ    $0x00000020, DX
+	CMPQ    DX, $0x00000020
+	JGE     addVSAVX2_wide
+
+addVSAVX2_one:
+	TESTQ   DX, DX
+	JZ      addVSAVX2_done
+	VADDPS  (CX), Y0, Y1
+	VMOVUPS Y1, (AX)
+	ADDQ    $0x00000020, AX
+	ADDQ    $0x00000020, CX
+	SUBQ    $0x00000008, DX
+	JMP     addVSAVX2_one
+
+addVSAVX2_done:
+	VZEROUPPER
+	RET
+
+// func mulVVAVX2(dst *float32, a *float32, b *float32, n int)
+// Requires: AVX
+TEXT ·mulVVAVX2(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), AX
+	MOVQ a+8(FP), CX
+	MOVQ b+16(FP), DX
+	MOVQ n+24(FP), BX
+	CMPQ BX, $0x00000020
+	JL   mulVVAVX2_one
+
+mulVVAVX2_wide:
+	VMOVUPS (CX), Y0
+	VMULPS  (DX), Y0, Y0
+	VMOVUPS Y0, (AX)
+	VMOVUPS 32(CX), Y0
+	VMULPS  32(DX), Y0, Y0
+	VMOVUPS Y0, 32(AX)
+	VMOVUPS 64(CX), Y0
+	VMULPS  64(DX), Y0, Y0
+	VMOVUPS Y0, 64(AX)
+	VMOVUPS 96(CX), Y0
+	VMULPS  96(DX), Y0, Y0
+	VMOVUPS Y0, 96(AX)
+	ADDQ    $0x00000080, AX
+	ADDQ    $0x00000080, CX
+	ADDQ    $0x00000080, DX
+	SUBQ    $0x00000020, BX
+	CMPQ    BX, $0x00000020
+	JGE     mulVVAVX2_wide
+
+mulVVAVX2_one:
+	TESTQ   BX, BX
+	JZ      mulVVAVX2_done
+	VMOVUPS (CX), Y0
+	VMULPS  (DX), Y0, Y0
+	VMOVUPS Y0, (AX)
+	ADDQ    $0x00000020, AX
+	ADDQ    $0x00000020, CX
+	ADDQ    $0x00000020, DX
+	SUBQ    $0x00000008, BX
+	JMP     mulVVAVX2_one
+
+mulVVAVX2_done:
+	VZEROUPPER
+	RET
+
+// func mulVSAVX2(dst *float32, a *float32, s float32, n int)
+// Requires: AVX, AVX2, SSE
+TEXT ·mulVSAVX2(SB), NOSPLIT, $0-32
+	MOVQ         dst+0(FP), AX
+	MOVQ         a+8(FP), CX
+	MOVSS        s+16(FP), X0
+	VBROADCASTSS X0, Y0
+	MOVQ         n+24(FP), DX
+	CMPQ         DX, $0x00000020
+	JL           mulVSAVX2_one
+
+mulVSAVX2_wide:
+	VMULPS  (CX), Y0, Y1
+	VMOVUPS Y1, (AX)
+	VMULPS  32(CX), Y0, Y1
+	VMOVUPS Y1, 32(AX)
+	VMULPS  64(CX), Y0, Y1
+	VMOVUPS Y1, 64(AX)
+	VMULPS  96(CX), Y0, Y1
+	VMOVUPS Y1, 96(AX)
+	ADDQ    $0x00000080, AX
+	ADDQ    $0x00000080, CX
+	SUBQ    $0x00000020, DX
+	CMPQ    DX, $0x00000020
+	JGE     mulVSAVX2_wide
+
+mulVSAVX2_one:
+	TESTQ   DX, DX
+	JZ      mulVSAVX2_done
+	VMULPS  (CX), Y0, Y1
+	VMOVUPS Y1, (AX)
+	ADDQ    $0x00000020, AX
+	ADDQ    $0x00000020, CX
+	SUBQ    $0x00000008, DX
+	JMP     mulVSAVX2_one
+
+mulVSAVX2_done:
+	VZEROUPPER
+	RET
+
+// func recipAVX2(dst *float32, a *float32, n int)
+// Requires: AVX
+TEXT ·recipAVX2(SB), NOSPLIT, $0-24
+	MOVQ    dst+0(FP), AX
+	MOVQ    a+8(FP), CX
+	MOVQ    n+16(FP), DX
+	VMOVUPS exp_one<>+0(SB), Y0
+	CMPQ    DX, $0x00000020
+	JL      recipAVX2_one
+
+recipAVX2_wide:
+	VDIVPS  (CX), Y0, Y1
+	VMOVUPS Y1, (AX)
+	VDIVPS  32(CX), Y0, Y1
+	VMOVUPS Y1, 32(AX)
+	VDIVPS  64(CX), Y0, Y1
+	VMOVUPS Y1, 64(AX)
+	VDIVPS  96(CX), Y0, Y1
+	VMOVUPS Y1, 96(AX)
+	ADDQ    $0x00000080, AX
+	ADDQ    $0x00000080, CX
+	SUBQ    $0x00000020, DX
+	CMPQ    DX, $0x00000020
+	JGE     recipAVX2_wide
+
+recipAVX2_one:
+	TESTQ   DX, DX
+	JZ      recipAVX2_done
+	VDIVPS  (CX), Y0, Y1
+	VMOVUPS Y1, (AX)
+	ADDQ    $0x00000020, AX
+	ADDQ    $0x00000020, CX
+	SUBQ    $0x00000008, DX
+	JMP     recipAVX2_one
+
+recipAVX2_done:
 	VZEROUPPER
 	RET
