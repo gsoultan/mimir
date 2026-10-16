@@ -18,7 +18,9 @@ import (
 // in integer arithmetic, applying the scales once per block. Weights are
 // read once per row of the output for a matrix-vector product, which is
 // what a model's decoding step computes, and once per tile of up to four
-// rows of x otherwise, while those rows stay in cache.
+// rows of x otherwise, while those rows stay in cache. Products of many
+// rows of x by K-quant weights, a prompt's, run in larger tiles where the
+// CPU has kernels for them; see qtile.
 //
 // The activations of a Q8_0 product are blocks of 32 like the weights':
 //
@@ -356,17 +358,25 @@ func runQMatMul(ctx context.Context, b *Backend, k *backend.Kernel, outBuf backe
 		return err
 	}
 
-	// Multiply, splitting the rows of W between workers.
-	kernels := qdots[w.dt]
+	// Multiply, splitting the rows of W between workers: in tiles of
+	// rows of x first, where there are enough of them, and the rest
+	// with the qdots.
 	nb, wstride := kk/bs, kk/bs*w.dt.BlockBytes()
 	wdata := w.data[vw.Offset/bs*w.dt.BlockBytes():]
+	done := 0
+	if t := qtiles[w.dt]; t != nil && m >= qtileMinRows {
+		if done, err = runQTiles(ctx, b, t, w.dt, wdata, nb, n, xq, xstride, out); err != nil || done == m {
+			return err
+		}
+	}
+	kernels := qdots[w.dt]
 	tile := max(maxRows, qmatmulCacheBytes/xstride/maxRows*maxRows)
-	chunk := max(qmatmulRowWork/(m*kk), n/(qmatmulChunks*b.workers), 1)
+	chunk := max(qmatmulRowWork/((m-done)*kk), n/(qmatmulChunks*b.workers), 1)
 	return b.parallelClaim(ctx, n, chunk, func(lo, hi int) error {
 		// Bounds checks here leave the kernels none to do.
 		_ = wdata[hi*wstride-1]
 		_ = xq[m*xstride-1]
-		for m0 := 0; m0 < m; m0 += tile {
+		for m0 := done; m0 < m; m0 += tile {
 			m1 := min(m, m0+tile)
 			for j := lo; j < hi; j++ {
 				wrow := &wdata[j*wstride]

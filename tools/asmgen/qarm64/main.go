@@ -1,6 +1,8 @@
 // Command qarm64 generates the arm64 assembly of backend/cpu's products by
 // quantized weights: the NEON dot products of Q8_0, Q4_K and Q6_K weights
-// with int8 activations, for one to four rows of activations.
+// with int8 activations, for one to four rows of activations, and, with
+// SDOT, the tiles of Q4_K and Q6_K weights, two rows of them by sixteen
+// rows of activations, that products of many rows of activations run in.
 //
 //	go run ./qarm64 -out ../../backend/cpu/qdot_arm64.s -stubs ../../backend/cpu/qdot_stub_arm64.go
 //
@@ -42,21 +44,26 @@ func main() {
 			q6K(&w, rows, sdot)
 		}
 	}
+	qtile(&w, false)
+	qtile(&w, true)
 	if err := os.WriteFile(*out, w.Bytes(), 0o644); err != nil {
 		log.Fatal(err)
 	}
 	var g bytes.Buffer
 	g.WriteString(header + "package cpu\n")
 	for _, d := range decls {
-		fmt.Fprintf(&g, "\n// %s\n//\n//go:noescape\nfunc %s(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)\n", d.doc, d.name)
+		fmt.Fprintf(&g, "\n// %s\n//\n//go:noescape\nfunc %s%s\n", d.doc, d.name, d.sig)
 	}
 	if err := os.WriteFile(*stubs, g.Bytes(), 0o644); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// decls are the functions generated, with their documentation.
-var decls []struct{ name, doc string }
+// decls are the functions generated, with their documentation and
+// signatures.
+var decls []decl
+
+type decl struct{ name, doc, sig string }
 
 // asm writes one function.
 type asm struct {
@@ -85,7 +92,7 @@ func begin(w *bytes.Buffer, dtype string, rows int, sdot bool) *asm {
 	}
 	a := &asm{w: w, name: fmt.Sprintf("qdot%s%sx%d", dtype, ext, rows), sdot: sdot}
 	doc := fmt.Sprintf("%s multiplies %s weights by %s of activations; see qdot.", a.name, dtype, rowsOf[rows])
-	decls = append(decls, struct{ name, doc string }{a.name, doc})
+	decls = append(decls, decl{a.name, doc, "(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)"})
 	fmt.Fprintf(w, "\n// %s\n", doc)
 	fmt.Fprintf(w, "//\n// func %s(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)\n", a.name)
 	fmt.Fprintf(w, "TEXT ·%s(SB), NOSPLIT, $0-48\n", a.name)
@@ -409,4 +416,166 @@ func q6K(w *bytes.Buffer, rows int, sdot bool) {
 	a.emit("BNE %s_loop", a.name)
 	a.label("done")
 	a.store(rows)
+}
+
+// The layouts of backend/cpu's tiles: a super-block of a row of weights,
+// unpacked, and one of sixteen rows of activations, interleaved.
+const (
+	tileRowBytes = 336
+	tileScales   = 256 // [16]int16
+	tilePairs    = 288 // [8][2]int16
+	tileD        = 320 // float32, and dmin after it
+	tileActBytes = 4672
+	tileSums     = 4096 // [8][16][2]int16
+	tileXD       = 4608 // [16]float32
+)
+
+// qtile emits the tile kernel of Q4_K weights, or of Q6_K weights if q6,
+// for two rows of weights by sixteen of activations, with SDOT by
+// element: a vector holds four quants of each of four rows of
+// activations, and SDOT adds their products with four quants of a row of
+// weights, one lane of a vector of sixteen, into an int32 for each row.
+// The sums of a group, in V8 to V15, are added times the group's scale to
+// those of the super-block, V0 to V3 for the first row of weights and V4
+// to V7 for the second; the quants of Q6_K, less 32, multiply as signed
+// bytes, so that the activations' sums apply only the mins of Q4_K.
+//
+// It loads nb into R0, the weights into R1, the activations into R2 and
+// acc into R3.
+func qtile(w *bytes.Buffer, q6 bool) {
+	dtype, group := "Q4_K", 32
+	if q6 {
+		dtype, group = "Q6_K", 16
+	}
+	a := &asm{w: w, name: "qtile" + dtype + "SDOT", sdot: true}
+	doc := a.name + " multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile."
+	const sig = "(nb int, w *byte, x *byte, acc *float32)"
+	decls = append(decls, decl{a.name, doc, sig})
+	fmt.Fprintf(w, "\n// %s\n", doc)
+	fmt.Fprintf(w, "//\n// func %s%s\n", a.name, sig)
+	fmt.Fprintf(w, "TEXT ·%s(SB), NOSPLIT, $0-32\n", a.name)
+	a.emit("MOVD nb+0(FP), R0")
+	a.emit("MOVD w+8(FP), R1")
+	a.emit("MOVD x+16(FP), R2")
+	a.emit("MOVD acc+24(FP), R3")
+	if q6 {
+		a.moviB(30, 32)
+	}
+	a.emit("CBZ R0, %s_done", a.name)
+	a.label("loop")
+
+	// The scales as int32s: four groups a vector, from V22 for the first
+	// row of weights and from V22+groups/4 for the second.
+	nsc := 256 / group / 4
+	for t := range 2 {
+		b := 22 + nsc*t
+		a.emit("ADD $%d, R1, R6", tileRowBytes*t+tileScales)
+		if q6 {
+			a.emit("VLD1 (R6), [V%d.B16, V%d.B16]", b, b+1)
+			a.word(0x4f10a400|enc3(b+3, b+1, 0), "SXTL2 V%d.4S, V%d.8H", b+3, b+1)
+			a.word(0x0f10a400|enc3(b+2, b+1, 0), "SXTL V%d.4S, V%d.4H", b+2, b+1)
+		} else {
+			a.emit("VLD1 (R6), [V%d.B16]", b)
+		}
+		a.word(0x4f10a400|enc3(b+1, b, 0), "SXTL2 V%d.4S, V%d.8H", b+1, b)
+		a.word(0x0f10a400|enc3(b, b, 0), "SXTL V%d.4S, V%d.4H", b, b)
+	}
+	for v := range 8 {
+		a.zero(v)
+	}
+	a.emit("MOVD R2, R7")
+	a.emit("MOVD R1, R8")
+	a.emit("ADD $%d, R1, R9", tileRowBytes)
+	for s := range 256 / group {
+		for v := 8; v < 16; v++ {
+			a.zero(v)
+		}
+		for q := range group / 4 {
+			quad := group/4*s + q
+			if quad%4 == 0 {
+				// The next four quads of quants of each row of weights.
+				for t := range 2 {
+					a.emit("VLD1.P 16(R%d), [V%d.B16]", 8+t, 20+t)
+					if q6 {
+						a.subB(20+t, 20+t, 30)
+					}
+				}
+			}
+			a.emit("VLD1.P 64(R7), [V16.B16, V17.B16, V18.B16, V19.B16]")
+			for t := range 2 {
+				for c := range 4 {
+					d, n, m, i := 8+4*t+c, 16+c, 20+t, quad%4
+					a.word(0x4f80e000|uint32(i&1)<<21|uint32(i>>1)<<11|enc3(d, n, m),
+						"SDOT V%d.4S, V%d.16B, V%d.4B[%d]", d, n, m, i)
+				}
+			}
+		}
+		for t := range 2 {
+			for c := range 4 {
+				a.mlaElem(4*t+c, 8+4*t+c, 22+nsc*t+s/4, s%4)
+			}
+		}
+	}
+
+	for t := range 2 {
+		if !q6 {
+			// The sums of the activations' pairs of groups of 16 times
+			// the mins: lanes of pairs of int32 in V8 to V15, which
+			// ADDP adds into V8 to V11.
+			a.emit("ADD $%d, R2, R7", tileSums)
+			for p := range 8 {
+				a.emit("MOVWU %d(R1), R10", tileRowBytes*t+tilePairs+4*p)
+				a.word(0x4e040c00|enc3(20, 10, 0), "DUP V20.4S, R10")
+				a.emit("VLD1.P 64(R7), [V16.B16, V17.B16, V18.B16, V19.B16]")
+				for c := range 4 {
+					lo, hi := 0x0e608000, 0x4e608000
+					name := "SMLAL"
+					if p == 0 {
+						lo, hi, name = 0x0e60c000, 0x4e60c000, "SMULL"
+					}
+					a.word(uint32(lo)|enc3(8+2*c, 16+c, 20), "%s V%d.4S, V%d.4H, V20.4H", name, 8+2*c, 16+c)
+					a.word(uint32(hi)|enc3(9+2*c, 16+c, 20), "%s2 V%d.4S, V%d.8H, V20.8H", name, 9+2*c, 16+c)
+				}
+			}
+			for c := range 4 {
+				a.word(0x4ea0bc00|enc3(8+c, 8+2*c, 9+2*c), "ADDP V%d.4S, V%d.4S, V%d.4S", 8+c, 8+2*c, 9+2*c)
+			}
+		}
+		// The products times float32(wd·xd), added to acc.
+		a.emit("ADD $%d, R2, R7", tileXD)
+		a.emit("VLD1 (R7), [V16.B16, V17.B16, V18.B16, V19.B16]")
+		a.emit("FMOVS %d(R1), F20", tileRowBytes*t+tileD)
+		a.emit("FMOVS %d(R1), F21", tileRowBytes*t+tileD+4)
+		a.emit("ADD $%d, R3, R7", 4*16*t)
+		a.emit("VLD1 (R7), [V24.B16, V25.B16, V26.B16, V27.B16]")
+		for c := range 4 {
+			a.accumulate(24+c, 4*t+c, 16+c, 20)
+		}
+		a.emit("VST1 [V24.B16, V25.B16, V26.B16, V27.B16], (R7)")
+		if !q6 {
+			a.emit("ADD $%d, R3, R7", 4*(32+16*t))
+			a.emit("VLD1 (R7), [V24.B16, V25.B16, V26.B16, V27.B16]")
+			for c := range 4 {
+				a.accumulate(24+c, 8+c, 16+c, 21)
+			}
+			a.emit("VST1 [V24.B16, V25.B16, V26.B16, V27.B16], (R7)")
+		}
+	}
+	a.emit("ADD $%d, R1, R1", 2*tileRowBytes)
+	a.emit("MOVD $%d, R10", tileActBytes)
+	a.emit("ADD R10, R2, R2")
+	a.emit("SUBS $1, R0, R0")
+	a.emit("BNE %s_loop", a.name)
+	a.label("done")
+	a.emit("RET")
+}
+
+// accumulate adds float32(wd·xd)·float32(sum) to the four float32 of Vacc,
+// rounding each product, as the portable kernels do: sum is in Vsum, xd in
+// Vxd and wd in lane 0 of Vwd. It uses V28 and V29.
+func (a *asm) accumulate(acc, sum, xd, wd int) {
+	a.word(0x4f809000|enc3(28, xd, wd), "FMUL V28.4S, V%d.4S, V%d.S[0]", xd, wd)
+	a.word(0x4e21d800|enc3(29, sum, 0), "SCVTF V29.4S, V%d.4S", sum)
+	a.word(0x6e20dc00|enc3(29, 29, 28), "FMUL V29.4S, V29.4S, V28.4S")
+	a.emit("VFADD V29.S4, V%d.S4, V%d.S4", acc, acc)
 }

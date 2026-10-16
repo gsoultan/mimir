@@ -32,6 +32,9 @@ func init() {
 	if hasDotProd() {
 		qdotSets["sdot"] = qdotsSDOT
 		qdotISA, qdots = "sdot", qdotsSDOT
+		tiles := map[backend.DType]qtile{backend.Q4_K: qtileQ4_KSDOT, backend.Q6_K: qtileQ6_KSDOT}
+		qtileSets["sdot"] = tiles
+		qtiles = tiles
 	}
 }
 

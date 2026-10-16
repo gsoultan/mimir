@@ -17,4 +17,7 @@ func init() {
 	}
 	qdotSets["avx2"] = avx2
 	qdotISA, qdots = "avx2", avx2
+	tiles := map[backend.DType]qtile{backend.Q4_K: qtileQ4KAVX2, backend.Q6_K: qtileQ6KAVX2}
+	qtileSets["avx2"] = tiles
+	qtiles = tiles
 }
