@@ -7,7 +7,8 @@ package cpu
 import "github.com/gsoultan/mimir/backend"
 
 func init() {
-	if f := x86Features(); !f.avx2 || !f.f16c {
+	f := x86Features()
+	if !f.avx2 || !f.f16c {
 		return
 	}
 	avx2 := map[backend.DType]*[maxRows]qdot{
@@ -20,4 +21,21 @@ func init() {
 	tiles := map[backend.DType]qtile{backend.Q4_K: qtileQ4KAVX2, backend.Q6_K: qtileQ6KAVX2}
 	qtileSets["avx2"] = tiles
 	qtiles = tiles
+	qtileUnpacks[backend.Q4_K] = func(dst, w []byte, nb int) {
+		if nb > 0 {
+			_, _ = dst[(nb-1)*qtileBlockBytes+qtileRowBytes-1], w[nb*144-1]
+			unpackQ4KAVX2(nb, &dst[0], &w[0])
+		}
+	}
+	qtileUnpacks[backend.Q6_K] = func(dst, w []byte, nb int) {
+		if nb > 0 {
+			_, _ = dst[(nb-1)*qtileBlockBytes+qtileRowBytes-1], w[nb*210-1]
+			unpackQ6KAVX2(nb, &dst[0], &w[0])
+		}
+	}
+	if f.avx512vnni {
+		tiles := map[backend.DType]qtile{backend.Q4_K: qtileQ4KAVX512, backend.Q6_K: qtileQ6KAVX512}
+		qtileSets["avx512vnni"] = tiles
+		qtiles = tiles
+	}
 }

@@ -2,7 +2,9 @@
 // quantized weights: the AVX2 dot products of Q8_0, Q4_K and Q6_K weights
 // with int8 activations, for one to four rows of activations, and the
 // tiles of Q4_K and Q6_K weights, two rows of them by sixteen rows of
-// activations, that products of many rows of activations run in.
+// activations, that products of many rows of activations run in, with
+// AVX2 or with AVX-512 VNNI, and the unpacking of rows of weights for
+// them.
 //
 //	go run ./qamd64 -out ../../backend/cpu/qdot_amd64.s -stubs ../../backend/cpu/qdot_stub_amd64.go -pkg cpu
 //
@@ -39,6 +41,10 @@ func main() {
 	}
 	qtile(false)
 	qtile(true)
+	qtile512(false)
+	qtile512(true)
+	unpackQ4K()
+	unpackQ6K()
 	Generate()
 }
 
@@ -386,10 +392,11 @@ func q6K(rows int) {
 // The layouts of backend/cpu's tiles: a super-block of a row of weights,
 // unpacked, and one of sixteen rows of activations, interleaved.
 const (
-	tileRowBytes = 336
-	tileScales   = 256 // [16]int16
-	tilePairs    = 288 // [8][2]int16
-	tileD        = 320 // float32, and dmin after it
+	tileRowBytes = 368
+	tileScales   = 256 // [16]int32
+	tilePairs    = 320 // [8][2]int16
+	tileD        = 352 // float32, and dmin after it
+	tileBlock    = 2 * tileRowBytes
 	tileActBytes = 4672
 	tileSums     = 4096 // [8][16][2]int16
 	tileXD       = 4608 // [16]float32
@@ -425,7 +432,8 @@ func qtile(q6 bool) {
 		var sc [2]VecVirtual
 		for t := range 2 {
 			sc[t] = YMM()
-			VPBROADCASTW(Mem{Base: w, Disp: tileRowBytes*t + tileScales + 2*s}, sc[t])
+			// The low half of the int32, which holds all of it.
+			VPBROADCASTW(Mem{Base: w, Disp: tileRowBytes*t + tileScales + 4*s}, sc[t])
 		}
 		for r := 0; r < group/4; r += run {
 			var h [2][2]VecVirtual
@@ -497,9 +505,9 @@ func qtile(q6 bool) {
 				VPSLLD(U8(5), m[c], m[c])
 				VPSUBD(m[c], isum[t][c], isum[t][c])
 			}
-			accumulate(wd, xd, isum[t][c], Mem{Base: out, Disp: 4 * (16*t + 8*c)})
+			accumulate(wd, xd, isum[t][c], Mem{Base: out, Disp: 4 * (16*t + 8*c)}, YMM)
 			if !q6 {
-				accumulate(wm, xd, m[c], Mem{Base: out, Disp: 4 * (32 + 16*t + 8*c)})
+				accumulate(wm, xd, m[c], Mem{Base: out, Disp: 4 * (32 + 16*t + 8*c)}, YMM)
 			}
 		}
 	}
@@ -513,13 +521,252 @@ func qtile(q6 bool) {
 	RET()
 }
 
-// accumulate adds float32(wd·xd)·float32(sum) to the eight float32 at m,
-// rounding each product, as the portable kernels do.
-func accumulate(wd, xd, sum VecVirtual, m Mem) {
-	dd, f := YMM(), YMM()
+// accumulate adds float32(wd·xd)·float32(sum) to the float32 at m, eight
+// or sixteen of them as vec makes YMM or ZMM registers, rounding each
+// product, as the portable kernels do.
+func accumulate(wd, xd, sum VecVirtual, m Mem, vec func() VecVirtual) {
+	dd, f := vec(), vec()
 	VMULPS(xd, wd, dd)
 	VCVTDQ2PS(sum, f)
 	VMULPS(dd, f, f)
 	VADDPS(m, f, f)
 	VMOVUPS(f, m)
+}
+
+// qtile512 emits the tile kernel of Q4_K weights, or of Q6_K weights if
+// q6, for two rows of weights by sixteen of activations, with AVX-512
+// VNNI. A ZMM register holds a lane for each of the sixteen rows of
+// activations: VPDPBUSD multiplies four quants of a row of weights,
+// broadcast, by four of each row and adds the products straight into
+// int32, so that a group's sum needs no care for overflow; VPMULLD then
+// applies the group's scale, and VPDPWSSD the mins or the offset of 32.
+func qtile512(q6 bool) {
+	name, group := "qtileQ4KAVX512", 32
+	if q6 {
+		name, group = "qtileQ6KAVX512", 16
+	}
+	TEXT(name, NOSPLIT, "func(nb int, w, x *byte, acc *float32)")
+	Pragma("noescape")
+	Doc(name + " multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.")
+	nb, w, x, out := GP64(), GP64(), GP64(), GP64()
+	Load(Param("nb"), nb)
+	Load(Param("w"), w)
+	Load(Param("x"), x)
+	Load(Param("acc"), out)
+	TESTQ(nb, nb)
+	JZ(LabelRef(name + "_done"))
+
+	Label(name + "_loop")
+	// A zero to start each sum from, made from a register already set,
+	// so that the allocator sees no read of one never written.
+	zero := ZMM()
+	VMOVDQU64(Mem{Base: x}, zero)
+	VPXORD(zero, zero, zero)
+	var isum [2]VecVirtual
+	for s := range 256 / group {
+		var g [2]VecVirtual
+		for t := range 2 {
+			g[t] = ZMM()
+			VMOVDQA64(zero, g[t])
+		}
+		for q := range group / 4 {
+			quad := group/4*s + q
+			a := ZMM()
+			VMOVDQU64(Mem{Base: x, Disp: 64 * quad}, a)
+			for t := range 2 {
+				wb := ZMM()
+				VPBROADCASTD(Mem{Base: w, Disp: tileRowBytes*t + 4*quad}, wb)
+				VPDPBUSD(a, wb, g[t])
+			}
+		}
+		for t := range 2 {
+			VPMULLD_BCST(Mem{Base: w, Disp: tileRowBytes*t + tileScales + 4*s}, g[t], g[t])
+			if s == 0 {
+				isum[t] = g[t]
+				continue
+			}
+			VPADDD(g[t], isum[t], isum[t])
+		}
+	}
+
+	for t := range 2 {
+		// The sums of the activations' pairs of groups of 16, times the
+		// weights' mins or scales.
+		m := ZMM()
+		VMOVDQA64(zero, m)
+		for p := range 8 {
+			pb := ZMM()
+			VPBROADCASTD(Mem{Base: w, Disp: tileRowBytes*t + tilePairs + 4*p}, pb)
+			VPDPWSSD(Mem{Base: x, Disp: tileSums + 64*p}, pb, m)
+		}
+		xd, wd := ZMM(), ZMM()
+		VMOVUPS(Mem{Base: x, Disp: tileXD}, xd)
+		VBROADCASTSS(Mem{Base: w, Disp: tileRowBytes*t + tileD}, wd)
+		if q6 {
+			// sumi - 32·summ
+			VPSLLD(U8(5), m, m)
+			VPSUBD(m, isum[t], isum[t])
+		}
+		accumulate(wd, xd, isum[t], Mem{Base: out, Disp: 64 * t}, ZMM)
+		if !q6 {
+			wm := ZMM()
+			VBROADCASTSS(Mem{Base: w, Disp: tileRowBytes*t + tileD + 4}, wm)
+			accumulate(wm, xd, m, Mem{Base: out, Disp: 4 * (32 + 16*t)}, ZMM)
+		}
+	}
+	ADDQ(U32(2*tileRowBytes), w)
+	ADDQ(U32(tileActBytes), x)
+	DECQ(nb)
+	JNZ(LabelRef(name + "_loop"))
+
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
+}
+
+// unpackPrologue loads the arguments of an unpacking of super-blocks of a
+// row of weights, and starts its loop.
+func unpackPrologue(name, doc string) (nb, dst, w GPVirtual) {
+	TEXT(name, NOSPLIT, "func(nb int, dst, w *byte)")
+	Pragma("noescape")
+	Doc(name + " " + doc)
+	nb, dst, w = GP64(), GP64(), GP64()
+	Load(Param("nb"), nb)
+	Load(Param("dst"), dst)
+	Load(Param("w"), w)
+	TESTQ(nb, nb)
+	JZ(LabelRef(name + "_done"))
+	Label(name + "_loop")
+	return nb, dst, w
+}
+
+// unpackEpilogue advances to the next super-block and ends the loop.
+func unpackEpilogue(name string, nb, dst, w GPVirtual, blockBytes int) {
+	ADDQ(U32(tileBlock), dst)
+	ADDQ(U32(blockBytes), w)
+	DECQ(nb)
+	JNZ(LabelRef(name + "_loop"))
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
+}
+
+// unpackQ4K emits the unpacking of Q4_K super-blocks into the layout of
+// a row of a tile, as unpackQ4KRow does it.
+func unpackQ4K() {
+	name := "unpackQ4KAVX2"
+	nb, dst, w := unpackPrologue(name, "unpacks nb Q4_K super-blocks at w to dst, one every qtileBlockBytes; see unpackQ4KRow.")
+	mask := YMM()
+	VMOVDQU(nibbles, mask)
+	for c := range 4 {
+		v, hi := YMM(), YMM()
+		VMOVDQU(Mem{Base: w, Disp: 16 + 32*c}, v)
+		VPSRLW(U8(4), v, hi)
+		VPAND(mask, v, v)
+		VPAND(mask, hi, hi)
+		VMOVDQU(v, Mem{Base: dst, Disp: 64 * c})
+		VMOVDQU(hi, Mem{Base: dst, Disp: 64*c + 32})
+	}
+
+	// The scales and mins of the eight groups, a byte each, from the 12
+	// bytes of both.
+	u0, u1, u2 := GP32(), GP32(), GP32()
+	MOVL(Mem{Base: w, Disp: 4}, u0)
+	MOVL(Mem{Base: w, Disp: 8}, u1)
+	MOVL(Mem{Base: w, Disp: 12}, u2)
+	bytes := func(lo, hi4, top GPVirtual) VecVirtual {
+		// lo&0x3f3f3f3f | (hi4&0x0f0f0f0f | (top>>6&0x03030303)<<4)<<32
+		l, h, t := GP64(), GP32(), GP32()
+		MOVL(lo, l.As32())
+		ANDL(U32(0x3f3f3f3f), l.As32())
+		MOVL(hi4, h)
+		ANDL(U32(0x0f0f0f0f), h)
+		MOVL(top, t)
+		SHRL(U8(2), t)
+		ANDL(U32(0x30303030), t)
+		ORL(t, h)
+		SHLQ(U8(32), h.As64())
+		ORQ(h.As64(), l)
+		v, y := XMM(), YMM()
+		VMOVQ(l, v)
+		VPMOVZXBD(v, y)
+		return y
+	}
+	sc := bytes(u0, u2, u0)
+	VMOVDQU(sc, Mem{Base: dst, Disp: tileScales})
+	SHRL(U8(4), u2)
+	mn := bytes(u1, u2, u1)
+	sh := YMM()
+	VPSLLD(U8(16), mn, sh)
+	VPOR(sh, mn, mn)
+	VMOVDQU(mn, Mem{Base: dst, Disp: tilePairs})
+	zero := YMM()
+	VPXOR(zero, zero, zero)
+	VMOVDQU(zero, Mem{Base: dst, Disp: tileScales + 32})
+
+	d := XMM()
+	VMOVD(Mem{Base: w}, d)
+	VCVTPH2PS(d, d)
+	VMOVQ(d, Mem{Base: dst, Disp: tileD})
+	MOVQ(U32(0), Mem{Base: dst, Disp: tileD + 8})
+	unpackEpilogue(name, nb, dst, w, 144)
+}
+
+// unpackQ6K emits the unpacking of Q6_K super-blocks into the layout of
+// a row of a tile, as unpackQ6KRow does it.
+func unpackQ6K() {
+	name := "unpackQ6KAVX2"
+	nb, dst, w := unpackPrologue(name, "unpacks nb Q6_K super-blocks at w to dst, one every qtileBlockBytes; see unpackQ6KRow.")
+	lo, hi := YMM(), YMM()
+	VMOVDQU(nibbles, lo)
+	VMOVDQU(high2, hi)
+	for n := range 2 {
+		l0, l1, h := YMM(), YMM(), YMM()
+		VMOVDQU(Mem{Base: w, Disp: 64 * n}, l0)
+		VMOVDQU(Mem{Base: w, Disp: 64*n + 32}, l1)
+		VMOVDQU(Mem{Base: w, Disp: 128 + 32*n}, h)
+		// The low four bits of quarter k from l0 or l1, and the high two
+		// from bits 2k and 2k+1 of h, moved to bits 4 and 5.
+		for k := range 4 {
+			l := l0
+			if k%2 == 1 {
+				l = l1
+			}
+			q, t := YMM(), YMM()
+			if k < 2 {
+				VPAND(lo, l, q)
+			} else {
+				VPSRLW(U8(4), l, q)
+				VPAND(lo, q, q)
+			}
+			switch k {
+			case 0:
+				VPSLLW(U8(4), h, t)
+			case 1:
+				VPSLLW(U8(2), h, t)
+			case 2:
+				VMOVDQA(h, t)
+			case 3:
+				VPSRLW(U8(2), h, t)
+			}
+			VPAND(hi, t, t)
+			VPOR(t, q, q)
+			VMOVDQU(q, Mem{Base: dst, Disp: 128*n + 32*k})
+		}
+	}
+
+	for k := range 2 {
+		s := YMM()
+		VPMOVSXBD(Mem{Base: w, Disp: 192 + 8*k}, s)
+		VMOVDQU(s, Mem{Base: dst, Disp: tileScales + 32*k})
+	}
+	p := YMM()
+	VPMOVSXBW(Mem{Base: w, Disp: 192}, p)
+	VMOVDQU(p, Mem{Base: dst, Disp: tilePairs})
+
+	d := half(Mem{Base: w, Disp: 208})
+	VMOVSS(d, Mem{Base: dst, Disp: tileD})
+	MOVL(U32(0), Mem{Base: dst, Disp: tileD + 4})
+	MOVQ(U32(0), Mem{Base: dst, Disp: tileD + 8})
+	unpackEpilogue(name, nb, dst, w, 210)
 }
