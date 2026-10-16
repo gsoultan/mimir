@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
@@ -198,11 +199,13 @@ func quantizeRow(dst []byte, x []float32, bs int, sums bool) {
 		var amax float32
 		finite := true
 		for _, f := range v {
-			a := float32(math.Abs(float64(f)))
-			if !(a <= math.MaxFloat32) {
+			u := math.Float32bits(f) &^ (1 << 31)
+			if u >= 0x7f800000 {
 				finite = false
 			}
-			amax = max(amax, a)
+			if a := math.Float32frombits(u); a > amax {
+				amax = a
+			}
 		}
 		q := out[4 : 4+bs]
 		var d float32
@@ -216,8 +219,7 @@ func quantizeRow(dst []byte, x []float32, bs int, sums bool) {
 			d = amax / 127
 			id := 127 / amax
 			for i, f := range v {
-				r := math.RoundToEven(float64(f * id))
-				q[i] = byte(int8(max(-127, min(127, r))))
+				q[i] = byte(int8(max(-127, min(127, roundEven(f*id)))))
 			}
 		}
 		putF32(out, d)
@@ -235,6 +237,14 @@ func quantizeRow(dst []byte, x []float32, bs int, sums bool) {
 	}
 }
 
+// roundEven returns f, of magnitude 2²² or less, rounded to the nearest
+// integer, ties to even: adding and taking away 1.5·2²³ leaves no bits
+// below the units, and rounds them as the float32 sum is rounded.
+func roundEven(f float32) int32 {
+	const magic = 0x1.8p23
+	return int32(f + magic - magic)
+}
+
 // putF32 stores f little-endian at b.
 func putF32(b []byte, f float32) {
 	u := math.Float32bits(f)
@@ -247,6 +257,33 @@ var actScratch = sync.Pool{New: func() any { return new([]byte) }}
 // qmatmulRowWork is the least number of weights' multiply-adds worth a
 // worker of its own.
 const qmatmulRowWork = 1 << 16
+
+// qmatmulChunks is how many chunks of the rows of W each worker takes,
+// on average: the workers claim them in turn, so that one slowed down by
+// another program, or another loop, claims fewer.
+const qmatmulChunks = 8
+
+// parallelClaim runs fn over [0, n) in chunks of chunk elements, which up
+// to b.workers goroutines claim in turn until none is left. It returns
+// the first error of fn, once every claimed chunk has finished.
+func (b *Backend) parallelClaim(ctx context.Context, n, chunk int, fn func(lo, hi int) error) error {
+	chunks := (n + chunk - 1) / chunk
+	var next atomic.Int64
+	return b.parallelFor(ctx, min(b.workers, chunks), 1, func(int, int) error {
+		for {
+			c := int(next.Add(1) - 1)
+			if c >= chunks {
+				return nil
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := fn(c*chunk, min(n, (c+1)*chunk)); err != nil {
+				return err
+			}
+		}
+	})
+}
 
 // qmatmulCacheBytes bounds the quantized rows of x a tile walks while the
 // row of weights it multiplies stays in L1: they stay in L2.
@@ -324,7 +361,8 @@ func runQMatMul(ctx context.Context, b *Backend, k *backend.Kernel, outBuf backe
 	nb, wstride := kk/bs, kk/bs*w.dt.BlockBytes()
 	wdata := w.data[vw.Offset/bs*w.dt.BlockBytes():]
 	tile := max(maxRows, qmatmulCacheBytes/xstride/maxRows*maxRows)
-	return b.parallelFor(ctx, n, max(1, qmatmulRowWork/(m*kk)), func(lo, hi int) error {
+	chunk := max(qmatmulRowWork/(m*kk), n/(qmatmulChunks*b.workers), 1)
+	return b.parallelClaim(ctx, n, chunk, func(lo, hi int) error {
 		// Bounds checks here leave the kernels none to do.
 		_ = wdata[hi*wstride-1]
 		_ = xq[m*xstride-1]

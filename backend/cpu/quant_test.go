@@ -472,3 +472,73 @@ func BenchmarkMemoryBandwidth(b *testing.B) {
 		})
 	}
 }
+
+// quantizeRowRef is quantizeRow as first written, in float64.
+func quantizeRowRef(dst []byte, x []float32, bs int) {
+	for b := 0; b < len(x)/bs; b++ {
+		v, out := x[b*bs:(b+1)*bs], dst[b*(4+bs):(b+1)*(4+bs)]
+		var amax float32
+		finite := true
+		for _, f := range v {
+			a := float32(math.Abs(float64(f)))
+			if !(a <= math.MaxFloat32) {
+				finite = false
+			}
+			amax = max(amax, a)
+		}
+		q := out[4 : 4+bs]
+		var d float32
+		switch {
+		case !finite:
+			d = float32(math.NaN())
+			clear(q)
+		case amax == 0:
+			clear(q)
+		default:
+			d = amax / 127
+			id := 127 / amax
+			for i, f := range v {
+				r := math.RoundToEven(float64(f * id))
+				q[i] = byte(int8(max(-127, min(127, r))))
+			}
+		}
+		putF32(out, d)
+	}
+}
+
+func TestQuantizeRowRoundsTiesToEven(t *testing.T) {
+	rng := rand.New(rand.NewPCG(17, 18))
+	const bs = 32
+	x := make([]float32, 64*bs)
+	for b := range 64 {
+		v := x[b*bs : (b+1)*bs]
+		for i := range v {
+			switch b % 4 {
+			case 0:
+				v[i] = rng.Float32()*2 - 1
+			case 1:
+				// Halves, which an amax of 127 leaves as ties.
+				v[i] = float32(rng.IntN(254)-127) / 2
+			case 2:
+				v[i] = float32(rng.NormFloat64()) * 1e-30
+			case 3:
+				v[i] = float32(rng.NormFloat64()) * 1e30
+			}
+		}
+		if b%4 == 1 {
+			v[0] = 127
+		}
+	}
+	x[5*bs+3] = float32(math.Inf(1))
+	x[9*bs] = float32(math.NaN())
+	got, want := make([]byte, 64*(4+bs)), make([]byte, 64*(4+bs))
+	quantizeRow(got, x, bs, false)
+	quantizeRowRef(want, x, bs)
+	if !slices.Equal(got, want) {
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("byte %d of block %d = %#x, want %#x", i%(4+bs), i/(4+bs), got[i], want[i])
+			}
+		}
+	}
+}
