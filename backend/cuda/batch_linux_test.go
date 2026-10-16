@@ -39,7 +39,7 @@ func (f *fakeDriver) install(t *testing.T) {
 	}
 	saved := []any{cuCtxSetCurrent, cuLaunchKernel, cublasSgemmStridedBatched, cuGetErrorName,
 		cuStreamBeginCapture, cuStreamEndCapture, cuStreamGetCaptureInfo, cuGraphInstantiate,
-		cuGraphExecKernelNodeSetParams, cuGraphLaunch, cuGraphExecDestroy, cuGraphDestroy, graphsReady}
+		cuGraphExecKernelNodeSetParams, cuGraphLaunch, cuGraphExecDestroy, cuGraphDestroy, graphsReady, graphsOn}
 	t.Cleanup(func() {
 		cuCtxSetCurrent = saved[0].(func(uintptr) result)
 		cuLaunchKernel = saved[1].(func(uintptr, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uintptr, *unsafe.Pointer, uintptr) result)
@@ -54,6 +54,7 @@ func (f *fakeDriver) install(t *testing.T) {
 		cuGraphExecDestroy = saved[10].(func(uintptr) result)
 		cuGraphDestroy = saved[11].(func(uintptr) result)
 		graphsReady = saved[12].(func() error)
+		graphsOn = saved[13].(bool)
 	})
 	cuCtxSetCurrent = func(uintptr) result { return cudaSuccess }
 	cuGetErrorName = func(result, **byte) result { return 1 }
@@ -104,6 +105,7 @@ func (f *fakeDriver) install(t *testing.T) {
 	cuGraphExecDestroy = func(uintptr) result { f.destroyedExecs++; return cudaSuccess }
 	cuGraphDestroy = func(uintptr) result { f.destroyedGraphs++; return cudaSuccess }
 	graphsReady = func() error { return nil }
+	graphsOn = true
 }
 
 // fakeBatch returns a backend over the fake driver and a batch of a fused
@@ -191,10 +193,49 @@ func TestBatchesLaunchAsCUDAGraphs(t *testing.T) {
 		t.Errorf("updated node writes %#x, want %#x", ptr, 0x600)
 	}
 
-	// A product's new operand needs a new capture.
+	// A product's new operand needs a new capture, which waits for the
+	// batch's runs to repeat twice.
 	bt.Ins[1][0] = &buffer{ptr: 0x700, dt: backend.Float32, n: 16}
 	run("new operand")
-	want("a product's new operand captures the graph again", counts{launches: 3, products: 3, captures: 2, instantiated: 2, graphLaunches: 5, updates: 2, destroyedExecs: 1, destroyedGraphs: 1})
+	want("a product's new operand drops the graph", counts{launches: 3, products: 3, captures: 1, instantiated: 1, graphLaunches: 4, updates: 2, destroyedExecs: 1, destroyedGraphs: 1})
+	run("first repeat")
+	want("a run that repeats once launches one by one", counts{launches: 4, products: 4, captures: 1, instantiated: 1, graphLaunches: 4, updates: 2, destroyedExecs: 1, destroyedGraphs: 1})
+	run("second repeat")
+	want("a run that repeats twice captures the graph again", counts{launches: 5, products: 5, captures: 2, instantiated: 2, graphLaunches: 5, updates: 2, destroyedExecs: 1, destroyedGraphs: 1})
+}
+
+// TestBatchesWhoseProductsMoveLaunchOneByOne checks that a batch whose
+// products take other buffers from run to run does not capture its graph
+// again and again, which costs more than its launches.
+func TestBatchesWhoseProductsMoveLaunchOneByOne(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		every    int // runs between moves of a product
+		captures int
+	}{
+		{"every run", 1, 0},
+		{"every other run", 2, 1}, // the second run repeats the first
+		{"every eighth run", 8, 3},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeDriver{}
+			f.install(t)
+			b, bt := fakeBatch(t)
+			const runs = 64
+			for i := range runs {
+				if i > 0 && i%c.every == 0 {
+					bt.Ins[1][0] = &buffer{ptr: 0x1000 + uint64(i), dt: backend.Float32, n: 16}
+				}
+				if err := b.RunBatch(t.Context(), bt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A capture issues the calls too, without running them.
+			if f.captures != c.captures || f.products-f.captures+f.graphLaunches != runs {
+				t.Errorf("driver saw %+v, want %d runs and %d captures", f.counts, runs, c.captures)
+			}
+		})
+	}
 }
 
 func TestBatchesFallBackWhenCaptureFails(t *testing.T) {
@@ -217,8 +258,7 @@ func TestBatchesFallBackWhenCaptureFails(t *testing.T) {
 func TestBatchesWithoutGraphsLaunchOneByOne(t *testing.T) {
 	f := &fakeDriver{}
 	f.install(t)
-	defer func(off bool) { graphsOff = off }(graphsOff)
-	graphsOff = true
+	graphsOn = false
 	b, bt := fakeBatch(t)
 	for range 3 {
 		if err := b.RunBatch(t.Context(), bt); err != nil {
