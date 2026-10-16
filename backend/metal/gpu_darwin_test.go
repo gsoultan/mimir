@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/internal/kerneltest"
 )
 
 var (
@@ -28,7 +29,7 @@ type gpuTarget struct {
 
 // newGPU returns the Metal device as a target, or nil if there is none or
 // it cannot run the products asked of it.
-func newGPU(t *testing.T, mpsMin, tensorMin int) target {
+func newGPU(t *testing.T, mpsMin, tensorMin int) kerneltest.Target {
 	t.Helper()
 	gpuOnce.Do(func() { gpu, gpuErr = New() })
 	if gpuErr != nil {
@@ -49,7 +50,7 @@ func newGPU(t *testing.T, mpsMin, tensorMin int) target {
 	return gpuTarget{gpu, mpsMin, tensorMin}
 }
 
-func (g gpuTarget) run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buffer) ([][]byte, bool) {
+func (g gpuTarget) Run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buffer) ([][]byte, bool) {
 	t.Helper()
 	// The GPU is shared by parallel tests, and a Sync reports the errors
 	// of every kernel run since the last one, so tests take turns.
@@ -68,7 +69,7 @@ func (g gpuTarget) run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buff
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := g.b.Upload(t.Context(), b, contents(t, src)); err != nil {
+		if err := g.b.Upload(t.Context(), b, kerneltest.Contents(t, src)); err != nil {
 			t.Fatal(err)
 		}
 		return b
@@ -118,7 +119,7 @@ func BenchmarkMatMul(b *testing.B) {
 			be                backend.Backend
 			mpsMin, tensorMin int
 		}{
-			{"cpu", host, -1, -1},
+			{"cpu", kerneltest.Host, -1, -1},
 			{"kernel", be, -1, -1},
 			{"mps", be, 0, -1},
 			{"tensor", be, -1, 0},

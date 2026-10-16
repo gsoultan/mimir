@@ -1,4 +1,18 @@
-package metal
+// Package gen generates the source of the kernels GPU backends run: one
+// kernel per Backend.Run, in the C++ dialect of the device, Metal Shading
+// Language or CUDA C++.
+//
+// The source depends on the structure of a kernel: its op, dtypes, the
+// rank of its coalesced shape, which inputs are read contiguously and
+// which strides are zero. Sizes, strides, offsets and constants are
+// parameters, so kernels that differ only in them share one compiled
+// program.
+//
+// Each thread computes one output element, except for long reductions,
+// where a group of GroupSize threads computes one. Threads visit the
+// inputs an element sums in the same order as the CPU backend, so sums
+// that one thread computes match it bit for bit.
+package gen
 
 import (
 	"fmt"
@@ -9,45 +23,34 @@ import (
 	"github.com/gsoultan/mimir/backend"
 )
 
-// Every kernel runs as Metal Shading Language source that this file
-// generates, one dispatch per Backend.Run. The source depends on the
-// structure of a kernel: its op, dtypes, the rank of its coalesced shape,
-// which inputs are read contiguously and which strides are zero. Sizes,
-// strides and offsets are parameters, so kernels that differ only in them
-// share one compiled pipeline.
-//
-// Each thread computes one output element, except for long reductions,
-// where a threadgroup of groupSize threads computes one. Threads visit the
-// inputs an element sums in the same order as the CPU backend, so sums
-// that one thread computes match it bit for bit.
+// GroupSize is the number of threads in a group: a Metal threadgroup or a
+// CUDA block.
+const GroupSize = 256
 
-// groupSize is the number of threads in a threadgroup.
-const groupSize = 256
-
-// Error codes a kernel ORs into its error word.
+// Bits a kernel ORs into its error word.
 const (
-	errDivideByZero = 1 << iota
-	errIndex
+	ErrDivideByZero = 1 << iota
+	ErrIndex
 )
 
-// launch is one compute dispatch: kernel k of src, run as groups
-// threadgroups of threads threads each. The kernel binds the outputs, then
-// the inputs, then params as constant int* p, then the error word.
-type launch struct {
-	src      string
-	groups   int
-	threads  int
-	params   []int32
-	barriers bool // threads of a threadgroup synchronize
-	metal4   bool // the source is Metal Shading Language 4
+// Launch is one kernel launch: kernel k of Src, run as Groups groups of
+// Threads threads each. The kernel takes the outputs, then the inputs,
+// then Params, then the error word.
+type Launch struct {
+	Src      string
+	Groups   int
+	Threads  int
+	Params   []int32
+	Barriers bool // threads of a group synchronize
 }
 
-// maxElems bounds the elements of a buffer and the offsets kernels
+// MaxElems bounds the elements of a buffer and the offsets kernels
 // compute, which are 32-bit ints.
-const maxElems = math.MaxInt32
+const MaxElems = math.MaxInt32
 
 // gen builds the source of one kernel.
 type gen struct {
+	d      *Dialect
 	k      *backend.Kernel
 	outs   []backend.DType
 	ins    []backend.DType
@@ -57,8 +60,8 @@ type gen struct {
 	err    error
 }
 
-func newGen(k *backend.Kernel, outs, ins []backend.Buffer) *gen {
-	g := &gen{k: k}
+func newGen(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) *gen {
+	g := &gen{d: d, k: k}
 	for _, b := range outs {
 		g.outs = append(g.outs, b.DType())
 	}
@@ -74,7 +77,7 @@ func (g *gen) param(v int) string {
 		g.err = fmt.Errorf("value %d does not fit a 32-bit kernel parameter: %w", v, backend.ErrShape)
 	}
 	g.params = append(g.params, int32(v))
-	return fmt.Sprintf("p[%d]", len(g.params)-1)
+	return fmt.Sprintf(g.d.param, len(g.params)-1)
 }
 
 // v returns a fresh variable name.
@@ -87,65 +90,26 @@ func (g *gen) line(format string, args ...any) {
 	fmt.Fprintf(&g.body, "\t"+format+"\n", args...)
 }
 
-// launch returns the dispatch of the generated kernel over n elements, one
-// thread each.
-func (g *gen) perElement(n int) (*launch, error) {
-	return g.finish((n+groupSize-1)/groupSize, false)
+// perElement returns the launch of the generated kernel over n elements,
+// one thread each.
+func (g *gen) perElement(n int) (*Launch, error) {
+	return g.finish((n+GroupSize-1)/GroupSize, false)
 }
 
-func (g *gen) finish(groups int, barriers bool) (*launch, error) {
+func (g *gen) finish(groups int, barriers bool) (*Launch, error) {
 	if g.err != nil {
 		return nil, g.err
 	}
+	if len(g.params) == 0 {
+		g.params = []int32{0} // a Metal constant buffer may not be empty
+	}
 	var s strings.Builder
-	s.WriteString(prelude)
-	s.WriteString("kernel void k(")
-	var args []string
-	for i, dt := range g.outs {
-		args = append(args, fmt.Sprintf("device %s* o%d [[buffer(%d)]]", typeName(dt), i, len(args)))
-	}
-	for i, dt := range g.ins {
-		args = append(args, fmt.Sprintf("const device %s* i%d [[buffer(%d)]]", typeName(dt), i, len(args)))
-	}
-	n := len(args)
-	args = append(args,
-		fmt.Sprintf("constant int* p [[buffer(%d)]]", n),
-		fmt.Sprintf("device atomic_uint* err [[buffer(%d)]]", n+1),
-		"uint gid [[thread_position_in_grid]]",
-		"uint tid [[thread_position_in_threadgroup]]",
-		"uint bid [[threadgroup_position_in_grid]]")
-	s.WriteString(strings.Join(args, ", "))
-	s.WriteString(") {\n")
+	s.WriteString(g.d.prelude)
+	g.d.signature(&s, g.outs, g.ins, len(g.params))
 	s.WriteString(g.body.String())
 	s.WriteString("}\n")
-	if len(g.params) == 0 {
-		g.params = []int32{0} // a constant buffer may not be empty
-	}
-	return &launch{src: s.String(), groups: groups, threads: groupSize, params: g.params, barriers: barriers}, nil
+	return &Launch{Src: s.String(), Groups: groups, Threads: GroupSize, Params: g.params, Barriers: barriers}, nil
 }
-
-// prelude declares the helpers kernels share. mx is the maximum that
-// propagates NaN and orders -0 below +0, like Go's max; md is the
-// truncated remainder of int32s, which reports division by zero.
-const prelude = `#include <metal_stdlib>
-using namespace metal;
-
-static inline float mx(float a, float b) {
-	if (a != a || b != b) return a + b;
-	if (a == b) return signbit(a) ? b : a;
-	return a > b ? a : b;
-}
-static inline int mx(int a, int b) { return a > b ? a : b; }
-static inline int md(int a, int b, device atomic_uint* err) {
-	if (b == 0) {
-		atomic_fetch_or_explicit(err, 1u, memory_order_relaxed);
-		return 0;
-	}
-	return b == -1 ? 0 : a % b;
-}
-static inline float md(float a, float b, device atomic_uint* err) { return fmod(a, b); }
-
-`
 
 func typeName(dt backend.DType) string {
 	if dt == backend.Float32 {
@@ -159,18 +123,21 @@ func typeName(dt backend.DType) string {
 // an optimizer's update at each step, share one compiled pipeline.
 func (g *gen) constant(v float64, dt backend.DType) string {
 	if dt == backend.Float32 {
-		return fmt.Sprintf("as_type<float>(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
+		return fmt.Sprintf("fbits(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
 	}
 	return g.param(int(int32(v)))
 }
 
-// literal returns an exact MSL expression for v converted to dt, as the
-// CPU backend converts it.
+// literal returns an exact expression for v converted to dt, as the CPU
+// backend converts it.
 func literal(v float64, dt backend.DType) string {
 	if dt == backend.Float32 {
-		return fmt.Sprintf("as_type<float>(0x%08xu)", math.Float32bits(float32(v)))
+		return fmt.Sprintf("fbits(0x%08xu)", math.Float32bits(float32(v)))
 	}
-	return fmt.Sprintf("as_type<int>(0x%08xu)", uint32(int32(v)))
+	if i := int32(v); i != math.MinInt32 {
+		return fmt.Sprint(i)
+	}
+	return "(-2147483647 - 1)"
 }
 
 // offsets emits code that sets, for the element at linear index lin of
@@ -346,19 +313,20 @@ func checkProgram(prog []backend.Instr, stores []int, out backend.DType, ins []b
 // indexable reports an error if a kernel cannot index an output of n
 // elements or one of the inputs in int.
 func indexable(n int, ins []backend.Buffer) error {
-	if n > maxElems {
-		return fmt.Errorf("%d elements exceed the %d a Metal kernel indexes: %w", n, maxElems, backend.ErrShape)
+	if n > MaxElems {
+		return fmt.Errorf("%d elements exceed the %d a GPU kernel indexes: %w", n, MaxElems, backend.ErrShape)
 	}
 	for _, b := range ins {
-		if b.Len() > maxElems {
-			return fmt.Errorf("input of %d elements exceeds the %d a Metal kernel indexes: %w", b.Len(), maxElems, backend.ErrShape)
+		if b.Len() > MaxElems {
+			return fmt.Errorf("input of %d elements exceeds the %d a GPU kernel indexes: %w", b.Len(), MaxElems, backend.ErrShape)
 		}
 	}
 	return nil
 }
 
-// plan returns the dispatch that runs k, or nil if k has no elements.
-func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
+// Plan returns the launch that runs k in dialect d, or nil if k has no
+// elements.
+func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, error) {
 	n, _ := backend.NumElements(k.Shape)
 	if err := indexable(n, ins); err != nil {
 		return nil, err
@@ -366,7 +334,7 @@ func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
 	if n == 0 {
 		return nil, nil
 	}
-	g := newGen(k, outs, ins)
+	g := newGen(d, k, outs, ins)
 	g.line("if (gid >= uint(%s)) return;", g.param(n))
 	g.line("int i = int(gid);")
 	switch op := k.Op; {
@@ -389,7 +357,7 @@ func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
 	case op == backend.OpRandUniform || op == backend.OpRandNormal:
 		return g.random(n)
 	case op.IsReduce():
-		return planReduce(k, outs, ins, n)
+		return planReduce(d, k, outs, ins, n)
 	case op == backend.OpPad:
 		return g.pad(n)
 	case op == backend.OpGather:
@@ -403,12 +371,12 @@ func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
 	case op == backend.OpMatMul:
 		return g.matmul(n)
 	}
-	return nil, fmt.Errorf("no metal kernel for %s: %w", k.Op, backend.ErrInternal)
+	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
 
 // elementwise emits a program over inputs read through views of the
 // output's shape, writing its value and the values it stores.
-func (g *gen) elementwise(n int, prog []backend.Instr, stores []int) (*launch, error) {
+func (g *gen) elementwise(n int, prog []backend.Instr, stores []int) (*Launch, error) {
 	if err := checkProgram(prog, stores, g.k.DType, g.ins); err != nil {
 		return nil, err
 	}
@@ -429,31 +397,33 @@ func (g *gen) elementwise(n int, prog []backend.Instr, stores []int) (*launch, e
 
 // random fills the output from Philox4x32-10, as the CPU backend does:
 // element i comes from word i%4 of block i/4.
-func (g *gen) random(n int) (*launch, error) {
+func (g *gen) random(n int) (*Launch, error) {
 	if g.k.DType != backend.Float32 {
 		return nil, backend.ErrDType
 	}
 	seed := g.k.Attrs.Seed
-	g.line("uint4 w = uint4(uint(i / 4), 0u, 0u, 0u);")
-	g.line("uint2 key = uint2(as_type<uint>(%s), as_type<uint>(%s));", g.param(int(int32(uint32(seed)))), g.param(int(int32(uint32(seed>>32)))))
+	g.line("uint w0 = uint(i / 4), w1 = 0u, w2 = 0u, w3 = 0u;")
+	g.line("uint key0 = uint(%s), key1 = uint(%s);", g.param(int(int32(uint32(seed)))), g.param(int(int32(uint32(seed>>32)))))
 	g.line("for (int round = 0; round < 10; round++) {")
-	g.line("\tif (round > 0) { key.x += 0x9E3779B9u; key.y += 0xBB67AE85u; }")
-	g.line("\tuint hi0 = mulhi(0xD2511F53u, w.x), lo0 = 0xD2511F53u * w.x;")
-	g.line("\tuint hi1 = mulhi(0xCD9E8D57u, w.z), lo1 = 0xCD9E8D57u * w.z;")
-	g.line("\tw = uint4(hi1 ^ w.y ^ key.x, lo1, hi0 ^ w.w ^ key.y, lo0);")
+	g.line("\tif (round > 0) { key0 += 0x9E3779B9u; key1 += 0xBB67AE85u; }")
+	g.line("\tuint hi0 = mulhi(0xD2511F53u, w0), lo0 = 0xD2511F53u * w0;")
+	g.line("\tuint hi1 = mulhi(0xCD9E8D57u, w2), lo1 = 0xCD9E8D57u * w2;")
+	g.line("\tuint y0 = hi1 ^ w1 ^ key0, y2 = hi0 ^ w3 ^ key1;")
+	g.line("\tw0 = y0; w1 = lo1; w2 = y2; w3 = lo0;")
 	g.line("}")
 	g.line("int lane = i %% 4;")
 	if g.k.Op == backend.OpRandUniform {
-		g.line("o0[i] = float(w[lane] >> 8) * 5.9604644775390625e-8f;")
+		g.line("uint w = lane == 0 ? w0 : lane == 1 ? w1 : lane == 2 ? w2 : w3;")
+		g.line("o0[i] = float(w >> 8) * 5.9604644775390625e-8f;")
 		return g.perElement(n)
 	}
-	g.line("int pair = lane & ~1;")
-	g.line("float u1 = float((w[pair] >> 8) + 1u) * 5.9604644775390625e-8f;")
-	g.line("float u2 = float(w[pair + 1] >> 8) * 5.9604644775390625e-8f;")
+	g.line("uint wa = lane < 2 ? w0 : w2, wb = lane < 2 ? w1 : w3;")
+	g.line("float u1 = float((wa >> 8) + 1u) * 5.9604644775390625e-8f;")
+	g.line("float u2 = float(wb >> 8) * 5.9604644775390625e-8f;")
 	g.line("float r = sqrt(-2.0f * log(u1));")
 	// The angle is 2πu2. Doubling u2 is exact, while multiplying by 2π in
 	// float would round the angle by as much as 2.4e-7.
-	g.line("o0[i] = (lane & 1) == 0 ? r * cospi(2.0f * u2) : r * sinpi(2.0f * u2);")
+	g.line("o0[i] = (lane & 1) == 0 ? r * cos_pi(2.0f * u2) : r * sin_pi(2.0f * u2);")
 	return g.perElement(n)
 }
 
@@ -463,9 +433,9 @@ func reduceInit(op backend.Op, dt backend.DType) string {
 	case op == backend.OpReduceSum:
 		return literal(0, dt)
 	case dt == backend.Float32:
-		return "-INFINITY"
+		return "fbits(0xff800000u)"
 	default:
-		return "as_type<int>(0x80000000u)"
+		return literal(math.MinInt32, dt)
 	}
 }
 
@@ -480,9 +450,8 @@ func reduceStep(op backend.Op, acc, x string) string {
 // planReduce reduces the input over k.Attrs.Axes. Each output element
 // combines its reduced positions in row-major order, one thread per
 // element, unless there are few elements that each reduce many positions:
-// then a threadgroup computes each, and sums are no longer in the CPU's
-// order.
-func planReduce(k *backend.Kernel, outs, ins []backend.Buffer, n int) (*launch, error) {
+// then a group computes each, and sums are no longer in the CPU's order.
+func planReduce(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int) (*Launch, error) {
 	v := k.In[0]
 	if len(v.Shape) != len(k.Shape) || ins[0].DType() != k.DType {
 		return nil, fmt.Errorf("reduction of %v to %v: %w", v.Shape, k.Shape, backend.ErrInternal)
@@ -503,24 +472,24 @@ func planReduce(k *backend.Kernel, outs, ins []backend.Buffer, n int) (*launch, 
 	positions, _ := backend.NumElements(rshape)
 	kshape, kviews := backend.Coalesce(k.Shape, []backend.View{kept})
 
-	g := newGen(k, outs, ins)
+	g := newGen(d, k, outs, ins)
 	t := typeName(k.DType)
 	init := reduceInit(k.Op, k.DType)
 	if positions >= 1024 || positions >= 128 && n < 4096 {
-		// A threadgroup per output element.
+		// A group per output element.
 		g.line("int i = int(bid);")
 		base := g.offsets("i", kshape, kviews)[0]
 		g.line("%s acc = %s;", t, init)
-		g.line("for (int j = int(tid); j < %s; j += %d) {", g.param(positions), groupSize)
+		g.line("for (int j = int(tid); j < %s; j += %d) {", g.param(positions), GroupSize)
 		off := g.offsets("j", rshape, []backend.View{red})[0]
 		g.line("\tacc = %s;", reduceStep(k.Op, "acc", fmt.Sprintf("i0[%s + %s]", base, off)))
 		g.line("}")
-		g.line("threadgroup %s part[%d];", t, groupSize)
+		g.line("%s %s part[%d];", d.shared, t, GroupSize)
 		g.line("part[tid] = acc;")
-		g.line("threadgroup_barrier(mem_flags::mem_threadgroup);")
-		g.line("for (uint s = %d; s > 0; s >>= 1) {", groupSize/2)
+		g.line("%s;", d.sync)
+		g.line("for (uint s = %d; s > 0; s >>= 1) {", GroupSize/2)
 		g.line("\tif (tid < s) part[tid] = %s;", reduceStep(k.Op, "part[tid]", "part[tid + s]"))
-		g.line("\tthreadgroup_barrier(mem_flags::mem_threadgroup);")
+		g.line("\t%s;", d.sync)
 		g.line("}")
 		g.line("if (tid == 0) o0[i] = part[0];")
 		return g.finish(n, true)
@@ -546,7 +515,7 @@ func planReduce(k *backend.Kernel, outs, ins []backend.Buffer, n int) (*launch, 
 }
 
 // pad copies the input into the middle of the output and fills the rest.
-func (g *gen) pad(n int) (*launch, error) {
+func (g *gen) pad(n int) (*Launch, error) {
 	v := g.k.In[0]
 	if len(g.k.Attrs.Pads) != len(v.Shape) || len(g.k.Shape) != len(v.Shape) {
 		return nil, fmt.Errorf("pad of %v by %v: %w", v.Shape, g.k.Attrs.Pads, backend.ErrInternal)
@@ -565,7 +534,7 @@ func (g *gen) pad(n int) (*launch, error) {
 }
 
 // gather reads out[m] = src[m with m[axis] = idx[m]].
-func (g *gen) gather(n int) (*launch, error) {
+func (g *gen) gather(n int) (*Launch, error) {
 	axis := g.k.Attrs.Axis
 	vs, vi := g.k.In[0], g.k.In[1]
 	if g.ins[1] != backend.Int32 || axis < 0 || axis >= len(g.k.Shape) || len(vs.Shape) != len(g.k.Shape) {
@@ -577,7 +546,7 @@ func (g *gen) gather(n int) (*launch, error) {
 	offs := g.offsets("i", shape, views)
 	g.line("int j = i1[%s];", offs[0])
 	g.line("if (j < 0 || j >= %s) {", g.param(vs.Shape[axis]))
-	g.line("\tatomic_fetch_or_explicit(err, %du, memory_order_relaxed);", errIndex)
+	g.line("\treport(err, %du);", ErrIndex)
 	g.line("\to0[i] = 0;")
 	g.line("\treturn;")
 	g.line("}")
@@ -590,7 +559,7 @@ func (g *gen) gather(n int) (*launch, error) {
 // land on it in the order of their position along axis, as the CPU
 // backend does, and the threads at position 0 along axis check the
 // indices of their column.
-func (g *gen) scatterAdd(n int) (*launch, error) {
+func (g *gen) scatterAdd(n int) (*Launch, error) {
 	axis := g.k.Attrs.Axis
 	vd, vi, vu := g.k.In[0], g.k.In[1], g.k.In[2]
 	r := len(g.k.Shape)
@@ -619,7 +588,7 @@ func (g *gen) scatterAdd(n int) (*launch, error) {
 	g.line("\tint si = %s, su = %s;", g.param(vi.Strides[axis]), g.param(vu.Strides[axis]))
 	g.line("\tfor (int j = 0; j < %s; j++) {", g.param(vi.Shape[axis]))
 	g.line("\t\tint to = i1[idx + j * si];")
-	g.line("\t\tif (at == 0 && (to < 0 || to >= limit)) atomic_fetch_or_explicit(err, %du, memory_order_relaxed);", errIndex)
+	g.line("\t\tif (at == 0 && (to < 0 || to >= limit)) report(err, %du);", ErrIndex)
 	g.line("\t\tif (to == at) acc = acc + i2[upd + j * su];")
 	g.line("\t}")
 	g.line("}")
@@ -640,7 +609,7 @@ func (g *gen) windows() (s int, err error) {
 
 // unfold copies the sliding windows of the input: element [b, k, o] reads
 // input [b, o*stride - pad + k*dilation], or the fill value in the padding.
-func (g *gen) unfold(n int) (*launch, error) {
+func (g *gen) unfold(n int) (*Launch, error) {
 	s, err := g.windows()
 	if err != nil {
 		return nil, err
@@ -671,7 +640,7 @@ func (g *gen) unfold(n int) (*launch, error) {
 // fold sums the windows of the input into the output, dropping the
 // padding: output [b, x] adds input [b, k, o] for every kernel offset k,
 // in row-major order, whose window position o reads x.
-func (g *gen) fold(n int) (*launch, error) {
+func (g *gen) fold(n int) (*Launch, error) {
 	s, err := g.windows()
 	if err != nil {
 		return nil, err
@@ -713,7 +682,7 @@ func (g *gen) fold(n int) (*launch, error) {
 // matmul computes [..., M, K] x [..., K, N] -> [..., M, N], summing the
 // products over the batch axes k.Attrs.Axes, one thread per output
 // element, and applies the epilogue program, if any, to the result.
-func (g *gen) matmul(n int) (*launch, error) {
+func (g *gen) matmul(n int) (*Launch, error) {
 	k := g.k
 	vx, vy := k.In[0], k.In[1]
 	r := len(k.Shape)
@@ -769,7 +738,7 @@ func (g *gen) matmul(n int) (*launch, error) {
 // product g.k if it has one. The epilogue reads the product as input 0 and
 // inputs 2 on as inputs 1 on, through views of a shape that lists the
 // output's elements in row-major order.
-func (g *gen) epilogue(n int, acc string) (*launch, error) {
+func (g *gen) epilogue(n int, acc string) (*Launch, error) {
 	k := g.k
 	if k.Attrs.Program == nil {
 		g.line("o0[i] = %s;", acc)

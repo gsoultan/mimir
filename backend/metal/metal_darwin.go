@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/internal/gen"
 )
 
 // Backend runs kernels on the default Metal device. It is safe for
@@ -115,7 +116,7 @@ func (b *Backend) DeviceName() string { return b.name }
 // Alloc returns a zeroed buffer of n elements in memory the CPU and GPU
 // share.
 func (b *Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
-	if n < 0 || n > maxElems {
+	if n < 0 || n > gen.MaxElems {
 		return nil, fmt.Errorf("metal: alloc %d elements: %w", n, backend.ErrShape)
 	}
 	if dt.Size() == 0 {
@@ -213,9 +214,9 @@ func (b *Backend) Sync(ctx context.Context) error {
 	word := (*uint32)(b.errWord.data)
 	switch w := *word; {
 	case err != nil:
-	case w&errDivideByZero != 0:
+	case w&gen.ErrDivideByZero != 0:
 		err = fmt.Errorf("metal: %w", backend.ErrDivideByZero)
-	case w&errIndex != 0:
+	case w&gen.ErrIndex != 0:
 		err = fmt.Errorf("metal: %w", backend.ErrIndex)
 	}
 	*word = 0
@@ -284,44 +285,44 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	for i, buf := range ins {
 		lens[i] = buf.Len()
 	}
-	g, isGEMM := planGEMM(k, lens)
+	g, isGEMM := gen.PlanGEMM(k, lens)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	work := g.batch * g.m * g.n * g.k
+	work := g.Batch * g.M * g.N * g.K
 	switch {
 	case isGEMM && b.tensorMin >= 0 && work >= b.tensorMin:
 		l, err := planTensorGEMM(g, len(ins))
 		if err != nil {
 			return fmt.Errorf("metal: %s: %w", k.Op, err)
 		}
-		return b.encodeProduct(k, outs, ins, bufs, func() error { return b.encode(k, l, bufs) })
-	case isGEMM && b.mpsMin >= 0 && work >= b.mpsMin && g.packed():
+		return b.encodeProduct(k, outs, ins, bufs, func() error { return b.encode(k, l, true, bufs) })
+	case isGEMM && b.mpsMin >= 0 && work >= b.mpsMin && packed(g):
 		return b.encodeProduct(k, outs, ins, bufs, func() error { b.encodeGEMM(g, bufs); return nil })
 	}
-	l, err := plan(k, outs, ins)
+	l, err := gen.Plan(gen.Metal, k, outs, ins)
 	if err != nil {
 		return fmt.Errorf("metal: %s: %w", k.Op, err)
 	}
 	if l == nil {
 		return nil
 	}
-	return b.encode(k, l, bufs)
+	return b.encode(k, l, false, bufs)
 }
 
 // encodeProduct encodes a product of k with encodeGEMM, then its
 // epilogue, if it has one. b.mu is held.
 func (b *Backend) encodeProduct(k *backend.Kernel, outs, ins []backend.Buffer, bufs []*buffer, encodeGEMM func() error) error {
-	var epilogue *launch
+	var epilogue *gen.Launch
 	if k.Attrs.Program != nil {
 		var err error
-		if epilogue, err = planEpilogue(k, outs, ins); err != nil {
+		if epilogue, err = gen.PlanEpilogue(gen.Metal, k, outs, ins); err != nil {
 			return fmt.Errorf("metal: %s: %w", k.Op, err)
 		}
 	}
 	if err := encodeGEMM(); err != nil || epilogue == nil {
 		return err
 	}
-	return b.encode(k, epilogue, bufs)
+	return b.encode(k, epilogue, false, bufs)
 }
 
 // tensorOpsSupported reports whether the device runs Metal 4 tensor
@@ -348,9 +349,10 @@ func (b *Backend) tensorOpsSupported() bool {
 }
 
 // encode encodes the launch l of k over bufs, the outputs then the
-// inputs. b.mu is held.
-func (b *Backend) encode(k *backend.Kernel, l *launch, bufs []*buffer) error {
-	pso, err := b.pipeline(l.src, l.metal4, l.threads)
+// inputs. Its source is Metal Shading Language 4 if metal4 is set. b.mu
+// is held.
+func (b *Backend) encode(k *backend.Kernel, l *gen.Launch, metal4 bool, bufs []*buffer) error {
+	pso, err := b.pipeline(l.Src, metal4, l.Threads)
 	if err != nil {
 		return fmt.Errorf("metal: %s: %w", k.Op, err)
 	}
@@ -360,10 +362,10 @@ func (b *Backend) encode(k *backend.Kernel, l *launch, bufs []*buffer) error {
 		for i, mb := range bufs {
 			send(enc, selSetBuffer, uintptr(mb.obj), 0, uintptr(i))
 		}
-		send(enc, selSetBytes, uintptr(unsafe.Pointer(&l.params[0])), uintptr(4*len(l.params)), uintptr(len(bufs)))
+		send(enc, selSetBytes, uintptr(unsafe.Pointer(&l.Params[0])), uintptr(4*len(l.Params)), uintptr(len(bufs)))
 		send(enc, selSetBuffer, uintptr(b.errWord.obj), 0, uintptr(len(bufs)+1))
-		groups := &[3]uint{uint(l.groups), 1, 1}
-		threads := &[3]uint{uint(l.threads), 1, 1}
+		groups := &[3]uint{uint(l.Groups), 1, 1}
+		threads := &[3]uint{uint(l.Threads), 1, 1}
 		send(enc, selDispatch, uintptr(unsafe.Pointer(groups)), uintptr(unsafe.Pointer(threads)))
 	})
 	runtime.KeepAlive(l)
@@ -373,30 +375,30 @@ func (b *Backend) encode(k *backend.Kernel, l *launch, bufs []*buffer) error {
 
 // encodeGEMM encodes the product g with Metal Performance Shaders, from
 // bufs[1] and bufs[2] into bufs[0]. b.mu is held.
-func (b *Backend) encodeGEMM(g gemm, bufs []*buffer) {
+func (b *Backend) encodeGEMM(g gen.GEMM, bufs []*buffer) {
 	const float32Type = 0x10000000 | 32 // MPSDataTypeFloat32
-	key := gemmKey{g.a.trans, g.b.trans, g.m, g.n, g.k}
+	key := gemmKey{g.A.Trans, g.B.Trans, g.M, g.N, g.K}
 	autoreleased(func() {
 		kern := b.gemms[key]
 		if kern == 0 {
 			kern = initMatMul(id(send(id(getClass("MPSMatrixMultiplication")), selAlloc)), selInitMatMul,
-				b.dev, g.a.trans, g.b.trans, uint(g.m), uint(g.n), uint(g.k), 1, 0)
+				b.dev, g.A.Trans, g.B.Trans, uint(g.M), uint(g.N), uint(g.K), 1, 0)
 			b.gemms[key] = kern
 		}
 		mat := func(buf *buffer, offset, rows, cols, ld, stride int) id {
 			desc := id(send(id(getClass("MPSMatrixDescriptor")), selMatrixDescriptor,
-				uintptr(rows), uintptr(cols), uintptr(g.batch), uintptr(4*ld), uintptr(4*stride), float32Type))
+				uintptr(rows), uintptr(cols), uintptr(g.Batch), uintptr(4*ld), uintptr(4*stride), float32Type))
 			return id(send(id(send(id(getClass("MPSMatrix")), selAlloc)), selInitMatrix, uintptr(buf.obj), uintptr(4*offset), uintptr(desc)))
 		}
-		left := mat(bufs[1], g.a.offset, g.a.rows, g.a.cols, g.a.ld, g.a.stride)
+		left := mat(bufs[1], g.A.Offset, g.A.Rows, g.A.Cols, g.A.LD, g.A.Stride)
 		defer release(left)
-		right := mat(bufs[2], g.b.offset, g.b.rows, g.b.cols, g.b.ld, g.b.stride)
+		right := mat(bufs[2], g.B.Offset, g.B.Rows, g.B.Cols, g.B.LD, g.B.Stride)
 		defer release(right)
-		result := mat(bufs[0], 0, g.m, g.n, g.n, g.resultSize)
+		result := mat(bufs[0], 0, g.M, g.N, g.N, g.ResultSize)
 		defer release(result)
 		b.endCompute()
 		send(kern, selSetBatchStart, 0)
-		send(kern, selSetBatchSize, uintptr(g.batch))
+		send(kern, selSetBatchSize, uintptr(g.Batch))
 		send(kern, selEncodeMatMul, uintptr(b.commandBuffer()), uintptr(left), uintptr(right), uintptr(result))
 	})
 	runtime.KeepAlive(bufs)
