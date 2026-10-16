@@ -5,7 +5,8 @@
 // turns movement ops into views of their input's buffer where the layout
 // allows, and frees every intermediate buffer right after its last use.
 // A target can also take over the memory of a realized node that the
-// caller is done with (see RealizeInto).
+// caller is done with (see RealizeInto). A schedule that would take its
+// device past a memory budget is refused before it starts (see SetBudget).
 package sched
 
 import (
@@ -278,6 +279,11 @@ func download(ctx context.Context, n *graph.Node, dst []byte) error {
 	buf, v := n.Buf(), n.View
 	if !v.IsContiguous() || v.Offset != 0 || buf.Len() != n.Size() {
 		m := poolOf(be)
+		s := m.simulate()
+		s.take(n.DType, n.Size())
+		if err := m.reserve(s); err != nil {
+			return err
+		}
 		tmp, err := runNew(ctx, m, &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: n.Shape, In: []backend.View{v}}, buf)
 		if err != nil {
 			return err
@@ -341,11 +347,15 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 	p := newPlan(order, isTarget, candidates(be, targets, dsts))
 	p.be = be
 	into := p.destinations(targets, dsts)
-	uses := make(map[*graph.Node]int, len(p.order))
-	for _, n := range p.order {
-		for _, in := range p.work[n].deps {
-			uses[in]++
-		}
+	uses := p.uses()
+	// The schedule is refused before it allocates anything if it would
+	// not fit in the budget.
+	s, err := p.forecast(m, uses, into, isTarget)
+	if err != nil {
+		return err
+	}
+	if err := m.reserve(s); err != nil {
+		return err
 	}
 
 	results := make(map[*graph.Node]result, len(order))
@@ -401,10 +411,7 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 		for i, in := range w.deps {
 			ins[i] = lookup(in)
 		}
-		nodes := []*graph.Node{n}
-		for _, s := range w.stores {
-			nodes = append(nodes, s.n)
-		}
+		nodes := w.nodes(n)
 		err := ctx.Err()
 		if err == nil && slices.ContainsFunc(nodes, func(x *graph.Node) bool { return into[x] != nil }) {
 			ctx = context.WithoutCancel(ctx)
@@ -412,7 +419,7 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 		var rs []result
 		var fresh []backend.Buffer
 		if err == nil {
-			rs, fresh, err = step(ctx, m, n, w, ins, nodes, into)
+			rs, fresh, err = step(ctx, m, n, w, ins, into)
 		}
 		if err != nil {
 			for buf := range refs {
@@ -450,7 +457,8 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 		return err
 	}
 	for _, r := range moved {
-		if refs[r.buf] == 0 {
+		// A view of a moved input may have released its buffer already.
+		if n, ok := refs[r.buf]; ok && n == 0 {
 			delete(refs, r.buf)
 			m.release(r.buf)
 		}
@@ -543,76 +551,59 @@ func topoSort(targets []*graph.Node) ([]*graph.Node, error) {
 }
 
 // step computes one node as w plans, from the results of w.deps, and the
-// targets its kernel stores: nodes, n first. It returns their results and
+// targets its kernel stores (see work.nodes). It returns their results and
 // the buffers it allocated, which hold the results of the nodes not in
 // into. A node in into is written over the memory of its destination
 // instead; the result of a view may also be a view of an input's buffer.
-func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result, nodes []*graph.Node, into map[*graph.Node]*graph.Node) ([]result, []backend.Buffer, error) {
-	fresh := func(buf backend.Buffer, v backend.View, err error) ([]result, []backend.Buffer, error) {
-		if err != nil {
-			return nil, nil, err
-		}
-		return []result{{buf: buf, view: v}}, []backend.Buffer{buf}, nil
-	}
-	if w.swap {
-		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
-		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
-			ins[0].view.Permute(n.Attrs.Axes), ins[1].view.Permute(n.Attrs.Axes),
-		}}
-		return runInto(ctx, m, k, nodes, into, ins[0].buf, ins[1].buf)
-	}
-	switch n.Op {
-	case backend.OpLoad:
-		return nil, nil, fmt.Errorf("sched: load without data: %w", backend.ErrInternal)
-	case backend.OpConst:
-		// One element, broadcast to the full shape with zero strides.
-		buf, err := runNew(ctx, m, &backend.Kernel{Op: backend.OpConst, DType: n.DType, Attrs: n.Attrs})
-		return fresh(buf, broadcast(n.Shape), err)
-	case backend.OpPermute, backend.OpExpand, backend.OpShrink, backend.OpFlip, backend.OpReshape:
-		in := ins[0]
-		if v, ok := viewOf(in.view, n); ok {
-			return []result{{in.buf, v, in.mem}}, nil, nil
-		}
-		// Only a reshape can fail, and copying makes it contiguous.
-		k := &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: in.view.Shape, In: []backend.View{in.view}}
-		buf, err := runNew(ctx, m, k, in.buf)
-		return fresh(buf, backend.Contiguous(n.Shape), err)
-	}
-
-	k := &backend.Kernel{Op: n.Op, DType: n.DType, Shape: n.Shape, In: make([]backend.View, len(ins)), Attrs: n.Attrs}
-	switch {
-	case w.gemm != nil:
-		// The product, rewritten in place by any epilogue, holds n in
-		// row-major order. A summed product's axes are the batch axes it
-		// sums.
-		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog, Axes: w.gemm.Attrs.Axes}
-	case w.prog != nil:
-		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: w.prog}
-		for _, s := range w.stores {
-			k.Attrs.Stores = append(k.Attrs.Stores, s.at)
-		}
-	}
+func step(ctx context.Context, m *pool, n *graph.Node, w *work, ins []result, into map[*graph.Node]*graph.Node) ([]result, []backend.Buffer, error) {
+	views := make([]backend.View, len(ins))
 	bufs := make([]backend.Buffer, len(ins))
 	for i, in := range ins {
-		k.In[i], bufs[i] = in.view, in.buf
+		views[i], bufs[i] = in.view, in.buf
 	}
-	return runInto(ctx, m, k, nodes, into, bufs...)
+	k, view, err := w.kernel(n, views)
+	if err != nil {
+		return nil, nil, err
+	}
+	if k == nil {
+		return []result{{ins[0].buf, view, ins[0].mem}}, nil, nil
+	}
+	return runInto(ctx, m, k, w.nodes(n), into, bufs...)
 }
 
-// runInto executes k, which computes nodes, each contiguous: into the
-// memory of its destination in into, whose old values it makes stale, or
-// into a new buffer from m. It returns their results and the new buffers.
-// On error the new buffers go back to m.
-func runInto(ctx context.Context, m *pool, k *backend.Kernel, nodes []*graph.Node, into map[*graph.Node]*graph.Node, ins ...backend.Buffer) ([]result, []backend.Buffer, error) {
+// elements returns the number of elements of k's output.
+func elements(k *backend.Kernel) (int, error) {
 	n, ok := backend.NumElements(k.Shape)
 	if !ok {
-		return nil, nil, fmt.Errorf("sched: %s: shape %v: %w", k.Op, k.Shape, backend.ErrShape)
+		return 0, fmt.Errorf("sched: %s: shape %v: %w", k.Op, k.Shape, backend.ErrShape)
+	}
+	return n, nil
+}
+
+// resultView returns how the node x reads the output of k that holds it:
+// contiguously, or, for a constant, the one element broadcast to its
+// shape with zero strides.
+func resultView(k *backend.Kernel, x *graph.Node) backend.View {
+	if k.Op == backend.OpConst {
+		return broadcast(x.Shape)
+	}
+	return backend.Contiguous(x.Shape)
+}
+
+// runInto executes k, which computes nodes (see resultView): into the
+// memory of its destination in into, whose old values it makes stale, or
+// into a new buffer from m, as forecast predicts. It returns their results
+// and the new buffers. On error the new buffers go back to m.
+func runInto(ctx context.Context, m *pool, k *backend.Kernel, nodes []*graph.Node, into map[*graph.Node]*graph.Node, ins ...backend.Buffer) ([]result, []backend.Buffer, error) {
+	n, err := elements(k)
+	if err != nil {
+		return nil, nil, err
 	}
 	rs := make([]result, len(nodes))
 	outs := make([]backend.Buffer, len(nodes))
 	var fresh []backend.Buffer
 	for i, x := range nodes {
-		rs[i].view = backend.Contiguous(x.Shape)
+		rs[i].view = resultView(k, x)
 		if into[x] != nil {
 			continue
 		}
@@ -645,9 +636,9 @@ func runInto(ctx context.Context, m *pool, k *backend.Kernel, nodes []*graph.Nod
 // runNew executes k, which computes one value, into a new buffer from m.
 // On error the buffer goes back to m and nil is returned.
 func runNew(ctx context.Context, m *pool, k *backend.Kernel, ins ...backend.Buffer) (backend.Buffer, error) {
-	n, ok := backend.NumElements(k.Shape)
-	if !ok {
-		return nil, fmt.Errorf("sched: %s: shape %v: %w", k.Op, k.Shape, backend.ErrShape)
+	n, err := elements(k)
+	if err != nil {
+		return nil, err
 	}
 	out, err := m.alloc(k.DType, n)
 	if err != nil {

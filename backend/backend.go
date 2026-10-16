@@ -28,6 +28,9 @@ var (
 	ErrDevice = errors.New("tensors on different devices")
 	// ErrOutOfMemory reports an allocation the device cannot satisfy.
 	ErrOutOfMemory = errors.New("out of memory")
+	// ErrMemoryBudget reports work refused before it started because it
+	// would take a device past its memory budget.
+	ErrMemoryBudget = errors.New("memory budget exceeded")
 	// ErrInternal reports a defect inside mimir, such as a recovered panic
 	// in a kernel. It is never expected; please report it.
 	ErrInternal = errors.New("internal error")

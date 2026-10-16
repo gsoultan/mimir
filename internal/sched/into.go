@@ -38,8 +38,8 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 		if s, ok := p.storer[t]; ok {
 			writer = s
 		}
-		if _, ok := pos[writer]; !ok || writer.Op.IsView() && !p.work[writer].swap {
-			continue // no kernel writes t
+		if _, ok := pos[writer]; !ok || writer.Op.IsView() && !p.work[writer].swap || writer.Op == backend.OpConst {
+			continue // no kernel writes t, or one of a single element
 		}
 		if p.overwrites(writer, d, targets, pos) {
 			into[t] = d

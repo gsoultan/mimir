@@ -1,0 +1,210 @@
+package sched
+
+import (
+	"fmt"
+	"maps"
+
+	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/internal/graph"
+)
+
+// A budget caps the memory that schedules on a device hold, so that a
+// graph that does not fit is refused before it starts instead of failing
+// midway or taking the process down. Before a schedule transfers an input
+// or runs a kernel it predicts the memory it would obtain from the backend
+// by mirroring its own allocations on a copy of the pool's free lists (see
+// forecast), and it is refused with ErrMemoryBudget when that, with the
+// memory the pool holds already, exceeds the budget. Pooled buffers the
+// schedule would not take are freed first when that makes it fit: a
+// schedule of new shapes, such as a smaller batch after a refusal, cannot
+// reuse them.
+
+// SetBudget limits the memory that schedules on be may hold to bytes, or
+// removes the limit when bytes is 0 or less.
+func SetBudget(be backend.Backend, bytes int64) {
+	mu.Lock()
+	defer mu.Unlock()
+	poolOf(be).budget = max(bytes, 0)
+}
+
+// Budget returns the memory budget of be, or 0 if it has none.
+func Budget(be backend.Backend) int64 {
+	mu.Lock()
+	defer mu.Unlock()
+	return poolOf(be).budget
+}
+
+// Memory describes the device memory that the pool of a backend manages.
+type Memory struct {
+	Allocated int64 // bytes obtained from the backend whose buffers are alive
+	Obtained  int64 // bytes obtained from the backend in all
+	Predicted int64 // bytes that schedules and downloads predicted they would obtain, in all
+}
+
+// MemoryOf returns the memory of be's pool. Predicted equals Obtained as
+// long as every schedule predicted its allocations exactly and none
+// failed midway, which tests check.
+func MemoryOf(be backend.Backend) Memory {
+	mu.Lock()
+	defer mu.Unlock()
+	p := poolOf(be)
+	return Memory{Allocated: p.held(), Obtained: p.obtained, Predicted: p.predicted}
+}
+
+// A sim predicts what an operation obtains from the backend by mirroring
+// the pool's allocations on a count of its free lists. The pool serves
+// the most recently freed buffer of a key first, so a buffer the
+// operation frees is taken before one pooled earlier.
+type sim struct {
+	pooled map[poolKey]int // buffers in the pool not taken yet
+	freed  map[poolKey]int // buffers the operation freed and has not taken back
+	extra  int64           // bytes taken from the backend
+}
+
+// simulate returns a sim of p's free lists.
+func (p *pool) simulate() *sim {
+	s := &sim{pooled: make(map[poolKey]int, len(p.free)), freed: map[poolKey]int{}}
+	for key, bufs := range p.free {
+		s.pooled[key] = len(bufs)
+	}
+	return s
+}
+
+// take mirrors alloc: a pooled buffer of the key serves if there is one,
+// and otherwise the backend does.
+func (s *sim) take(dt backend.DType, n int) {
+	key := poolKey{dt, n}
+	switch {
+	case s.freed[key] > 0:
+		s.freed[key]--
+	case s.pooled[key] > 0:
+		s.pooled[key]--
+	default:
+		s.extra += key.bytes()
+	}
+}
+
+// give mirrors release.
+func (s *sim) give(key poolKey) { s.freed[key]++ }
+
+// reserve admits an operation that s predicts, recording the prediction,
+// or refuses it with ErrMemoryBudget when the bytes it obtains from the
+// backend and those held already exceed the budget. The pooled buffers it
+// would not take are freed first when that makes it fit.
+func (p *pool) reserve(s *sim) error {
+	if p.budget > 0 && p.held()+s.extra > p.budget {
+		var spare int64
+		for key, n := range s.pooled {
+			spare += key.bytes() * int64(n)
+		}
+		if p.held()-spare+s.extra > p.budget {
+			return fmt.Errorf("sched: schedule needs %s with %s in use, budget %s: %w", mib(s.extra), mib(p.held()), mib(p.budget), backend.ErrMemoryBudget)
+		}
+		for key, n := range s.pooled {
+			p.evict(key, n)
+		}
+	}
+	p.predicted += s.extra
+	return nil
+}
+
+// mib formats bytes as mebibytes.
+func mib(bytes int64) string { return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20)) }
+
+// forecast predicts the buffers that realizing p takes, by mirroring what
+// realize does on a sim of m's free lists: the transfers of inputs held on
+// other devices, the buffers each kernel writes (see work.kernel and
+// runInto), the views that share their inputs' buffers, and the release of
+// each buffer after its last reader, which lets the pool serve the next
+// buffer of the same dtype and length. Nothing is freed to the backend
+// within a schedule, so what the sim takes from the backend in all is
+// also the most the schedule holds beyond what the pool held before.
+func (p *plan) forecast(m *pool, uses map[*graph.Node]int, into map[*graph.Node]*graph.Node, isTarget map[*graph.Node]bool) (*sim, error) {
+	s := m.simulate()
+	uses = maps.Clone(uses)
+	// Buffers taken in the schedule are numbered from 1, so that 0 is
+	// memory the schedule does not own, such as a realized input's or a
+	// destination's.
+	type result struct {
+		buf  int
+		view backend.View
+	}
+	var keys []poolKey // of the buffers taken, by number
+	take := func(dt backend.DType, n int) int {
+		s.take(dt, n)
+		keys = append(keys, poolKey{dt, n})
+		return len(keys)
+	}
+	results := make(map[*graph.Node]result, len(p.order))
+	refs := map[int]int{}
+	moved := map[*graph.Node]result{}
+	for _, n := range p.order {
+		for _, in := range p.work[n].deps {
+			if _, ok := moved[in]; ok || !in.Realized() || in.Mem.Dev == m.be {
+				continue
+			}
+			buf := take(in.DType, in.Size())
+			refs[buf] = 0
+			moved[in] = result{buf, backend.Contiguous(in.Shape)}
+		}
+	}
+	lookup := func(n *graph.Node) result {
+		if r, ok := moved[n]; ok {
+			return r
+		}
+		if n.Realized() {
+			return result{view: n.View}
+		}
+		return results[n]
+	}
+	release := func(n *graph.Node) {
+		uses[n]--
+		if uses[n] > 0 || isTarget[n] || n.Realized() {
+			return
+		}
+		r := results[n]
+		delete(results, n)
+		if _, owned := refs[r.buf]; owned {
+			if refs[r.buf]--; refs[r.buf] == 0 {
+				delete(refs, r.buf)
+				s.give(keys[r.buf-1])
+			}
+		}
+	}
+
+	for _, n := range p.order {
+		w := p.work[n]
+		views := make([]backend.View, len(w.deps))
+		for i, in := range w.deps {
+			views[i] = lookup(in).view
+		}
+		k, view, err := w.kernel(n, views)
+		if err != nil {
+			return nil, err
+		}
+		if k == nil {
+			r := result{lookup(w.deps[0]).buf, view}
+			if _, owned := refs[r.buf]; owned {
+				refs[r.buf]++
+			}
+			results[n] = r
+		} else {
+			size, err := elements(k)
+			if err != nil {
+				return nil, err
+			}
+			for _, x := range w.nodes(n) {
+				r := result{view: resultView(k, x)}
+				if into[x] == nil {
+					r.buf = take(k.DType, size)
+					refs[r.buf] = 1
+				}
+				results[x] = r
+			}
+		}
+		for _, in := range w.deps {
+			release(in)
+		}
+	}
+	return s, nil
+}

@@ -1,0 +1,328 @@
+package sched
+
+import (
+	"errors"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/cpu"
+	"github.com/gsoultan/mimir/internal/graph"
+)
+
+// exact realizes targets on be and returns the bytes the schedule obtained
+// from the backend, failing the test unless it predicted them exactly.
+func exact(t *testing.T, be backend.Backend, targets ...*graph.Node) int64 {
+	t.Helper()
+	before := MemoryOf(be)
+	if err := Realize(t.Context(), be, targets...); err != nil {
+		t.Fatal(err)
+	}
+	return predictedExactly(t, be, before)
+}
+
+// predictedExactly fails the test unless every schedule on be since
+// before obtained from the backend exactly what it predicted, and returns
+// the bytes obtained.
+func predictedExactly(t *testing.T, be backend.Backend, before Memory) int64 {
+	t.Helper()
+	after := MemoryOf(be)
+	got, want := after.Obtained-before.Obtained, after.Predicted-before.Predicted
+	if got != want {
+		t.Errorf("schedule obtained %d bytes from the backend, predicted %d", got, want)
+	}
+	return got
+}
+
+func TestSchedulesPredictTheirAllocationsExactly(t *testing.T) {
+	const f = 4 // bytes per float32
+	neg := func(n *graph.Node) *graph.Node { return must(graph.Unary(backend.OpNeg, n)) }
+	add := func(a, b *graph.Node) *graph.Node { return must(graph.Binary(backend.OpAdd, a, b)) }
+	sum := func(n *graph.Node, axes ...int) *graph.Node { return must(graph.Reduce(backend.OpReduceSum, n, axes)) }
+	tests := []struct {
+		name string
+		// build returns the targets, and the bytes the schedule obtains
+		// from the backend.
+		build func(t *testing.T, be backend.Backend) ([]*graph.Node, int64)
+	}{
+		{"fused elementwise chain", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := realized(t, be, []int{1000}, 1)
+			y := x
+			for range 20 {
+				y = must(graph.Unary(backend.OpSqrt, add(y, x)))
+			}
+			return []*graph.Node{y}, 1000 * f // one kernel, one buffer
+		}},
+		{"unfused chain reuses its buffers", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			y := must(graph.Rand([]int{1000, 1}, 1, false))
+			for range 50 {
+				y = sum(y, 1) // reductions do not fuse; each frees its input
+			}
+			return []*graph.Node{y}, 2 * 1000 * f
+		}},
+		{"reduction", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := must(graph.Rand([]int{64, 32}, 1, false))
+			return []*graph.Node{sum(x, 1)}, (64*32 + 64) * f
+		}},
+		{"matmul with a fused epilogue", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x, w, b := realized(t, be, []int{64, 48}, 1), realized(t, be, []int{48, 30}, 2), realized(t, be, []int{30}, 3)
+			bias := must(graph.Expand(must(graph.Reshape(b, []int{1, 30})), []int{64, 30}))
+			zero := must(graph.Const(backend.Float32, []int{64, 30}, 0))
+			y := must(graph.Binary(backend.OpMax, add(must(graph.MatMul(x, w)), bias), zero))
+			return []*graph.Node{y}, 64 * 30 * f // the product never gets a buffer
+		}},
+		{"transposed product", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			a, b := realized(t, be, []int{5, 3}, 1), realized(t, be, []int{3, 4}, 2)
+			return []*graph.Node{must(graph.Permute(must(graph.MatMul(a, b)), []int{1, 0}))}, 5 * 4 * f
+		}},
+		{"summed product with its gradient-like accumulation", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x, w := realized(t, be, []int{4, 30, 20}, 1), realized(t, be, []int{4, 20, 25}, 2)
+			return []*graph.Node{sum(must(graph.MatMul(x, w)), 0)}, 30 * 25 * f
+		}},
+		{"permute then reshape copies", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := realized(t, be, []int{4, 6}, 1)
+			r := must(graph.Reshape(must(graph.Permute(x, []int{1, 0})), []int{24}))
+			return []*graph.Node{neg(r)}, 2 * 24 * f // the copy, then the result
+		}},
+		{"reshape, shrink, flip and expand are views", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := realized(t, be, []int{4, 6}, 1)
+			v := must(graph.Flip(must(graph.Shrink(must(graph.Reshape(x, []int{2, 12})), [][2]int{{0, 1}, {0, 12}})), []int{1}))
+			e := must(graph.Expand(v, []int{3, 12}))
+			return []*graph.Node{neg(e)}, 3 * 12 * f
+		}},
+		{"views shared by several readers", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			// The permuted copy is read by two kernels and freed after the
+			// second, in time for the third to reuse it.
+			x := realized(t, be, []int{8, 8}, 1)
+			c := must(graph.Reshape(must(graph.Permute(x, []int{1, 0})), []int{64}))
+			a, b := sum(c, 0), must(graph.Reduce(backend.OpReduceMax, c, []int{0}))
+			d := neg(must(graph.Reshape(x, []int{64})))
+			return []*graph.Node{a, b, d}, (64 + 1 + 1) * f
+		}},
+		{"broadcasting", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x, row := realized(t, be, []int{16, 32}, 1), realized(t, be, []int{1, 32}, 2)
+			return []*graph.Node{add(x, must(graph.Expand(row, []int{16, 32})))}, 16 * 32 * f
+		}},
+		{"gather", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := realized(t, be, []int{5, 3}, 1)
+			idx := must(graph.Const(backend.Int32, []int{2, 3}, 1))
+			return []*graph.Node{must(graph.Gather(x, idx, 0))}, 1*f + 2*3*f // the index constant, then the result
+		}},
+		{"constants read by programs cost nothing", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := realized(t, be, []int{10}, 1)
+			two := must(graph.Const(backend.Float32, []int{10}, 2))
+			return []*graph.Node{must(graph.Binary(backend.OpMul, x, two))}, 10 * f
+		}},
+		{"pad and unfold", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			x := realized(t, be, []int{2, 5, 5}, 1)
+			p := must(graph.Pad(x, [][2]int{{0, 0}, {1, 1}, {1, 1}}, 0))
+			w := graph.Window{Kernel: []int{3, 3}, Stride: []int{1, 1}, Dilation: []int{1, 1}, Pads: [][2]int{{0, 0}, {0, 0}}}
+			u := must(graph.Unfold(p, w, 0))
+			return []*graph.Node{u}, (2*7*7 + 2*3*3*5*5) * f
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			be := &counting{Backend: cpu.New()}
+			targets, want := tt.build(t, be)
+			if got := exact(t, be, targets...); got != want {
+				t.Errorf("schedule obtained %d bytes, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestInPlaceUpdatesArePredictedToAllocateNothing(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x, m, g := realized(t, be, []int{3000}, 1), realized(t, be, []int{3000}, 2), realized(t, be, []int{3000}, 3)
+	bin := func(op backend.Op, a, b *graph.Node) *graph.Node { return must(graph.Binary(op, a, b)) }
+	nextM := bin(backend.OpAdd, m, g)
+	nextX := bin(backend.OpAdd, nextM, bin(backend.OpMul, x, m))
+	before := MemoryOf(be)
+	if err := RealizeInto(t.Context(), be, []*graph.Node{nextX, nextM}, []*graph.Node{x, m}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := predictedExactly(t, be, before); got != 0 {
+		t.Errorf("an in-place update obtained %d bytes", got)
+	}
+
+	// A kept node computed first costs its own schedule, predicted too.
+	y := realized(t, be, []int{3000}, 4)
+	reader := must(graph.Unary(backend.OpNeg, y))
+	before = MemoryOf(be)
+	keep := func() []*graph.Node { return []*graph.Node{reader} }
+	if err := RealizeInto(t.Context(), be, []*graph.Node{bin(backend.OpAdd, y, g)}, []*graph.Node{y}, keep); err != nil {
+		t.Fatal(err)
+	}
+	if got := predictedExactly(t, be, before); got != 3000*4 {
+		t.Errorf("update with a kept reader obtained %d bytes, want the reader's %d", got, 3000*4)
+	}
+}
+
+func TestTransfersFromOtherDevicesArePredicted(t *testing.T) {
+	a, b := &counting{Backend: cpu.New()}, &counting{Backend: cpu.New()}
+	x := realized(t, a, []int{1000}, 1)
+	y := must(graph.Unary(backend.OpNeg, x))
+	if got := exact(t, b, y); got != 2*1000*4 {
+		t.Errorf("schedule reading an input from another device obtained %d bytes, want the copy and the result", got)
+	}
+	// The copy is pooled afterwards and serves the next transfer.
+	if got := exact(t, b, must(graph.Unary(backend.OpNeg, x))); got != 1000*4 {
+		t.Errorf("schedule reading the same input again obtained %d bytes, want only its result's", got)
+	}
+
+	// A view of a moved input shares the copy, which is released once its
+	// last reader has run, and once only.
+	c, d := &counting{Backend: cpu.New()}, &counting{Backend: cpu.New()}
+	z := realized(t, c, []int{1000}, 2)
+	v := must(graph.Reshape(z, []int{10, 100}))
+	s := must(graph.Reduce(backend.OpReduceSum, v, []int{1}))
+	if got := exact(t, d, s); got != (1000+10)*4 {
+		t.Errorf("schedule reading a view of an input from another device obtained %d bytes", got)
+	}
+	if d.allocs != 2 {
+		t.Errorf("%d allocations, want 2", d.allocs)
+	}
+	if pooled := poolOf(d).pooledElements(); pooled != 1000 {
+		t.Errorf("%d elements pooled after the schedule, want the copy's 1000 once", pooled)
+	}
+}
+
+func TestBudgetRefusesSchedulesBeforeAllocating(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	// The random input and the sum take a buffer of 1000 elements each.
+	x := must(graph.Rand([]int{1000, 1}, 1, false))
+	y := must(graph.Reduce(backend.OpReduceSum, x, []int{1}))
+	const need = 2 * 1000 * 4
+	SetBudget(be, need-1)
+	err := Realize(t.Context(), be, y)
+	if !errors.Is(err, backend.ErrMemoryBudget) {
+		t.Fatalf("got %v, want ErrMemoryBudget", err)
+	}
+	if want := "schedule needs 0.0 MiB with 0.0 MiB in use, budget 0.0 MiB"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q, want it to say %q", err, want)
+	}
+	if be.allocs != 0 || len(be.ops) != 0 {
+		t.Errorf("a refused schedule made %d allocations and ran %d kernels", be.allocs, len(be.ops))
+	}
+	if y.Realized() || x.Realized() {
+		t.Error("a refused schedule realized nodes")
+	}
+	if m := MemoryOf(be); m.Predicted != 0 || m.Obtained != 0 {
+		t.Errorf("memory after a refused schedule: %+v", m)
+	}
+	SetBudget(be, need)
+	if err := Realize(t.Context(), be, y); err != nil {
+		t.Fatalf("schedule within a budget equal to its need: %v", err)
+	}
+	if m := MemoryOf(be); m.Allocated != need {
+		t.Errorf("%d bytes allocated, want %d", m.Allocated, need)
+	}
+
+	// Memory that results hold counts against the next schedule.
+	be = &counting{Backend: cpu.New()}
+	held := realized(t, be, []int{1000}, 2)
+	z := must(graph.Reduce(backend.OpReduceSum, must(graph.Reshape(held, []int{10, 100})), []int{1}))
+	SetBudget(be, 1000*4+10*4-1)
+	if err := Realize(t.Context(), be, z); !errors.Is(err, backend.ErrMemoryBudget) {
+		t.Fatalf("got %v, want ErrMemoryBudget with %d bytes in use", err, 1000*4)
+	}
+	SetBudget(be, 1000*4+10*4)
+	if err := Realize(t.Context(), be, z); err != nil {
+		t.Fatal(err)
+	}
+	if got := Budget(be); got != 1000*4+10*4 {
+		t.Errorf("Budget = %d, want %d", got, 1000*4+10*4)
+	}
+	SetBudget(be, -5)
+	if got := Budget(be); got != 0 {
+		t.Errorf("Budget after a negative one = %d, want 0 for no limit", got)
+	}
+}
+
+func TestBudgetFreesPooledBuffersTheScheduleCannotReuse(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	// Two buffers of 1000 elements: the result holds one and the pool
+	// the other.
+	y := must(graph.Rand([]int{1000, 1}, 1, false))
+	for range 3 {
+		y = must(graph.Reduce(backend.OpReduceSum, y, []int{1}))
+	}
+	if err := Realize(t.Context(), be, y); err != nil {
+		t.Fatal(err)
+	}
+	if held := MemoryOf(be).Allocated; held != 2*1000*4 {
+		t.Fatalf("%d bytes held, want %d", held, 2*1000*4)
+	}
+	// A schedule of another shape cannot use the pooled buffer, so it is
+	// freed to make room.
+	z := must(graph.Reduce(backend.OpReduceSum, must(graph.Rand([]int{500, 1}, 2, false)), []int{1}))
+	SetBudget(be, 1000*4+2*500*4)
+	allocs := be.allocs
+	if err := Realize(t.Context(), be, z); err != nil {
+		t.Fatal(err)
+	}
+	if n := be.allocs - allocs; n != 2 {
+		t.Errorf("%d allocations, want 2", n)
+	}
+	if m := MemoryOf(be); m.Allocated != 1000*4+2*500*4 || poolOf(be).pooledElements() != 500 {
+		t.Errorf("after the schedule %d bytes are held and %d elements pooled, want the pooled buffer of 1000 freed", m.Allocated, poolOf(be).pooledElements())
+	}
+	// Freeing would not have been enough for a larger schedule, so the
+	// pool is left alone and the schedule refused.
+	w := must(graph.Reduce(backend.OpReduceSum, must(graph.Rand([]int{2000, 1}, 3, false)), []int{1}))
+	if err := Realize(t.Context(), be, w); !errors.Is(err, backend.ErrMemoryBudget) {
+		t.Fatalf("got %v, want ErrMemoryBudget", err)
+	}
+	if pooled := poolOf(be).pooledElements(); pooled != 500 {
+		t.Errorf("a refused schedule left %d elements pooled, want 500", pooled)
+	}
+}
+
+func TestDownloadsCheckTheirCopyAgainstTheBudget(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{4, 6}, 1)
+	p := must(graph.Permute(x, []int{1, 0}))
+	if err := Realize(t.Context(), be, p); err != nil {
+		t.Fatal(err)
+	}
+	held := MemoryOf(be).Allocated
+	out := make([]byte, 24*4)
+	SetBudget(be, held+24*4-1)
+	if err := Download(t.Context(), be, p, out); !errors.Is(err, backend.ErrMemoryBudget) {
+		t.Fatalf("got %v, want ErrMemoryBudget", err)
+	}
+	SetBudget(be, held+24*4)
+	before := MemoryOf(be)
+	if err := Download(t.Context(), be, p, out); err != nil {
+		t.Fatal(err)
+	}
+	if got := predictedExactly(t, be, before); got != 24*4 {
+		t.Errorf("download obtained %d bytes, want its copy's %d", got, 24*4)
+	}
+}
+
+func TestCollectedResultsLeaveTheAccount(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	const n = 1 << 20
+	if err := Realize(t.Context(), be, must(graph.Rand([]int{n}, 1, false))); err != nil {
+		t.Fatal(err)
+	}
+	if held := MemoryOf(be).Allocated; held != n*4 {
+		t.Fatalf("%d bytes held, want the result's %d", held, n*4)
+	}
+	// The result is dropped: once collected, its bytes are no longer held.
+	deadline := time.Now().Add(10 * time.Second)
+	for MemoryOf(be).Allocated != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d bytes still held after the result was collected", MemoryOf(be).Allocated)
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	if m := MemoryOf(be); m.Obtained != n*4 || m.Predicted != n*4 {
+		t.Errorf("memory %+v, want %d obtained and predicted", m, n*4)
+	}
+}
