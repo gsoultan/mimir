@@ -215,6 +215,17 @@ func TestKVCacheErrors(t *testing.T) {
 	if _, _, err := cache.Append(ctx, kv(2), kv(2)); !errors.Is(err, tensor.ErrShape) {
 		t.Errorf("overflow: got %v, want ErrShape", err)
 	}
+	cache.Truncate(1)
+	keys, values, err = cache.Append(ctx, kv(2).Mul(tensor.Scalar[float32](3)), kv(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := data(t, keys); cache.Len() != 3 || got[0] != 1 || got[3] != 3 {
+		t.Errorf("after truncating to 1 and appending 2: length %d, keys %v", cache.Len(), got)
+	}
+	if v := data(t, values); v[0] != 2 || v[3] != 1 {
+		t.Errorf("values %v", v)
+	}
 }
 
 func TestRMSNormKeepsTheInputDType(t *testing.T) {
