@@ -19,7 +19,7 @@ var quantTypes = []tensor.DType{tensor.Q8_0, tensor.Q4_K, tensor.Q6_K}
 // quantized returns a random [n, k] tensor of dt and its values.
 func quantized(rng *rand.Rand, dt tensor.DType, n, k int) (*tensor.Tensor, []float32) {
 	raw := quanttest.Random(rng, dt, n*k)
-	return tensor.FromBytes(dt, raw, n, k), quanttest.Dequantize(dt, raw)
+	return tensor.FromBytes(dt, raw, n, k).To(tensor.DefaultDevice()), quanttest.Dequantize(dt, raw)
 }
 
 func TestQuantizedTensorsDequantizeLikeGGML(t *testing.T) {
@@ -298,7 +298,7 @@ func TestQuantGolden(t *testing.T) {
 				t.Fatalf("weights of %s %s%v", kind, raw.DType, raw.Shape)
 			}
 			rows, k := raw.Shape[0], raw.Shape[1]/dt.BlockBytes()*dt.BlockSize()
-			w := tensor.FromBytes(dt, raw.Data, rows, k)
+			w := tensor.FromBytes(dt, raw.Data, rows, k).To(tensor.DefaultDevice())
 			switch op {
 			case "dequantize":
 				goldentest.CompareTensor(t, c.Want, w.Cast(tensor.Float32), goldentest.Tol{})
