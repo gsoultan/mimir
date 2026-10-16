@@ -340,12 +340,12 @@ func TestDownloadsCheckTheirCopyAgainstTheBudget(t *testing.T) {
 	held := MemoryOf(be).Allocated
 	out := make([]byte, 24*4)
 	SetBudget(be, held+24*4-1)
-	if err := Download(t.Context(), be, p, out); !errors.Is(err, backend.ErrMemoryBudget) {
+	if err := Download(t.Context(), be, p, out, nil); !errors.Is(err, backend.ErrMemoryBudget) {
 		t.Fatalf("got %v, want ErrMemoryBudget", err)
 	}
 	SetBudget(be, held+24*4)
 	before := MemoryOf(be)
-	if err := Download(t.Context(), be, p, out); err != nil {
+	if err := Download(t.Context(), be, p, out, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := predictedExactly(t, be, before); got != 24*4 {

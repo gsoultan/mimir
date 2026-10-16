@@ -152,7 +152,7 @@ func (m *mlp) adopt(targets []*graph.Node) {
 func values(tb testing.TB, be backend.Backend, n *graph.Node) []float32 {
 	tb.Helper()
 	b := make([]byte, 4*n.Size())
-	if err := Download(context.Background(), be, n, b); err != nil {
+	if err := Download(context.Background(), be, n, b, nil); err != nil {
 		tb.Fatal(err)
 	}
 	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), n.Size())

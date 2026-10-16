@@ -30,6 +30,12 @@ import (
 // every buffer first lets a backend that runs a whole batch at once, such
 // as CUDA through a CUDA graph, see the schedule's kernels and buffers
 // together (see backend.Batch).
+//
+// A donated leaf whose memory the schedule takes (see donate.go) is
+// given to the pool as a pooled buffer is, after its last reader, so
+// that the kernels after it can take it; it has a pooled buffer's slot
+// whose taking is the binding of the leaf's buffer at the start of the
+// run.
 
 // program is a compiled schedule. Its scratch slices are bound for one
 // run at a time, under mu.
@@ -51,7 +57,13 @@ type program struct {
 	keyOf []int32          // by pooled buffer: the index of its key in peaks
 	short []int            // by peak: the buffers of its key the run has yet to obtain
 	mems  []*graph.Storage // by pooled buffer: the storage of the results it holds
+
+	donated []donation // the donated leaves the program gives to the pool
 }
+
+// donation is a donated leaf, in slot leaf, whose buffer the program
+// holds as the pooled buffer tmp until it gives it to the pool.
+type donation struct{ tmp, leaf int32 }
 
 // kstep is one kernel of a program.
 type kstep struct {
@@ -122,18 +134,67 @@ func compile(p *plan, w *walker, targets, dsts []*graph.Node, into map[*graph.No
 		return results[n]
 	}
 	uses := p.uses()
+	// gifts holds the storages of the donated leaves that the program
+	// gives to the pool, each with the number of reads of it by kernels
+	// and live views still to come. A leaf that a target or destination
+	// shares memory with keeps it.
+	type donor struct {
+		leaf int32
+		refs int
+	}
+	gifts := map[*graph.Storage]*donor{}
+	for _, g := range w.gifts {
+		if l := w.leaves[g.leaf]; uses[l] > 0 {
+			gifts[l.Mem] = &donor{g.leaf, uses[l]}
+		}
+	}
+	if len(gifts) > 0 {
+		for i, t := range targets {
+			if d := destination(dsts, i); d != nil && d.Realized() {
+				delete(gifts, d.Mem)
+			}
+			if t.Realized() {
+				delete(gifts, t.Mem)
+			}
+		}
+	}
+	// unref counts a read of the memory of the leaf in slot, which the
+	// program gives to the pool after the last.
+	unref := func(slot int32) {
+		g := gifts[w.leaves[slot].Mem]
+		if g == nil {
+			return
+		}
+		if g.refs--; g.refs > 0 {
+			return
+		}
+		buf := w.leaves[g.leaf].Buf()
+		k := int32(len(prog.tmps))
+		prog.tmps = append(prog.tmps, poolKey{buf.DType(), buf.Len()})
+		prog.events = append(prog.events, ^k)
+		prog.donated = append(prog.donated, donation{k, g.leaf})
+	}
 	release := func(n *graph.Node) {
 		uses[n]--
-		if uses[n] > 0 || isTarget[n] || n.Realized() {
+		if n.Realized() {
+			if len(gifts) > 0 {
+				unref(n.Mark.Num)
+			}
+			return
+		}
+		if uses[n] > 0 || isTarget[n] {
 			return
 		}
 		r := results[n]
 		delete(results, n)
-		if r.slot >= base {
+		switch {
+		case r.slot >= base:
 			if refs[r.slot]--; refs[r.slot] == 0 {
 				delete(refs, r.slot)
 				give(r.slot)
 			}
+		case int(r.slot) < prog.leaves && len(gifts) > 0:
+			unref(r.slot)
 		}
 	}
 	// dest returns the slot of the destination that target x is written
@@ -173,8 +234,13 @@ func compile(p *plan, w *walker, targets, dsts []*graph.Node, into map[*graph.No
 		}
 		if k == nil {
 			r := result{ins[0], view}
-			if r.slot >= base {
+			switch {
+			case r.slot >= base:
 				refs[r.slot]++
+			case int(r.slot) < prog.leaves:
+				if g := gifts[w.leaves[r.slot].Mem]; g != nil {
+					g.refs++
+				}
 			}
 			results[n] = r
 		} else {
@@ -339,6 +405,16 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 		}
 	}
 	base := p.leaves + p.targets
+	// The donated leaves are the pool's from now on, to be given to it
+	// after their last readers, and their nodes are stale.
+	for _, d := range p.donated {
+		n := w.leaves[d.leaf]
+		m.track(n.Buf())
+		p.bufs[base+int(d.tmp)], p.held[d.tmp] = n.Buf(), true
+		n.Mem.Version++
+		n.Mem.Refs = 0
+		n.Mem.Donated = true
+	}
 	// The run obtains from the backend the buffers that the pool lacks at
 	// its peaks, as reserve predicted: those that results of earlier runs
 	// took away.
@@ -390,7 +466,7 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 			mem = dsts[int(slot)-p.leaves].Mem
 		default:
 			if p.mems[k] == nil {
-				p.mems[k] = &graph.Storage{Buf: p.bufs[slot], Dev: m.be}
+				p.mems[k] = &graph.Storage{Buf: p.bufs[slot], Dev: m.be, Pooled: true}
 			}
 			mem = p.mems[k]
 		}

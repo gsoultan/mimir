@@ -101,7 +101,7 @@ func TestViewsShareBuffersAndConstantsTakeOneElement(t *testing.T) {
 		t.Errorf("peak %d elements, want 1 for a broadcast constant", be.peak)
 	}
 	out := make([]byte, 6*4)
-	if err := Download(t.Context(), be, r, out); err != nil {
+	if err := Download(t.Context(), be, r, out, nil); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 6 {
@@ -185,12 +185,12 @@ func TestElementwiseChainsFuse(t *testing.T) {
 		y = must(graph.Unary(backend.OpSqrt, y))
 	}
 	xs := make([]byte, 4000)
-	if err := Download(t.Context(), be, x, xs); err != nil {
+	if err := Download(t.Context(), be, x, xs, nil); err != nil {
 		t.Fatal(err)
 	}
 	be.ops = nil
 	out := make([]byte, 4000)
-	if err := Download(t.Context(), be, y, out); err != nil {
+	if err := Download(t.Context(), be, y, out, nil); err != nil {
 		t.Fatal(err)
 	}
 	if want := []backend.Op{backend.OpFused}; !slices.Equal(be.ops, want) {
@@ -316,10 +316,10 @@ func TestElementwiseConsumersOfAProductRunAsItsEpilogue(t *testing.T) {
 	fused := layer(must(graph.MatMul(x, w)))
 	be.ops = nil
 	want, got := make([]byte, 128*30*4), make([]byte, 128*30*4)
-	if err := Download(t.Context(), be, separate, want); err != nil {
+	if err := Download(t.Context(), be, separate, want, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := Download(t.Context(), be, fused, got); err != nil {
+	if err := Download(t.Context(), be, fused, got, nil); err != nil {
 		t.Fatal(err)
 	}
 	if ops := []backend.Op{backend.OpFused, backend.OpMatMul}; !slices.Equal(be.ops, ops) {
@@ -435,7 +435,7 @@ func TestTargetsReadByOneConsumerAreWrittenByItsKernel(t *testing.T) {
 	}
 	get := func(n *graph.Node) []float32 {
 		b := make([]byte, 4000)
-		if err := Download(t.Context(), be, n, b); err != nil {
+		if err := Download(t.Context(), be, n, b, nil); err != nil {
 			t.Fatal(err)
 		}
 		f := make([]float32, 1000)
@@ -469,7 +469,7 @@ func TestTransposedProductsAreComputedTransposed(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := make([]byte, 2*4*5*4)
-	if err := Download(t.Context(), be, must(graph.Permute(product, []int{0, 2, 1})), want); err != nil {
+	if err := Download(t.Context(), be, must(graph.Permute(product, []int{0, 2, 1})), want, nil); err != nil {
 		t.Fatal(err)
 	}
 	transposed := must(graph.Permute(must(graph.MatMul(a, b)), []int{0, 2, 1}))
@@ -484,7 +484,7 @@ func TestTransposedProductsAreComputedTransposed(t *testing.T) {
 		t.Errorf("result view %+v, want contiguous", v)
 	}
 	got := make([]byte, len(want))
-	if err := Download(t.Context(), be, transposed, got); err != nil {
+	if err := Download(t.Context(), be, transposed, got, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(got, want) {
@@ -528,7 +528,7 @@ func TestTransposedSummedProductsAreComputedTransposed(t *testing.T) {
 func floats(t *testing.T, be backend.Backend, n *graph.Node) []float32 {
 	t.Helper()
 	b := make([]byte, 4*n.Size())
-	if err := Download(t.Context(), be, n, b); err != nil {
+	if err := Download(t.Context(), be, n, b, nil); err != nil {
 		t.Fatal(err)
 	}
 	f := make([]float32, n.Size())
@@ -623,7 +623,7 @@ func TestRealizeIntoWritesOverTheDestinations(t *testing.T) {
 		}
 	}
 	for _, old := range []*graph.Node{x, m} {
-		if err := Download(t.Context(), be, old, make([]byte, 4*n)); !errors.Is(err, graph.ErrOverwritten) {
+		if err := Download(t.Context(), be, old, make([]byte, 4*n), nil); !errors.Is(err, graph.ErrOverwritten) {
 			t.Errorf("reading an overwritten value: got %v, want ErrOverwritten", err)
 		}
 		if err := Realize(t.Context(), be, must(graph.Unary(backend.OpNeg, old))); !errors.Is(err, graph.ErrOverwritten) {

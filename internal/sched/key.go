@@ -43,7 +43,13 @@ type walker struct {
 	mems   int32         // storages numbered
 	key    []uint64
 	stack  []frame
+
+	gifts []gift // the donated leaves whose memory the schedule takes
 }
+
+// gift is a donated leaf whose memory a schedule takes (see donate.go):
+// its number, and the index of the key word that says so.
+type gift struct{ leaf, at int32 }
 
 type frame struct {
 	n    *graph.Node
@@ -99,6 +105,7 @@ func (w *walker) pushInts(s []int) {
 func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
 	walks++
 	w.walk, w.be = walks, be
+	w.gifts = w.gifts[:0]
 	w.order, w.leaves, w.mems = w.order[:0], w.leaves[:0], 0
 	w.key = w.key[:0]
 	for _, t := range targets {
@@ -164,6 +171,9 @@ func destination(dsts []*graph.Node, i int) *graph.Node {
 }
 
 func stale(n *graph.Node) error {
+	if n.Mem.Donated {
+		return fmt.Errorf("sched: %s%v: %w: %w", n.DType, n.Shape, graph.ErrDonated, graph.ErrOverwritten)
+	}
 	return fmt.Errorf("sched: %s%v: %w", n.DType, n.Shape, graph.ErrOverwritten)
 }
 
@@ -199,8 +209,9 @@ func (w *walker) node(n *graph.Node) {
 
 // leaf numbers the realized node n and writes it to the key: what a plan
 // reads of it, which is its dtype, shape and view, the length of its
-// buffer, whether it lives on the schedule's device, and which other
-// leaves share its storage.
+// buffer, whether it lives on the schedule's device, whether the
+// schedule may take its memory (see donate.go), and which other leaves
+// share its storage.
 func (w *walker) leaf(n *graph.Node) {
 	n.Mark = graph.Mark{Walk: w.walk, Num: int32(len(w.leaves))}
 	w.leaves = append(w.leaves, n)
@@ -209,11 +220,15 @@ func (w *walker) leaf(n *graph.Node) {
 		m.Mark = graph.Mark{Walk: w.walk, Num: w.mems}
 		w.mems++
 	}
-	var here uint64
+	var here, donated uint64
 	if m.Dev == w.be {
 		here = 1
 	}
-	w.push(tagLeaf<<56 | here<<48 | uint64(n.DType)<<32 | uint64(len(n.Shape)))
+	if donates(n, w.be) {
+		donated = 1
+		w.gifts = append(w.gifts, gift{n.Mark.Num, int32(len(w.key))})
+	}
+	w.push(tagLeaf<<56 | donated<<49 | here<<48 | uint64(n.DType)<<32 | uint64(len(n.Shape)))
 	for _, d := range n.Shape {
 		w.push(uint64(d))
 	}

@@ -125,6 +125,10 @@ var (
 	// such as a parameter's value from before an optimizer step (see
 	// RealizeInto).
 	ErrOverwritten = graph.ErrOverwritten
+	// ErrDonated reports a tensor whose memory a computation took over
+	// after the tensor was donated to it (see Donate). An error that
+	// wraps it wraps ErrOverwritten too.
+	ErrDonated = graph.ErrDonated
 )
 
 // eager computes each operation as soon as it is created.
@@ -328,7 +332,7 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 		for j, i := range idx {
 			group[j] = nodes[i]
 		}
-		if err := sched.Realize(ctx, be, group...); err != nil {
+		if err := sched.RealizeInto(ctx, be, group, nil, lazy.values); err != nil {
 			return err
 		}
 	}
@@ -398,6 +402,42 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 	return nil
 }
 
+// Donate hands t's memory over to the next computation that reads t, as
+// jax.jit donates its arguments, and returns t. The caller must be done
+// with t, as a training loop is with a batch once the step that reads it
+// has run: that step may then compute its own results and temporaries
+// into t's memory instead of new memory, and the next FromSlice of the
+// same size may reuse it too, so that a loop that uploads and donates a
+// batch every step allocates nothing for it.
+//
+// The computation that next reads t, once t is computed, takes its
+// memory if t is the only tensor in it, as a tensor of FromSlice or To,
+// or one computed into memory of its own is. From then on t, and every
+// tensor that shares t's memory, such as one of the same values without
+// gradients, is stale: reading it, or computing a tensor built from it,
+// returns ErrDonated (and ErrOverwritten). Read everything you need of t
+// in that computation, such as a loss and its gradients in one Backward,
+// or donate a Clone. The memory is taken even if the computation fails
+// once it has started; one refused before it starts, as one past the
+// memory budget is, leaves t alone.
+//
+// Donating a tensor that is not computed yet does nothing: the
+// computation that reads it frees the memory it uses anyway. Memory that t does not own alone is never taken: a
+// mapped file's (see FromBytes), or memory that another tensor views
+// too, or that a parameter's value not computed yet reads, such as a
+// batch that batch normalization's running statistics are computed
+// from; nor is the memory of a tensor that the computation writes over
+// (see RealizeInto) or returns. Never donate a parameter's value. With
+// MIMIR_EAGER=1, which computes each operation as it is created, Donate
+// does nothing.
+func (t *Tensor) Donate() *Tensor {
+	if firstErr(t) != nil || eager {
+		return t
+	}
+	sched.Donate(t.node)
+	return t
+}
+
 // byDevice groups the indexes of nodes by the device that computes them,
 // in order of their first node, so that each device runs one schedule.
 func byDevice(nodes []*graph.Node) iter.Seq2[backend.Backend, []int] {
@@ -438,7 +478,7 @@ func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := sched.Download(ctx, backendOf(t.node), t.node, asBytes(out)); err != nil {
+	if err := sched.Download(ctx, backendOf(t.node), t.node, asBytes(out), lazy.values); err != nil {
 		return nil, err
 	}
 	return out, nil
