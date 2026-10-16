@@ -135,18 +135,6 @@ func TestAttentionGolden(t *testing.T) {
 	}
 }
 
-func near(t *testing.T, what string, got, want []float32, tol float64) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("%s: %d values, want %d", what, len(got), len(want))
-	}
-	for i := range want {
-		if d := math.Abs(float64(got[i] - want[i])); !(d <= tol*math.Max(1, math.Abs(float64(want[i])))) {
-			t.Fatalf("%s[%d] = %v, want %v", what, i, got[i], want[i])
-		}
-	}
-}
-
 // TestDecodingWithACacheMatchesForward runs a sequence through blocks at
 // once and in steps of several sizes with a cache, which must agree.
 func TestDecodingWithACacheMatchesForward(t *testing.T) {
