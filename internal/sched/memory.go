@@ -97,18 +97,51 @@ func poolOf(be backend.Backend) *pool {
 // alloc returns a buffer of n elements of dt with unspecified contents,
 // the most recently freed one if the pool has one.
 func (p *pool) alloc(dt backend.DType, n int) (backend.Buffer, error) {
-	key := poolKey{dt, n}
+	buf, _, err := p.take(poolKey{dt, n}, 0, false)
+	return buf, err
+}
+
+// take returns a buffer of key with unspecified contents: the one at
+// address at if the pool holds it; otherwise a new one from the backend
+// if obtain is set or the pool has none of key, and otherwise the most
+// recently freed one. It reports whether the buffer is new.
+//
+// A program asks for the buffers it took in its last run, so that a
+// replayed schedule runs over the same buffers every time, rather than
+// ones the order of the pool shuffled, and a backend can keep what it
+// derived from them, such as a CUDA graph. A buffer that a result took
+// away leaves the pool, so the program's run must obtain a new one from
+// the backend: it does so for the buffer that went missing (obtain)
+// rather than take the buffer of another, which would have to take
+// another's in turn. The address is a preference only: a newer buffer at
+// the address of a collected one serves as well as any other.
+func (p *pool) take(key poolKey, at uintptr, obtain bool) (backend.Buffer, bool, error) {
 	if bufs := p.free[key]; len(bufs) > 0 {
-		p.free[key] = bufs[:len(bufs)-1]
-		return bufs[len(bufs)-1].buf, nil
+		i := -1
+		if at != 0 {
+			for j := len(bufs) - 1; j >= 0; j-- {
+				if uintptr(addressOf(bufs[j].buf)) == at {
+					i = j
+					break
+				}
+			}
+		}
+		if i >= 0 || !obtain {
+			if i < 0 {
+				i = len(bufs) - 1
+			}
+			buf := bufs[i].buf
+			p.free[key] = append(bufs[:i], bufs[i+1:]...)
+			return buf, false, nil
+		}
 	}
-	buf, err := p.be.Alloc(dt, n)
+	buf, err := p.be.Alloc(key.dt, key.n)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	p.obtained += key.bytes()
 	p.track(buf)
-	return buf, nil
+	return buf, true, nil
 }
 
 // release returns buf to the pool.

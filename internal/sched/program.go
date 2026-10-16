@@ -47,6 +47,9 @@ type program struct {
 	batch backend.Batch    // the kernels, and the buffers of each run
 	bufs  []backend.Buffer // by slot, for one run
 	held  []bool           // by pooled buffer: taken and not given back
+	last  []uintptr        // by pooled buffer: the address of the one the last run took
+	keyOf []int32          // by pooled buffer: the index of its key in peaks
+	short []int            // by peak: the buffers of its key the run has yet to obtain
 	mems  []*graph.Storage // by pooled buffer: the storage of the results it holds
 }
 
@@ -245,6 +248,15 @@ func compile(p *plan, w *walker, targets, dsts []*graph.Node, into map[*graph.No
 
 	prog.bufs = make([]backend.Buffer, int(base)+len(prog.tmps))
 	prog.held = make([]bool, len(prog.tmps))
+	prog.last = make([]uintptr, len(prog.tmps))
+	prog.keyOf = make([]int32, len(prog.tmps))
+	prog.short = make([]int, len(prog.peaks))
+	for e, key := range prog.tmps {
+		i, _ := slices.BinarySearchFunc(prog.peaks, key, func(pk peak, key poolKey) int {
+			return cmp.Or(cmp.Compare(pk.key.dt, key.dt), cmp.Compare(pk.key.n, key.n))
+		})
+		prog.keyOf[e] = int32(i)
+	}
 	prog.mems = make([]*graph.Storage, len(prog.tmps))
 	prog.batch.Kernels = make([]*backend.Kernel, len(prog.steps))
 	prog.batch.Outs = make([][]backend.Buffer, len(prog.steps))
@@ -327,18 +339,29 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 		}
 	}
 	base := p.leaves + p.targets
+	// The run obtains from the backend the buffers that the pool lacks at
+	// its peaks, as reserve predicted: those that results of earlier runs
+	// took away.
+	for i, pk := range p.peaks {
+		p.short[i] = max(pk.n-len(m.free[pk.key]), 0)
+	}
 	for _, e := range p.events {
 		if e < 0 {
 			m.release(p.bufs[base+int(^e)])
 			p.held[^e] = false
 			continue
 		}
-		buf, err := m.alloc(p.tmps[e].dt, p.tmps[e].n)
+		k := p.keyOf[e]
+		buf, obtained, err := m.take(p.tmps[e], p.last[e], p.last[e] != 0 && p.short[k] > 0)
 		if err != nil {
 			p.giveBack(m)
 			return err
 		}
+		if obtained {
+			p.short[k]--
+		}
 		p.bufs[base+int(e)], p.held[e] = buf, true
+		p.last[e] = uintptr(addressOf(buf))
 	}
 	for _, mv := range p.moves {
 		if err := copyFrom(ctx, w.leaves[mv.leaf], m.be, p.bufs[mv.to]); err != nil {
