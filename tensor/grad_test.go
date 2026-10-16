@@ -198,58 +198,63 @@ func weighted(ctx context.Context, f func([]*tensor.Tensor) *tensor.Tensor, x []
 }
 
 func TestGradientsMatchFiniteDifferences(t *testing.T) {
-	const h = 1e-2
 	for _, c := range gradCases() {
-		t.Run(c.name, func(t *testing.T) {
-			ctx := t.Context()
-			x := make([]*tensor.Tensor, len(c.in))
-			for i, v := range c.in {
-				x[i] = tensor.FromSlice(v, c.dims[i]...).RequiresGrad()
-			}
-			loss, err := weighted(ctx, c.f, x)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := loss.Backward(ctx); err != nil {
-				t.Fatal(err)
-			}
-			for i, v := range c.in {
-				g := x[i].Grad()
-				if g == nil {
-					t.Fatalf("input %d has no gradient", i)
-				}
-				if !slices.Equal(g.Shape(), c.dims[i]) {
-					t.Fatalf("input %d: gradient shape %v, want %v", i, g.Shape(), c.dims[i])
-				}
-				got := data[float32](t, g)
-				for j := range v {
-					at := func(d float32) float64 {
-						p := slices.Clone(v)
-						p[j] += d
-						y := slices.Clone(x)
-						y[i] = tensor.FromSlice(p, c.dims[i]...)
-						for k := range y {
-							if k != i {
-								y[k] = y[k].Detach()
-							}
-						}
-						l, err := weighted(ctx, c.f, y)
-						if err != nil {
-							t.Fatal(err)
-						}
-						s, err := l.Item[float32](ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						return float64(s)
-					}
-					want := (at(h) - at(-h)) / (2 * h)
-					if diff := math.Abs(float64(got[j]) - want); diff > 5e-3+1e-2*math.Abs(want) {
-						t.Errorf("input %d element %d: gradient %v, finite difference %v", i, j, got[j], want)
+		t.Run(c.name, func(t *testing.T) { checkFiniteDifferences(t, c) })
+	}
+}
+
+// checkFiniteDifferences compares the gradient Backward computes for each
+// input of c with central differences.
+func checkFiniteDifferences(t *testing.T, c gradCase) {
+	t.Helper()
+	const h = 1e-2
+	ctx := t.Context()
+	x := make([]*tensor.Tensor, len(c.in))
+	for i, v := range c.in {
+		x[i] = tensor.FromSlice(v, c.dims[i]...).RequiresGrad()
+	}
+	loss, err := weighted(ctx, c.f, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loss.Backward(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range c.in {
+		g := x[i].Grad()
+		if g == nil {
+			t.Fatalf("input %d has no gradient", i)
+		}
+		if !slices.Equal(g.Shape(), c.dims[i]) {
+			t.Fatalf("input %d: gradient shape %v, want %v", i, g.Shape(), c.dims[i])
+		}
+		got := data[float32](t, g)
+		for j := range v {
+			at := func(d float32) float64 {
+				p := slices.Clone(v)
+				p[j] += d
+				y := slices.Clone(x)
+				y[i] = tensor.FromSlice(p, c.dims[i]...)
+				for k := range y {
+					if k != i {
+						y[k] = y[k].Detach()
 					}
 				}
+				l, err := weighted(ctx, c.f, y)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s, err := l.Item[float32](ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return float64(s)
 			}
-		})
+			want := (at(h) - at(-h)) / (2 * h)
+			if diff := math.Abs(float64(got[j]) - want); diff > 5e-3+1e-2*math.Abs(want) {
+				t.Errorf("input %d element %d: gradient %v, finite difference %v", i, j, got[j], want)
+			}
+		}
 	}
 }
 
