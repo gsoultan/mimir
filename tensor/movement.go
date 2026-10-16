@@ -600,6 +600,27 @@ func (t *Tensor) Unfold(axis, size, step int) *Tensor {
 	return w.permute(append(perm, a))
 }
 
+// SliceScatter returns a copy of t with the block ranges, half-open in
+// each dimension like Shrink's, replaced by src, which has the block's
+// shape and t's dtype, like torch.slice_scatter. Computed over t's memory
+// with RealizeInto, it writes the block alone and leaves the rest of t in
+// place, so a cache can grow a few rows at a time without copying what it
+// holds. t's gradient is the result's with the block zeroed, and src's
+// the block of it.
+func (t *Tensor) SliceScatter(src *Tensor, ranges [][2]int) *Tensor {
+	if err := firstErr(t, src); err != nil {
+		return fail(err)
+	}
+	out := wrap(graph.SliceScatter(t.node, src.node, ranges))
+	if !tracked(t, src) || out.err != nil {
+		return out
+	}
+	block := slices.Clone(src.node.Shape)
+	return track(out, func(g *Tensor) []*Tensor {
+		return grads(g.SliceScatter(Zeros(g.node.DType, block...), ranges), g.shrink(ranges))
+	}, t, src)
+}
+
 // padAxis returns pads for a rank-r tensor that pad only axis.
 func padAxis(r, axis, before, after int) [][2]int {
 	pads := make([][2]int, r)
