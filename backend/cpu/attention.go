@@ -26,9 +26,16 @@ import (
 // queries in the inner one, which packs every block once. A problem's
 // rows, of the result or of the query gradient, are contiguous in the
 // output, so the kernels accumulate into it directly.
+//
+// A problem of few query rows, such as a decoding step, has too few to
+// fill a tile: packing the keys transposed for the micro-kernel would
+// cost more than the scores. Its scores are dot products of each query
+// with the keys, read in place, and its whole rows of probabilities are
+// multiplied by the values at once; see forwardFew.
 const (
 	attnRows = 64  // query rows of a tile
 	attnKeys = 128 // keys of a block
+	attnFew  = 16  // query rows of a problem that forwardFew computes
 )
 
 // attnGeom is the layout of an attention kernel's inputs: per problem,
@@ -208,6 +215,16 @@ func attention(ctx context.Context, b *Backend, k *backend.Kernel, out []float32
 	if g.rows == 0 || g.problems == 0 {
 		return nil
 	}
+	if g.rows <= attnFew && g.in[1].y == 1 {
+		return b.parallelFor(ctx, g.problems, 1, func(lo, hi int) error {
+			ws := attnWorkspaces.Get().(*attnWorkspace)
+			defer attnWorkspaces.Put(ws)
+			for pr := lo; pr < hi; pr++ {
+				g.forwardFew(k, ws, pr, out)
+			}
+			return nil
+		})
+	}
 	tr := tileRows(gemmKernels[0])
 	tiles := (g.rows + tr - 1) / tr
 	parts := b.split(g.problems, tiles)
@@ -317,6 +334,69 @@ func (g *attnGeom) forward(k *backend.Kernel, ws *attnWorkspace, pr, r0, r1 int,
 		}
 		scaleRow(o[r*s.DV:][:s.DV], 1/l)
 		lse[r] = ws.m[r] + float32(math.Log(float64(l)))
+	}
+}
+
+// forwardFew computes problem pr, whose rows are few and whose keys have
+// contiguous features, from whole rows of scores: each the dot products
+// of a query, scaled, with the keys it may see.
+func (g *attnGeom) forwardFew(k *backend.Kernel, ws *attnWorkspace, pr int, out []float32) {
+	gk := gemmKernels[0]
+	s := g.s
+	q, kk, v := &g.in[0], &g.in[1], &g.in[2]
+	scale := float32(k.Attrs.Scale)
+	rows, n := g.rows, s.K
+	o := out[pr*rows*s.DV:][:rows*s.DV]
+	lse := out[s.Size()-s.Batches()*s.Heads*s.Q+pr*rows:][:rows]
+	// Packing reads whole panels of rows.
+	ws.s = grow(ws.s, roundUp(rows, gk.mr)*n)
+	ws.q = grow(ws.q, s.D)
+	ws.l = grow(ws.l, rows)
+	keys := kk.data[kk.at(pr, 0, 0, 0):]
+	var d [4]float32
+	for r := range rows {
+		hd, i := r/s.Q, r%s.Q
+		qr := ws.q[:s.D]
+		off := q.at(pr, hd, i, 0)
+		for p := range qr {
+			qr[p] = q.data[off+p*q.y] * scale
+		}
+		row := ws.s[r*n:][:n]
+		seen := visible(k, i, 0, n)
+		j := 0
+		for ; j+4 <= seen; j += 4 {
+			dots4(&d, qr, keys[j*kk.x:], kk.x)
+			copy(row[j:], d[:])
+		}
+		for ; j < seen; j++ {
+			dots4(&d, qr, keys[j*kk.x:], 0)
+			row[j] = d[0]
+		}
+		g.prepare(k, pr, attnTile{r0: r, r1: r + 1, hi: i}, 0, n, row, n, 3)
+		m := rowMax(row)
+		if math.IsInf(float64(m), -1) {
+			clear(row) // no key is visible
+			ws.l[r], lse[r] = 0, float32(math.Inf(-1))
+			continue
+		}
+		ws.l[r] = expShift(row, m)
+		lse[r] = m + float32(math.Log(float64(ws.l[r])))
+	}
+	if n == 0 {
+		clear(o)
+		return
+	}
+	ws.p = grow(ws.p, roundUp(rows, gk.mr)*n+packSlack)
+	packA(ws.p, operand{data: ws.s, rs: n, cs: 1}, 0, rows, 0, n, gk.mr)
+	ws.v = grow(ws.v, roundUp(s.DV, gk.nr)*n+packSlack)
+	packB(ws.v, operand{data: v.data, off: v.at(pr, 0, 0, 0), rs: v.x, cs: v.y}, 0, n, 0, s.DV, gk.nr)
+	macroKernel(gk, ws.p, ws.v, n, rows, s.DV, o, s.DV, false, &ws.tile)
+	for r, l := range ws.l[:rows] {
+		if l == 0 {
+			clear(o[r*s.DV:][:s.DV])
+			continue
+		}
+		scaleRow(o[r*s.DV:][:s.DV], 1/l)
 	}
 }
 
