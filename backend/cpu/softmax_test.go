@@ -11,13 +11,11 @@ import (
 func withRoutines(t *testing.T, f func(t *testing.T)) {
 	saved := rowVector
 	defer func() { rowVector = saved }()
-	sets := map[string]*rowRoutines{"go": nil}
-	if saved != nil {
-		sets["vector"] = saved
+	sets := rowRoutineSets()
+	if sets == nil {
+		sets = map[string]*rowRoutines{}
 	}
-	if saved == &rowAVX512 && x86Features().avx2 {
-		sets["avx2"] = &rowAVX2
-	}
+	sets["go"] = nil
 	for name, r := range sets {
 		rowVector = r
 		t.Run(name, f)

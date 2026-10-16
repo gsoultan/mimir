@@ -24,6 +24,11 @@ func scaleRowAVX512(x *float32, n int, a float32)
 //go:noescape
 func softmaxGradAVX512(p *float32, dp *float32, n int, d float32)
 
+// dotAVX512 returns the sum of the products of the n elements at x and y, a multiple of 16.
+//
+//go:noescape
+func dotAVX512(x *float32, y *float32, n int) float32
+
 // rowMaxAVX2 returns the largest of the n elements at x, a positive multiple of 8.
 //
 //go:noescape
@@ -43,3 +48,8 @@ func scaleRowAVX2(x *float32, n int, a float32)
 //
 //go:noescape
 func softmaxGradAVX2(p *float32, dp *float32, n int, d float32)
+
+// dotAVX2 returns the sum of the products of the n elements at x and y, a multiple of 8.
+//
+//go:noescape
+func dotAVX2(x *float32, y *float32, n int) float32

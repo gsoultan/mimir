@@ -59,8 +59,57 @@ func main() {
 		expShift(v)
 		scaleRow(v)
 		softmaxGrad(v)
+		dot(v)
 	}
 	Generate()
+}
+
+func dot(v isa) {
+	name := "dot" + v.name
+	TEXT(name, NOSPLIT, "func(x *float32, y *float32, n int) float32")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s returns the sum of the products of the n elements at x and y, a multiple of %d.", name, v.lanes))
+	px := Load(Param("x"), GP64())
+	py := Load(Param("y"), GP64())
+	n := Load(Param("n"), GP64())
+	// Four accumulators hide the latency of the fused multiply-adds.
+	var acc [4]VecVirtual
+	for i := range acc {
+		acc[i] = v.vec()
+		VXORPS(acc[i], acc[i], acc[i])
+	}
+	step := 4 * v.lanes
+	CMPQ(n, U32(step))
+	JL(LabelRef(name + "_tail"))
+	Label(name + "_wide")
+	for i := range acc {
+		t := v.vec()
+		VMOVUPS(Mem{Base: px, Disp: 4 * v.lanes * i}, t)
+		VFMADD231PS(Mem{Base: py, Disp: 4 * v.lanes * i}, t, acc[i])
+	}
+	ADDQ(U32(4*step), px)
+	ADDQ(U32(4*step), py)
+	SUBQ(U32(step), n)
+	CMPQ(n, U32(step))
+	JGE(LabelRef(name + "_wide"))
+	Label(name + "_tail")
+	TESTQ(n, n)
+	JZ(LabelRef(name + "_done"))
+	Label(name + "_loop")
+	t := v.vec()
+	VMOVUPS(Mem{Base: px}, t)
+	VFMADD231PS(Mem{Base: py}, t, acc[0])
+	ADDQ(U32(4*v.lanes), px)
+	ADDQ(U32(4*v.lanes), py)
+	SUBQ(U32(v.lanes), n)
+	JNZ(LabelRef(name + "_loop"))
+	Label(name + "_done")
+	VADDPS(acc[1], acc[0], acc[0])
+	VADDPS(acc[3], acc[2], acc[2])
+	VADDPS(acc[2], acc[0], acc[0])
+	Store(horizontal(v, acc[0], VADDPS), ReturnIndex(0))
+	VZEROUPPER()
+	RET()
 }
 
 // The exponential is Cephes' expf: e^x = 2^n · e^r with n = round(x/ln 2)

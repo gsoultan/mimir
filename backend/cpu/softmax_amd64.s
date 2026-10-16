@@ -367,6 +367,62 @@ softmaxGradAVX512_done:
 	VZEROUPPER
 	RET
 
+// func dotAVX512(x *float32, y *float32, n int) float32
+// Requires: AVX, AVX512DQ, AVX512F, SSE
+TEXT ·dotAVX512(SB), NOSPLIT, $0-28
+	MOVQ   x+0(FP), AX
+	MOVQ   y+8(FP), CX
+	MOVQ   n+16(FP), DX
+	VXORPS Z0, Z0, Z0
+	VXORPS Z1, Z1, Z1
+	VXORPS Z2, Z2, Z2
+	VXORPS Z3, Z3, Z3
+	CMPQ   DX, $0x00000040
+	JL     dotAVX512_tail
+
+dotAVX512_wide:
+	VMOVUPS     (AX), Z4
+	VFMADD231PS (CX), Z4, Z0
+	VMOVUPS     64(AX), Z4
+	VFMADD231PS 64(CX), Z4, Z1
+	VMOVUPS     128(AX), Z4
+	VFMADD231PS 128(CX), Z4, Z2
+	VMOVUPS     192(AX), Z4
+	VFMADD231PS 192(CX), Z4, Z3
+	ADDQ        $0x00000100, AX
+	ADDQ        $0x00000100, CX
+	SUBQ        $0x00000040, DX
+	CMPQ        DX, $0x00000040
+	JGE         dotAVX512_wide
+
+dotAVX512_tail:
+	TESTQ DX, DX
+	JZ    dotAVX512_done
+
+dotAVX512_loop:
+	VMOVUPS     (AX), Z4
+	VFMADD231PS (CX), Z4, Z0
+	ADDQ        $0x00000040, AX
+	ADDQ        $0x00000040, CX
+	SUBQ        $0x00000010, DX
+	JNZ         dotAVX512_loop
+
+dotAVX512_done:
+	VADDPS        Z1, Z0, Z0
+	VADDPS        Z3, Z2, Z2
+	VADDPS        Z2, Z0, Z0
+	VEXTRACTF64X4 $0x01, Z0, Y1
+	VADDPS        Y1, Y0, Y0
+	VEXTRACTF128  $0x01, Y0, X1
+	VADDPS        X1, X0, X0
+	VPERMILPS     $0x4e, X0, X1
+	VADDPS        X1, X0, X0
+	VPERMILPS     $0xb1, X0, X1
+	VADDPS        X1, X0, X0
+	MOVSS         X0, ret+24(FP)
+	VZEROUPPER
+	RET
+
 // func rowMaxAVX2(x *float32, n int) float32
 // Requires: AVX, SSE
 TEXT ·rowMaxAVX2(SB), NOSPLIT, $0-20
@@ -488,5 +544,59 @@ softmaxGradAVX2_loop:
 	JNZ     softmaxGradAVX2_loop
 
 softmaxGradAVX2_done:
+	VZEROUPPER
+	RET
+
+// func dotAVX2(x *float32, y *float32, n int) float32
+// Requires: AVX, FMA3, SSE
+TEXT ·dotAVX2(SB), NOSPLIT, $0-28
+	MOVQ   x+0(FP), AX
+	MOVQ   y+8(FP), CX
+	MOVQ   n+16(FP), DX
+	VXORPS Y0, Y0, Y0
+	VXORPS Y1, Y1, Y1
+	VXORPS Y2, Y2, Y2
+	VXORPS Y3, Y3, Y3
+	CMPQ   DX, $0x00000020
+	JL     dotAVX2_tail
+
+dotAVX2_wide:
+	VMOVUPS     (AX), Y4
+	VFMADD231PS (CX), Y4, Y0
+	VMOVUPS     32(AX), Y4
+	VFMADD231PS 32(CX), Y4, Y1
+	VMOVUPS     64(AX), Y4
+	VFMADD231PS 64(CX), Y4, Y2
+	VMOVUPS     96(AX), Y4
+	VFMADD231PS 96(CX), Y4, Y3
+	ADDQ        $0x00000080, AX
+	ADDQ        $0x00000080, CX
+	SUBQ        $0x00000020, DX
+	CMPQ        DX, $0x00000020
+	JGE         dotAVX2_wide
+
+dotAVX2_tail:
+	TESTQ DX, DX
+	JZ    dotAVX2_done
+
+dotAVX2_loop:
+	VMOVUPS     (AX), Y4
+	VFMADD231PS (CX), Y4, Y0
+	ADDQ        $0x00000020, AX
+	ADDQ        $0x00000020, CX
+	SUBQ        $0x00000008, DX
+	JNZ         dotAVX2_loop
+
+dotAVX2_done:
+	VADDPS       Y1, Y0, Y0
+	VADDPS       Y3, Y2, Y2
+	VADDPS       Y2, Y0, Y0
+	VEXTRACTF128 $0x01, Y0, X1
+	VADDPS       X1, X0, X0
+	VPERMILPS    $0x4e, X0, X1
+	VADDPS       X1, X0, X0
+	VPERMILPS    $0xb1, X0, X1
+	VADDPS       X1, X0, X0
+	MOVSS        X0, ret+24(FP)
 	VZEROUPPER
 	RET
