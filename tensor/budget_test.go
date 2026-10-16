@@ -60,11 +60,17 @@ func TestMemoryBudgetRefusesTrainingStepsThatDoNotFit(t *testing.T) {
 	// The loss is built afresh each time: in eager mode a tensor built
 	// past the budget carries the error.
 	lossOf := func() *tensor.Tensor { return x.Mul(w.Value()).ReLU().Sum() }
-	held := sched.MemoryOf(be).Allocated
-	// The parameter and the input are held; the loss needs more than one
-	// byte beyond them.
-	tensor.SetMemoryBudget(dev, held+1)
+	// Results dropped while building the inputs, as eager mode computes
+	// each operation, count until they are collected, which a refusal does
+	// first: after one, what is held is what the inputs hold.
+	tensor.SetMemoryBudget(dev, 1)
 	defer tensor.SetMemoryBudget(dev, 0)
+	if _, err := x.Neg().Data[float32](t.Context()); !errors.Is(err, tensor.ErrMemoryBudget) {
+		t.Fatalf("Data in a budget of one byte: got %v, want ErrMemoryBudget", err)
+	}
+	held := sched.MemoryOf(be).Allocated
+	// The loss needs more than one byte beyond what the inputs hold.
+	tensor.SetMemoryBudget(dev, held+1)
 	if got := tensor.MemoryBudget(dev); got != held+1 {
 		t.Fatalf("MemoryBudget = %d, want %d", got, held+1)
 	}

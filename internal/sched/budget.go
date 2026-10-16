@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"maps"
+	"runtime"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
@@ -21,6 +22,12 @@ import (
 // oldest first and only as many as it needs: a schedule of new shapes,
 // such as a smaller batch after a refusal, cannot reuse them, but the
 // next one of the old shapes can reuse those left.
+//
+// The memory of results that were dropped counts until the garbage
+// collector reclaims them (see memory.go). Before it refuses a schedule,
+// the pool runs the collector and takes what it reclaimed off the
+// account, so that whether a schedule fits does not depend on when the
+// collector last ran.
 
 // SetBudget limits the memory that schedules on be may hold to bytes, or
 // removes the limit when bytes is 0 or less.
@@ -94,15 +101,15 @@ func (s *sim) give(key poolKey) { s.freed[key]++ }
 // or refuses it with ErrMemoryBudget when the bytes it obtains from the
 // backend and those held already exceed the budget. When freeing pooled
 // buffers that it would not take makes it fit, the oldest of them are
-// freed until it does.
+// freed until it does. Before refusing, it collects dropped results.
 func (p *pool) reserve(s *sim) error {
-	if over := p.held() + s.extra - p.budget; p.budget > 0 && over > 0 {
-		spares := p.spares(s)
-		n, freed := 0, int64(0)
-		for ; n < len(spares) && freed < over; n++ {
-			freed += spares[n].bytes
+	if p.budget > 0 && p.held()+s.extra > p.budget {
+		spares, n := p.room(s)
+		if n < 0 {
+			p.collect()
+			spares, n = p.room(s)
 		}
-		if freed < over {
+		if n < 0 {
 			return fmt.Errorf("sched: schedule needs %s with %s in use, budget %s: %w", mib(s.extra), mib(p.held()), mib(p.budget), backend.ErrMemoryBudget)
 		}
 		evict := map[poolKey]int{}
@@ -115,6 +122,38 @@ func (p *pool) reserve(s *sim) error {
 	}
 	p.predicted += s.extra
 	return nil
+}
+
+// room returns the pooled buffers that the operation s predicts would not
+// take, oldest first, and how many of them it frees to fit in the budget,
+// none if it fits already, or -1 if freeing all of them is not enough.
+func (p *pool) room(s *sim) ([]spare, int) {
+	over := p.held() + s.extra - p.budget
+	spares := p.spares(s)
+	n := 0
+	for ; n < len(spares) && over > 0; n++ {
+		over -= spares[n].bytes
+	}
+	if over > 0 {
+		return nil, -1
+	}
+	return spares, n
+}
+
+// collect runs the garbage collector and takes the buffers it reclaimed
+// off the account at once, rather than when their cleanups run, which
+// may be later. The collector has cleared the weak pointers to them by
+// the time runtime.GC returns, and a cleanup that runs afterwards finds
+// its buffer off the account already.
+func (p *pool) collect() {
+	runtime.GC()
+	p.acct.Lock()
+	defer p.acct.Unlock()
+	for ref, e := range p.owned {
+		if ref.Value() == nil {
+			p.drop(e)
+		}
+	}
 }
 
 // spare is a pooled buffer that an operation would not take.
