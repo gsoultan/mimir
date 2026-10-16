@@ -281,13 +281,47 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		}
 		bufs = append(bufs, mb)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var c call
+	if err := b.plan(&c, k, outs, ins); err != nil {
+		return err
+	}
+	b.issue(&c, bufs)
+	return nil
+}
+
+// call is how the backend encodes one kernel: a product through Metal
+// Performance Shaders, if mps is set, then its launches in order, which
+// are a tensor product, a product's epilogue or the kernel itself.
+type call struct {
+	mps      *gen.GEMM
+	launches []launch
+}
+
+// launch is a generated kernel's launch and its compiled pipeline.
+type launch struct {
+	l   *gen.Launch
+	pso id
+}
+
+// plan sets c to the call that encodes k over outs and ins, compiling the
+// pipelines it needs. b.mu is held.
+func (b *Backend) plan(c *call, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	*c = call{launches: c.launches[:0]}
 	lens := make([]int, len(ins))
 	for i, buf := range ins {
 		lens[i] = buf.Len()
 	}
+	add := func(l *gen.Launch, metal4 bool) error {
+		pso, err := b.pipeline(l.Src, metal4, l.Threads)
+		if err != nil {
+			return fmt.Errorf("metal: %s: %w", k.Op, err)
+		}
+		c.launches = append(c.launches, launch{l, pso})
+		return nil
+	}
 	g, isGEMM := gen.PlanGEMM(k, lens)
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	work := g.Batch * g.M * g.N * g.K
 	switch {
 	case isGEMM && b.tensorMin >= 0 && work >= b.tensorMin:
@@ -295,34 +329,40 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		if err != nil {
 			return fmt.Errorf("metal: %s: %w", k.Op, err)
 		}
-		return b.encodeProduct(k, outs, ins, bufs, func() error { return b.encode(k, l, true, bufs) })
+		if err := add(l, true); err != nil {
+			return err
+		}
 	case isGEMM && b.mpsMin >= 0 && work >= b.mpsMin && packed(g):
-		return b.encodeProduct(k, outs, ins, bufs, func() error { b.encodeGEMM(g, bufs); return nil })
+		c.mps = &g
+	default:
+		l, err := gen.Plan(gen.Metal, k, outs, ins)
+		if err != nil {
+			return fmt.Errorf("metal: %s: %w", k.Op, err)
+		}
+		if l == nil {
+			return nil
+		}
+		return add(l, false)
 	}
-	l, err := gen.Plan(gen.Metal, k, outs, ins)
+	if k.Attrs.Program == nil {
+		return nil
+	}
+	epilogue, err := gen.PlanEpilogue(gen.Metal, k, outs, ins)
 	if err != nil {
 		return fmt.Errorf("metal: %s: %w", k.Op, err)
 	}
-	if l == nil {
-		return nil
-	}
-	return b.encode(k, l, false, bufs)
+	return add(epilogue, false)
 }
 
-// encodeProduct encodes a product of k with encodeGEMM, then its
-// epilogue, if it has one. b.mu is held.
-func (b *Backend) encodeProduct(k *backend.Kernel, outs, ins []backend.Buffer, bufs []*buffer, encodeGEMM func() error) error {
-	var epilogue *gen.Launch
-	if k.Attrs.Program != nil {
-		var err error
-		if epilogue, err = gen.PlanEpilogue(gen.Metal, k, outs, ins); err != nil {
-			return fmt.Errorf("metal: %s: %w", k.Op, err)
-		}
+// issue encodes the call c over bufs, the outputs then the inputs. b.mu
+// is held.
+func (b *Backend) issue(c *call, bufs []*buffer) {
+	if c.mps != nil {
+		b.encodeGEMM(*c.mps, bufs)
 	}
-	if err := encodeGEMM(); err != nil || epilogue == nil {
-		return err
+	for _, l := range c.launches {
+		b.encode(l, bufs)
 	}
-	return b.encode(k, epilogue, false, bufs)
 }
 
 // tensorOpsSupported reports whether the device runs Metal 4 tensor
@@ -348,29 +388,23 @@ func (b *Backend) tensorOpsSupported() bool {
 	return err == nil
 }
 
-// encode encodes the launch l of k over bufs, the outputs then the
-// inputs. Its source is Metal Shading Language 4 if metal4 is set. b.mu
-// is held.
-func (b *Backend) encode(k *backend.Kernel, l *gen.Launch, metal4 bool, bufs []*buffer) error {
-	pso, err := b.pipeline(l.Src, metal4, l.Threads)
-	if err != nil {
-		return fmt.Errorf("metal: %s: %w", k.Op, err)
-	}
+// encode encodes the launch l over bufs, the outputs then the inputs.
+// b.mu is held.
+func (b *Backend) encode(l launch, bufs []*buffer) {
 	autoreleased(func() {
 		enc := b.computeEncoder()
-		send(enc, selSetPipeline, uintptr(pso))
+		send(enc, selSetPipeline, uintptr(l.pso))
 		for i, mb := range bufs {
 			send(enc, selSetBuffer, uintptr(mb.obj), 0, uintptr(i))
 		}
-		send(enc, selSetBytes, uintptr(unsafe.Pointer(&l.Params[0])), uintptr(4*len(l.Params)), uintptr(len(bufs)))
+		send(enc, selSetBytes, uintptr(unsafe.Pointer(&l.l.Params[0])), uintptr(4*len(l.l.Params)), uintptr(len(bufs)))
 		send(enc, selSetBuffer, uintptr(b.errWord.obj), 0, uintptr(len(bufs)+1))
-		groups := &[3]uint{uint(l.Groups), 1, 1}
-		threads := &[3]uint{uint(l.Threads), 1, 1}
+		groups := &[3]uint{uint(l.l.Groups), 1, 1}
+		threads := &[3]uint{uint(l.l.Threads), 1, 1}
 		send(enc, selDispatch, uintptr(unsafe.Pointer(groups)), uintptr(unsafe.Pointer(threads)))
 	})
-	runtime.KeepAlive(l)
+	runtime.KeepAlive(l.l)
 	runtime.KeepAlive(bufs)
-	return nil
 }
 
 // encodeGEMM encodes the product g with Metal Performance Shaders, from
