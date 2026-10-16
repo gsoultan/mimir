@@ -29,8 +29,10 @@ func values(t *testing.T, m nn.Module) []float32 {
 	return out
 }
 
-// sameValues fails the test unless got equals want to within 1e-5,
-// relative to the larger value.
+// sameValues fails the test unless got equals want to within 1e-4,
+// relative to the larger value: training in chunks sums the gradients in
+// another order than training on whole batches, and the rounding differs
+// more on a GPU, whose reductions are trees.
 func sameValues(t *testing.T, what string, got, want []float32) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -38,7 +40,7 @@ func sameValues(t *testing.T, what string, got, want []float32) {
 	}
 	for i := range got {
 		g, w := float64(got[i]), float64(want[i])
-		if math.Abs(g-w) > 1e-5*max(math.Abs(g), math.Abs(w), 1e-3) {
+		if math.Abs(g-w) > 1e-4*max(math.Abs(g), math.Abs(w), 1e-3) {
 			t.Fatalf("%s: value %d = %v, want %v", what, i, g, w)
 		}
 	}
