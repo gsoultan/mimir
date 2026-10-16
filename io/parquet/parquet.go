@@ -22,7 +22,8 @@
 // FIXED_LEN_BYTE_ARRAY; data pages V1 and V2; the PLAIN, RLE, dictionary,
 // DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and
 // BYTE_STREAM_SPLIT encodings; and the UNCOMPRESSED, SNAPPY, GZIP and ZSTD
-// codecs. Logical types are ignored: a column is read by its physical type.
+// codecs. A column is read by its physical type: its logical type, such as
+// DECIMAL or TIMESTAMP, is reported on Column but not applied.
 //
 // Nested columns (repeated fields and fields inside groups) and INT96
 // columns are listed but cannot be read, and neither can encrypted files or
@@ -97,7 +98,21 @@ type Column struct {
 	Name     string // the path in the schema, "a.b" for a nested column
 	Type     Type
 	Nullable bool
-	Length   int // the size of a FixedLenByteArray value
+	// Nested is set for a column below a group or repeated, such as the
+	// element of a list, which Reader cannot read.
+	Nested bool
+	Length int // the size of a FixedLenByteArray value
+	// Logical is the name of the column's logical type, from the
+	// LogicalType of the schema or, in files of older writers, its
+	// ConvertedType: "DECIMAL", "DATE", "TIME", "TIMESTAMP", "STRING",
+	// "ENUM", "UUID", "JSON", "BSON", "INTERVAL", "INT", "UINT", "LIST",
+	// "MAP", "FLOAT16", or "" for none. The values are those of the
+	// physical type: a DECIMAL is its unscaled integer, a DATE a number
+	// of days and a TIMESTAMP one of units since the epoch.
+	Logical string
+	// Precision and Scale are those of a DECIMAL, whose value is the
+	// unscaled integer divided by 10^Scale.
+	Precision, Scale int
 }
 
 // leaf is a leaf of the schema with what the reader needs beyond Column.
@@ -105,7 +120,6 @@ type leaf struct {
 	Column
 	maxDef int
 	maxRep int
-	nested bool // below a group or repeated, so levels exceed the flat case
 }
 
 // File is an open Parquet file. Its methods are safe for concurrent use.
@@ -330,7 +344,12 @@ func buildSchema(elems []schemaElement) ([]leaf, error) {
 		if !e.hasType {
 			return fmt.Errorf("%w: column %q has no type", ErrFormat, name)
 		}
-		l := leaf{Column: Column{Name: name, Type: e.typ, Nullable: def > 0}, maxDef: def, maxRep: rep, nested: depth > 0 || rep > 0}
+		l := leaf{Column: Column{Name: name, Type: e.typ, Nullable: def > 0, Nested: depth > 0 || rep > 0}, maxDef: def, maxRep: rep}
+		logical, precision, scale := e.logicalType()
+		if logical == "DECIMAL" && (precision < 1 || scale < 0 || scale > precision) {
+			return fmt.Errorf("%w: column %q is a DECIMAL of precision %d and scale %d", ErrFormat, name, precision, scale)
+		}
+		l.Logical, l.Precision, l.Scale = logical, int(precision), int(scale)
 		if e.typ == FixedLenByteArray {
 			if e.typeLength <= 0 {
 				return fmt.Errorf("%w: column %q has length %d", ErrFormat, name, e.typeLength)

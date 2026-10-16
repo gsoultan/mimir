@@ -118,7 +118,7 @@ func (r *Reader) Reset(group, column int) error {
 	l := &f.leaves[column]
 	ch := &f.meta.rowGroups[group].columns[column]
 	switch {
-	case l.nested:
+	case l.Nested:
 		return fmt.Errorf("%w: nested column %q", ErrUnsupported, l.Name)
 	case l.Type == Int96 || l.Type > FixedLenByteArray:
 		return fmt.Errorf("%w: %v column %q", ErrUnsupported, l.Type, l.Name)
@@ -151,6 +151,14 @@ func (r *Reader) Reset(group, column int) error {
 	r.hasDict = false
 	r.kind, r.remaining = kindNone, 0
 	return nil
+}
+
+// bufferBytes returns the bytes of the buffers r holds, for the tests.
+func (r *Reader) bufferBytes() int {
+	d := &r.dict
+	return cap(r.chunk.buf) + cap(r.page) + cap(r.defs) + cap(r.u8s) + cap(r.bytesBuf) + cap(r.prev) + cap(d.bytes) +
+		4*(cap(r.idx)+cap(r.u32s)+cap(r.spans)+cap(r.lens)+cap(r.prefixes)+cap(r.sel)+cap(d.u32s)+cap(d.spans)) +
+		8*(cap(r.u64s)+cap(d.u64s))
 }
 
 // number is the set of types the numeric Read methods fill.
