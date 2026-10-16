@@ -223,6 +223,8 @@ func (t *Tensor) Argmax(axis int) *Tensor {
 	n := x.node.Shape[a]
 	shape := slices.Repeat([]int{1}, len(x.node.Shape))
 	shape[a] = n
-	pos := Arange[int32](0, int32(n), 1).reshape(shape)
+	// The positions come from a scan of ones, which, unlike a tensor of
+	// data, belongs to no device, so t may be on any.
+	pos := Ones(Int32, shape...).cumsum(a).Sub(Scalar[int32](1))
 	return Where(hit, pos, Scalar(int32(n))).Min(a)
 }
