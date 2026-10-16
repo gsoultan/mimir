@@ -411,6 +411,12 @@ func (a *SelfAttention) Forward(x *tensor.Tensor) *tensor.Tensor {
 // after those cache holds, to them and to themselves, and appends their
 // keys and values to cache (see KVCache.Append).
 func (a *SelfAttention) Decode(ctx context.Context, x *tensor.Tensor, cache *KVCache) (*tensor.Tensor, error) {
+	return a.decode(ctx, x, cache)
+}
+
+// decode is Decode, computing the tensors of also in the schedule that
+// computes the queries, keys and values.
+func (a *SelfAttention) decode(ctx context.Context, x *tensor.Tensor, cache *KVCache, also ...*tensor.Tensor) (*tensor.Tensor, error) {
 	past := cache.Len()
 	q, k, v, err := a.project(x, past)
 	if err != nil {
@@ -419,7 +425,7 @@ func (a *SelfAttention) Decode(ctx context.Context, x *tensor.Tensor, cache *KVC
 	// The queries, keys and values share one projection: realized
 	// together, it runs once, where appending the keys and values alone
 	// would leave the queries to compute it again.
-	if err := tensor.Realize(ctx, q, k, v); err != nil {
+	if err := tensor.Realize(ctx, append([]*tensor.Tensor{q, k, v}, also...)...); err != nil {
 		return nil, err
 	}
 	keys, values, err := cache.Append(ctx, k, v)
@@ -525,9 +531,11 @@ func (b *DecoderBlock) Forward(x *tensor.Tensor) *tensor.Tensor {
 }
 
 // Decode is Forward for the positions after those cache holds, whose keys
-// and values it appends to cache (see SelfAttention.Decode).
+// and values it appends to cache (see SelfAttention.Decode). It computes
+// x along with them, so that x, often the lazy output of the block
+// before, is not computed again for the residual connection.
 func (b *DecoderBlock) Decode(ctx context.Context, x *tensor.Tensor, cache *KVCache) (*tensor.Tensor, error) {
-	a, err := b.Attn.Decode(ctx, b.Norm1.Forward(x), cache)
+	a, err := b.Attn.decode(ctx, b.Norm1.Forward(x), cache, x)
 	if err != nil {
 		return nil, err
 	}
