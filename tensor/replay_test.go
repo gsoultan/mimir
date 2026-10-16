@@ -56,6 +56,12 @@ func (r *batchRecorder) RunBatch(ctx context.Context, bt *backend.Batch) error {
 // own: a backend can then keep what it derived from the buffers, such as
 // the CUDA graph of a step and the products in it.
 func TestReplayedStepsRunOverTheSameBuffers(t *testing.T) {
+	if tensor.Eager() {
+		// Each operation is then a schedule of its own, whose inputs are
+		// the results of the operations before it: tensors that leave the
+		// pool, and come back to it, one by one, as the step drops them.
+		t.Skip("eager mode computes every operation into memory of its own")
+	}
 	for _, c := range []struct {
 		name  string
 		model func() nn.Module
