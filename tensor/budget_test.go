@@ -2,6 +2,7 @@ package tensor_test
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/gsoultan/mimir/backend/cpu"
@@ -83,5 +84,51 @@ func TestMemoryBudgetRefusesTrainingStepsThatDoNotFit(t *testing.T) {
 	}
 	if w.Grad() == nil {
 		t.Error("no gradient after Backward")
+	}
+}
+
+func TestGradientScalingAllocatesNothingExtra(t *testing.T) {
+	if os.Getenv("MIMIR_EAGER") == "1" {
+		t.Skip("eager mode computes the scaled gradient into memory of its own")
+	}
+	// The scaled gradient is read by both of Adam's moments, and is
+	// computed inside their kernel rather than into a buffer of its own:
+	// a step allocates the same with and without a gradient scale.
+	step := func(scale float64) (int64, []float32) {
+		be := cpu.New()
+		defer tensor.SetDevice(be)()
+		nn.ManualSeed(3)
+		model := nn.NewSequential(nn.NewLinear(8, 32), nn.ReLU(), nn.NewLinear(32, 4))
+		opt := optim.Adam(nn.Parameters(model), optim.LR(0.01))
+		opt.SetGradScale(scale)
+		x := tensor.Randn(1, 16, 8)
+		y := tensor.FromSlice([]int32{0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3})
+		l := loss.CrossEntropy(model.Forward(x), y).Mul(tensor.Scalar(float32(scale)))
+		if err := l.Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		before := sched.MemoryOf(be).Obtained
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		var w []float32
+		for _, p := range nn.Parameters(model) {
+			v, err := p.Value().Data[float32](t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			w = append(w, v...)
+		}
+		return sched.MemoryOf(be).Obtained - before, w
+	}
+	plain, w := step(1)
+	scaled, ws := step(1024)
+	if scaled != plain {
+		t.Errorf("a step at gradient scale 1024 obtained %d bytes, one without %d", scaled, plain)
+	}
+	for i := range w {
+		if w[i] != ws[i] {
+			t.Fatalf("parameter value %d = %v at scale 1024, %v without", i, ws[i], w[i])
+		}
 	}
 }
