@@ -75,8 +75,40 @@ const (
 	// for chains of elementwise ops; it is not part of the public IR.
 	OpFused
 
+	// OpScan is the inclusive scan of In[0] along Attrs.Axis by
+	// Attrs.Combine: out[m] combines the elements In[0][m'] with m' = m
+	// outside axis and m'[axis] <= m[axis], in order along axis. Half
+	// elements are combined in float32 and rounded once, into an output
+	// of their dtype.
+	OpScan
+
 	numOps
 )
+
+// Combine is the function a scan combines elements with. Each is
+// associative, so a device may group the elements of a line as it likes,
+// and the last bits of a float scan can differ between devices.
+type Combine uint8
+
+// Scan combines.
+const (
+	CombineSum       Combine = iota + 1 // a + b; Int32 wraps
+	CombineMax                          // max(a, b), like OpMax: NaN propagates
+	CombineLogSumExp                    // log(exp(a) + exp(b)), without overflow; float types only
+)
+
+func (c Combine) String() string {
+	switch c {
+	case CombineSum:
+		return "sum"
+	case CombineMax:
+		return "max"
+	case CombineLogSumExp:
+		return "logsumexp"
+	default:
+		return fmt.Sprintf("Combine(%d)", uint8(c))
+	}
+}
 
 var opNames = [numOps]string{
 	OpInvalid:     "invalid",
@@ -113,6 +145,7 @@ var opNames = [numOps]string{
 	OpFold:        "fold",
 	OpContiguous:  "contiguous",
 	OpFused:       "fused",
+	OpScan:        "scan",
 }
 
 func (o Op) String() string {

@@ -139,7 +139,7 @@ type Kernel struct {
 // Each Op documents which fields it uses.
 type Attrs struct {
 	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
-	Axis   int      // Gather, ScatterAdd: the indexed axis.
+	Axis   int      // Gather, ScatterAdd: the indexed axis. Scan: the scanned axis.
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension.
 	Value  float64  // Const, Pad, Unfold: the fill value.
@@ -155,6 +155,9 @@ type Attrs struct {
 	// Stores[i] into output i+1. Stored values have the output's dtype
 	// and are computed, not loaded: a copy of an input is OpContiguous.
 	Stores []int
+
+	// Scan: how the elements along Axis combine.
+	Combine Combine
 }
 
 // Instr is one instruction of a fused program. Instruction i computes
