@@ -9,8 +9,8 @@
 package kerneltest
 
 import (
+	"bytes"
 	"encoding/binary"
-	"fmt"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -31,8 +31,8 @@ type Target interface {
 }
 
 // Case is a kernel and its inputs, which are Host buffers. Tol is the
-// relative error allowed against the CPU backend; 0 requires identical
-// bits.
+// relative error allowed against the CPU backend for a float output of
+// any dtype; 0 requires identical bits.
 type Case struct {
 	Name string
 	K    backend.Kernel
@@ -83,44 +83,98 @@ func Check(t *testing.T, tg Target, c Case) {
 	if failed {
 		t.Fatal("kernel reported an error, CPU succeeded")
 	}
+	dt := c.K.DType
 	for o := range outs {
-		for i := 0; i < len(want[o]); i += 4 {
-			w := binary.LittleEndian.Uint32(want[o][i:])
-			g := binary.LittleEndian.Uint32(got[o][i:])
-			if w == g {
+		if bytes.Equal(want[o], got[o]) || len(got[o]) != len(want[o]) {
+			if len(got[o]) != len(want[o]) {
+				t.Fatalf("output %d: got %d bytes, want %d", o, len(got[o]), len(want[o]))
+			}
+			continue
+		}
+		wv, gv := Values(t, dt, want[o]), Values(t, dt, got[o])
+		for i, w := range wv {
+			g := gv[i]
+			size := dt.Size()
+			if bytes.Equal(want[o][i*size:(i+1)*size], got[o][i*size:(i+1)*size]) {
 				continue
 			}
-			if c.K.DType == backend.Float32 && c.Tol > 0 {
-				wf, gf := float64(math.Float32frombits(w)), float64(math.Float32frombits(g))
-				if math.Abs(wf-gf) <= c.Tol*math.Max(1, math.Abs(wf)) || math.IsNaN(wf) && math.IsNaN(gf) {
-					continue
-				}
+			if dt.IsFloat() && c.Tol > 0 && (math.Abs(w-g) <= c.Tol*math.Max(1, math.Abs(w)) || math.IsNaN(w) && math.IsNaN(g)) {
+				continue
 			}
-			t.Fatalf("output %d element %d: got %s, want %s", o, i/4, show(c.K.DType, g), show(c.K.DType, w))
+			t.Fatalf("output %d element %d: got %v (%x), want %v (%x)", o, i, g, got[o][i*size:(i+1)*size], w, want[o][i*size:(i+1)*size])
 		}
 	}
 }
 
-func show(dt backend.DType, w uint32) string {
-	if dt == backend.Float32 {
-		return fmt.Sprint(math.Float32frombits(w))
+// Values returns the elements of dt in raw as numbers: the values of
+// half elements, or int32s.
+func Values(t *testing.T, dt backend.DType, raw []byte) []float64 {
+	t.Helper()
+	n := len(raw) / dt.Size()
+	out := make([]float64, n)
+	switch {
+	case dt == backend.Int32:
+		for i := range out {
+			out[i] = float64(int32(binary.LittleEndian.Uint32(raw[4*i:])))
+		}
+	case dt == backend.Float32:
+		for i, f := range FromBytes(raw) {
+			out[i] = float64(f)
+		}
+	default:
+		b, err := Host.Alloc(dt, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Host.Upload(t.Context(), b, raw); err != nil {
+			t.Fatal(err)
+		}
+		for i, f := range Floats(t, b) {
+			out[i] = float64(f)
+		}
 	}
-	return fmt.Sprint(int32(w))
+	return out
 }
+
+// byteSize returns the size of b in bytes.
+func byteSize(b backend.Buffer) int { return b.Len() * b.DType().Size() }
 
 // Contents returns the bytes of the Host buffer b.
 func Contents(t *testing.T, b backend.Buffer) []byte {
 	t.Helper()
-	out := make([]byte, 4*b.Len())
+	out := make([]byte, byteSize(b))
 	if err := Host.Download(t.Context(), out, b); err != nil {
 		t.Fatal(err)
 	}
 	return out
 }
 
-// Floats returns the elements of the float32 Host buffer b.
+// cast returns a Host buffer holding the elements of the Host buffer b
+// converted to dt by the CPU backend.
+func cast(t *testing.T, b backend.Buffer, dt backend.DType) backend.Buffer {
+	t.Helper()
+	if b.DType() == dt {
+		return b
+	}
+	out, err := Host.Alloc(dt, b.Len())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shape := []int{b.Len()}
+	k := &backend.Kernel{Op: backend.OpCast, DType: dt, Shape: shape, In: []backend.View{backend.Contiguous(shape)}}
+	if err := Host.Run(t.Context(), k, []backend.Buffer{out}, []backend.Buffer{b}); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// Floats returns the elements of the float Host buffer b, the values of
+// half elements.
 func Floats(t *testing.T, b backend.Buffer) []float32 {
 	t.Helper()
+	if b.DType().Size() == 2 {
+		b = cast(t, b, backend.Float32)
+	}
 	return FromBytes(Contents(t, b))
 }
 
@@ -142,19 +196,24 @@ func Bytes(v []float32) []byte {
 	return raw
 }
 
-// HostBuffer returns a Host buffer of n random values: floats in [-2, 2)
-// or ints in [lo, hi). Without rng, every element is a NaN payload that no
-// kernel writes.
+// HostBuffer returns a Host buffer of n random values: floats in [-2, 2),
+// rounded to a half dtype, or ints in [lo, hi). Without rng, every
+// element is a NaN payload that no kernel writes.
 func HostBuffer(t *testing.T, rng *rand.Rand, dt backend.DType, n, lo, hi int) backend.Buffer {
 	t.Helper()
+	if rng != nil && dt.Size() == 2 {
+		return cast(t, HostBuffer(t, rng, backend.Float32, n, lo, hi), dt)
+	}
 	b, err := Host.Alloc(dt, n)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := make([]byte, 4*n)
+	raw := make([]byte, n*dt.Size())
 	for i := range n {
 		var w uint32
 		switch {
+		case rng == nil && dt.Size() == 2:
+			w = 0x7fdd // a NaN in both half formats
 		case rng == nil:
 			w = 0x7fc0dead
 		case dt == backend.Float32:
@@ -162,7 +221,11 @@ func HostBuffer(t *testing.T, rng *rand.Rand, dt backend.DType, n, lo, hi int) b
 		default:
 			w = uint32(int32(lo + rng.IntN(hi-lo)))
 		}
-		binary.LittleEndian.PutUint32(raw[4*i:], w)
+		if dt.Size() == 2 {
+			binary.LittleEndian.PutUint16(raw[2*i:], uint16(w))
+		} else {
+			binary.LittleEndian.PutUint32(raw[4*i:], w)
+		}
 	}
 	if err := Host.Upload(t.Context(), b, raw); err != nil {
 		t.Fatal(err)

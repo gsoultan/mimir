@@ -10,6 +10,20 @@ import (
 	"github.com/gsoultan/mimir/backend"
 )
 
+// halfTypes are the half element types, which kernels compute in float
+// and round on store.
+var halfTypes = []backend.DType{backend.BFloat16, backend.Float16}
+
+// halfTol is the relative error allowed on a half result of a
+// transcendental function: a float32 result that differs from the CPU's
+// by an ulp may round to the neighbouring half element.
+func halfTol(dt backend.DType) float64 {
+	if dt == backend.BFloat16 {
+		return 1.0 / 64
+	}
+	return 1.0 / 512
+}
+
 // Elementwise returns cases of elementwise kernels and fused programs.
 func Elementwise(t *testing.T) []Case {
 	rng := rand.New(rand.NewPCG(1, 2))
@@ -73,6 +87,96 @@ func Elementwise(t *testing.T) []Case {
 		Case{Name: "const", K: backend.Kernel{Op: backend.OpConst, DType: i, Shape: shape, Attrs: backend.Attrs{Value: -7}}},
 		Case{Name: "empty", K: backend.Kernel{Op: backend.OpConst, DType: f, Shape: []int{0, 3}, Attrs: backend.Attrs{Value: 1}}},
 	)
+	return append(cases, halfElementwise(t, rng)...)
+}
+
+// halfElementwise returns cases of elementwise kernels on half elements:
+// loaded as float, computed in float and rounded on store.
+func halfElementwise(t *testing.T, rng *rand.Rand) []Case {
+	f, i := backend.Float32, backend.Int32
+	all := []backend.DType{f, i, backend.BFloat16, backend.Float16}
+	shape := []int{3, 5, 7}
+	n := 105
+	var cases []Case
+	for _, dt := range halfTypes {
+		for name, x := range Views(shape) {
+			for _, op := range []backend.Op{backend.OpNeg, backend.OpExp2, backend.OpSin, backend.OpSqrt, backend.OpContiguous} {
+				var tol float64
+				if op == backend.OpExp2 || op == backend.OpSin || op == backend.OpSqrt {
+					tol = halfTol(dt)
+				}
+				cases = append(cases, Case{
+					Name: fmt.Sprintf("%s/%s/%s", op, dt, name),
+					K:    backend.Kernel{Op: op, DType: dt, Shape: shape, In: []backend.View{x.V}},
+					Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0)},
+					Tol:  tol,
+				})
+			}
+			for _, op := range []backend.Op{backend.OpAdd, backend.OpMul, backend.OpMax, backend.OpCmpLT, backend.OpCmpEQ, backend.OpMod} {
+				cases = append(cases, Case{
+					Name: fmt.Sprintf("%s/%s/%s", op, dt, name),
+					K:    backend.Kernel{Op: op, DType: dt, Shape: shape, In: []backend.View{x.V, backend.Contiguous(shape)}},
+					Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0), HostBuffer(t, rng, dt, n, 0, 0)},
+				})
+			}
+		}
+		// Casts from dt to every type and to dt from every type, of
+		// values that exercise rounding: random floats, which a cast to
+		// the other half type rounds, and ints beyond the precision of
+		// the half types.
+		for _, to := range all {
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("cast/%s to %s", dt, to),
+				K:    backend.Kernel{Op: backend.OpCast, DType: to, Shape: shape, In: []backend.View{backend.Contiguous(shape)}},
+				Ins:  []backend.Buffer{HostBuffer(t, rng, dt, n, 0, 0)},
+			})
+			if to != dt {
+				cases = append(cases, Case{
+					Name: fmt.Sprintf("cast/%s to %s", to, dt),
+					K:    backend.Kernel{Op: backend.OpCast, DType: dt, Shape: shape, In: []backend.View{backend.Contiguous(shape)}},
+					Ins:  []backend.Buffer{HostBuffer(t, rng, to, n, -5000, 5000)},
+				})
+			}
+		}
+		cases = append(cases,
+			Case{Name: "where/" + dt.String(), K: backend.Kernel{Op: backend.OpWhere, DType: dt, Shape: shape, In: []backend.View{backend.Contiguous(shape), backend.Contiguous(shape), backend.Contiguous([]int{1, 1, 1}).Expand(shape)}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, f, n, 0, 0), HostBuffer(t, rng, dt, n, 0, 0), HostBuffer(t, rng, dt, 1, 0, 0)}},
+			Case{Name: "const/" + dt.String(), K: backend.Kernel{Op: backend.OpConst, DType: dt, Shape: shape, Attrs: backend.Attrs{Value: 1.0 / 3}}},
+			// Every value of a half type is rounded; a float32 product of
+			// the rounded values is stored in float32.
+			Case{Name: "fused mixed/" + dt.String(), K: backend.Kernel{Op: backend.OpFused, DType: f, Shape: shape,
+				In: []backend.View{backend.Contiguous(shape), backend.Contiguous([]int{7, 5, 3}).Permute([]int{2, 1, 0}), backend.Contiguous([]int{1, 5, 1}).Expand(shape)},
+				Attrs: backend.Attrs{Program: []backend.Instr{
+					{Op: backend.OpLoad, DType: dt, Args: []int{0}},
+					{Op: backend.OpLoad, DType: f, Args: []int{1}},
+					{Op: backend.OpLoad, DType: i, Args: []int{2}},
+					{Op: backend.OpCast, DType: dt, Args: []int{1}},
+					{Op: backend.OpAdd, DType: dt, Args: []int{0, 3}},
+					{Op: backend.OpConst, DType: dt, Value: 0.3},
+					{Op: backend.OpMul, DType: dt, Args: []int{4, 5}},
+					{Op: backend.OpCast, DType: f, Args: []int{6}},
+					{Op: backend.OpCast, DType: f, Args: []int{0}},
+					{Op: backend.OpMul, DType: f, Args: []int{7, 8}},
+					{Op: backend.OpWhere, DType: f, Args: []int{2, 9, 1}},
+				}}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, dt, n, 0, 0), HostBuffer(t, rng, f, n, 0, 0), HostBuffer(t, rng, i, 5, 0, 2)}},
+			// Stores of half values, and a transcendental in between.
+			Case{Name: "fused with stores/" + dt.String(), K: backend.Kernel{Op: backend.OpFused, DType: dt, Shape: shape,
+				In: []backend.View{backend.Contiguous(shape), backend.Contiguous([]int{1, 1, 7}).Expand(shape)},
+				Attrs: backend.Attrs{Program: []backend.Instr{
+					{Op: backend.OpLoad, DType: dt, Args: []int{0}},
+					{Op: backend.OpLoad, DType: f, Args: []int{1}},
+					{Op: backend.OpCast, DType: dt, Args: []int{1}},
+					{Op: backend.OpMul, DType: dt, Args: []int{0, 2}},
+					{Op: backend.OpExp2, DType: dt, Args: []int{3}},
+					{Op: backend.OpConst, DType: dt, Value: -1},
+					{Op: backend.OpMax, DType: dt, Args: []int{4, 5}},
+					{Op: backend.OpCmpLT, DType: dt, Args: []int{0, 6}},
+					{Op: backend.OpWhere, DType: dt, Args: []int{7, 3, 6}},
+				}, Stores: []int{3, 6}}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, dt, n, 0, 0), HostBuffer(t, rng, f, 7, 0, 0)}, Tol: halfTol(dt)},
+		)
+	}
 	return cases
 }
 
@@ -116,6 +220,15 @@ func Reduce(t *testing.T) []Case {
 						Name: fmt.Sprintf("%s/%s/%v%v/%s", op, dt, s.shape, s.axes, name),
 						K:    backend.Kernel{Op: op, DType: dt, Shape: out, In: []backend.View{x.V}, Attrs: backend.Attrs{Axes: s.axes}},
 						Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, -50, 50)},
+						Tol:  1e-5,
+					})
+				}
+				// Half inputs are reduced in float, into a float32 output.
+				for _, dt := range halfTypes {
+					cases = append(cases, Case{
+						Name: fmt.Sprintf("%s/%s/%v%v/%s", op, dt, s.shape, s.axes, name),
+						K:    backend.Kernel{Op: op, DType: backend.Float32, Shape: out, In: []backend.View{x.V}, Attrs: backend.Attrs{Axes: s.axes}},
+						Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0)},
 						Tol:  1e-5,
 					})
 				}
@@ -165,6 +278,36 @@ func Movement(t *testing.T) []Case {
 		Case{Name: "scatter add out of range", K: backend.Kernel{Op: backend.OpScatterAdd, DType: i, Shape: []int{4}, In: []backend.View{backend.Contiguous([]int{4}), backend.Contiguous([]int{6}), backend.Contiguous([]int{6})}},
 			Ins: []backend.Buffer{HostBuffer(t, rng, i, 4, 0, 9), HostBuffer(t, rng, i, 6, -1, 1), HostBuffer(t, rng, i, 6, 0, 9)}},
 	)
+	// Half elements move as they are; a scatter add sums them in float
+	// and rounds once.
+	for _, dt := range halfTypes {
+		for name, x := range Views([]int{3, 4, 5}) {
+			if name != "contiguous" && name != "transposed" {
+				continue
+			}
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("pad/%s/%s", dt, name),
+				K: backend.Kernel{Op: backend.OpPad, DType: dt, Shape: []int{4, 4, 8}, In: []backend.View{x.V},
+					Attrs: backend.Attrs{Pads: [][2]int{{1, 0}, {0, 0}, {2, 1}}, Value: -1.0 / 3}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0)},
+			})
+			idx := []int{3, 2, 5}
+			n, _ := backend.NumElements(idx)
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("gather/%s/%s", dt, name),
+				K:    backend.Kernel{Op: backend.OpGather, DType: dt, Shape: idx, In: []backend.View{x.V, backend.Contiguous(idx)}, Attrs: backend.Attrs{Axis: 0}},
+				Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0), HostBuffer(t, rng, i, n, 0, 3)},
+			})
+			upd := []int{7, 2, 5}
+			m, _ := backend.NumElements(upd)
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("scatter add/%s/%s", dt, name),
+				K: backend.Kernel{Op: backend.OpScatterAdd, DType: dt, Shape: []int{3, 4, 5},
+					In: []backend.View{x.V, backend.Contiguous(upd), backend.Contiguous(upd)}, Attrs: backend.Attrs{Axis: 0}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0), HostBuffer(t, rng, i, m, 0, 3), HostBuffer(t, rng, dt, m, 0, 0)},
+			})
+		}
+	}
 	return cases
 }
 
@@ -201,6 +344,22 @@ func Window(t *testing.T) []Case {
 				Name: "fold/" + w.name + "/" + name,
 				K:    backend.Kernel{Op: backend.OpFold, DType: f, Shape: w.in, In: []backend.View{x.V}, Attrs: attrs},
 				Ins:  []backend.Buffer{HostBuffer(t, rng, f, x.N, 0, 0)},
+			})
+		}
+		// Half windows move as they are, with the fill value rounded, and
+		// fold in float, rounded once.
+		for _, dt := range halfTypes {
+			x := Views(w.in)["padded"]
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("unfold/%s/%s", w.name, dt),
+				K:    backend.Kernel{Op: backend.OpUnfold, DType: dt, Shape: win, In: []backend.View{x.V}, Attrs: attrs},
+				Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0)},
+			})
+			y := Views(win)["transposed"]
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("fold/%s/%s", w.name, dt),
+				K:    backend.Kernel{Op: backend.OpFold, DType: dt, Shape: w.in, In: []backend.View{y.V}, Attrs: attrs},
+				Ins:  []backend.Buffer{HostBuffer(t, rng, dt, y.N, 0, 0)},
 			})
 		}
 	}
