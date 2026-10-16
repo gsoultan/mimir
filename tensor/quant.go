@@ -32,7 +32,19 @@ func (t *Tensor) MatMulT(w *Tensor) *Tensor {
 	if dt.Size() == 2 {
 		return t.Cast(Float32).MatMulT(w).Cast(dt)
 	}
-	out := wrap(graph.QMatMul(t.node, w.node))
-	q := w.detached()
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.MatMul(q.Cast(Float32)), nil) }, t, w)
+	var out *Tensor
+	if l := batchLevel(t, w); l != 0 {
+		out = batchQMatMul(l, t, w)
+	} else {
+		out = wrap(graph.QMatMul(t.node, w.node))
+	}
+	return record(out, qmatmulRule(), t, w)
+}
+
+// qmatmulRule differentiates the product as if by the dequantized weights.
+func qmatmulRule() rule {
+	return rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor { return grads(g.MatMul(in[1].Cast(Float32)), nil) },
+		jvp: func(t, in []*Tensor, _ *Tensor) *Tensor { return t[0].MatMul(in[1].Cast(Float32).Transpose(-2, -1)) },
+	}
 }

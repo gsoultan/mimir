@@ -158,6 +158,14 @@ func wrap(n *graph.Node, err error) *Tensor {
 	if err != nil {
 		return fail(err)
 	}
+	// An operation reaches a tensor inside VMap only through its batching
+	// rule, which builds the node from the batch: one without a rule
+	// cannot run inside VMap.
+	for _, in := range n.Inputs {
+		if in.Placeholder {
+			return fail(fmt.Errorf("tensor: %s inside VMap has no batching rule: %w", n.Op, ErrNotBatchable))
+		}
+	}
 	if eager {
 		if err := sched.Realize(context.Background(), backendOf(n), n); err != nil {
 			return fail(err)
@@ -308,6 +316,9 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 	if err := firstErr(ts...); err != nil {
 		return err
 	}
+	if err := computable(ts...); err != nil {
+		return err
+	}
 	nodes := make([]*graph.Node, len(ts))
 	for i, t := range ts {
 		nodes[i] = t.node
@@ -353,6 +364,9 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 	if err := firstErr(srcs...); err != nil {
 		return err
 	}
+	if err := computable(srcs...); err != nil {
+		return err
+	}
 	targets := make([]*graph.Node, len(srcs))
 	into := make([]*graph.Node, len(srcs))
 	for i, src := range srcs {
@@ -362,6 +376,9 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 			continue
 		}
 		if err := firstErr(d); err != nil {
+			return err
+		}
+		if err := computable(d); err != nil {
 			return err
 		}
 		if !slices.Equal(d.node.Shape, src.node.Shape) || d.node.DType != src.node.DType {
@@ -406,6 +423,9 @@ func byDevice(nodes []*graph.Node) iter.Seq2[backend.Backend, []int] {
 // t's dtype; a half tensor is read through Cast(Float32).
 func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err := firstErr(t); err != nil {
+		return nil, err
+	}
+	if err := computable(t); err != nil {
 		return nil, err
 	}
 	if want := dtypeOf[T](); t.node.DType != want {
