@@ -342,69 +342,95 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	if err := backend.CheckRun(k, outs, ins); err != nil {
 		return fmt.Errorf("cuda: %w", err)
 	}
-	bufs := make([]*buffer, 0, len(outs)+len(ins))
+	ptrs := make([]uint64, 0, len(outs)+len(ins))
 	for _, buf := range slices.Concat(outs, ins) {
 		cb, err := b.own(buf)
 		if err != nil {
 			return err
 		}
-		bufs = append(bufs, cb)
+		ptrs = append(ptrs, cb.ptr)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	defer b.enter()()
+	var c call
+	if err := b.plan(&c, k, outs, ins); err != nil {
+		return err
+	}
+	return b.issue(&c, ptrs, nil)
+}
+
+// call is how the backend runs one kernel: a cuBLAS product, if gemm is
+// set, then the generated kernel l, if it is set, which is the product's
+// epilogue or the kernel itself.
+type call struct {
+	gemm *sgemm
+	l    *gen.Launch
+	fn   uintptr // the compiled kernel of l
+}
+
+// plan sets c to the call that runs k over outs and ins. b.mu is held
+// and the context is current.
+func (b *Backend) plan(c *call, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	*c = call{}
 	lens := make([]int, len(ins))
 	for i, buf := range ins {
 		lens[i] = buf.Len()
 	}
-	g, isGEMM := gen.PlanGEMM(k, lens)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	defer b.enter()()
-	if isGEMM && b.blasMin >= 0 && g.Batch*g.M*g.N*g.K >= b.blasMin {
-		var epilogue *gen.Launch
+	var err error
+	if g, isGEMM := gen.PlanGEMM(k, lens); isGEMM && b.blasMin >= 0 && g.Batch*g.M*g.N*g.K >= b.blasMin {
+		s := planSgemm(g)
+		c.gemm = &s
 		if k.Attrs.Program != nil {
-			var err error
-			if epilogue, err = gen.PlanEpilogue(gen.CUDA, k, outs, ins); err != nil {
-				return fmt.Errorf("cuda: %s: %w", k.Op, err)
-			}
+			c.l, err = gen.PlanEpilogue(gen.CUDA, k, outs, ins)
 		}
-		if err := b.sgemm(planSgemm(g), bufs); err != nil || epilogue == nil {
+	} else {
+		c.l, err = gen.Plan(gen.CUDA, k, outs, ins)
+	}
+	if err != nil {
+		return fmt.Errorf("cuda: %s: %w", k.Op, err)
+	}
+	if c.l != nil {
+		if c.fn, err = b.function(c.l.Src, c.l.Threads); err != nil {
+			return fmt.Errorf("cuda: %s: %w", k.Op, err)
+		}
+	}
+	return nil
+}
+
+// issue queues the call c over the device pointers ptrs of its outputs,
+// then its inputs, building the kernel's arguments in args, which may be
+// nil. b.mu is held and the context is current.
+func (b *Backend) issue(c *call, ptrs []uint64, args []unsafe.Pointer) error {
+	if c.gemm != nil {
+		if err := b.sgemm(*c.gemm, ptrs); err != nil {
 			return err
 		}
-		return b.launch(k, epilogue, bufs)
 	}
-	l, err := gen.Plan(gen.CUDA, k, outs, ins)
-	if err != nil {
-		return fmt.Errorf("cuda: %s: %w", k.Op, err)
-	}
-	if l == nil {
+	if c.l == nil {
 		return nil
 	}
-	return b.launch(k, l, bufs)
+	args = kernelArgs(args, ptrs, c.l, &b.errDev)
+	r := cuLaunchKernel(c.fn, uint32(c.l.Groups), 1, 1, uint32(c.l.Threads), 1, 1, 0, b.stream, &args[0], 0)
+	runtime.KeepAlive(ptrs)
+	runtime.KeepAlive(c)
+	return check(r, "launch")
 }
 
-// launch queues the launch l of k over bufs, the outputs then the
-// inputs. b.mu is held and the context is current.
-func (b *Backend) launch(k *backend.Kernel, l *gen.Launch, bufs []*buffer) error {
-	fn, err := b.function(l.Src, l.Threads)
-	if err != nil {
-		return fmt.Errorf("cuda: %s: %w", k.Op, err)
-	}
-	ptrs := make([]uint64, len(bufs))
-	args := make([]unsafe.Pointer, 0, len(bufs)+2)
-	for i, cb := range bufs {
-		ptrs[i] = cb.ptr
+// kernelArgs returns, in args, the arguments of a launch of l as the
+// driver takes them: the address of each buffer pointer, of the launch's
+// parameters and of the error word's pointer.
+func kernelArgs(args []unsafe.Pointer, ptrs []uint64, l *gen.Launch, errDev *uint64) []unsafe.Pointer {
+	args = args[:0]
+	for i := range ptrs {
 		args = append(args, unsafe.Pointer(&ptrs[i]))
 	}
-	args = append(args, unsafe.Pointer(&l.Params[0]), unsafe.Pointer(&b.errDev))
-	r := cuLaunchKernel(fn, uint32(l.Groups), 1, 1, uint32(l.Threads), 1, 1, 0, b.stream, &args[0], 0)
-	runtime.KeepAlive(args)
-	runtime.KeepAlive(ptrs)
-	runtime.KeepAlive(l)
-	return check(r, k.Op.String()+": launch")
+	return append(args, unsafe.Pointer(&l.Params[0]), unsafe.Pointer(errDev))
 }
 
-// sgemm queues the cuBLAS call s over bufs, the output then the inputs.
-// b.mu is held and the context is current.
-func (b *Backend) sgemm(s sgemm, bufs []*buffer) error {
+// sgemm queues the cuBLAS call s over the device pointers ptrs of the
+// output, then the inputs. b.mu is held and the context is current.
+func (b *Backend) sgemm(s sgemm, ptrs []uint64) error {
 	alpha, beta := float32(1), float32(0)
 	op := func(trans bool) int32 {
 		if trans {
@@ -412,11 +438,10 @@ func (b *Backend) sgemm(s sgemm, bufs []*buffer) error {
 		}
 		return blasOpN
 	}
-	at := func(o operand) uint64 { return bufs[1+o.in].ptr + 4*uint64(o.offset) }
+	at := func(o operand) uint64 { return ptrs[1+o.in] + 4*uint64(o.offset) }
 	st := cublasSgemmStridedBatched(b.blas, op(s.a.trans), op(s.b.trans), int32(s.m), int32(s.n), int32(s.k),
 		&alpha, at(s.a), int32(s.a.ld), int64(s.a.stride), at(s.b), int32(s.b.ld), int64(s.b.stride),
-		&beta, bufs[0].ptr, int32(s.ldc), int64(s.strideC), int32(s.batch))
-	runtime.KeepAlive(bufs)
+		&beta, ptrs[0], int32(s.ldc), int64(s.strideC), int32(s.batch))
 	if st != blasSuccess {
 		return fmt.Errorf("cuda: cuBLAS sgemm: status %d: %w", st, backend.ErrInternal)
 	}
