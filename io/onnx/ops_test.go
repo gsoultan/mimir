@@ -653,6 +653,28 @@ func TestMovement(t *testing.T) {
 
 func abs(x int) int { return max(x, -x) }
 
+// TestOpset11 checks the operators whose axes or sizes were attributes
+// before opset 13.
+func TestOpset11(t *testing.T) {
+	x := random(145, 2, 3, 4)
+	g := newGraph().input("x", Float, 2, 3, 4).
+		node("Unsqueeze", []string{"x", "->", "u"}, aInts("axes", 0)).
+		node("Squeeze", []string{"u", "->", "s"}, aInts("axes", 0)).
+		node("Split", []string{"s", "->", "a", "b"}, aInt("axis", 2), aInts("split", 3, 1)).
+		node("ReduceSum", []string{"a", "->", "y"}, aInts("axes", 1, 2), aInt("keepdims", 0)).output("y")
+	g.opset = 11
+	got, shape := runOne(t, g, map[string]*tensor.Tensor{"x": x.tensor()}, "y")
+	want := newArr(2)
+	for b := range 2 {
+		for j := range 3 {
+			for k := range 3 {
+				want.data[b] += x.at(b, j, k)
+			}
+		}
+	}
+	expect(t, got, shape, want, 1e-6)
+}
+
 // TestHostShapes checks operators on host values of the kind a graph
 // computes for shapes: Range, ConstantOfShape, Cast, Equal, Where, Mul
 // and Expand in the manner of an exported causal mask.
