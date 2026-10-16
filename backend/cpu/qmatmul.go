@@ -53,6 +53,9 @@ var qdots = map[backend.DType]*[maxRows]qdot{
 	backend.Q6_K: portable(backend.Q6_K, qdotQ6KGo),
 }
 
+// qdotISA names the instructions of the kernels in qdots.
+var qdotISA = "portable"
+
 // portable returns the kernels of each number of rows that apply dot,
 // the dot product of one row of weights of dt with one of activations,
 // row by row.

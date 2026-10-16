@@ -27,6 +27,7 @@ func init() {
 
 type x86 struct {
 	avx, avx2, fma, avx512 bool
+	f16c                   bool // VCVTPH2PS, converting float16
 }
 
 // x86Features reports the vector extensions that both the CPU and the
@@ -37,7 +38,7 @@ func x86Features() x86 {
 		return x86{}
 	}
 	_, _, ecx1, _ := cpuid(1, 0)
-	const osxsave, avx, fma = 1 << 27, 1 << 28, 1 << 12
+	const osxsave, avx, fma, f16c = 1 << 27, 1 << 28, 1 << 12, 1 << 29
 	if ecx1&osxsave == 0 || ecx1&avx == 0 {
 		return x86{}
 	}
@@ -54,6 +55,7 @@ func x86Features() x86 {
 		avx:    true,
 		avx2:   ebx7&avx2 != 0,
 		fma:    ecx1&fma != 0,
+		f16c:   ecx1&f16c != 0,
 		avx512: ebx7&avx512f != 0 && xcr0&zmmState == zmmState,
 	}
 }
