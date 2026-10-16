@@ -120,6 +120,7 @@ func TestKernelsCompileWithNVRTC(t *testing.T) {
 	for _, f := range []func(*testing.T) []kerneltest.Case{
 		kerneltest.Elementwise, kerneltest.Random, kerneltest.Reduce,
 		kerneltest.Movement, kerneltest.Window, kerneltest.MatMul,
+		kerneltest.Scan,
 	} {
 		cases = append(cases, f(t)...)
 	}
