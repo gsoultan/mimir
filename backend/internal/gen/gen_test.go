@@ -82,6 +82,22 @@ func TestSliceScatterInPlaceWritesTheBlock(t *testing.T) {
 	}
 }
 
+// TestAttentionOfHugeHeadsIsRefused checks that attention whose tiles
+// cannot fit a group's memory fails with ErrShape instead of compiling.
+func TestAttentionOfHugeHeadsIsRefused(t *testing.T) {
+	f := backend.Float32
+	s := backend.AttentionShape{Batch: []int{1}, Heads: 1, KVHeads: 1, Q: 2, K: 2, D: 1024, DV: 1024}
+	in := []backend.View{backend.Contiguous(s.QShape()), backend.Contiguous(s.KShape()), backend.Contiguous(s.VShape())}
+	ins := []backend.Buffer{kerneltest.HostBuffer(t, nil, f, 2048, 0, 0), kerneltest.HostBuffer(t, nil, f, 2048, 0, 0), kerneltest.HostBuffer(t, nil, f, 2048, 0, 0)}
+	k := &backend.Kernel{Op: backend.OpAttention, DType: f, Shape: []int{s.Size()}, In: in, Attrs: backend.Attrs{Scale: 1}}
+	out := kerneltest.HostBuffer(t, nil, f, s.Size(), 0, 0)
+	for _, d := range dialects {
+		if _, err := gen.Plan(d, k, []backend.Buffer{out}, ins); !errors.Is(err, backend.ErrShape) {
+			t.Errorf("%s: got %v, want ErrShape", d.Name, err)
+		}
+	}
+}
+
 // TestConstantsAreParameters checks that kernels differing only in their
 // constants, as an optimizer's update does from one step to the next,
 // share their source and so one compiled program.
