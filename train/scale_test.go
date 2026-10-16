@@ -29,13 +29,16 @@ const memoryMargin = 64 << 20
 
 // TestFlatMemoryOverManyRows trains a small model over a synthetic stream
 // of rows and asserts that memory stays flat however many rows pass: the
-// memory held after the last tenth of the epoch is at most memoryMargin
-// above the memory held after the first tenth. MIMIR_SCALE_ROWS sets the
-// number of rows; the default of a million keeps the test short, and
+// memory held at each later sample, up to the last batch, is at most
+// memoryMargin above the memory held a tenth of the way in. It also
+// asserts that the model learned: the mean loss of the last tenth of the
+// epoch is low. MIMIR_SCALE_ROWS sets the number of rows; the default of
+// a million keeps the test short, and
 //
-//	MIMIR_SCALE_ROWS=1000000000 go test -run FlatMemory -timeout 3h -v ./train
+//	MIMIR_SCALE_ROWS=1000000000 go test -run FlatMemory -timeout 85m -v ./train
 //
-// is the billion-row run that the scale job of CI performs.
+// is the billion-row run that the scale job of CI performs, in about 20
+// minutes on its runner.
 func TestFlatMemoryOverManyRows(t *testing.T) {
 	rows := int64(scaleRows)
 	if s := os.Getenv("MIMIR_SCALE_ROWS"); s != "" {
@@ -64,12 +67,17 @@ func TestFlatMemoryOverManyRows(t *testing.T) {
 	sampleAt := map[int]bool{steps / 10: true, steps * 4 / 10: true, steps * 7 / 10: true, steps - 1: true}
 	var samples []memorySample
 	var epoch train.Epoch
+	var lateLoss float64 // the sum of the losses of the last tenth of the epoch
+	late := steps - steps/10
 	began := time.Now()
 	err = train.Fit(t.Context(), m, opt, ds,
 		train.Loss(loss.CrossEntropy),
 		train.OnBatch(func(b train.Batch) error {
 			if sampleAt[b.Index] {
 				samples = append(samples, measureMemory(b.Index))
+			}
+			if b.Index >= late {
+				lateLoss += b.Loss
 			}
 			return nil
 		}),
@@ -78,16 +86,17 @@ func TestFlatMemoryOverManyRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(began)
-	t.Logf("%d rows in %d steps of %d took %s: %.0f rows/s, mean loss %.3f",
-		rows, steps, batch, elapsed.Round(time.Millisecond), float64(steps*batch)/elapsed.Seconds(), epoch.Loss)
+	lateLoss /= float64(steps - late)
+	t.Logf("%d rows in %d steps of %d took %s: %.0f rows/s, mean loss %.3f, %.3f over the last tenth",
+		rows, steps, batch, elapsed.Round(time.Millisecond), float64(steps*batch)/elapsed.Seconds(), epoch.Loss, lateLoss)
 	for _, s := range samples {
 		t.Log(s)
 	}
 	if epoch.Steps != steps {
 		t.Errorf("took %d steps, want %d", epoch.Steps, steps)
 	}
-	if epoch.Loss > 0.5 {
-		t.Errorf("mean loss %.3f, want below 0.5 on separable data", epoch.Loss)
+	if lateLoss > 0.25 {
+		t.Errorf("mean loss %.3f over the last tenth of the epoch, want below 0.25 on separable data (ln 2 at chance)", lateLoss)
 	}
 	base := samples[0]
 	for _, s := range samples[1:] {
@@ -116,11 +125,14 @@ func (s memorySample) String() string {
 func mib(bytes uint64) string { return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20)) }
 
 // measureMemory collects garbage, returns what memory it can to the
-// operating system and samples what remains held.
+// operating system and samples what remains held. FreeOSMemory collects
+// again, which may queue more cleanups of off-heap buffers, so those are
+// waited out too before the sample.
 func measureMemory(step int) memorySample {
 	runtime.GC()
 	settleOffHeap()
 	debug.FreeOSMemory()
+	settleOffHeap()
 	ms := []metrics.Sample{{Name: "/memory/classes/total:bytes"}, {Name: "/memory/classes/heap/released:bytes"}}
 	metrics.Read(ms)
 	return memorySample{step: step, held: ms[0].Value.Uint64() - ms[1].Value.Uint64(), resident: residentBytes()}

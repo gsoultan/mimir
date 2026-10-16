@@ -46,7 +46,7 @@ func defaultPrefetch() int { return max(1, min(4, runtime.GOMAXPROCS(0))) }
 // Prefetch sets how many shards a Stream, or Statistics, reads at once,
 // ahead of the batches it yields; it is at least 1. The default is
 // min(4, GOMAXPROCS). Memory grows with it: a Stream holds up to
-// 2×shards+1 chunks of about 4 MiB each (at most 8192 examples), which
+// 2×shards+1 chunks of at most 4 MiB and 8192 examples each, which
 // it keeps from one epoch to the next, and Statistics one such chunk per
 // shard being read.
 func Prefetch(shards int) Option { return func(c *config) { c.prefetch = shards } }
@@ -80,8 +80,10 @@ func Normalize(s *Stats) Option { return func(c *config) { c.normalize, c.stats 
 // and whatever the Prefetch. Without Shuffle, shards are read in order
 // and examples in order.
 //
-// Memory is bounded however many examples the source holds: 2×Prefetch+1
-// chunks of about 4 MiB each, the shuffle buffer of
+// Memory is bounded however many examples the source holds: up to
+// 2×Prefetch+1 chunks running at once in an epoch, each of at most 4 MiB
+// and 8192 examples (or of one example, when one is larger), the shuffle
+// buffer of
 // ShuffleBuffer×Features×4 bytes and one batch of BatchSize×Features×4
 // bytes, which the Stream keeps from one epoch to the next, plus the
 // tensors of the batch being yielded.

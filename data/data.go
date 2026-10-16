@@ -15,8 +15,8 @@
 // files of datasets.ParquetShards, through a Stream, which reads a
 // few shards ahead of the batches it yields and shuffles the shard order
 // and a buffer of examples every epoch, so resident memory stays flat
-// however many rows there are: a Stream holds 2×Prefetch+1 chunks of
-// about 4 MiB each, the shuffle buffer of ShuffleBuffer×Features×4 bytes
+// however many rows there are: a Stream holds up to 2×Prefetch+1 chunks
+// of at most 4 MiB each, the shuffle buffer of ShuffleBuffer×Features×4 bytes
 // and one batch, and keeps them from one epoch to the next. Statistics
 // reads the source once for the per-feature mean and deviation that
 // Normalize applies on the way:
