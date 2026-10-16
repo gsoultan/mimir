@@ -86,13 +86,13 @@ func Normalize(s *Stats) Option { return func(c *config) { c.normalize, c.stats 
 // bytes, which the Stream keeps from one epoch to the next, plus the
 // tensors of the batch being yielded.
 type Stream struct {
-	src          Source
-	shards       int
-	features     int
-	cfg          config
-	chunkRows    int
-	scale, shift []float32 // x*scale+shift standardizes, per feature; nil without Normalize
-	epoch        atomic.Int64
+	src         Source
+	shards      int
+	features    int
+	cfg         config
+	chunkRows   int
+	mean, scale []float32 // (x-mean)*scale standardizes, per feature; nil without Normalize
+	epoch       atomic.Int64
 
 	// The buffers of past epochs, for the next: an epoch takes chunks
 	// and a collector at its start and puts them back at its end, so a
@@ -130,7 +130,7 @@ func NewStream(src Source, opts ...Option) (*Stream, error) {
 	s := &Stream{src: src, shards: shards, features: features, cfg: cfg, chunkRows: chunkRows(features)}
 	if cfg.normalize {
 		var err error
-		if s.scale, s.shift, err = cfg.stats.affine(features); err != nil {
+		if s.mean, s.scale, err = cfg.stats.standardizer(features); err != nil {
 			return nil, err
 		}
 	}
@@ -268,7 +268,10 @@ func (s *Stream) startReaders(ctx context.Context, wg *sync.WaitGroup, order []i
 	var next atomic.Int64
 	for range workers {
 		wg.Go(func() {
-			for {
+			// Checked before each select, which picks either case when
+			// both are ready: a reader whose epoch has ended claims no
+			// more shards.
+			for ctx.Err() == nil {
 				select {
 				case <-p.slots:
 				case <-ctx.Done():
@@ -340,7 +343,7 @@ func (s *Stream) readShard(ctx context.Context, shard int, out chan<- *chunk, fr
 	}()
 	f := s.features
 	row, idle := 0, 0
-	for {
+	for ctx.Err() == nil { // see startReaders
 		var c *chunk
 		select {
 		case c = <-free:
@@ -387,6 +390,7 @@ func (s *Stream) readShard(ctx context.Context, shard int, out chan<- *chunk, fr
 			return rerr
 		}
 	}
+	return ctx.Err()
 }
 
 // prepare standardizes the examples of c and checks its targets, which
@@ -394,11 +398,11 @@ func (s *Stream) readShard(ctx context.Context, shard int, out chan<- *chunk, fr
 func (s *Stream) prepare(c *chunk, row int) error {
 	f := s.features
 	if s.scale != nil {
-		scale, shift := s.scale[:f], s.shift[:f]
+		mean, scale := s.mean[:f], s.scale[:f]
 		for i := range c.n {
 			x := c.x[i*f : (i+1)*f : (i+1)*f]
 			for j, v := range x {
-				x[j] = v*scale[j] + shift[j]
+				x[j] = (v - mean[j]) * scale[j]
 			}
 		}
 	}

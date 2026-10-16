@@ -6,6 +6,8 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -131,6 +133,69 @@ func TestNormalizeStandardizes(t *testing.T) {
 		if math.Abs(mean) > 1e-5 || math.Abs(std-wantStd) > 1e-5 {
 			t.Errorf("feature %d: mean %v, std %v", j, mean, std)
 		}
+	}
+}
+
+// TestNormalizeSubtractsTheMeanFirst checks that a feature far from zero
+// relative to its spread, such as a timestamp, standardizes to within the
+// precision of its float32 input: the mean is subtracted before scaling,
+// rather than folded into a shift that would round x*scale at the
+// magnitude of mean/std.
+func TestNormalizeSubtractsTheMeanFirst(t *testing.T) {
+	const mean, std = 1.7e9, 1e5
+	x := float32(mean + 2*std)
+	src, err := data.FromSlices(1, data.Shard{X: []float32{x}, Y: []float32{0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := &data.Stats{Rows: 1, Mean: []float32{mean}, Std: []float32{std}}
+	s, err := data.NewStream(src, data.Normalize(stats))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for b, err := range s.All(t.Context()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := b.X.Data[float32](t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := (float64(x) - float64(float32(mean))) / float64(float32(std))
+		if math.Abs(float64(got[0])-want) > 1e-6 {
+			t.Errorf("standardized %v as %v, want %v", x, got[0], want)
+		}
+	}
+}
+
+// TestStatisticsHoldsPrefetchShards checks that the memory Statistics
+// allocates does not grow with the number of shards: the moments of a
+// shard are merged as soon as the shards before it are, not kept until
+// every shard is read.
+func TestStatisticsHoldsPrefetchShards(t *testing.T) {
+	const shards, features = 4000, 256
+	shard := data.Shard{X: make([]float32, features), Y: make([]float32, 1)}
+	for j := range shard.X {
+		shard.X[j] = float32(j)
+	}
+	src, err := data.FromSlices(features, slices.Repeat([]data.Shard{shard}, shards)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	stats, err := data.Statistics(t.Context(), src, data.Prefetch(2))
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Rows != shards || stats.Mean[1] != 1 || stats.Std[1] != 0 {
+		t.Errorf("rows %d, mean %v, std %v", stats.Rows, stats.Mean[1], stats.Std[1])
+	}
+	// The two readers' chunks are about 4 MiB each; the moments of every
+	// shard, four float64 slices each, would add 32 MiB.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 12<<20 {
+		t.Errorf("allocated %d bytes for %d shards of %d features", alloc, shards, features)
 	}
 }
 
