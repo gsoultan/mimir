@@ -21,6 +21,12 @@ func New() (*Backend, error) {
 	return nil, fmt.Errorf("cuda: not built in (needs Linux on amd64 or arm64, without the nocuda tag): %w", ErrUnavailable)
 }
 
+// NewDevice reports ErrUnavailable: the backend is not built in.
+func NewDevice(int) (*Backend, error) { return New() }
+
+// DeviceCount returns 0.
+func DeviceCount() int { return 0 }
+
 // Name returns "cuda".
 func (*Backend) Name() string { return "cuda" }
 
