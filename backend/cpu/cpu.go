@@ -220,6 +220,7 @@ func (*Backend) Upload(ctx context.Context, dst backend.Buffer, src []byte) erro
 		return fmt.Errorf("cpu: upload %d bytes into %d-byte buffer: %w", len(src), len(b), backend.ErrShape)
 	}
 	copy(b, src)
+	runtime.KeepAlive(dst) // see Run
 	return nil
 }
 
@@ -236,6 +237,7 @@ func (*Backend) Download(ctx context.Context, dst []byte, src backend.Buffer) er
 		return fmt.Errorf("cpu: download %d-byte buffer into %d bytes: %w", len(b), len(dst), backend.ErrShape)
 	}
 	copy(dst, b)
+	runtime.KeepAlive(src) // see Run
 	return nil
 }
 

@@ -3,6 +3,7 @@ package cpu
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/gsoultan/mimir/backend"
 )
@@ -11,6 +12,11 @@ import (
 // written contiguously. Any panic inside a kernel is reported as
 // backend.ErrInternal instead of crashing the program.
 func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buffer, ins []backend.Buffer) (err error) {
+	// A kernel works on the buffers' memory, not the buffers: one that the
+	// caller drops must stay reachable until the kernel is done, or the
+	// cleanup of an off-heap buffer unmaps it under the kernel.
+	defer runtime.KeepAlive(outs)
+	defer runtime.KeepAlive(ins)
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("cpu: panic in %s: %v: %w", k.Op, r, backend.ErrInternal)
