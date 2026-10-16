@@ -9,6 +9,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/gsoultan/mimir/backend/cpu"
+	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -253,6 +255,35 @@ func TestSliceScatterWritesTheBlock(t *testing.T) {
 	} {
 		if err := x.SliceScatter(bad.src, bad.ranges).Err(); !errors.Is(err, bad.want) {
 			t.Errorf("%v at %v: got %v, want %v", bad.src, bad.ranges, err, bad.want)
+		}
+	}
+}
+
+// TestKVCacheAppendsInPlace checks that decoding steps write their keys
+// and values into the cache's memory instead of copying the cache.
+func TestKVCacheAppendsInPlace(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("eager mode computes every operation into memory of its own")
+	}
+	ctx := t.Context()
+	be := &allocCounter{Backend: cpu.New()}
+	defer tensor.SetDevice(be)()
+	const heads, capacity, dim = 2, 64, 8
+	cache := nn.NewKVCache(1, heads, capacity, dim, tensor.Float32)
+	for i := range 8 {
+		before := be.elements
+		k := tensor.Randn(uint64(i), 1, heads, 1, dim)
+		keys, values, err := cache.Append(ctx, k, k.Neg())
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := tensor.Randn(uint64(100+i), 1, 2*heads, 1, dim)
+		if err := tensor.ScaledDotProductAttention(q, keys, values).Realize(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// The first append computes the cache; later ones write a position.
+		if n := be.elements - before; i > 0 && n >= heads*capacity*dim {
+			t.Errorf("step %d allocated %d elements, as much as the cache", i, n)
 		}
 	}
 }

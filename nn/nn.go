@@ -13,6 +13,12 @@
 //	)
 //	logits := model.Forward(x)
 //
+// Transformers are built from MultiheadAttention, RMSNorm,
+// RotaryEmbedding and DecoderBlock, whose GPT-2 and Llama forms
+// NewGPT2Block and NewLlamaBlock return. Their attention runs as one fused
+// kernel (see tensor.ScaledDotProductAttention), and a KVCache lets a
+// decoder compute only the new positions at each step.
+//
 // New layers start in training mode; Eval switches dropout and batch
 // normalization to inference behavior and Train switches them back.
 // Weights are initialized like PyTorch's defaults from a seeded
