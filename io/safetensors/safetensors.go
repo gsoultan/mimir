@@ -43,6 +43,7 @@ type Tensor struct {
 type File struct {
 	Metadata map[string]string
 	tensors  map[string]Tensor
+	mapping  *mapping // the mapping the tensors alias, when Open made one
 }
 
 type entry struct {
