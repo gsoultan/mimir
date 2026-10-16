@@ -99,6 +99,34 @@ func TestReductionsMatchReference(t *testing.T) {
 	}
 }
 
+func TestColumnSumsDoNotDependOnWorkers(t *testing.T) {
+	// Few rows of sums over many positions, such as a bias gradient, sum
+	// blocks of positions in parallel.
+	x := make([]float32, 1000*5)
+	for i := range x {
+		x[i] = float32(math.Sin(float64(i))) * 1e3
+	}
+	k := &backend.Kernel{
+		Op: backend.OpReduceSum, DType: backend.Float32, Shape: []int{1, 5},
+		In: []backend.View{backend.Contiguous([]int{1000, 5})}, Attrs: backend.Attrs{Axes: []int{0}},
+	}
+	first := runOn[float32](t, 1, k, f32buf(x...))
+	for j, got := range first {
+		var want float64
+		for i := range 1000 {
+			want += float64(x[i*5+j])
+		}
+		if math.Abs(float64(got)-want) > 1e-6*math.Abs(want)+1e-3 {
+			t.Errorf("column %d: sum %v, want %v", j, got, want)
+		}
+	}
+	for _, workers := range []int{2, 4} {
+		if got := runOn[float32](t, workers, k, f32buf(x...)); !slices.Equal(got, first) {
+			t.Errorf("%d workers: sums %v, want %v as with one", workers, got, first)
+		}
+	}
+}
+
 func TestReduceSumAccumulatesFloat32InFloat64(t *testing.T) {
 	// 2^24 + 1 is not a float32, so a float32 running sum drops every 1.
 	x := []float32{1 << 24, 1, 1, 1, 1, 1, 1, 1, 1}
