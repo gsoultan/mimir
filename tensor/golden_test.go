@@ -161,6 +161,29 @@ func TestGolden(t *testing.T) {
 	}
 }
 
+// TestGoldenSplit checks Split against the golden data of the slices of
+// "shrink_flip_add", taking them as parts of splits instead of shrinks:
+// the output and, through Split's gradient, the input's gradient.
+func TestGoldenSplit(t *testing.T) {
+	fn := func(x *tensor.Tensor) *tensor.Tensor {
+		mid := x.Split(0, 1, 3, 1)[1].Split(1, 2, 4)[1]
+		corner := x.Split(0, 3, 2)[0].Split(1, 4, 2)[0]
+		return mid.Flip(0).Add(corner)
+	}
+	ops, _ := goldentest.Load(t, "ops")
+	c, ok := ops["shrink_flip_add"]
+	if !ok {
+		t.Fatal(`no golden case "shrink_flip_add" in ops`)
+	}
+	goldentest.CompareTensor(t, c.Want, fn(goldentest.Tensor(t, c.Inputs[0])), tight)
+	grads, _ := goldentest.Load(t, "grads")
+	if c, ok = grads["shrink_flip_add"]; !ok {
+		t.Fatal(`no golden case "shrink_flip_add" in grads`)
+	}
+	in := goldentest.Inputs(t, c)
+	goldentest.CheckGradients(t, c, fn(in[0]), map[int]goldentest.Grader{0: in[0]}, goldentest.Tol{Atol: 1e-5, Rtol: 1e-4})
+}
+
 // gradOnlyCases are the gradient goldens without a forward-only
 // counterpart in goldenCases.
 var gradOnlyCases = map[string]func(in ...*tensor.Tensor) *tensor.Tensor{
