@@ -203,15 +203,21 @@ func (t *Tensor) To(d Device) *Tensor {
 	if from == to {
 		return t
 	}
+	src := Device{from}
+	toRule := rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.To(src)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].To(d) },
+	}
+	if l := batchLevel(t); l != 0 {
+		return record(batchTo(l, t, d), toRule, t)
+	}
 	ctx := context.Background()
 	size, _ := t.node.DType.Bytes(t.node.Size())
 	data := make([]byte, size)
 	if err := sched.Download(ctx, from, t.node, data); err != nil {
 		return fail(err)
 	}
-	out := upload(to, t.node.DType, data, t.node.Shape)
-	src := Device{from}
-	return track(out, func(g *Tensor) []*Tensor { return []*Tensor{g.To(src)} }, t)
+	return record(upload(to, t.node.DType, data, t.node.Shape), toRule, t)
 }
 
 // upload returns a tensor of shape holding data, as elements of dt, on be.

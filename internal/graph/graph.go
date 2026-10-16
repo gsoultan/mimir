@@ -22,9 +22,13 @@ var ErrOverwritten = errors.New("tensor memory was overwritten")
 // once a node is realized it holds its result and drops its inputs, so a
 // realized tensor does not keep the graph that produced it alive.
 type Node struct {
-	Op     backend.Op
-	DType  backend.DType
-	Shape  []int
+	Op    backend.Op
+	DType backend.DType
+	// Placeholder marks a node that no graph computes, set when it is
+	// made: it stands for values computed elsewhere, as a tensor inside
+	// tensor.VMap stands for one example of a batch.
+	Placeholder bool
+	Shape       []int
 	Attrs  backend.Attrs
 	Inputs []*Node
 

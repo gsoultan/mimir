@@ -186,6 +186,23 @@ func gradCases() []gradCase {
 	add("slice_scatter", func(x []*tensor.Tensor) *tensor.Tensor {
 		return x[0].Exp().SliceScatter(x[1].Mul(x[1]), [][2]int{{1, 3}, {0, 2}})
 	}, u(-1, 1, 3, 4), u(-1, 1, 2, 2))
+
+	// A recurrence, plain and checkpointed two steps at a time, reading
+	// its weight from its surroundings.
+	for _, c := range []struct {
+		name string
+		opts []tensor.ScanOption
+	}{{"scan_loop", nil}, {"scan_loop_checkpointed", []tensor.ScanOption{tensor.ScanCheckpoint(2), tensor.ScanReverse()}}} {
+		opts := c.opts
+		add(c.name, func(x []*tensor.Tensor) *tensor.Tensor {
+			step := func(carry, xs []*tensor.Tensor) (next, ys []*tensor.Tensor) {
+				h := carry[0].MatMul(x[2]).Add(xs[0]).Tanh()
+				return []*tensor.Tensor{h}, []*tensor.Tensor{h.Mul(xs[0])}
+			}
+			carry, ys := tensor.Scan(step, []*tensor.Tensor{x[1]}, []*tensor.Tensor{x[0]}, 0, opts...)
+			return ys[0].Sum(0).Add(carry[0])
+		}, u(-1, 1, 5, 2, 3), u(-1, 1, 2, 3), u(-1, 1, 3, 3))
+	}
 	return cases
 }
 
