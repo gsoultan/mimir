@@ -271,7 +271,10 @@ by it as llama.cpp does, rounding activations to int8 and summing in
 integers with AVX2 or NEON dot-product kernels, and GPUs dequantize it in
 the kernel. Quantized weights are for inference and have no gradient. A
 one-row product by a Q4_K weight takes 0.7 to 0.9 times llama.cpp's time on
-the same CPU.
+the same CPU, and products of many rows, as a prompt needs, run in tiles
+with AVX-512 VNNI, AVX2 or SDOT kernels chosen at run time. On one core,
+a Llama-3.2-1B-shaped Q4_K_M model decodes at about 1.15 times llama.cpp's
+time per token and reads a 64-token prompt at about 1.35 times.
 
 `examples/gpt2` trains a byte-level GPT-2 from scratch on a text file, with
 warmup and cosine decay, gradient clipping and bfloat16 on a GPU, and
