@@ -18,35 +18,70 @@ const warmup = 3
 
 // BenchmarkDecoderBlockStep times one training step of a GPT-2 small
 // block (768 features in 12 heads) over 8 sequences: the forward pass, a
-// loss, the backward pass and an AdamW update.
+// loss, the backward pass and an AdamW update. In the upload and donated
+// sub-benchmarks each step reads a new input, uploaded from host memory
+// as a batch is, and donated reads it once only (see
+// tensor.Tensor.Donate). Each reports the page faults of a step, where
+// the platform counts them.
 func BenchmarkDecoderBlockStep(b *testing.B) {
 	const batch, embed, heads = 8, 768, 12
 	for _, seq := range []int{256, 1024} {
-		b.Run(fmt.Sprintf("seq%d", seq), func(b *testing.B) {
-			ctx := b.Context()
-			block := nn.NewGPT2Block(embed, heads, nn.Seed(1))
-			opt := optim.AdamW(nn.Parameters(block))
-			x := tensor.Randn(2, batch, seq, embed)
-			w := tensor.Randn(3, batch, seq, embed)
-			if err := tensor.Realize(ctx, x, w); err != nil {
-				b.Fatal(err)
+		for _, feed := range []string{"", "/upload", "/donated"} {
+			if seq > 256 && feed != "" {
+				continue
 			}
-			step := func() {
-				if err := block.Forward(x).Mul(w).Mean().Backward(ctx); err != nil {
-					b.Fatal(err)
-				}
-				if err := opt.Step(ctx); err != nil {
-					b.Fatal(err)
-				}
-				opt.ZeroGrad()
+			b.Run(fmt.Sprintf("seq%d%s", seq, feed), func(b *testing.B) {
+				decoderBlockStep(b, batch, seq, embed, heads, feed)
+			})
+		}
+	}
+}
+
+// decoderBlockStep times a step of BenchmarkDecoderBlockStep, with its
+// input fed as feed says.
+func decoderBlockStep(b *testing.B, batch, seq, embed, heads int, feed string) {
+	ctx := b.Context()
+	block := nn.NewGPT2Block(embed, heads, nn.Seed(1))
+	opt := optim.AdamW(nn.Parameters(block))
+	x := tensor.Randn(2, batch, seq, embed)
+	w := tensor.Randn(3, batch, seq, embed)
+	if err := tensor.Realize(ctx, x, w); err != nil {
+		b.Fatal(err)
+	}
+	var inputs [2][]float32
+	for i := range inputs {
+		var err error
+		if inputs[i], err = tensor.Randn(uint64(i+4), batch, seq, embed).Data[float32](ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+	n := 0
+	step := func() {
+		x := x
+		if feed != "" {
+			n++
+			x = tensor.FromSlice(inputs[n%len(inputs)], batch, seq, embed)
+			if feed == "/donated" {
+				x = x.Donate()
 			}
-			for range warmup {
-				step()
-			}
-			for b.Loop() {
-				step()
-			}
-		})
+		}
+		if err := block.Forward(x).Mul(w).Mean().Backward(ctx); err != nil {
+			b.Fatal(err)
+		}
+		if err := opt.Step(ctx); err != nil {
+			b.Fatal(err)
+		}
+		opt.ZeroGrad()
+	}
+	for range warmup {
+		step()
+	}
+	faults, counted := pageFaults()
+	for b.Loop() {
+		step()
+	}
+	if after, _ := pageFaults(); counted {
+		b.ReportMetric(float64(after-faults)/float64(b.N), "faults/op")
 	}
 }
 
