@@ -361,6 +361,31 @@ func planConvInput(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*
 	})
 }
 
+// ConvGroups returns the number of groups that the convolution kernel k
+// launches, one per tile of its products, or 0 if k is not one.
+func ConvGroups(k *backend.Kernel) int {
+	c, err := backend.ConvOf(k)
+	if err != nil {
+		return 0
+	}
+	batches, items := c.N*c.G, 1
+	if k.Op != backend.OpConvWeight && shared(k.In[0]) {
+		batches, items = c.G, c.N
+	}
+	var rows, cols int
+	switch k.Op {
+	case backend.OpConv:
+		rows, cols = c.M, items*c.Cols()
+	case backend.OpConvInput:
+		pixels, _ := backend.NumElements(c.Image)
+		rows, cols = c.C, items*pixels
+	default:
+		batches, rows, cols = c.Parts*c.G, c.M, c.Rows()
+	}
+	t := chooseTiling(rows, cols)
+	return batches * ceilDiv(rows, t.height()) * ceilDiv(cols, t.width())
+}
+
 // convGroups is the number of groups a weight gradient's parts aim to
 // give the device: a few per multiprocessor of a mid-sized GPU.
 const convGroups = 160

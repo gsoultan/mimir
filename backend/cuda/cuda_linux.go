@@ -28,6 +28,7 @@ type Backend struct {
 	stream uintptr
 	name   string
 	cc     int // compute capability, such as 86 for 8.6
+	sms    int // multiprocessors
 	pools  bool
 
 	// arch is the architecture NVRTC compiles for, and cubin whether it
@@ -95,16 +96,16 @@ func New() (*Backend, error) {
 		return nil, check(r, "device name")
 	}
 	b.name = goString(&name[0])
-	var major, minor, pools int32
+	var major, minor, pools, sms int32
 	for _, a := range []struct {
 		v    *int32
 		attr int32
-	}{{&major, attrComputeMajor}, {&minor, attrComputeMinor}, {&pools, attrMemoryPools}} {
+	}{{&major, attrComputeMajor}, {&minor, attrComputeMinor}, {&pools, attrMemoryPools}, {&sms, attrMultiprocessors}} {
 		if r := cuDeviceGetAttribute(a.v, a.attr, b.dev); r != cudaSuccess {
 			return nil, check(r, "device attribute")
 		}
 	}
-	b.cc, b.pools = int(major)*10+int(minor), pools != 0
+	b.cc, b.pools, b.sms = int(major)*10+int(minor), pools != 0, int(sms)
 	if r := cuDevicePrimaryCtxRetain(&b.ctx, b.dev); r != cudaSuccess {
 		return nil, check(r, "retain context")
 	}

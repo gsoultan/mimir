@@ -158,3 +158,72 @@ func TestConvolutionKernelsMatchProducts(t *testing.T) {
 		})
 	}
 }
+
+// windowChooser is a convolver that asks for the products of windows
+// instead of every forward and input-gradient kernel, and records the
+// kernels it was asked about.
+type windowChooser struct {
+	*convolver
+	asked []backend.Kernel
+}
+
+var _ backend.WindowChooser = (*windowChooser)(nil)
+
+func (w *windowChooser) Windowed(k *backend.Kernel) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.asked = append(w.asked, *k)
+	return true
+}
+
+// TestConvolutionsAWindowChooserDeclinesRunAsProducts checks that a
+// backend that chooses the products of windows for a convolution's
+// forward pass and input gradient gets them, with the weight gradient
+// still a kernel, and that they compute what the CPU computes.
+func TestConvolutionsAWindowChooserDeclinesRunAsProducts(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("every unfold is computed as it is created")
+	}
+	ctx := t.Context()
+	x := tensor.Randn(1, 2, 4, 9, 9)
+	w := tensor.Randn(2, 6, 4, 3, 3)
+	run := func(be backend.Backend) [][]float32 {
+		defer tensor.SetDevice(be)()
+		xt, wt := x.To(tensor.DefaultDevice()).Detach().RequiresGrad(), w.To(tensor.DefaultDevice()).Detach().RequiresGrad()
+		out := xt.Conv2d(wt, nil, tensor.ConvOptions{Padding: 1})
+		if err := out.Mul(out).Sum().Backward(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return [][]float32{data[float32](t, out), data[float32](t, xt.Grad()), data[float32](t, wt.Grad())}
+	}
+	want := run(cpu.New())
+	be := &windowChooser{convolver: newConvolver(1)}
+	got := run(be)
+	for i := range want {
+		for j, v := range want[i] {
+			if d := math.Abs(float64(got[i][j] - v)); d > 1e-4*math.Max(1, math.Abs(float64(v))) {
+				t.Fatalf("result %d element %d: got %v, want %v", i, j, got[i][j], v)
+			}
+		}
+	}
+	for _, op := range []backend.Op{backend.OpUnfold, backend.OpFold, backend.OpConvWeight} {
+		if be.ops[op] == 0 {
+			t.Errorf("no %s kernel ran", op)
+		}
+	}
+	for _, op := range []backend.Op{backend.OpConv, backend.OpConvInput} {
+		if be.ops[op] != 0 {
+			t.Errorf("%d %s kernels ran", be.ops[op], op)
+		}
+	}
+	asked := map[backend.Op]bool{}
+	for _, k := range be.asked {
+		if _, err := backend.ConvOf(&k); err != nil {
+			t.Errorf("asked about a %s kernel that is not one: %v", k.Op, err)
+		}
+		asked[k.Op] = true
+	}
+	if !asked[backend.OpConv] || !asked[backend.OpConvInput] || asked[backend.OpConvWeight] {
+		t.Errorf("asked about %v, want the forward pass and the input gradient", asked)
+	}
+}

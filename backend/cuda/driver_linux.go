@@ -23,9 +23,10 @@ const (
 	cudaNoDevice    result = 100
 
 	// CUdevice_attribute values.
-	attrComputeMajor = 75
-	attrComputeMinor = 76
-	attrMemoryPools  = 115
+	attrMultiprocessors = 16
+	attrComputeMajor    = 75
+	attrComputeMinor    = 76
+	attrMemoryPools     = 115
 
 	// CUfunction_attribute values, numbered apart from the device's.
 	funcAttrMaxThreadsPerBlock = 0

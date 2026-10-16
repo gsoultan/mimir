@@ -253,3 +253,19 @@ func TestHalfKernelsConvertOnLoadAndStore(t *testing.T) {
 func TestConvKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Conv(t), emulators(t)) }
 func TestSortKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Sort(t), emulators(t)) }
 func TestFFTKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.FFT(t), emulators(t)) }
+
+// TestConvGroupsCountTheLaunchesGroups checks ConvGroups against the
+// groups of the launch of every convolution kernel case.
+func TestConvGroupsCountTheLaunchesGroups(t *testing.T) {
+	for _, c := range kerneltest.Conv(t) {
+		n, _ := backend.NumElements(c.K.Shape)
+		outs := []backend.Buffer{kerneltest.HostBuffer(t, nil, c.K.DType, n, 0, 0)}
+		l, err := gen.Plan(gen.CUDA, &c.K, outs, c.Ins)
+		if err != nil || l == nil {
+			continue
+		}
+		if got := gen.ConvGroups(&c.K); got != l.Groups {
+			t.Errorf("%s: ConvGroups is %d, the launch has %d", c.Name, got, l.Groups)
+		}
+	}
+}
