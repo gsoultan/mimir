@@ -200,6 +200,13 @@ func (e *emulator) run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buff
 	if err != nil {
 		t.Fatal(err)
 	}
+	return e.exec(t, l, outs, ins)
+}
+
+// exec runs the launch l over outs and ins on the emulator and returns the
+// contents of the outputs and the error word.
+func (e *emulator) exec(t *testing.T, l *launch, outs, ins []backend.Buffer) ([][]byte, bool) {
+	t.Helper()
 	all := slices.Concat(outs, ins)
 	if l == nil {
 		res := make([][]byte, len(outs))
@@ -240,6 +247,57 @@ func (e *emulator) run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buff
 		res = res[4*b.Len():]
 	}
 	return got[:len(outs)], binary.LittleEndian.Uint32(res) != 0
+}
+
+// emulatedMPS runs products that Metal Performance Shaders would run as
+// the backend reads them for MPS, on the host, and their epilogues on the
+// emulator. Other kernels run on the emulator.
+type emulatedMPS struct{ *emulator }
+
+func (e emulatedMPS) run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buffer) ([][]byte, bool) {
+	t.Helper()
+	g, ok := planGEMM(k, []int{ins[0].Len(), ins[1].Len()})
+	if !ok {
+		return e.emulator.run(t, k, outs, ins)
+	}
+	x, y := floats(t, ins[0]), floats(t, ins[1])
+	z := make([]float32, outs[0].Len())
+	for b := range g.batch {
+		for i := range g.m {
+			for j := range g.n {
+				var acc float32
+				for p := range g.k {
+					acc += x[g.a.at(b, i, p)] * y[g.b.at(b, p, j)]
+				}
+				z[b*g.resultSize+i*g.n+j] = acc
+			}
+		}
+	}
+	raw := make([]byte, 4*len(z))
+	for i, v := range z {
+		binary.LittleEndian.PutUint32(raw[4*i:], math.Float32bits(v))
+	}
+	if k.Attrs.Program == nil {
+		return [][]byte{raw}, false
+	}
+	if err := host.Upload(t.Context(), outs[0], raw); err != nil {
+		t.Fatal(err)
+	}
+	l, err := planEpilogue(k, outs, ins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.exec(t, l, outs, ins)
+}
+
+func floats(t *testing.T, b backend.Buffer) []float32 {
+	t.Helper()
+	raw := contents(t, b)
+	out := make([]float32, b.Len())
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+	}
+	return out
 }
 
 func boolInt(b bool) int {
@@ -355,13 +413,23 @@ func show(dt backend.DType, w uint32) string {
 }
 
 // run checks cases on the emulator and on the GPU, where they exist.
-func run(t *testing.T, cases []kernelCase) {
+func run(t *testing.T, cases []kernelCase) { runOn(t, cases, false) }
+
+// runOn checks cases like run and, if mps is set, also running every
+// product it can through Metal Performance Shaders.
+func runOn(t *testing.T, cases []kernelCase, mps bool) {
 	targets := map[string]target{}
 	if e := newEmulator(t); e != nil {
 		targets["emulator"] = e
+		if mps {
+			targets["emulator-mps"] = emulatedMPS{e}
+		}
 	}
-	if g := newGPU(t); g != nil {
+	if g := newGPU(t, -1); g != nil {
 		targets["gpu"] = g
+		if mps {
+			targets["gpu-mps"] = newGPU(t, 0)
+		}
 	}
 	if len(targets) == 0 {
 		t.Skip("no Metal device or kernel emulator")
@@ -620,6 +688,8 @@ func TestMatMulKernels(t *testing.T) {
 		{[]int{3, 2}, 4, 6, 5, []int{0}},
 		{[]int{3, 2}, 4, 6, 5, []int{0, 1}},
 		{[]int{2}, 3, 0, 4, nil},
+		{nil, 1, 9, 6, nil},
+		{[]int{3}, 33, 70, 17, nil},
 	} {
 		xs := slices.Concat(s.batch, []int{s.m, s.k})
 		ys := slices.Concat(s.batch, []int{s.k, s.n})
@@ -627,15 +697,22 @@ func TestMatMulKernels(t *testing.T) {
 		for _, a := range s.axes {
 			out[a] = 1
 		}
-		for name, x := range views(xs) {
-			for _, dt := range []backend.DType{f, i} {
-				y := views(ys)["transposed"]
-				cases = append(cases, kernelCase{
-					name: fmt.Sprintf("%s/%v x %v sum %v/%s", dt, xs, ys, s.axes, name),
-					k:    backend.Kernel{Op: backend.OpMatMul, DType: dt, Shape: out, In: []backend.View{x.v, y.v}, Attrs: backend.Attrs{Axes: s.axes}},
-					ins:  []backend.Buffer{hostBuffer(t, rng, dt, x.n, -5, 5), hostBuffer(t, rng, dt, y.n, -5, 5)},
-					tol:  1e-5,
-				})
+		for xn, x := range views(xs) {
+			for yn, y := range views(ys) {
+				// Every pair of views for float32, which MPS may run, and a
+				// few for int32.
+				dts := []backend.DType{f}
+				if yn == "transposed" {
+					dts = append(dts, i)
+				}
+				for _, dt := range dts {
+					cases = append(cases, kernelCase{
+						name: fmt.Sprintf("%s/%v x %v sum %v/%s/%s", dt, xs, ys, s.axes, xn, yn),
+						k:    backend.Kernel{Op: backend.OpMatMul, DType: dt, Shape: out, In: []backend.View{x.v, y.v}, Attrs: backend.Attrs{Axes: s.axes}},
+						ins:  []backend.Buffer{hostBuffer(t, rng, dt, x.n, -5, 5), hostBuffer(t, rng, dt, y.n, -5, 5)},
+						tol:  1e-5,
+					})
+				}
 			}
 		}
 	}
@@ -655,5 +732,45 @@ func TestMatMulKernels(t *testing.T) {
 		ins: []backend.Buffer{hostBuffer(t, rng, f, 30, 0, 0), hostBuffer(t, rng, f, 20, 0, 0), hostBuffer(t, rng, f, 4, 0, 0)},
 		tol: 1e-5,
 	})
-	run(t, cases)
+	runOn(t, cases, true)
+}
+
+// TestConstantsAreParameters checks that kernels differing only in their
+// constants, as an optimizer's update does from one step to the next,
+// share their source and so one compiled pipeline.
+func TestConstantsAreParameters(t *testing.T) {
+	f := backend.Float32
+	shape := []int{4, 5}
+	in := backend.Contiguous(shape)
+	kernels := func(c float64) []*backend.Kernel {
+		return []*backend.Kernel{
+			{Op: backend.OpConst, DType: f, Shape: shape, Attrs: backend.Attrs{Value: c}},
+			{Op: backend.OpFused, DType: f, Shape: shape, In: []backend.View{in}, Attrs: backend.Attrs{Program: []backend.Instr{
+				{Op: backend.OpLoad, DType: f, Args: []int{0}},
+				{Op: backend.OpConst, DType: f, Value: c},
+				{Op: backend.OpMul, DType: f, Args: []int{0, 1}},
+			}}},
+			{Op: backend.OpPad, DType: f, Shape: []int{6, 5}, In: []backend.View{in}, Attrs: backend.Attrs{Value: c, Pads: [][2]int{{1, 1}, {0, 0}}}},
+		}
+	}
+	a, b := kernels(0.9), kernels(0.999)
+	for i := range a {
+		var srcs [2]string
+		for j, k := range []*backend.Kernel{a[i], b[i]} {
+			n, _ := backend.NumElements(k.Shape)
+			outs := []backend.Buffer{hostBuffer(t, nil, f, n, 0, 0)}
+			var ins []backend.Buffer
+			for range k.In {
+				ins = append(ins, hostBuffer(t, nil, f, 20, 0, 0))
+			}
+			l, err := plan(k, outs, ins)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srcs[j] = l.src
+		}
+		if srcs[0] != srcs[1] {
+			t.Errorf("%s: sources differ with the constant:\n%s\n%s", a[i].Op, srcs[0], srcs[1])
+		}
+	}
 }
