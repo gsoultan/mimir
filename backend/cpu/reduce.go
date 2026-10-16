@@ -2,6 +2,7 @@ package cpu
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
@@ -148,9 +149,39 @@ func forReduction[A any](ctx context.Context, b *Backend, p reduction, n int, el
 	})
 }
 
+// runReduce runs a reduction of in into out. Half inputs are reduced in
+// float32, into a Float32 output.
+func runReduce(ctx context.Context, b *Backend, k *backend.Kernel, out, in backend.Buffer) error {
+	switch in := in.(type) {
+	case *buffer[float32]:
+		return reduce[float32](ctx, b, k, out, in.data)
+	case *buffer[int32]:
+		return reduce[int32](ctx, b, k, out, in.data)
+	case *buffer[bf16]:
+		return reduce[float32](ctx, b, k, out, in.data)
+	case *buffer[f16]:
+		return reduce[float32](ctx, b, k, out, in.data)
+	default:
+		return fmt.Errorf("foreign buffer %T: %w", in, backend.ErrDType)
+	}
+}
+
+// reduce runs a reduction of the elements in, read as T, into the T
+// output outBuf.
+func reduce[T number, S elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, in []S) error {
+	out, err := data[T](outBuf)
+	if err != nil {
+		return err
+	}
+	if k.Op == backend.OpReduceMax {
+		return reduceMax(ctx, b, k, out, in)
+	}
+	return reduceSum(ctx, b, k, out, in)
+}
+
 // reduceMax computes the maximum of the reduced elements, propagating NaN.
 // The graph rejects reductions over empty axes, which have no maximum.
-func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
+func reduceMax[T number, S elem](ctx context.Context, b *Backend, k *backend.Kernel, out []T, in []S) error {
 	p := planReduction(k.In[0], k.Attrs.Axes)
 	inner, step := 1, 0
 	outer := p.red
@@ -169,16 +200,16 @@ func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, 
 		runs.walk(func(o int) {
 			src := off + o
 			if first {
-				acc, first = in[src], false
+				acc, first = conv[T](in[src]), false
 				src += step
 				for range inner - 1 {
-					acc = maxOf(acc, in[src])
+					acc = maxOf(acc, conv[T](in[src]))
 					src += step
 				}
 				return
 			}
 			for range inner {
-				acc = maxOf(acc, in[src])
+				acc = maxOf(acc, conv[T](in[src]))
 				src += step
 			}
 		})
@@ -191,17 +222,17 @@ func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, 
 			switch {
 			case first:
 				for j := range acc {
-					acc[j] = in[src]
+					acc[j] = conv[T](in[src])
 					src += p.rowStep
 				}
 				first = false
 			case p.rowStep == 1:
 				for j, x := range in[src : src+len(acc)] {
-					acc[j] = maxOf(acc[j], x)
+					acc[j] = maxOf(acc[j], conv[T](x))
 				}
 			default:
 				for j := range acc {
-					acc[j] = maxOf(acc[j], in[src])
+					acc[j] = maxOf(acc[j], conv[T](in[src]))
 					src += p.rowStep
 				}
 			}
@@ -211,8 +242,9 @@ func reduceMax[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, 
 	return forReduction(ctx, b, p, len(out), element, row)
 }
 
-// reduceSum accumulates float32 in float64 and int32 in int32 (wrapping).
-func reduceSum[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
+// reduceSum accumulates float32 and half inputs in float64 and int32 in
+// int32 (wrapping).
+func reduceSum[T number, S elem](ctx context.Context, b *Backend, k *backend.Kernel, out []T, in []S) error {
 	if dtypeOf[T]() == backend.Float32 {
 		return sumInto[T, float64](ctx, b, k, out, in)
 	}
@@ -220,7 +252,7 @@ func reduceSum[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, 
 }
 
 // sumInto sums the reduced elements in accumulators of type A.
-func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
+func sumInto[T number, A float64 | number, S elem](ctx context.Context, b *Backend, k *backend.Kernel, out []T, in []S) error {
 	p := planReduction(k.In[0], k.Attrs.Axes)
 	inner, step := 1, 0
 	outer := p.red
@@ -239,11 +271,11 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 		runs.walk(func(o int) {
 			src := off + o
 			if step == 1 {
-				acc += sumRun[T, A](in[src : src+inner])
+				acc += sumRun[A](in[src : src+inner])
 				return
 			}
 			for range inner {
-				acc += A(in[src])
+				acc += conv[A](in[src])
 				src += step
 			}
 		})
@@ -255,12 +287,12 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 			src := off + o
 			if p.rowStep == 1 {
 				for j, x := range in[src : src+len(acc)] {
-					acc[j] += A(x)
+					acc[j] += conv[A](x)
 				}
 				return
 			}
 			for j := range acc {
-				acc[j] += A(in[src])
+				acc[j] += conv[A](in[src])
 				src += p.rowStep
 			}
 		})
@@ -273,17 +305,17 @@ func sumInto[T elem, A float64 | elem](ctx context.Context, b *Backend, k *backe
 
 // sumRun returns the sum of x. Four running sums let the additions
 // overlap instead of each waiting for the one before.
-func sumRun[T elem, A float64 | elem](x []T) A {
+func sumRun[A float64 | number, S elem](x []S) A {
 	var a0, a1, a2, a3 A
 	for len(x) >= 4 {
-		a0 += A(x[0])
-		a1 += A(x[1])
-		a2 += A(x[2])
-		a3 += A(x[3])
+		a0 += conv[A](x[0])
+		a1 += conv[A](x[1])
+		a2 += conv[A](x[2])
+		a3 += conv[A](x[3])
 		x = x[4:]
 	}
 	for _, v := range x {
-		a0 += A(v)
+		a0 += conv[A](v)
 	}
 	return (a0 + a1) + (a2 + a3)
 }

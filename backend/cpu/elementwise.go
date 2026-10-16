@@ -39,6 +39,10 @@ const elementGrain = 1 << 15
 // is then read before it is written as long as nothing reads the input
 // after the instruction that writes the output; otherwise the input is
 // copied into scratch at the start of each tile.
+//
+// Values of a half type live in float32 lanes: a load converts the input
+// into scratch, every other instruction computes in float32 and rounds
+// its result to the nearest element of its type, which a store writes.
 
 // tileLen is the number of elements an instruction processes at a time.
 const tileLen = 1024
@@ -50,20 +54,22 @@ const wideRow = 64
 type program struct {
 	steps          []step
 	order          []int       // the steps in the order they run
-	slotsF, slotsI int         // scratch slots of each dtype
+	slotsF, slotsI int         // scratch slots of each lane type
 	inF            [][]float32 // the inputs by kernel input, in their dtype
 	inI            [][]int32
+	inH            [][]uint16 // the bits of half inputs
 }
 
 // step is one compiled instruction.
 type step struct {
 	backend.Instr
-	slot int // the scratch slot of a vector value, or -1
-	out  int // the output it writes: 0 for the result, i+1 for Stores[i], or -1
+	slot  int // the scratch slot of a vector value, or -1
+	out   int // the output it writes: 0 for the result, i+1 for Stores[i], or -1
+	store int // the half output it writes, as out; computed into slot first
 }
 
 // lane is a value over one tile: a vector, or a scalar when vec is nil.
-type lane[T elem] struct {
+type lane[T number] struct {
 	vec []T
 	s   T
 }
@@ -78,10 +84,22 @@ type scratch struct {
 	cur    cursor
 	inF    [][]float32 // the inputs, or their gathered tiles
 	inI    [][]int32
-	wideF  [][]float32 // the memory of inF and inI for wide tiles
+	inH    [][]uint16
+	wideF  [][]float32 // the memory of inF, inI and inH for wide tiles
 	wideI  [][]int32
+	wideH  [][]uint16
 	tileF  [][]float32 // the gathered tiles of inputs, by input
 	tileI  [][]int32
+	tileH  [][]uint16
+}
+
+// laneOf returns the type of the lanes that hold values of dt: Int32, or
+// Float32 for the float types.
+func laneOf(dt backend.DType) backend.DType {
+	if dt == backend.Int32 {
+		return backend.Int32
+	}
+	return backend.Float32
 }
 
 var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
@@ -134,13 +152,17 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 		outOf[j] = i + 1
 		writer = append(writer, j)
 	}
-	p := &program{steps: make([]step, len(prog)), inF: make([][]float32, len(ins)), inI: make([][]int32, len(ins))}
+	p := &program{steps: make([]step, len(prog)), inF: make([][]float32, len(ins)), inI: make([][]int32, len(ins)), inH: make([][]uint16, len(ins))}
 	for i, buf := range ins {
 		switch buf := buf.(type) {
 		case *buffer[float32]:
 			p.inF[i] = buf.data
 		case *buffer[int32]:
 			p.inI[i] = buf.data
+		case *buffer[bf16]:
+			p.inH[i] = bitsOf(buf.data)
+		case *buffer[f16]:
+			p.inH[i] = bitsOf(buf.data)
 		default:
 			return nil, fmt.Errorf("foreign buffer %T: %w", buf, backend.ErrDType)
 		}
@@ -194,8 +216,9 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 	// Free the slots of arguments at their last use before taking one for
 	// the result, which may then overwrite an argument in place: every loop
 	// reads index i of its arguments before writing index i of its result.
-	free := map[backend.DType][]int{} // free slots by dtype
+	free := map[backend.DType][]int{} // free slots by lane type
 	slot := func(dt backend.DType) int {
+		dt = laneOf(dt)
 		if f := free[dt]; len(f) > 0 {
 			free[dt] = f[:len(f)-1]
 			return f[len(f)-1]
@@ -210,7 +233,8 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 	released := make([]bool, len(prog))
 	release := func(j int) {
 		if s := p.steps[j].slot; s >= 0 && !released[j] {
-			free[prog[j].DType] = append(free[prog[j].DType], s)
+			dt := laneOf(prog[j].DType)
+			free[dt] = append(free[dt], s)
 			released[j] = true
 		}
 	}
@@ -221,10 +245,22 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 				release(a)
 			}
 		}
-		p.steps[j] = step{Instr: in, slot: -1, out: outOf[j]}
-		inPlace := in.Op == backend.OpLoad && strides[in.Args[0]] == 1 && !hoist[j]
-		if outOf[j] < 0 && !scalar[j] && !inPlace {
-			p.steps[j].slot = slot(in.DType)
+		p.steps[j] = step{Instr: in, slot: -1, out: outOf[j], store: -1}
+		half := in.DType.Size() == 2
+		if half {
+			// A half value is computed in a slot and stored from there;
+			// a half load converts into its slot, or writes its output.
+			p.steps[j].out, p.steps[j].store = -1, outOf[j]
+			if in.Op == backend.OpLoad && outOf[j] >= 0 || scalar[j] {
+				p.steps[j].slot = -1
+			} else {
+				p.steps[j].slot = slot(in.DType)
+			}
+		} else {
+			inPlace := in.Op == backend.OpLoad && strides[in.Args[0]] == 1 && !hoist[j]
+			if outOf[j] < 0 && !scalar[j] && !inPlace {
+				p.steps[j].slot = slot(in.DType)
+			}
 		}
 		if lastUse[j] == at {
 			release(j)
@@ -238,7 +274,9 @@ func check(in backend.Instr, j int, prog []backend.Instr, ins []backend.Buffer) 
 	bad := func(what string) error {
 		return fmt.Errorf("instruction %d (%s): %s: %w", j, in.Op, what, backend.ErrInternal)
 	}
-	if in.DType != backend.Float32 && in.DType != backend.Int32 {
+	switch in.DType {
+	case backend.Float32, backend.Int32, backend.BFloat16, backend.Float16:
+	default:
 		return backend.ErrDType
 	}
 	if in.Op == backend.OpLoad {
@@ -274,7 +312,7 @@ func check(in backend.Instr, j int, prog []backend.Instr, ins []backend.Buffer) 
 			return bad("argument dtype")
 		}
 	}
-	if floatOnly(in.Op) && in.DType != backend.Float32 {
+	if floatOnly(in.Op) && !in.DType.IsFloat() {
 		return backend.ErrDType
 	}
 	return nil
@@ -304,6 +342,7 @@ type evaluator struct {
 	strides []int          // the stride of each input in a tile: inner, or for wide tiles see wide
 	outF    [][]float32    // the outputs, in their dtype
 	outI    [][]int32
+	outH    [][]uint16 // the bits of half outputs
 
 	// Wide tiles span rows. An input read at one stride across the index
 	// space starts at base; the others are gathered, block by block, from
@@ -372,6 +411,10 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 			e.outF = append(e.outF, out.data)
 		case *buffer[int32]:
 			e.outI = append(e.outI, out.data)
+		case *buffer[bf16]:
+			e.outH = append(e.outH, bitsOf(out.data))
+		case *buffer[f16]:
+			e.outH = append(e.outH, bitsOf(out.data))
 		default:
 			return nil, fmt.Errorf("foreign buffer %T: %w", out, backend.ErrDType)
 		}
@@ -393,7 +436,7 @@ func (e *evaluator) apply(lo, hi int) error {
 // run computes output elements [lo, hi) with the scratch memory s.
 func (e *evaluator) run(s *scratch, lo, hi int) error {
 	s.size(e.p, len(e.strides))
-	s.inF, s.inI = e.p.inF, e.p.inI
+	s.inF, s.inI, s.inH = e.p.inF, e.p.inI, e.p.inH
 	if e.wide {
 		return e.runWide(s, lo, hi)
 	}
@@ -409,7 +452,7 @@ func (e *evaluator) run(s *scratch, lo, hi int) error {
 			for v := range s.offs {
 				s.offs[v] = c.offs[v] + (col+t)*e.strides[v]
 			}
-			if err := e.p.tile(s, e.strides, m, e.outF, e.outI, i+t); err != nil {
+			if err := e.p.tile(s, e.strides, m, e, i+t); err != nil {
 				return err
 			}
 		}
@@ -422,13 +465,19 @@ func (e *evaluator) run(s *scratch, lo, hi int) error {
 func (e *evaluator) runWide(s *scratch, lo, hi int) error {
 	s.wideF = append(s.wideF[:0], e.p.inF...)
 	s.wideI = append(s.wideI[:0], e.p.inI...)
-	s.inF, s.inI = s.wideF, s.wideI
+	s.wideH = append(s.wideH[:0], e.p.inH...)
+	s.inF, s.inI, s.inH = s.wideF, s.wideI, s.wideH
 	for _, v := range e.gather {
-		if e.p.inF[v] != nil {
+		switch {
+		case e.p.inF[v] != nil:
 			s.tileF = grow(s.tileF, v+1)
 			s.tileF[v] = grow(s.tileF[v], tileLen)
 			s.inF[v] = s.tileF[v]
-		} else {
+		case e.p.inH[v] != nil:
+			s.tileH = grow(s.tileH, v+1)
+			s.tileH[v] = grow(s.tileH[v], tileLen)
+			s.inH[v] = s.tileH[v]
+		default:
 			s.tileI = grow(s.tileI, v+1)
 			s.tileI[v] = grow(s.tileI[v], tileLen)
 			s.inI[v] = s.tileI[v]
@@ -443,9 +492,12 @@ func (e *evaluator) runWide(s *scratch, lo, hi int) error {
 			n := min(e.block-j, m-k)
 			for g, v := range e.gather {
 				pat := e.pat[g][j : j+n]
-				if src := e.p.inF[v]; src != nil {
-					gatherAt(s.inF[v][k:k+n], src, c.offs[v], pat)
-				} else {
+				switch {
+				case e.p.inF[v] != nil:
+					gatherAt(s.inF[v][k:k+n], e.p.inF[v], c.offs[v], pat)
+				case e.p.inH[v] != nil:
+					gatherAt(s.inH[v][k:k+n], e.p.inH[v], c.offs[v], pat)
+				default:
 					gatherAt(s.inI[v][k:k+n], e.p.inI[v], c.offs[v], pat)
 				}
 			}
@@ -461,7 +513,7 @@ func (e *evaluator) runWide(s *scratch, lo, hi int) error {
 		for _, v := range e.gather {
 			s.offs[v] = 0
 		}
-		if err := e.p.tile(s, e.strides, m, e.outF, e.outI, i); err != nil {
+		if err := e.p.tile(s, e.strides, m, e, i); err != nil {
 			return err
 		}
 		i += m
@@ -481,7 +533,7 @@ func linear(shape, strides []int) bool {
 }
 
 // gatherAt sets dst to the elements of src at off plus each offset in pat.
-func gatherAt[T elem](dst, src []T, off int, pat []int) {
+func gatherAt[T any](dst, src []T, off int, pat []int) {
 	for i, p := range pat {
 		dst[i] = src[off+p]
 	}
@@ -501,15 +553,18 @@ func (s *scratch) size(p *program, inputs int) {
 }
 
 // tile runs the program over the n elements at output index at, whose
-// inputs start at s.offs in s.inF and s.inI. Whichever of outF and outI holds the outputs is
-// written.
-func (p *program) tile(s *scratch, strides []int, n int, outF [][]float32, outI [][]int32, at int) error {
+// inputs start at s.offs in s.inF, s.inI and s.inH. Whichever of e.outF,
+// e.outI and e.outH holds the outputs is written.
+func (p *program) tile(s *scratch, strides []int, n int, e *evaluator, at int) error {
 	for _, j := range p.order {
 		var err error
-		if p.steps[j].DType == backend.Float32 {
-			err = run1(p, j, s.f, s.i, s.inF, s.slotsF, s.offs, strides, n, outF, at)
-		} else {
-			err = run1(p, j, s.i, s.f, s.inI, s.slotsI, s.offs, strides, n, outI, at)
+		switch dt := p.steps[j].DType; {
+		case dt.Size() == 2:
+			err = p.runHalf(s, j, strides, n, e.outH, at)
+		case dt == backend.Float32:
+			err = run1(p, j, s.f, s.i, s.inF, s.slotsF, s.offs, strides, n, e.outF, at)
+		default:
+			err = run1(p, j, s.i, s.f, s.inI, s.slotsI, s.offs, strides, n, e.outI, at)
 		}
 		if err != nil {
 			return err
@@ -518,11 +573,59 @@ func (p *program) tile(s *scratch, strides []int, n int, outF [][]float32, outI 
 	return nil
 }
 
-// run1 computes value j, of type T, into lanes[j], over the n elements
-// at output index at. other holds the values of the other dtype, which
-// casts and conditions may read. A value the kernel writes goes to its
-// output in outs.
-func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][]T, slots [][]T, offs, strides []int, n int, outs [][]T, at int) error {
+// runHalf computes value j, of a half type, into the float32 lane
+// s.f[j], over the n elements at output index at: a load converts the
+// input, or moves it to the output it writes; any other instruction
+// computes in float32 and rounds its result to the nearest element of its
+// type, which a store writes to its output in outs.
+func (p *program) runHalf(s *scratch, j int, strides []int, n int, outs [][]uint16, at int) error {
+	st := &p.steps[j]
+	dst := &s.f[j]
+	var buf []float32
+	if st.slot >= 0 {
+		buf = s.slotsF[st.slot][:n]
+	}
+	var out []uint16
+	if st.store >= 0 {
+		out = outs[st.store][at : at+n]
+	}
+	if st.Op == backend.OpLoad {
+		a := st.Args[0]
+		src, off, stride := s.inH[a], s.offs[a], strides[a]
+		switch {
+		case out != nil:
+			for i := range out {
+				out[i] = src[off]
+				off += stride
+			}
+		case stride == 0:
+			*dst = lane[float32]{s: halfToF32(st.DType, src[off])}
+		default:
+			loadHalf(st.DType, buf, src, off, stride)
+			*dst = lane[float32]{vec: buf}
+		}
+		return nil
+	}
+	if err := run1(p, j, s.f, s.i, s.inF, s.slotsF, s.offs, strides, n, nil, at); err != nil {
+		return err
+	}
+	if dst.vec == nil {
+		h := f32ToHalf(st.DType, dst.s)
+		dst.s = halfToF32(st.DType, h)
+		for i := range out {
+			out[i] = h
+		}
+		return nil
+	}
+	roundHalf(st.DType, dst.vec, out)
+	return nil
+}
+
+// run1 computes value j, of lane type T, into lanes[j], over the n
+// elements at output index at. other holds the values of the other lane
+// type, which casts and conditions may read. A value the kernel writes
+// goes to its output in outs.
+func run1[T, U number](p *program, j int, lanes []lane[T], other []lane[U], in [][]T, slots [][]T, offs, strides []int, n int, outs [][]T, at int) error {
 	st := &p.steps[j]
 	var buf []T // where a vector result goes
 	switch {
@@ -557,7 +660,7 @@ func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][
 		*dst = lane[T]{s: T(st.Value)}
 	case op == backend.OpCast:
 		a := st.Args[0]
-		if p.steps[a].DType == st.DType {
+		if laneOf(p.steps[a].DType) == laneOf(st.DType) {
 			copyLane(dst, buf, lanes[a])
 		} else {
 			castLane(dst, buf, other[a])
@@ -579,7 +682,7 @@ func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][
 		}
 	default: // OpWhere
 		c, x, y := st.Args[0], lanes[st.Args[1]], lanes[st.Args[2]]
-		if p.steps[c].DType == st.DType {
+		if laneOf(p.steps[c].DType) == laneOf(st.DType) {
 			whereLane(dst, buf, lanes[c], x, y)
 		} else {
 			whereLane(dst, buf, other[c], x, y)
@@ -599,7 +702,7 @@ func run1[T, U elem](p *program, j int, lanes []lane[T], other []lane[U], in [][
 }
 
 // copyLane sets dst to x, copying a vector into buf.
-func copyLane[T elem](dst *lane[T], buf []T, x lane[T]) {
+func copyLane[T number](dst *lane[T], buf []T, x lane[T]) {
 	if x.vec == nil {
 		*dst = x
 		return
@@ -609,7 +712,7 @@ func copyLane[T elem](dst *lane[T], buf []T, x lane[T]) {
 }
 
 // castLane sets dst to x converted to T, like a Go conversion.
-func castLane[T, U elem](dst *lane[T], buf []T, x lane[U]) {
+func castLane[T, U number](dst *lane[T], buf []T, x lane[U]) {
 	if x.vec == nil {
 		*dst = lane[T]{s: T(x.s)}
 		return
@@ -621,7 +724,7 @@ func castLane[T, U elem](dst *lane[T], buf []T, x lane[U]) {
 }
 
 // whereLane sets dst to x where c is non-zero and to y elsewhere.
-func whereLane[C, T elem](dst *lane[T], buf []T, c lane[C], x, y lane[T]) {
+func whereLane[C, T number](dst *lane[T], buf []T, c lane[C], x, y lane[T]) {
 	if c.vec == nil {
 		if c.s != 0 {
 			copyLane(dst, buf, x)
@@ -672,7 +775,7 @@ func whereLane[C, T elem](dst *lane[T], buf []T, c lane[C], x, y lane[T]) {
 }
 
 // unaryLoop sets dst[i] = op(a[i]).
-func unaryLoop[T elem](op backend.Op, dst, a []T) {
+func unaryLoop[T number](op backend.Op, dst, a []T) {
 	a = a[:len(dst)]
 	switch op {
 	case backend.OpNeg:
@@ -704,7 +807,7 @@ func unaryLoop[T elem](op backend.Op, dst, a []T) {
 
 // binaryLane sets dst to op applied to x and y, a vector in buf unless both
 // are scalars.
-func binaryLane[T elem](op backend.Op, dst *lane[T], buf []T, x, y lane[T]) error {
+func binaryLane[T number](op backend.Op, dst *lane[T], buf []T, x, y lane[T]) error {
 	var err error
 	switch {
 	case x.vec == nil && y.vec == nil:
@@ -725,7 +828,7 @@ func binaryLane[T elem](op backend.Op, dst *lane[T], buf []T, x, y lane[T]) erro
 }
 
 // binaryVV sets dst[i] = a[i] op b[i].
-func binaryVV[T elem](op backend.Op, dst, a, b []T) error {
+func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 	a, b = a[:len(dst)], b[:len(dst)]
 	switch op {
 	case backend.OpAdd:
@@ -761,7 +864,7 @@ func binaryVV[T elem](op backend.Op, dst, a, b []T) error {
 }
 
 // binaryVS sets dst[i] = a[i] op s.
-func binaryVS[T elem](op backend.Op, dst, a []T, s T) error {
+func binaryVS[T number](op backend.Op, dst, a []T, s T) error {
 	a = a[:len(dst)]
 	switch op {
 	case backend.OpAdd:
@@ -797,7 +900,7 @@ func binaryVS[T elem](op backend.Op, dst, a []T, s T) error {
 }
 
 // binarySV sets dst[i] = s op b[i].
-func binarySV[T elem](op backend.Op, dst []T, s T, b []T) error {
+func binarySV[T number](op backend.Op, dst []T, s T, b []T) error {
 	switch op {
 	case backend.OpCmpLT:
 		b = b[:len(dst)]
@@ -821,7 +924,7 @@ func binarySV[T elem](op backend.Op, dst []T, s T, b []T) error {
 
 // mod returns the truncated remainder of a/b with the sign of a, like C
 // fmod. Float modulo by zero is NaN; integer modulo by zero is an error.
-func mod[T elem](a, b T) (T, error) {
+func mod[T number](a, b T) (T, error) {
 	if dtypeOf[T]() == backend.Float32 {
 		return T(math.Mod(float64(a), float64(b))), nil
 	}
@@ -834,8 +937,8 @@ func mod[T elem](a, b T) (T, error) {
 // maxOf returns the larger of a and b, propagating NaN like PyTorch. The
 // builtin compiles to branch-free code, which matters when the comparison
 // is unpredictable, as in ReLU and max pooling.
-func maxOf[T elem](a, b T) T { return max(a, b) }
+func maxOf[T number](a, b T) T { return max(a, b) }
 
 // boolTo returns 1 for true and 0 for false. Reading the bool's byte
 // avoids a branch per element, which mispredicts on random data.
-func boolTo[T elem](v bool) T { return T(*(*uint8)(unsafe.Pointer(&v))) }
+func boolTo[T number](v bool) T { return T(*(*uint8)(unsafe.Pointer(&v))) }

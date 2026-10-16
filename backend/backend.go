@@ -37,6 +37,14 @@ var (
 )
 
 // DType is the element type of a tensor.
+//
+// BFloat16 and Float16 are storage types: kernels load their elements as
+// float32, compute in float32 and round the values they store to the
+// nearest representable element, ties to even, on every device alike. A
+// value of a half type is rounded after every operation, fused or not, so
+// a fused program computes what the operations compute one by one.
+// Reductions of half inputs accumulate in float32 and write Float32
+// outputs; matrix products and random numbers are Float32 only.
 type DType uint8
 
 // Supported element types.
@@ -44,6 +52,8 @@ const (
 	Invalid DType = iota
 	Float32
 	Int32
+	BFloat16 // IEEE 754 binary32 truncated to its top 16 bits: 8 exponent and 7 fraction bits
+	Float16  // IEEE 754 binary16: 5 exponent and 10 fraction bits
 )
 
 // Size returns the size of one element in bytes.
@@ -51,13 +61,15 @@ func (d DType) Size() int {
 	switch d {
 	case Float32, Int32:
 		return 4
+	case BFloat16, Float16:
+		return 2
 	default:
 		return 0
 	}
 }
 
 // IsFloat reports whether d is a floating-point type.
-func (d DType) IsFloat() bool { return d == Float32 }
+func (d DType) IsFloat() bool { return d == Float32 || d == BFloat16 || d == Float16 }
 
 func (d DType) String() string {
 	switch d {
@@ -65,6 +77,10 @@ func (d DType) String() string {
 		return "float32"
 	case Int32:
 		return "int32"
+	case BFloat16:
+		return "bfloat16"
+	case Float16:
+		return "float16"
 	default:
 		return fmt.Sprintf("DType(%d)", uint8(d))
 	}

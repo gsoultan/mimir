@@ -18,9 +18,18 @@ type refScalar struct {
 }
 
 // refEval evaluates instruction in at one index, given the values of the
-// earlier instructions and of the inputs at that index.
+// earlier instructions and of the inputs at that index. A value of a half
+// type is rounded to it.
 func refEval(in backend.Instr, prog []backend.Instr, vals []refScalar, inputs []refScalar) refScalar {
-	float := in.DType == backend.Float32
+	v := refEvalExact(in, prog, vals, inputs)
+	if in.DType.Size() == 2 && in.Op != backend.OpLoad {
+		v.f = halfToF32(in.DType, f32ToHalf(in.DType, v.f))
+	}
+	return v
+}
+
+func refEvalExact(in backend.Instr, prog []backend.Instr, vals []refScalar, inputs []refScalar) refScalar {
+	float := in.DType != backend.Int32
 	arg := func(i int) refScalar { return vals[in.Args[i]] }
 	b2f := func(v bool) refScalar {
 		if v {
@@ -35,13 +44,13 @@ func refEval(in backend.Instr, prog []backend.Instr, vals []refScalar, inputs []
 		return refScalar{float32(in.Value), int32(in.Value)}
 	case backend.OpCast:
 		x := arg(0)
-		if prog[in.Args[0]].DType == backend.Float32 {
+		if prog[in.Args[0]].DType != backend.Int32 {
 			return refScalar{x.f, int32(x.f)}
 		}
 		return refScalar{float32(x.i), x.i}
 	case backend.OpWhere:
 		c := arg(0)
-		if (prog[in.Args[0]].DType == backend.Float32 && c.f != 0) || (prog[in.Args[0]].DType == backend.Int32 && c.i != 0) {
+		if (prog[in.Args[0]].DType != backend.Int32 && c.f != 0) || (prog[in.Args[0]].DType == backend.Int32 && c.i != 0) {
 			return arg(1)
 		}
 		return arg(2)
@@ -96,8 +105,12 @@ func refEval(in backend.Instr, prog []backend.Instr, vals []refScalar, inputs []
 	}
 }
 
+// allDTypes lists the element types, the float ones first.
+var allDTypes = []backend.DType{backend.Float32, backend.BFloat16, backend.Float16, backend.Int32}
+
 // randomProgram returns a program of about n instructions over inputs of
-// the given dtypes whose last instruction has dtype out.
+// the given dtypes whose last instruction has dtype out. Its values are
+// of every dtype, float32 most often.
 func randomProgram(rng *rand.Rand, dtypes []backend.DType, n int, out backend.DType) []backend.Instr {
 	var prog []backend.Instr
 	for i, dt := range dtypes {
@@ -106,6 +119,8 @@ func randomProgram(rng *rand.Rand, dtypes []backend.DType, n int, out backend.DT
 	prog = append(prog,
 		backend.Instr{Op: backend.OpConst, DType: backend.Float32, Value: 0.5},
 		backend.Instr{Op: backend.OpConst, DType: backend.Int32, Value: 3},
+		backend.Instr{Op: backend.OpConst, DType: backend.BFloat16, Value: 0.75},
+		backend.Instr{Op: backend.OpConst, DType: backend.Float16, Value: -1.5},
 	)
 	of := func(dt backend.DType) int {
 		for {
@@ -118,8 +133,8 @@ func randomProgram(rng *rand.Rand, dtypes []backend.DType, n int, out backend.DT
 	binary := []backend.Op{backend.OpAdd, backend.OpMul, backend.OpMax, backend.OpCmpLT, backend.OpCmpEQ, backend.OpMod}
 	for len(prog) < n {
 		dt := backend.Float32
-		if rng.IntN(4) == 0 {
-			dt = backend.Int32
+		if rng.IntN(2) == 0 {
+			dt = allDTypes[1+rng.IntN(3)]
 		}
 		var in backend.Instr
 		switch rng.IntN(5) {
@@ -136,16 +151,10 @@ func randomProgram(rng *rand.Rand, dtypes []backend.DType, n int, out backend.DT
 			}
 			in = backend.Instr{Op: op, DType: dt, Args: []int{of(dt), of(dt)}}
 		case 3:
-			from := backend.Float32
-			if rng.IntN(2) == 0 {
-				from = backend.Int32
-			}
+			from := allDTypes[rng.IntN(len(allDTypes))]
 			in = backend.Instr{Op: backend.OpCast, DType: dt, Args: []int{of(from)}}
 		default:
-			cond := backend.Float32
-			if rng.IntN(2) == 0 {
-				cond = backend.Int32
-			}
+			cond := allDTypes[rng.IntN(len(allDTypes))]
 			in = backend.Instr{Op: backend.OpWhere, DType: dt, Args: []int{of(cond), of(dt), of(dt)}}
 		}
 		prog = append(prog, in)
@@ -168,22 +177,16 @@ func TestFusedProgramsMatchReference(t *testing.T) {
 			bufs   []backend.Buffer
 			data   [][]refScalar // input elements in row-major order
 		)
-		for i := range 4 {
+		for i := range 5 {
 			sv := views[rng.IntN(len(views))]
-			dt := backend.Float32
-			if i == 3 {
-				dt = backend.Int32
-			}
+			dt := allDTypes[max(i-1, 0)]
 			f := make([]float32, sv.size)
 			n := make([]int32, sv.size)
 			for j := range f {
 				f[j] = float32(rng.IntN(13)-6) / 2
 				n[j] = int32(rng.IntN(9) - 4)
 			}
-			var buf backend.Buffer = f32buf(f...)
-			if dt == backend.Int32 {
-				buf = i32buf(n...)
-			}
+			buf := typedBuf(dt, f, n)
 			vals := make([]refScalar, 0, size)
 			eachIndex(shape, func(idx []int) {
 				off := offsetOf(sv.view, idx)
@@ -191,10 +194,7 @@ func TestFusedProgramsMatchReference(t *testing.T) {
 			})
 			dtypes, in, bufs, data = append(dtypes, dt), append(in, sv.view), append(bufs, buf), append(data, vals)
 		}
-		out := backend.Float32
-		if trial%2 == 1 {
-			out = backend.Int32
-		}
+		out := allDTypes[trial%len(allDTypes)]
 		prog := randomProgram(rng, dtypes, 6+trial, out)
 		// Store up to two earlier values of the output's dtype as well.
 		var stores []int
@@ -223,23 +223,94 @@ func TestFusedProgramsMatchReference(t *testing.T) {
 		for _, workers := range []int{1, 3} {
 			name := fmt.Sprintf("trial %d, %v, %d workers, stores %v", trial, shape, workers, stores)
 			k := &backend.Kernel{Op: backend.OpFused, DType: out, Shape: shape, In: in, Attrs: backend.Attrs{Program: prog, Stores: stores}}
-			if out == backend.Float32 {
-				got := runOn[float32](t, workers, k, bufs...)
+			if out == backend.Int32 {
+				got := runOn[int32](t, workers, k, bufs...)
 				for e, w := range want {
-					if g := got[e]; math.Float32bits(g) != math.Float32bits(w.f) && !(g != g && w.f != w.f) {
-						t.Fatalf("%s: element %d = %v, want %v\nprogram %v", name, e, g, w.f, prog)
+					if got[e] != w.i {
+						t.Fatalf("%s: element %d = %v, want %v\nprogram %v", name, e, got[e], w.i, prog)
 					}
 				}
 				continue
 			}
-			got := runOn[int32](t, workers, k, bufs...)
+			got := runFloats(t, workers, k, bufs...)
 			for e, w := range want {
-				if got[e] != w.i {
-					t.Fatalf("%s: element %d = %v, want %v\nprogram %v", name, e, got[e], w.i, prog)
+				if g := got[e]; math.Float32bits(g) != math.Float32bits(w.f) && !(g != g && w.f != w.f) {
+					t.Fatalf("%s: element %d = %v, want %v\nprogram %v", name, e, g, w.f, prog)
 				}
 			}
 		}
 	}
+}
+
+// typedBuf returns a buffer of dtype dt holding f, rounded to dt, or n for
+// Int32.
+func typedBuf(dt backend.DType, f []float32, n []int32) backend.Buffer {
+	switch dt {
+	case backend.Float32:
+		return f32buf(f...)
+	case backend.Int32:
+		return i32buf(n...)
+	case backend.BFloat16:
+		b := make([]bf16, len(f))
+		for i, x := range f {
+			b[i] = bf16(f32ToBF16(x))
+		}
+		return &buffer[bf16]{data: b}
+	default:
+		b := make([]f16, len(f))
+		for i, x := range f {
+			b[i] = f16(f32ToF16(x))
+		}
+		return &buffer[f16]{data: b}
+	}
+}
+
+// floatsOf returns the values of a float buffer of any dtype.
+func floatsOf(t *testing.T, b backend.Buffer) []float32 {
+	t.Helper()
+	switch b := b.(type) {
+	case *buffer[float32]:
+		return b.data
+	case *buffer[bf16]:
+		out := make([]float32, len(b.data))
+		for i, h := range b.data {
+			out[i] = bf16ToF32(uint16(h))
+		}
+		return out
+	case *buffer[f16]:
+		out := make([]float32, len(b.data))
+		for i, h := range b.data {
+			out[i] = f16ToF32(uint16(h))
+		}
+		return out
+	}
+	t.Fatalf("not a float buffer: %T", b)
+	return nil
+}
+
+// runFloats runs a kernel with a float output of any dtype on a backend
+// with the given number of workers and returns the values of its outputs
+// end to end.
+func runFloats(t *testing.T, workers int, k *backend.Kernel, ins ...backend.Buffer) []float32 {
+	t.Helper()
+	b := New()
+	b.workers = workers
+	n, _ := backend.NumElements(k.Shape)
+	outs := make([]backend.Buffer, 1+len(k.Attrs.Stores))
+	for i := range outs {
+		var err error
+		if outs[i], err = b.Alloc(k.DType, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.Run(t.Context(), k, outs, ins); err != nil {
+		t.Fatal(err)
+	}
+	var got []float32
+	for _, out := range outs {
+		got = append(got, floatsOf(t, out)...)
+	}
+	return got
 }
 
 func TestFusedProgramRejectsMalformedInstructions(t *testing.T) {

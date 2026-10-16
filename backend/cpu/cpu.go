@@ -44,7 +44,13 @@ var _ backend.Backend = (*Backend)(nil)
 // Name returns "cpu".
 func (*Backend) Name() string { return "cpu" }
 
-type elem interface{ float32 | int32 }
+// elem is the element types of buffers. Kernels compute in the number
+// types; the half types bf16 and f16 are converted as they are read and
+// rounded as they are written.
+type elem interface{ float32 | int32 | bf16 | f16 }
+
+// number is the element types kernels compute in.
+type number interface{ float32 | int32 }
 
 // buffer is host memory for one dtype.
 type buffer[T elem] struct {
@@ -63,8 +69,12 @@ func dtypeOf[T elem]() backend.DType {
 	switch any(zero).(type) {
 	case float32:
 		return backend.Float32
-	default:
+	case int32:
 		return backend.Int32
+	case bf16:
+		return backend.BFloat16
+	default:
+		return backend.Float16
 	}
 }
 
@@ -96,6 +106,10 @@ func (*Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 		return alloc[float32](n)
 	case backend.Int32:
 		return alloc[int32](n)
+	case backend.BFloat16:
+		return alloc[bf16](n)
+	case backend.Float16:
+		return alloc[f16](n)
 	default:
 		return nil, fmt.Errorf("cpu: alloc %s: %w", dt, backend.ErrDType)
 	}
@@ -192,6 +206,10 @@ func Wrap(dt backend.DType, data []byte) (backend.Buffer, error) {
 		return &buffer[float32]{data: wrapSlice[float32](data)}, nil
 	case backend.Int32:
 		return &buffer[int32]{data: wrapSlice[int32](data)}, nil
+	case backend.BFloat16:
+		return &buffer[bf16]{data: wrapSlice[bf16](data)}, nil
+	case backend.Float16:
+		return &buffer[f16]{data: wrapSlice[f16](data)}, nil
 	default:
 		return nil, fmt.Errorf("cpu: wrap %s: %w", dt, backend.ErrDType)
 	}
@@ -249,6 +267,10 @@ func bytesOf(b backend.Buffer) ([]byte, error) {
 	case *buffer[float32]:
 		return asBytes(b.data), nil
 	case *buffer[int32]:
+		return asBytes(b.data), nil
+	case *buffer[bf16]:
+		return asBytes(b.data), nil
+	case *buffer[f16]:
 		return asBytes(b.data), nil
 	default:
 		return nil, fmt.Errorf("cpu: foreign buffer %T: %w", b, backend.ErrDType)
