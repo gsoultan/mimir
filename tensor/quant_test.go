@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"strings"
 	"testing"
 
+	"github.com/gsoultan/mimir/internal/goldentest"
 	"github.com/gsoultan/mimir/internal/quanttest"
 	"github.com/gsoultan/mimir/tensor"
 )
@@ -275,5 +277,40 @@ func TestBufferHoldsQuantizedWeightsInPlace(t *testing.T) {
 	}
 	if before[0] == after[0] {
 		t.Error("the buffer holds a copy of the weights")
+	}
+}
+
+// TestQuantGolden checks quantized weights against tools/golden: their
+// dequantization bit for bit, as ggml rounds it, and products by them
+// with their gradients. The golden activations are ones the CPU
+// backend rounds to int8 exactly, so its products differ from the
+// oracle's only in the order of their sums.
+func TestQuantGolden(t *testing.T) {
+	cases, _ := goldentest.Load(t, "quant")
+	dtypes := map[string]tensor.DType{"q8_0": tensor.Q8_0, "q4_K": tensor.Q4_K, "q6_K": tensor.Q6_K}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			cut := strings.LastIndexByte(name, '_')
+			kind, op := name[:max(cut, 0)], name[cut+1:]
+			dt, ok := dtypes[kind]
+			raw := c.Inputs[len(c.Inputs)-1]
+			if !ok || raw.DType != "U8" || len(raw.Shape) != 2 {
+				t.Fatalf("weights of %s %s%v", kind, raw.DType, raw.Shape)
+			}
+			rows, k := raw.Shape[0], raw.Shape[1]/dt.BlockBytes()*dt.BlockSize()
+			w := tensor.FromBytes(dt, raw.Data, rows, k)
+			switch op {
+			case "dequantize":
+				goldentest.CompareTensor(t, c.Want, w.Cast(tensor.Float32), goldentest.Tol{})
+			case "matmul":
+				x := goldentest.Tensor(t, c.Inputs[0]).RequiresGrad()
+				goldentest.CheckGradients(t, c, x.MatMulT(w), map[int]goldentest.Grader{0: x}, goldentest.Tol{Atol: 1e-5, Rtol: 1e-5})
+			default:
+				t.Fatalf("unknown case %s", name)
+			}
+		})
+	}
+	if len(cases) != 6 {
+		t.Errorf("%d golden cases, want 6", len(cases))
 	}
 }

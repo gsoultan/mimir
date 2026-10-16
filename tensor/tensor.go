@@ -56,21 +56,21 @@
 // Rand and Randn are Float32.
 //
 // FromSlice, Data and Item exchange float32 and int32 values: a half
-// tensor is read by casting it to Float32 first.
+// tensor is read by casting it to Float32 first. Gradients have the type
+// the chain rule gives them, so a half leaf may accumulate a Float32
+// gradient; an optimizer casts each update to its parameter's type, and
+// optim.MasterWeights keeps Float32 copies of half parameters to update.
 //
 // # Quantized weights
 //
 // Q8_0, Q4_K and Q6_K hold weights quantized in blocks, as ggml and GGUF
 // files store them (see backend.DType): FromBytes reads their blocks in
 // place, as io/gguf maps them. They are read-only and have no gradient.
-// Cast dequantizes one to a float type, Gather dequantizes the elements
-// it reads, so a quantized table serves an embedding, and MatMulT
-// multiplies by the transpose of a quantized matrix without
-// dequantizing it, as a linear layer does. Every other operation on one
-// fails with ErrDType. Gradients have the type
-// the chain rule gives them, so a half leaf may accumulate a Float32
-// gradient; an optimizer casts each update to its parameter's type, and
-// optim.MasterWeights keeps Float32 copies of half parameters to update.
+// Cast dequantizes one to a float type, bit for bit as ggml does, Gather
+// dequantizes the elements it reads, so a quantized table serves an
+// embedding, and MatMulT multiplies by the transpose of a quantized
+// matrix without dequantizing it, as a linear layer does. Every other
+// operation on one fails with ErrDType.
 package tensor
 
 import (

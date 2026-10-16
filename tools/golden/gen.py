@@ -18,6 +18,8 @@ Files:
     optim.safetensors   optimizer steps and learning-rate schedules (package optim)
     scan.safetensors    running sums, maxima and log-sum-exps (package tensor)
     rnn.safetensors     recurrent layers with their gradients (package nn)
+    quant.safetensors   block-quantized weights as ggml lays them out, U8
+                        blocks, dequantized and multiplied (package tensor)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -753,6 +755,93 @@ def rnn_cases(rng):
     return c
 
 
+# ---------------------------------------------------------------------------
+# Block-quantized weights, as ggml lays out and dequantizes them. The
+# dequantization computes in float32 and rounds after every operation, as
+# ggml does, so mimir must match it bit for bit.
+
+QUANT_BLOCKS = {"q8_0": (32, 34), "q4_K": (256, 144), "q6_K": (256, 210)}
+
+
+def f16_scales(rng, n, signed=True):
+    """n float16 scales near 1/64, as little-endian bytes [n, 2]."""
+    s = rng.choice([1 / 16, 1 / 32, 1 / 64, 1 / 128, 3 / 256], size=n)
+    if signed:
+        s = s * rng.choice([-1, 1], size=n)
+    return s.astype("<f2").view(np.uint8).reshape(n, 2)
+
+
+def quant_weights(rng, kind, rows, k):
+    """Random blocks of rows of k values, as uint8 [rows, bytes]: random
+    quants and finite scales."""
+    bs, bb = QUANT_BLOCKS[kind]
+    b = rng.integers(0, 256, size=(rows * k // bs, bb), dtype=np.uint8)
+    if kind == "q8_0":
+        b[:, 0:2] = f16_scales(rng, len(b))
+    elif kind == "q4_K":
+        b[:, 0:2] = f16_scales(rng, len(b))
+        b[:, 2:4] = f16_scales(rng, len(b), signed=False)
+    else:
+        b[:, 208:210] = f16_scales(rng, len(b))
+    return b.reshape(rows, -1)
+
+
+def np_dequantize(kind, raw):
+    """The float32 values of the uint8 blocks raw [rows, bytes]."""
+    bs, bb = QUANT_BLOCKS[kind]
+    rows = raw.shape[0]
+    b = raw.reshape(-1, bb)
+    half = lambda lo: b[:, lo:lo + 2].copy().view("<f2").astype(F32)  # noqa: E731
+    if kind == "q8_0":
+        y = b[:, 2:].view(np.int8).astype(F32) * half(0)
+    elif kind == "q4_K":
+        d, dmin, q = half(0), half(2), b[:, 4:16].astype(np.int32)
+        sc = np.concatenate([q[:, 0:4] & 63, (q[:, 8:12] & 15) | (q[:, 0:4] >> 6) << 4], axis=1)
+        m = np.concatenate([q[:, 4:8] & 63, (q[:, 8:12] >> 4) | (q[:, 4:8] >> 6) << 4], axis=1)
+        qs = b[:, 16:].reshape(-1, 4, 32).astype(np.int32)
+        nib = np.stack([qs & 15, qs >> 4], axis=2).reshape(-1, 8, 32)  # sub-block 2j, 2j+1
+        d1 = (d * sc.astype(F32))[:, :, None]
+        m1 = (dmin * m.astype(F32))[:, :, None]
+        y = d1 * nib.astype(F32) - m1
+    else:
+        ql, qh = b[:, 0:128].astype(np.int32), b[:, 128:192].astype(np.int32)
+        sc, d = b[:, 192:208].view(np.int8).astype(F32), half(208)
+        y = np.empty((len(b), 2, 4, 32), dtype=F32)
+        for n in range(2):
+            for k in range(4):
+                lo = ql[:, 64 * n + 32 * (k % 2):64 * n + 32 * (k % 2) + 32] >> (4 * (k // 2)) & 15
+                hi = qh[:, 32 * n:32 * n + 32] >> (2 * k) & 3
+                q = ((lo | hi << 4) - 32).astype(F32)
+                s = np.repeat(sc[:, 8 * n + 2 * k:8 * n + 2 * k + 2], 16, axis=1)
+                y[:, n, k] = (d * s) * q
+    return y.reshape(rows, -1).astype(F32)
+
+
+def quantizable(rng, shape, block=32):
+    """Values that int8 rounding in blocks of block keeps exactly: integers
+    over 128, with ±127/128 in every block."""
+    x = rng.integers(-127, 128, size=shape).astype(F32) / 128
+    flat = x.reshape(-1, block)
+    flat[np.arange(len(flat)), rng.integers(0, block, size=len(flat))] = rng.choice([-1, 1], size=len(flat)) * 127 / 128
+    return flat.reshape(shape)
+
+
+def quant_cases(rng):
+    """Dequantizations, with diff None, and products x @ W^T by quantized
+    weights, as gradient cases for x."""
+    c = {}
+    for kind, rows, k in [("q8_0", 4, 64), ("q4_K", 3, 512), ("q6_K", 3, 512)]:
+        raw = quant_weights(rng, kind, rows, k)
+        c[f"{kind}_dequantize"] = ([raw], None, lambda w, kind=kind: np_dequantize(kind, w), None)
+    for kind in QUANT_BLOCKS:
+        x, raw = quantizable(rng, (2, 3, 512)), quant_weights(rng, kind, 5, 512)
+        c[f"{kind}_matmul"] = (
+            [x, raw], [0],
+            lambda x, w, kind=kind: x @ np_dequantize(kind, w).astype(np.float64).T,
+            lambda T, x, w, kind=kind: x @ T.from_numpy(np_dequantize(kind, w.numpy())).to(x.dtype).T)
+    return c
+
+
 def evaluate(oracle, inputs, np_fn, torch_fn):
     if oracle == "torch" and torch_fn is not None:
         import torch
@@ -771,7 +860,7 @@ def write_safetensors(path, tensors, metadata):
     blobs, offset = [], 0
     for name in sorted(tensors):
         a = np.asarray(tensors[name], order="C")  # ascontiguousarray would make 0-d arrays 1-d
-        dtype = {np.dtype(F32): "F32", np.dtype(I32): "I32"}[a.dtype]
+        dtype = {np.dtype(F32): "F32", np.dtype(I32): "I32", np.dtype(np.uint8): "U8"}[a.dtype]
         data = a.astype(a.dtype.newbyteorder("<")).tobytes()
         header[name] = {"dtype": dtype, "shape": list(a.shape), "data_offsets": [offset, offset + len(data)]}
         blobs.append(data)
@@ -897,6 +986,19 @@ def main():
         for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
             tensors[f"{name}/{part}"] = a
     files["rnn"] = tensors
+
+    # Block-quantized weights, from their own streams at seed offset 16.
+    rng, gout_rng = np.random.default_rng(args.seed + 16), np.random.default_rng(args.seed + 116)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in quant_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        if diff is None:
+            tensors[f"{name}/out"] = evaluate(args.oracle, inputs, np_fn, torch_fn)
+            continue
+        for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
+            tensors[f"{name}/{part}"] = a
+    files["quant"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
