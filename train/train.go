@@ -36,7 +36,7 @@ var ErrConfig = errors.New("train: invalid option")
 // Epoch summarizes one epoch of training.
 type Epoch struct {
 	Epoch    int     // counted from 1
-	Loss     float64 // mean training loss over the epoch's batches
+	Loss     float64 // mean training loss over the epoch's batches, excluding steps DynamicLossScale skipped
 	LR       float64 // learning rate during the epoch
 	Steps    int     // optimizer steps taken since training began
 	Duration time.Duration
