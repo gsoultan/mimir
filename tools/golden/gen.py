@@ -1365,7 +1365,9 @@ def transform_cases(rng):
          lambda T, x, w, b, g: ((F(T).max_pool2d(F(T).conv2d(x, w, b, padding=1), 2) ** 2) * g).sum())
     case("hvp_logcumsumexp", "hvp", [u(3, 5, lo=-3, hi=3), u(3, 5)], [0],
          lambda x, g: (np.logaddexp.accumulate(x, axis=-1) * g).sum(),
-         lambda T, x, g: (T.logcumsumexp(x, dim=-1) * g).sum())
+         # torch's second derivative of logcumsumexp is NaN; the inputs are
+         # small enough to take the logarithm of the cumulative sum directly.
+         lambda T, x, g: (T.log(T.cumsum(T.exp(x), dim=-1)) * g).sum())
 
     case("jvp_mlp", "jvp", [u(4, 3), u(3, 5), u(5)], [0, 1, 2],
          lambda x, w, b: np.tanh(x @ w + b), lambda T, x, w, b: T.tanh(x @ w + b))
