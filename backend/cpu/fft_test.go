@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/cmplx"
 	"math/rand/v2"
+	"slices"
 	"testing"
 
 	"github.com/gsoultan/mimir/backend"
@@ -67,6 +68,25 @@ func TestFFTRoundTrips(t *testing.T) {
 			if d := math.Abs(float64(z[i])/float64(n) - float64(x[i])); d > 1e-5 {
 				t.Fatalf("n %d element %d: round trip %v, want %v", n, i, z[i]/float32(n), x[i])
 			}
+		}
+	}
+}
+
+// TestFFTOfALongLineSharedByTheWorkers checks that workers sharing a line
+// compute what one computes alone.
+func TestFFTOfALongLineSharedByTheWorkers(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 8))
+	for _, n := range []int{1 << 16, 3 * 5 << 13, 65537} {
+		x := make([]float32, 2*n)
+		for i := range x {
+			x[i] = float32(rng.NormFloat64())
+		}
+		shape := []int{n, 2}
+		k := &backend.Kernel{Op: backend.OpFFT, DType: backend.Float32, Shape: shape, In: []backend.View{backend.Contiguous(shape)}}
+		one := runOn[float32](t, 1, k, f32buf(x...))
+		four := runOn[float32](t, 4, k, f32buf(x...))
+		if !slices.Equal(one, four) {
+			t.Fatalf("n %d: four workers differ from one", n)
 		}
 	}
 }
