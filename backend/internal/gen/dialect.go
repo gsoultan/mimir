@@ -34,8 +34,9 @@ type Dialect struct {
 	// param is the format of the expression reading parameter %d.
 	param string
 	// shared declares a variable its group shares, and sync waits for
-	// every thread of the group to reach it.
-	shared, sync string
+	// every thread of the group to reach it. syncDevice also makes the
+	// group's writes to device memory visible to the group.
+	shared, sync, syncDevice string
 	// signature writes the kernel's declaration and opening brace.
 	signature func(s *strings.Builder, outs, ins []backend.DType, params int)
 	// decl declares a helper function, and global qualifies the type a
@@ -46,12 +47,13 @@ type Dialect struct {
 // Metal is Metal Shading Language. A kernel takes its outputs, inputs,
 // parameters and error word as buffers 0, 1 and so on, in that order.
 var Metal = &Dialect{
-	Name:   "metal",
-	param:  "p[%d]",
-	shared: "threadgroup",
-	sync:   "threadgroup_barrier(mem_flags::mem_threadgroup)",
-	decl:   "static inline",
-	global: "device ",
+	Name:       "metal",
+	param:      "p[%d]",
+	shared:     "threadgroup",
+	sync:       "threadgroup_barrier(mem_flags::mem_threadgroup)",
+	syncDevice: "threadgroup_barrier(mem_flags::mem_device)",
+	decl:       "static inline",
+	global:     "device ",
 	prelude: `#include <metal_stdlib>
 using namespace metal;
 
@@ -102,11 +104,12 @@ static inline float md(float a, float b, device atomic_uint* err) { return fmod(
 // struct Params of one int array, and the error word as a pointer, in
 // that order.
 var CUDA = &Dialect{
-	Name:   "cuda",
-	param:  "p.v[%d]",
-	shared: "__shared__",
-	sync:   "__syncthreads()",
-	decl:   "static __device__ inline",
+	Name:       "cuda",
+	param:      "p.v[%d]",
+	shared:     "__shared__",
+	sync:       "__syncthreads()",
+	syncDevice: "__syncthreads()",
+	decl:       "static __device__ inline",
 	prelude: `typedef unsigned int uint;
 typedef unsigned short ushort;
 typedef unsigned char uchar;

@@ -186,3 +186,5 @@ func TestHalfKernelsConvertOnLoadAndStore(t *testing.T) {
 	}
 }
 func TestConvKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Conv(t), emulators(t)) }
+func TestSortKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Sort(t), emulators(t)) }
+func TestFFTKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.FFT(t), emulators(t)) }

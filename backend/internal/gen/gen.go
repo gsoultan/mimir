@@ -460,6 +460,11 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return planConvWeight(d, k, outs, ins)
 	case op == backend.OpConvInput:
 		return planConvInput(d, k, outs, ins)
+
+	case op == backend.OpArgsort:
+		return planArgsort(d, k, outs, ins, n)
+	case op == backend.OpFFT:
+		return planFFT(d, k, outs, ins, n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
