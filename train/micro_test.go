@@ -273,3 +273,149 @@ func TestDynamicLossScaleGrowsAfterFiniteSteps(t *testing.T) {
 		t.Errorf("scale around the 2000th step: %v, %v, %v; want it doubled at the 2000th", scales[1998], scales[1999], scales[2000])
 	}
 }
+
+// allValues returns every parameter and buffer of m, flattened, in name
+// order.
+func allValues(t *testing.T, m nn.Module) []float32 {
+	t.Helper()
+	var out []float32
+	for _, p := range nn.NamedParams(m) {
+		v, err := p.Value().Data[float32](t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, v...)
+	}
+	return out
+}
+
+// normalized returns a model whose batch normalization sets its running
+// statistics during the forward pass, to values computed in Backward.
+func normalized() nn.Module {
+	nn.ManualSeed(11)
+	return nn.NewSequential(nn.NewLinear(2, 512), nn.NewBatchNorm1d(512), nn.ReLU(), nn.NewLinear(512, 3))
+}
+
+// TestMemoryBudgetRestoresBuffersOfRefusedChunks checks that a chunk the
+// budget refuses leaves no trace in the model: batch normalization had
+// set its running statistics to values the refused Backward would have
+// computed, which a retry that kept them would compute too, and would
+// then be refused as well, down to a chunk of one example.
+func TestMemoryBudgetRestoresBuffersOfRefusedChunks(t *testing.T) {
+	if os.Getenv("MIMIR_EAGER") == "1" {
+		t.Skip("eager mode computes every operation into memory of its own, which only the garbage collector reclaims")
+	}
+	ds := blobs(t, 256, 1, data.BatchSize(256))
+	var x, y *tensor.Tensor
+	for b := range ds.All(t.Context()) {
+		x, y = b.X, b.Y
+	}
+	probe := normalized()
+	lo, hi := int64(0), int64(1<<30)
+	if !fits(t, probe, x, y, hi) {
+		t.Fatal("a full-batch step does not fit in a gigabyte")
+	}
+	for hi-lo > 1024 {
+		if mid := (lo + hi) / 2; fits(t, probe, x, y, mid) {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	budget := hi * 3 / 4
+	half := normalized()
+	if !fits(t, half, x.Shrink([][2]int{{0, 128}, {0, 2}}), y.Shrink([][2]int{{0, 128}}), budget) {
+		t.Fatalf("half a batch does not fit in %d bytes, three quarters of what the batch needs", budget)
+	}
+	sgd := func(ps []*tensor.Param) *optim.Optimizer { return optim.SGD(ps, optim.LR(0.1), optim.Momentum(0.9)) }
+	// The batch does not fit and is halved once, so the steps and the
+	// running statistics are those of chunks of 128.
+	var split, chunked nn.Module
+	for i, newModel := range []func() nn.Module{normalized, normalized} {
+		m := newModel()
+		opts := []train.Option{train.Loss(loss.CrossEntropy), train.Epochs(3), train.MemoryBudget(budget)}
+		if i == 1 {
+			opts = []train.Option{train.Loss(loss.CrossEntropy), train.Epochs(3), train.MicroBatch(128)}
+		}
+		if err := train.Fit(t.Context(), m, sgd(nn.Parameters(m)), ds, opts...); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			split = m
+		} else {
+			chunked = m
+		}
+	}
+	sameValues(t, "parameters and running statistics after training within the budget", allValues(t, split), allValues(t, chunked))
+
+	// A chunk of one example that does not fit fails with the budget
+	// error, whatever the layer that fails on one example says.
+	m := normalized()
+	err := train.Fit(t.Context(), m, sgd(nn.Parameters(m)), ds, train.Loss(loss.CrossEntropy), train.MemoryBudget(1))
+	if !errors.Is(err, tensor.ErrMemoryBudget) {
+		t.Errorf("budget of one byte: %v, want ErrMemoryBudget", err)
+	}
+}
+
+// TestDynamicLossScaleStopsAtOne checks that a batch whose gradients are
+// never finite halves the scale down to 1 and no further: below 1 the
+// scale protects nothing, and its reciprocal would overflow float32 and
+// turn the next finite step's parameters into NaN.
+func TestDynamicLossScaleStopsAtOne(t *testing.T) {
+	x := []float32{1, 2, 3, 4, 5, 6, 7, 8, -1, -2, -3, -4, -5, -6, -7, -8}
+	x[0] = float32(math.NaN())
+	ds, err := data.FromTensors(tensor.FromSlice(x, 8, 2), tensor.FromSlice([]int32{0, 1, 2, 0, 1, 2, 0, 1}), data.BatchSize(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := model()
+	least, taken := math.Inf(1), 0
+	err = train.Fit(t.Context(), m, optim.SGD(nn.Parameters(m), optim.LR(0.1)), ds,
+		train.Loss(loss.CrossEntropy),
+		train.DynamicLossScale(),
+		train.Epochs(24), // 65536 halves to 1 in 16
+		train.OnBatch(func(b train.Batch) error {
+			least = min(least, b.LossScale)
+			if b.Index == 1 && !b.Skipped {
+				taken++
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if least != 1 || taken != 24 {
+		t.Errorf("least scale %v, finite batch taken %d times; want 1 and 24", least, taken)
+	}
+	for i, v := range values(t, m) {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			t.Fatalf("parameter value %d is %v", i, v)
+		}
+	}
+}
+
+// TestFailedStepLeavesNoGradient checks that a step that fails after
+// some of its chunks accumulated gradients clears them, so a later Fit
+// with the same optimizer starts clean.
+func TestFailedStepLeavesNoGradient(t *testing.T) {
+	ds := blobs(t, 8, 1, data.BatchSize(8))
+	m := model()
+	boom := errors.New("boom")
+	calls := 0
+	failing := func(pred, target *tensor.Tensor) *tensor.Tensor {
+		if calls++; calls == 2 {
+			return tensor.Failed(boom)
+		}
+		return loss.CrossEntropy(pred, target)
+	}
+	err := train.Fit(t.Context(), m, optim.SGD(nn.Parameters(m)), ds, train.Loss(failing), train.MicroBatch(4))
+	if !errors.Is(err, boom) {
+		t.Fatalf("Fit: %v, want the loss's error", err)
+	}
+	for name, p := range nn.NamedParams(m) {
+		if p.Grad() != nil {
+			t.Errorf("%s keeps a gradient after the failed step", name)
+		}
+	}
+}

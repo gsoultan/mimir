@@ -78,8 +78,8 @@ func (o *Optimizer) GradScale() float64 { return o.scale }
 // scale before Backward to keep small gradients from underflowing (see
 // train.LossScale). Step divides each gradient by scale as it reads it,
 // folded into the rule's input, so the division fuses with the update
-// and costs no memory. The default is 1. A scale that is not positive
-// and finite is a configuration error that Step reports.
+// and costs no memory. The default is 1. A scale whose reciprocal is not
+// a positive, finite float32 is a configuration error that Step reports.
 func (o *Optimizer) SetGradScale(scale float64) { o.scale = scale }
 
 // GradsFinite reports whether every gradient that Step would use is
@@ -129,7 +129,7 @@ func (o *Optimizer) Step(ctx context.Context) error {
 	if o.err != nil {
 		return o.err
 	}
-	if !(o.scale > 0) || math.IsInf(o.scale, 0) {
+	if inv := float32(1 / o.scale); !(o.scale > 0) || !(inv > 0) || math.IsInf(float64(inv), 0) {
 		return fmt.Errorf("optim: gradient scale %v: %w", o.scale, tensor.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {

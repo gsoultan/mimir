@@ -87,7 +87,9 @@ func (c *config) fail(format string, args ...any) {
 }
 
 // Loss sets the loss to minimize, such as loss.CrossEntropy. It is
-// required.
+// required. The loss must be a mean over the examples of the batch, as
+// every function of package loss is, for the chunks of MicroBatch and
+// MemoryBudget to add up to the batch.
 func Loss(f loss.Func) Option { return func(c *config) { c.loss = f } }
 
 // Epochs sets the number of passes over the training data. The default
@@ -125,8 +127,11 @@ func EarlyStopping(monitor string, patience int) Option {
 // each optimizer step, so that a batch too large for memory in one pass
 // trains as if it ran in one. Each chunk's loss is weighted by its share
 // of the batch, so the step and the reported loss are those of the whole
-// batch's mean loss; only layers whose result depends on the batch, such
-// as batch normalization, see each chunk instead.
+// batch's mean loss (a loss that sums over the batch instead would be
+// divided by the number of chunks); only layers whose result depends on
+// the batch, such as batch normalization, see each chunk instead. A lazy
+// batch, such as the shuffled gather of data.Tensors, is computed once
+// before it is split.
 func MicroBatch(n int) Option {
 	return func(c *config) {
 		c.micro = n
@@ -179,9 +184,9 @@ const (
 // DynamicLossScale scales the loss like LossScale, with a scale that
 // adjusts itself as training goes: it starts at 65536; a step whose
 // gradients are not all finite is skipped, leaving the parameters alone,
-// and halves the scale; and after 2000 steps in a row with finite
-// gradients the scale doubles. Batch reports skipped steps and the scale
-// in effect.
+// and halves the scale, to no less than 1, below which it would protect
+// nothing; and after 2000 steps in a row with finite gradients the scale
+// doubles. Batch reports skipped steps and the scale in effect.
 func DynamicLossScale() Option {
 	return func(c *config) { c.scale, c.dynamic = initialLossScale, true }
 }
@@ -233,6 +238,9 @@ func Fit(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dat
 	}
 	l := &loop{c: &c, dev: deviceOf(model), chunk: c.micro, scale: c.scale}
 	if c.budget > 0 {
+		for _, p := range nn.NamedParams(model) {
+			l.params = append(l.params, p)
+		}
 		prev := tensor.MemoryBudget(l.dev)
 		tensor.SetMemoryBudget(l.dev, c.budget)
 		defer tensor.SetMemoryBudget(l.dev, prev)
@@ -295,10 +303,11 @@ func stopped(err error) error {
 // loop is the state of one Fit that carries from step to step.
 type loop struct {
 	c      *config
-	dev    tensor.Device // where the batches go
-	chunk  int           // examples per chunk, or 0 for whole batches
-	scale  float64       // the loss scale, or 0 for none
-	finite int           // steps in a row whose gradients were finite
+	dev    tensor.Device   // where the batches go
+	params []*tensor.Param // the model's, under a memory budget
+	chunk  int             // examples per chunk, or 0 for whole batches
+	scale  float64         // the loss scale, or 0 for none
+	finite int             // steps in a row whose gradients were finite
 }
 
 func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dataset, epoch int) (Epoch, error) {
@@ -344,18 +353,40 @@ func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer,
 // step trains on one batch: the loss and gradients of each chunk, then
 // one optimizer step. It returns the batch's loss and whether the step
 // was skipped (see DynamicLossScale). A chunk refused by the memory
-// budget starts the batch over with smaller chunks.
-func (l *loop) step(ctx context.Context, model nn.Module, opt *optim.Optimizer, x, y *tensor.Tensor) (float64, bool, error) {
-	var v float64
+// budget starts the batch over with smaller chunks. A step that fails
+// leaves no gradient behind.
+func (l *loop) step(ctx context.Context, model nn.Module, opt *optim.Optimizer, x, y *tensor.Tensor) (v float64, skipped bool, err error) {
+	defer func() {
+		if err != nil {
+			opt.ZeroGrad()
+		}
+	}()
+	split := false // the batch did not fit and was split
 	for {
-		var err error
+		values := l.values()
 		if v, err = l.backward(ctx, model, x, y); err == nil {
 			break
 		}
-		if !errors.Is(err, tensor.ErrMemoryBudget) || l.c.budget == 0 || !l.halve(x) {
+		if split && !errors.Is(err, tensor.ErrMemoryBudget) {
+			_, chunk := l.chunks(x)
+			return 0, false, fmt.Errorf("train: chunk of %d examples, after the memory budget refused the batch: %w (%w)", chunk, err, tensor.ErrMemoryBudget)
+		}
+		if !errors.Is(err, tensor.ErrMemoryBudget) || l.c.budget == 0 {
 			return 0, false, err
 		}
-		opt.ZeroGrad() // the chunks so far, accumulated again from the start
+		// The chunks so far are accumulated again from the start, and
+		// the buffers that the refused attempt set to values it would
+		// have computed, as batch normalization sets its running
+		// statistics, go back to their values before it: a retry that
+		// kept them would compute the refused forward pass too.
+		opt.ZeroGrad()
+		if rerr := l.restore(values); rerr != nil {
+			return 0, false, rerr
+		}
+		if !l.halve(x) {
+			return 0, false, err
+		}
+		split = true
 	}
 	if l.c.dynamic {
 		ok, err := opt.GradsFinite(ctx)
@@ -364,7 +395,7 @@ func (l *loop) step(ctx context.Context, model nn.Module, opt *optim.Optimizer, 
 		}
 		if !ok {
 			opt.ZeroGrad()
-			l.scale /= 2
+			l.scale = max(l.scale/2, 1)
 			l.finite = 0
 			return v, true, nil
 		}
@@ -385,13 +416,46 @@ func (l *loop) step(ctx context.Context, model nn.Module, opt *optim.Optimizer, 
 	return v, false, nil
 }
 
+// values returns the current value of every parameter, under a memory
+// budget, for restore.
+func (l *loop) values() []*tensor.Tensor {
+	if l.params == nil {
+		return nil
+	}
+	values := make([]*tensor.Tensor, len(l.params))
+	for i, p := range l.params {
+		values[i] = p.Value()
+	}
+	return values
+}
+
+// restore puts back the values that the parameters had when values was
+// taken, where a parameter was set since.
+func (l *loop) restore(values []*tensor.Tensor) error {
+	for i, p := range l.params {
+		if p.Value() != values[i] {
+			if err := p.Set(values[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // backward computes the loss of each chunk of the batch x, y, weighted by
 // the chunk's share of the batch and scaled by the loss scale, and its
 // gradients, accumulating them. It returns the batch's loss, unscaled.
 func (l *loop) backward(ctx context.Context, model nn.Module, x, y *tensor.Tensor) (float64, error) {
 	rows, chunk := l.chunks(x)
-	if chunk < rows && (y.Rank() == 0 || y.Shape()[0] != rows) {
-		return 0, fmt.Errorf("train: split a batch of %d examples with targets of shape %v: %w", rows, y.Shape(), tensor.ErrShape)
+	if chunk < rows {
+		if y.Rank() == 0 || y.Shape()[0] != rows {
+			return 0, fmt.Errorf("train: split a batch of %d examples with targets of shape %v: %w", rows, y.Shape(), tensor.ErrShape)
+		}
+		// A lazy batch, such as a shuffled gather, is computed once, not
+		// once per chunk.
+		if err := tensor.Realize(ctx, x, y); err != nil {
+			return 0, err
+		}
 	}
 	var sum float64
 	for lo := 0; ; {
