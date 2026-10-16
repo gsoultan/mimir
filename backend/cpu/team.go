@@ -112,32 +112,53 @@ func (t *team) work() {
 	}
 }
 
+// pollStolen is how long a poll may take, many times what its loads
+// need, before the helper concludes that its thread lost the processor
+// during it.
+const pollStolen = 200 * time.Microsecond
+
 // help runs chunks of every loop it sees, forever.
 func (t *team) help() {
 	for {
 		idle := time.Now()
+		last := idle
 		for polls := 0; !t.poll(); polls++ {
+			now := time.Now()
 			switch {
+			case now.Sub(last) > pollStolen:
+				// The operating system ran another thread on this
+				// processor during the poll: the machine has more threads
+				// to run than processors, such as those of other
+				// processes, and polling takes time from them, including
+				// from the goroutines that finish the current loop. The
+				// helper parks until the next loop starts.
+				t.park()
+				now = time.Now()
+				idle = now
 			case t.left.Load() > 0:
 				// Others are finishing a loop, and the next is likely to
 				// follow: a helper parked now would start it late.
-				idle = time.Now()
-			case time.Since(idle) > teamSpin:
+				idle = now
+			case now.Sub(idle) > teamSpin:
 				t.park()
-				idle = time.Now()
+				now = time.Now()
+				idle = now
 			}
 			// Let other goroutines have the processor now and then. One
 			// that takes it has work of its own, such as reading the next
 			// batch, which polling would only slow down: the helper parks
 			// instead, and run wakes it when the next loop starts.
 			if polls%yieldEvery == 0 {
-				yielded := time.Now()
 				runtime.Gosched()
-				if time.Since(yielded) > yieldBusy {
+				yielded := time.Now()
+				if yielded.Sub(now) > yieldBusy {
 					t.park()
-					idle = time.Now()
+					yielded = time.Now()
+					idle = yielded
 				}
+				now = yielded
 			}
+			last = now
 		}
 		t.work()
 	}
