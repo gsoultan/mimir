@@ -205,8 +205,10 @@ func Save(ctx context.Context, w io.Writer, m Module) error {
 }
 
 // Load sets every parameter and buffer of m from f, which must hold each
-// of them with the same shape and dtype, as Save writes them. The values
-// live on the default device.
+// of them with the same shape, as Save writes them. The values live on
+// the default device. A float tensor of another dtype than its parameter,
+// as a model saved after Cast holds, is cast to the parameter's dtype,
+// which copies it; any other dtype difference is an error.
 //
 // A file that safetensors.Open mapped (f.Mapped reports it) is not copied
 // when the default device is the CPU: each parameter reads its values in
@@ -234,6 +236,9 @@ func LoadPrefixed(f *safetensors.File, prefix string, m Module) error {
 		if err != nil {
 			return fmt.Errorf("nn: load %s: %w", name, err)
 		}
+		if cur := p.Value().DType(); v.DType() != cur && v.DType().IsFloat() && cur.IsFloat() {
+			v = v.Cast(cur)
+		}
 		if err := p.Set(v); err != nil {
 			return fmt.Errorf("nn: load %s: %w", name, err)
 		}
@@ -241,23 +246,19 @@ func LoadPrefixed(f *safetensors.File, prefix string, m Module) error {
 	return nil
 }
 
-// decodeInPlace returns a safetensors tensor of dtype F32 or I32 as a
-// tensor over its bytes on the default device: in place on the CPU, as
-// tensor.FromBytes reads them, and as a copy on any other device.
+// decodeInPlace returns a safetensors tensor as a tensor of the dtype
+// DTypeOf gives over its bytes on the default device: in place on the
+// CPU, as tensor.FromBytes reads them, and as a copy on any other device.
 func decodeInPlace(st safetensors.Tensor) (*tensor.Tensor, error) {
-	var dt tensor.DType
-	switch st.DType {
-	case "F32":
-		dt = tensor.Float32
-	case "I32":
-		dt = tensor.Int32
-	default:
+	dt, ok := DTypeOf(st.DType)
+	if !ok {
 		return nil, fmt.Errorf("nn: dtype %s: %w", st.DType, tensor.ErrDType)
 	}
 	return tensor.FromBytes(dt, st.Data, st.Shape...).To(tensor.DefaultDevice()), nil
 }
 
-// Encode computes t and returns it as a safetensors tensor.
+// Encode computes t and returns it as a safetensors tensor of the dtype
+// DTypeName gives.
 func Encode(ctx context.Context, t *tensor.Tensor) (safetensors.Tensor, error) {
 	switch t.DType() {
 	case tensor.Float32:
@@ -266,13 +267,18 @@ func Encode(ctx context.Context, t *tensor.Tensor) (safetensors.Tensor, error) {
 	case tensor.Int32:
 		v, err := t.Data[int32](ctx)
 		return safetensors.Int32Tensor(t.Shape(), v), err
+	case tensor.BFloat16, tensor.Float16:
+		return encodeHalf(ctx, t)
 	}
 	return safetensors.Tensor{}, t.Err()
 }
 
-// Decode returns a safetensors tensor of dtype F32 or I32 as a tensor.
+// Decode returns a safetensors tensor of dtype F32, I32, BF16 or F16 as a
+// tensor of the dtype DTypeOf gives.
 func Decode(st safetensors.Tensor) (*tensor.Tensor, error) {
 	switch st.DType {
+	case "BF16", "F16":
+		return decodeHalf(st)
 	case "F32":
 		v, err := st.Float32s()
 		if err != nil {
