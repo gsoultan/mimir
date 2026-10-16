@@ -30,6 +30,34 @@
 // Every operation has a gradient. Each is derived from about twenty
 // primitive rules, so composite operations such as Softmax need none of
 // their own; Func adds hand-written rules.
+//
+// # Mixed precision
+//
+// Tensors hold Float32, Int32, BFloat16 or Float16 elements. The half
+// types are storage types: every device loads them as float32, computes
+// in float32 and rounds what it stores to the nearest element, ties to
+// even, so results are the same on every device. A value of a half type
+// is rounded after every primitive operation, fused or not; composite
+// elementwise operations such as Exp, Sigmoid and Div compute in Float32
+// and round their result once.
+//
+// Cast converts between all four types, rounding to nearest even and
+// keeping NaN and infinities; between float types it is differentiable,
+// with the gradient cast back to the input's type. Elementwise operations
+// accept half tensors wherever they accept Float32 ones. Two float
+// operands of different types are promoted: a half type with Float32, or
+// BFloat16 with Float16, computes in Float32 and returns Float32; Int32
+// combines with no float type. Reductions, and the operations built on
+// them (Sum, Max, Min, Mean, Var, Softmax, LogSoftmax), accumulate half
+// inputs in float32 and return Float32. Matrix products (MatMul, Conv2d)
+// of half operands run in Float32 and return the operands' type, so every
+// device multiplies in float32. Rand and Randn are Float32.
+//
+// FromSlice, Data and Item exchange float32 and int32 values: a half
+// tensor is read by casting it to Float32 first. Gradients have the type
+// the chain rule gives them, so a half leaf may accumulate a Float32
+// gradient; an optimizer casts each update to its parameter's type, and
+// optim.MasterWeights keeps Float32 copies of half parameters to update.
 package tensor
 
 import (
@@ -50,13 +78,17 @@ import (
 // DType is the element type of a tensor.
 type DType = backend.DType
 
-// Element types.
+// Element types. BFloat16 and Float16 are storage types computed in
+// float32; see the package documentation.
 const (
-	Float32 = backend.Float32
-	Int32   = backend.Int32
+	Float32  = backend.Float32
+	Int32    = backend.Int32
+	BFloat16 = backend.BFloat16
+	Float16  = backend.Float16
 )
 
-// Elem is the set of Go types that tensors hold.
+// Elem is the set of Go types that FromSlice, Data and Item exchange with
+// tensors. A half tensor is read by casting it to Float32 first.
 type Elem interface{ float32 | int32 }
 
 // Errors carried by tensors. Test for them with errors.Is.
@@ -354,12 +386,15 @@ func byDevice(nodes []*graph.Node) iter.Seq2[backend.Backend, []int] {
 }
 
 // Data computes t and returns its elements in row-major order. T must match
-// t's dtype.
+// t's dtype; a half tensor is read through Cast(Float32).
 func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err := firstErr(t); err != nil {
 		return nil, err
 	}
 	if want := dtypeOf[T](); t.node.DType != want {
+		if t.node.DType.Size() == 2 {
+			return nil, fmt.Errorf("tensor: Data[%s] of %s tensor: cast it to float32 first: %w", want, t.node.DType, ErrDType)
+		}
 		return nil, fmt.Errorf("tensor: Data[%s] of %s tensor: %w", want, t.node.DType, ErrDType)
 	}
 	out, err := alloc[T](t.node.Size())
