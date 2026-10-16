@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,21 +23,39 @@ import (
 // and y = k.
 func shards(t *testing.T, sizes ...int) *data.Slices {
 	t.Helper()
+	return shardsOf(t, 2, sizes...)
+}
+
+// shardsOf is shards with features values per example: x = [k, -k, 0...].
+func shardsOf(t *testing.T, features int, sizes ...int) *data.Slices {
+	t.Helper()
 	var out []data.Shard
 	k := 0
 	for _, n := range sizes {
-		sh := data.Shard{X: make([]float32, 2*n), Y: make([]float32, n)}
+		sh := data.Shard{X: make([]float32, features*n), Y: make([]float32, n)}
 		for i := range n {
-			sh.X[2*i], sh.X[2*i+1], sh.Y[i] = float32(k), -float32(k), float32(k)
+			sh.X[i*features], sh.Y[i] = float32(k), float32(k)
+			if features > 1 {
+				sh.X[i*features+1] = -float32(k)
+			}
 			k++
 		}
 		out = append(out, sh)
 	}
-	src, err := data.FromSlices(2, out...)
+	src, err := data.FromSlices(features, out...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return src
+}
+
+// seq returns lo, lo+1, ..., hi-1.
+func seq(lo, hi int) []float32 {
+	out := make([]float32, 0, hi-lo)
+	for k := lo; k < hi; k++ {
+		out = append(out, float32(k))
+	}
+	return out
 }
 
 // targets returns the Y values of each batch of one pass over s, checking
@@ -63,12 +83,13 @@ func targets(t *testing.T, s *data.Stream, classes bool) [][]float32 {
 		} else if y, err = b.Y.Data[float32](t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		if xs, ys := b.X.Shape(), b.Y.Shape(); len(xs) != 2 || xs[0] != len(y) || xs[1] != 2 || len(ys) != 1 || ys[0] != len(y) {
+		f := s.Features()
+		if xs, ys := b.X.Shape(), b.Y.Shape(); len(xs) != 2 || xs[0] != len(y) || xs[1] != f || len(ys) != 1 || ys[0] != len(y) {
 			t.Fatalf("batch shapes X %v Y %v", xs, ys)
 		}
 		for i, v := range y {
-			if x[2*i] != v || x[2*i+1] != -v {
-				t.Fatalf("batch row %d: x %v does not match y %v", i, x[2*i:2*i+2], v)
+			if x[i*f] != v || f > 1 && x[i*f+1] != -v {
+				t.Fatalf("batch row %d: x %v does not match y %v", i, x[i*f:i*f+min(f, 2)], v)
 			}
 		}
 		out = append(out, y)
@@ -124,16 +145,12 @@ func TestStreamVisitsEveryExampleOnce(t *testing.T) {
 	}
 }
 
-func want13() []float32 {
-	out := make([]float32, 13)
-	for i := range out {
-		out[i] = float32(i)
-	}
-	return out
-}
+func want13() []float32 { return seq(0, 13) }
 
 func TestStreamRejectsBadClassTargets(t *testing.T) {
-	for name, y := range map[string]float32{"fraction": 1.5, "negative": -1} {
+	// A NaN fails every comparison, so a check written as what fails
+	// lets it through as a garbage index.
+	for name, y := range map[string]float32{"fraction": 1.5, "negative": -1, "nan": float32(math.NaN()), "inf": float32(math.Inf(1))} {
 		src, err := data.FromSlices(1, data.Shard{X: []float32{1}, Y: []float32{1}}, data.Shard{X: []float32{2}, Y: []float32{y}})
 		if err != nil {
 			t.Fatal(err)
@@ -165,6 +182,263 @@ func TestStreamRejectsBadClassTargets(t *testing.T) {
 		if y, _ := b.Y.Data[int32](t.Context()); !slices.Equal(y, []int32{2}) {
 			t.Errorf("rounded target %v", y)
 		}
+	}
+}
+
+func TestStreamBatchLargerThanChunk(t *testing.T) {
+	// Examples of 4096 features fill a chunk of about 4 MiB at 255 of
+	// them (TestChunkRows pins that), so batches of 256 span chunks and
+	// the last batch takes the tail of one.
+	const features, batch = 4096, 256
+	src := shardsOf(t, features, 300, 300)
+	stream := func(opts ...data.Option) *data.Stream {
+		s, err := data.NewStream(src, append([]data.Option{data.BatchSize(batch), data.Prefetch(1), data.ShuffleBuffer(100)}, opts...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	got := targets(t, stream(), false)
+	want := [][]float32{seq(0, 256), seq(256, 512), seq(512, 600)}
+	if !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("%d batches, want 256, 256 and 88 examples in order", len(got))
+	}
+	if got := targets(t, stream(data.DropLast()), false); !slices.EqualFunc(got, want[:2], slices.Equal) {
+		t.Errorf("DropLast gave %d batches", len(got))
+	}
+	all := func(s *data.Stream) []float32 { return slices.Concat(targets(t, s, false)...) }
+	first := all(stream(data.Shuffle(7)))
+	if !slices.Equal(slices.Sorted(slices.Values(first)), seq(0, 600)) {
+		t.Error("shuffled epoch did not visit each example once")
+	}
+	if got := all(stream(data.Shuffle(7), data.Prefetch(8))); !slices.Equal(got, first) {
+		t.Error("Prefetch(8) changed the shuffled order")
+	}
+}
+
+// allocated returns the bytes the heap allocated while f ran.
+func allocated(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// Examples of wideFeatures values make chunks of about chunkBytes, far
+// above whatever else an epoch over a few rows allocates, so a chunk
+// allocated shows in the bytes an epoch allocates.
+const wideFeatures, chunkBytes = 1024, 4 << 20
+
+func TestStreamKeepsChunksAcrossEpochs(t *testing.T) {
+	src := shardsOf(t, wideFeatures, 10, 10, 10, 10)
+	s, err := data.NewStream(src, data.BatchSize(10), data.Prefetch(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func() {
+		for _, err := range s.All(t.Context()) {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if got := allocated(run); got < chunkBytes/2 {
+		t.Fatalf("first epoch allocated %d bytes, want at least a chunk of about %d", got, chunkBytes)
+	}
+	if got := allocated(run); got > chunkBytes/4 {
+		t.Errorf("second epoch allocated %d bytes, want the chunks of the first kept", got)
+	}
+}
+
+// funcSource is a Source whose shards open makes.
+type funcSource struct {
+	features, shards int
+	open             func(ctx context.Context, shard int) (data.Rows, error)
+}
+
+func (s *funcSource) Shards() int   { return s.shards }
+func (s *funcSource) Features() int { return s.features }
+func (s *funcSource) Open(ctx context.Context, shard int) (data.Rows, error) {
+	return s.open(ctx, shard)
+}
+
+// readFunc is a Rows that reads with itself and closes with nothing.
+type readFunc func(x, y []float32) (int, error)
+
+func (f readFunc) Read(x, y []float32) (int, error) { return f(x, y) }
+func (readFunc) Close() error                       { return nil }
+
+func TestStreamReaderReturnsChunkOnFailure(t *testing.T) {
+	// Shard 1 fails at its first read, after shard 0 has been read. The
+	// reader must hand the chunk it holds back, or every epoch after
+	// the first allocates another in its place.
+	good := shardsOf(t, wideFeatures, 10)
+	badTarget, err := data.FromSlices(wideFeatures,
+		data.Shard{X: make([]float32, 10*wideFeatures), Y: make([]float32, 10)},
+		data.Shard{X: make([]float32, wideFeatures), Y: []float32{1.5}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overCount := &funcSource{features: wideFeatures, shards: 2, open: func(ctx context.Context, shard int) (data.Rows, error) {
+		if shard == 0 {
+			return good.Open(ctx, 0)
+		}
+		return readFunc(func(x, y []float32) (int, error) { return len(y) + 1, nil }), nil
+	}}
+	for name, tc := range map[string]struct {
+		src  data.Source
+		opts []data.Option
+		want error
+	}{
+		"target": {badTarget, []data.Option{data.ClassTargets()}, data.ErrTarget},
+		"count":  {overCount, nil, data.ErrSource},
+	} {
+		s, err := data.NewStream(tc.src, append([]data.Option{data.BatchSize(10), data.Prefetch(1)}, tc.opts...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run := func() {
+			var got error
+			for _, err := range s.All(t.Context()) {
+				if err != nil {
+					got = err
+				}
+			}
+			if !errors.Is(got, tc.want) || !strings.Contains(got.Error(), "shard 1") {
+				t.Fatalf("%s: epoch ended with %v", name, got)
+			}
+		}
+		run() // allocates the chunks of an epoch
+		if got := allocated(func() {
+			for range 3 {
+				run()
+			}
+		}); got > chunkBytes/4 {
+			t.Errorf("%s: three more failing epochs allocated %d bytes, want the chunks of the first kept", name, got)
+		}
+	}
+}
+
+// aheadSource is a two-shard source of one example per read, for
+// TestStreamReaderReturnsChunkOnCancel: shard 1 reads freely and shard 0
+// yields nothing until shard 1 has been read twice in the same epoch.
+type aheadSource struct {
+	mu    sync.Mutex
+	ahead chan struct{}
+}
+
+func (s *aheadSource) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ahead = make(chan struct{})
+}
+
+func (s *aheadSource) Shards() int   { return 2 }
+func (s *aheadSource) Features() int { return wideFeatures }
+
+func (s *aheadSource) Open(_ context.Context, shard int) (data.Rows, error) {
+	s.mu.Lock()
+	ahead := s.ahead
+	s.mu.Unlock()
+	reads := 0
+	return readFunc(func(x, y []float32) (int, error) {
+		reads++
+		switch {
+		case shard == 0:
+			<-ahead
+		case reads == 2:
+			close(ahead)
+		}
+		clear(x[:wideFeatures])
+		y[0] = float32(shard)
+		return 1, nil
+	}), nil
+}
+
+func TestStreamReaderReturnsChunkOnCancel(t *testing.T) {
+	// The consumer leaves the epoch after one batch, from shard 0, while
+	// shard 1's reader, ahead of it, has filled its channel with one
+	// chunk and holds a second one to send. Cancelled there, the reader
+	// must hand that chunk back, or the epochs keep allocating.
+	src := &aheadSource{}
+	s, err := data.NewStream(src, data.BatchSize(1), data.Prefetch(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func() {
+		src.reset()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		for b, err := range s.All(ctx) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if y, _ := b.Y.Data[float32](ctx); !slices.Equal(y, []float32{0}) {
+				t.Fatalf("first batch has targets %v, want shard 0's", y)
+			}
+			break
+		}
+	}
+	for range 5 {
+		run() // by now every chunk an epoch can take is allocated
+	}
+	if got := allocated(func() {
+		for range 3 {
+			run()
+		}
+	}); got > chunkBytes/4 {
+		t.Errorf("three more cut-short epochs allocated %d bytes, want the chunks of the readers cancelled kept", got)
+	}
+}
+
+func TestStreamFailsAShardThatMakesNoProgress(t *testing.T) {
+	// A Rows that returns no examples and no error for ever would spin
+	// the reader until the context ends; one that does so a few times
+	// before its examples is fine.
+	stuck := &funcSource{features: 1, shards: 1, open: func(context.Context, int) (data.Rows, error) {
+		return readFunc(func([]float32, []float32) (int, error) { return 0, nil }), nil
+	}}
+	slow := &funcSource{features: 1, shards: 1, open: func(context.Context, int) (data.Rows, error) {
+		reads := 0
+		return readFunc(func(x, y []float32) (int, error) {
+			switch reads++; {
+			case reads < 50:
+				return 0, nil
+			case reads == 50:
+				x[0], y[0] = 1, 1
+				return 1, nil
+			}
+			return 0, io.EOF
+		}), nil
+	}}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	s, err := data.NewStream(stuck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got error
+	n := 0
+	for _, err := range s.All(ctx) {
+		got = err
+		n++
+	}
+	if !errors.Is(got, io.ErrNoProgress) || !errors.Is(got, data.ErrSource) || !strings.Contains(got.Error(), "shard 0") || n != 1 {
+		t.Errorf("stuck shard: %d yields, the last %v", n, got)
+	}
+	if _, err := data.Statistics(ctx, stuck); !errors.Is(err, io.ErrNoProgress) || !errors.Is(err, data.ErrSource) {
+		t.Errorf("statistics of a stuck shard: %v", err)
+	}
+	if s, err = data.NewStream(slow); err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Concat(targets(t, s, false)...); !slices.Equal(got, []float32{1}) {
+		t.Errorf("slow shard gave %v", got)
+	}
+	if st, err := data.Statistics(ctx, slow); err != nil || st.Rows != 1 {
+		t.Errorf("statistics of a slow shard: %v, %v", st, err)
 	}
 }
 

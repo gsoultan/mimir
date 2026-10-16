@@ -11,7 +11,8 @@ import (
 
 // BenchmarkStream streams an epoch of 2^18 synthetic examples of 32
 // features in batches of 4096, in order and shuffled, with one shard
-// read ahead and with four. After the first epoch the only allocations
+// read ahead and with four. The stream keeps its chunks and buffers from
+// one epoch to the next, so after the first epoch the only allocations
 // per batch are its two tensors.
 func BenchmarkStream(b *testing.B) {
 	const rows, features, batch = 1 << 18, 32, 4096

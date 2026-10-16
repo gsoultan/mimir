@@ -21,7 +21,11 @@ var (
 
 // Source is a sharded source of examples, such as a directory of files.
 // Shards are opened independently, possibly several at once from
-// different goroutines.
+// different goroutines. Open takes the context of the epoch, or of the
+// Statistics call, reading the shard; Read does not, so a cancellation
+// waits for the Read in progress to return before the epoch ends, and a
+// Rows whose reads may block for long should watch the context it was
+// opened with.
 type Source interface {
 	// Shards returns the number of shards, at least 1.
 	Shards() int
@@ -36,7 +40,9 @@ type Source interface {
 // their targets, and returns how many it read. It returns io.EOF once the
 // shard is exhausted, and n > 0 with a nil error until then; a final short
 // read may come with nil and the next call returns 0, io.EOF, or with
-// io.EOF itself.
+// io.EOF itself. A Read that returns 0 and nil 100 times in a row fails
+// the shard with io.ErrNoProgress. Read takes no context: a Stream or
+// Statistics that is cancelled waits for the Read in progress to return.
 type Rows interface {
 	Read(x, y []float32) (n int, err error)
 	Close() error

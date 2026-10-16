@@ -125,6 +125,112 @@ func TestCSVShardsClasses(t *testing.T) {
 	}
 }
 
+func TestCSVShardsQuotedFields(t *testing.T) {
+	// Quoted fields are unquoted in place, a comma inside kept; a quote
+	// inside, escaped as "", goes through encoding/csv, line after line.
+	paths := writeShards(t, [2]string{"q.csv", "x1,x2,label\n1,2,\"cat\"\n\"3\",\"4\",\"a,b\"\n5,6,\"say \"\"hi\"\"\"\n7,8,\"say \"\"hi\"\"\"\n\"9\",10,cat\n"})
+	src, features, err := CSVShards(paths, "label", Classes("cat", "a,b", `say "hi"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(features, []string{"x1", "x2"}) {
+		t.Errorf("features %v", features)
+	}
+	ys, xs := readAll(t, src)
+	if !slices.Equal(ys, []float32{0, 1, 2, 2, 0}) {
+		t.Errorf("targets %v", ys)
+	}
+	if want := [][]float32{{1, 2}, {3, 4}, {5, 6}, {7, 8}, {9, 10}}; !slices.EqualFunc(xs, want, slices.Equal) {
+		t.Errorf("rows %v", xs)
+	}
+
+	// A quote where encoding/csv rejects one is this reader's line and
+	// csv's column, not csv's count of the lines it has seen.
+	for name, tc := range map[string]struct {
+		body string
+		want []string // substrings of the error
+	}{
+		"bare":         {"x1,x2,label\n1,a\"b,cat\n", []string{"line 2 column 4", `bare "`}},
+		"unterminated": {"x1,x2,label\n1,2,\"cat\n", []string{"line 2 column"}},
+		"after quote":  {"x1,x2,label\n1,2,\"cat\"dog\n", []string{"line 2 column"}},
+	} {
+		paths := writeShards(t, [2]string{name + ".csv", tc.body})
+		src, _, err := CSVShards(paths, "label", Classes("cat"))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		rows, err := src.Open(t.Context(), 0)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		defer rows.Close()
+		_, err = rows.Read(make([]float32, 2), make([]float32, 1))
+		if !errors.Is(err, ErrFormat) || strings.Contains(err.Error(), "on line") {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		for _, w := range tc.want {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("%s: %v does not mention %q", name, err, w)
+			}
+		}
+	}
+}
+
+func TestCSVShardsQuotedLabelsAllocateNothing(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("x1,label,x2\n")
+	for i := range 2000 {
+		fmt.Fprintf(&b, "%d,%q,%d\n", i, []string{"cat", "dog"}[i%2], -i)
+	}
+	paths := writeShards(t, [2]string{"quoted.csv", b.String()})
+	src, _, err := CSVShards(paths, "label", Classes("cat", "dog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := src.Open(t.Context(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	x, y := make([]float32, 100*2), make([]float32, 100)
+	allocs := testing.AllocsPerRun(10, func() {
+		if n, err := rows.Read(x, y); n != 100 || err != nil {
+			t.Fatalf("read %d, %v", n, err)
+		}
+	})
+	if allocs > 0 {
+		t.Errorf("reading 100 rows of quoted labels allocated %v times", allocs)
+	}
+	// The eleventh read holds rows 1000 to 1099.
+	if y[0] != 0 || y[1] != 1 || x[0] != 1000 || x[3] != -1001 {
+		t.Errorf("read y %v x %v", y[:2], x[:4])
+	}
+}
+
+func TestCSVShardsSkipsBOMAndDetectsGzip(t *testing.T) {
+	paths := writeShards(t,
+		[2]string{"bom.csv", "\xEF\xBB\xBFx1,price,x2\n1,10,2\n"},
+		[2]string{"zipped.csv.gz", "x1,price,x2\n3,20,4\n"},
+	)
+	// Gzipped, but not named so.
+	unnamed := filepath.Join(t.TempDir(), "unnamed.csv")
+	if err := os.WriteFile(unnamed, gz(t, []byte("x1,price,x2\n5,30,6\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, features, err := CSVShards(append(paths, unnamed), "price")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(features, []string{"x1", "x2"}) {
+		t.Errorf("features %v", features)
+	}
+	ys, xs := readAll(t, src)
+	if !slices.Equal(ys, []float32{10, 20, 30}) || !slices.EqualFunc(xs, [][]float32{{1, 2}, {3, 4}, {5, 6}}, slices.Equal) {
+		t.Errorf("targets %v, rows %v", ys, xs)
+	}
+}
+
 func TestCSVShardsErrors(t *testing.T) {
 	good := "x1,label,x2\n1,cat,2\n"
 	paths := writeShards(t,
@@ -215,6 +321,13 @@ func TestCSVShardsErrors(t *testing.T) {
 	if _, _, err := CSVShards(empty, "label"); !errors.Is(err, ErrFormat) || !strings.Contains(err.Error(), "line 1") {
 		t.Errorf("empty file: %v", err)
 	}
+	only := writeShards(t, [2]string{"only.csv", "label\ncat\n"})
+	if _, _, err := CSVShards(only, "label"); !errors.Is(err, ErrFormat) || !strings.Contains(err.Error(), "only.csv") || !strings.Contains(err.Error(), `"label"`) {
+		t.Errorf("target as the only column: %v", err)
+	}
+	if _, _, err := CSVShards([]string{good0}, "label", With(data.BatchSize(2))); !errors.Is(err, data.ErrOption) {
+		t.Errorf("With: %v", err)
+	}
 }
 
 func TestCSVShardsLongLines(t *testing.T) {
@@ -252,8 +365,10 @@ func TestCSVShardsLongLines(t *testing.T) {
 }
 
 // writeBenchCSV writes a CSV of rows rows and features features to a new
-// temp file and returns its path and size.
-func writeBenchCSV(b *testing.B, rows, features int) (string, int64) {
+// temp file and returns its path and size. With quoted, the target is a
+// quoted class label, "no" or "yes", as R and pandas write strings; else
+// it is 0 or 1.
+func writeBenchCSV(b *testing.B, rows, features int, quoted bool) (string, int64) {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), "bench.csv")
 	f, err := os.Create(path)
@@ -269,6 +384,10 @@ func writeBenchCSV(b *testing.B, rows, features int) (string, int64) {
 	}
 	w.WriteString(",y\n")
 	r := rand.New(rand.NewPCG(1, 2))
+	labels := []string{"0", "1"}
+	if quoted {
+		labels = []string{`"no"`, `"yes"`}
+	}
 	for range rows {
 		for j := range features {
 			if j > 0 {
@@ -276,7 +395,7 @@ func writeBenchCSV(b *testing.B, rows, features int) (string, int64) {
 			}
 			fmt.Fprintf(w, "%.4f", r.Float64()*100-50)
 		}
-		fmt.Fprintf(w, ",%d\n", r.IntN(2))
+		fmt.Fprintf(w, ",%s\n", labels[r.IntN(2)])
 		if w.Len() > 1<<19 {
 			if _, err := f.Write(w.Bytes()); err != nil {
 				b.Fatal(err)
@@ -298,34 +417,46 @@ func writeBenchCSV(b *testing.B, rows, features int) (string, int64) {
 }
 
 // BenchmarkCSVShards reads a 50,000-row CSV of 20 features through the
-// shard reader; MB/s is the file's bytes.
+// shard reader, with a numeric target and with a quoted class label; MB/s
+// is the file's bytes.
 func BenchmarkCSVShards(b *testing.B) {
 	const rows, features = 50000, 20
-	path, size := writeBenchCSV(b, rows, features)
-	src, _, err := CSVShards([]string{path}, "y")
-	if err != nil {
-		b.Fatal(err)
-	}
-	x, y := make([]float32, 8192*features), make([]float32, 8192)
-	b.SetBytes(size)
-	b.ReportAllocs()
-	for b.Loop() {
-		rows, err := src.Open(b.Context(), 0)
-		if err != nil {
-			b.Fatal(err)
-		}
-		for {
-			_, err := rows.Read(x, y)
-			if errors.Is(err, io.EOF) {
-				break
-			}
+	for _, bm := range []struct {
+		name   string
+		quoted bool
+		opts   []CSVOption
+	}{
+		{"numeric", false, nil},
+		{"quoted", true, []CSVOption{Classes("no", "yes")}},
+	} {
+		b.Run(bm.name, func(b *testing.B) {
+			path, size := writeBenchCSV(b, rows, features, bm.quoted)
+			src, _, err := CSVShards([]string{path}, "y", bm.opts...)
 			if err != nil {
 				b.Fatal(err)
 			}
-		}
-		if err := rows.Close(); err != nil {
-			b.Fatal(err)
-		}
+			x, y := make([]float32, 8192*features), make([]float32, 8192)
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for b.Loop() {
+				rows, err := src.Open(b.Context(), 0)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for {
+					_, err := rows.Read(x, y)
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := rows.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(rows)*float64(b.N)/b.Elapsed().Seconds(), "rows/s")
+		})
 	}
-	b.ReportMetric(float64(rows)*float64(b.N)/b.Elapsed().Seconds(), "rows/s")
 }

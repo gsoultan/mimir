@@ -27,6 +27,7 @@ type CSVOption func(*csvConfig)
 type csvConfig struct {
 	classes bool
 	names   []string
+	with    bool // With was given
 	data    []data.Option
 }
 
@@ -40,10 +41,11 @@ func Classes(names ...string) CSVOption {
 	return func(c *csvConfig) { c.classes, c.names = true, names }
 }
 
-// With applies data options, such as data.BatchSize, to the dataset. It
-// has no effect on CSVShards, whose options go to data.NewStream.
+// With applies data options, such as data.BatchSize, to the dataset of
+// CSV. CSVShards rejects it with data.ErrOption: the data options of a
+// stream go to data.NewStream.
 func With(opts ...data.Option) CSVOption {
-	return func(c *csvConfig) { c.data = append(c.data, opts...) }
+	return func(c *csvConfig) { c.with, c.data = true, append(c.data, opts...) }
 }
 
 // classIndex returns the index of each class name, or an error for a
