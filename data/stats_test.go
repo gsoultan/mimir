@@ -236,11 +236,13 @@ func TestStatisticsErrors(t *testing.T) {
 }
 
 func TestStatisticsReportsTheLowestFailedShard(t *testing.T) {
-	// Shard 2 fails first, and shard 1 once it has. Shard 0 reads one
-	// example once the failure has cancelled the context, so it is cut
-	// short by the cancellation, which the failures outrank.
+	// Shard 2 fails first, once shard 1 is reading, and shard 1 once it
+	// has. Shard 0 reads one example once the failure has cancelled the
+	// context, so it is cut short by the cancellation, which the failures
+	// outrank. Shard 2 waits for shard 1 to read, or the cancellation
+	// could stop shard 1 before it read anything.
 	boom := errors.New("boom")
-	failed := make(chan struct{})
+	failed, reading := make(chan struct{}), make(chan struct{})
 	src := &funcSource{features: 1, shards: 4, open: func(ctx context.Context, shard int) (data.Rows, error) {
 		return readFunc(func(x, y []float32) (int, error) {
 			switch shard {
@@ -249,9 +251,11 @@ func TestStatisticsReportsTheLowestFailedShard(t *testing.T) {
 				x[0], y[0] = 1, 1
 				return 1, nil
 			case 1:
+				close(reading)
 				<-failed
 				return 0, boom
 			case 2:
+				<-reading
 				close(failed)
 				return 0, boom
 			}
