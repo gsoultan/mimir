@@ -453,3 +453,11 @@ func batchCumMax(l uint64, t *Tensor, axis int) (values, indices *Tensor) {
 func batchReLU(l uint64, t *Tensor) *Tensor {
 	return newBatched(t.batch().phys.ReLU(), l)
 }
+
+func batchFFT(l uint64, t *Tensor, axis int, inverse bool) *Tensor {
+	return newBatched(t.batch().phys.dft(axis+1, inverse), l)
+}
+
+func batchArgsort(l uint64, t *Tensor, axis, k int, descending bool) *Tensor {
+	return newBatched(t.batch().phys.argsort(axis+1, k, descending), l)
+}

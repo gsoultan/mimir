@@ -496,6 +496,72 @@ func TestTransformsWithScheduleCache(t *testing.T) {
 	}
 }
 
+// TestTransformsOfFactorizations checks what the transformations do with
+// the matrix factorizations, whose gradient rules hold to first order:
+// their forward derivatives come from transposing those rules, while
+// second derivatives fail with ErrNotDifferentiable, and VMap, which has
+// no batching rule for them, fails with ErrNotBatchable.
+func TestTransformsOfFactorizations(t *testing.T) {
+	r := rand.New(rand.NewPCG(15, 16))
+	m := tensor.FromSlice(vals(r, 3*3, -1, 1), 3, 3)
+	spd := func(x *tensor.Tensor) *tensor.Tensor {
+		return x.MatMul(x.Transpose(0, 1)).Add(tensor.FromSlice([]float32{1, 0, 0, 0, 1, 0, 0, 0, 1}, 3, 3))
+	}
+	v := tensor.FromSlice(vals(r, 3*3, -1, 1), 3, 3)
+	for name, f := range map[string]func(x *tensor.Tensor) *tensor.Tensor{
+		"cholesky": func(x *tensor.Tensor) *tensor.Tensor { return spd(x).Cholesky() },
+		"inv":      func(x *tensor.Tensor) *tensor.Tensor { return spd(x).Inv() },
+		"det":      func(x *tensor.Tensor) *tensor.Tensor { return spd(x).Det() },
+		"qr": func(x *tensor.Tensor) *tensor.Tensor {
+			_, r := spd(x).QR()
+			return r
+		},
+		"svd": func(x *tensor.Tensor) *tensor.Tensor {
+			_, s, _ := spd(x).SVD()
+			return s
+		},
+		"eigh": func(x *tensor.Tensor) *tensor.Tensor {
+			w, _ := spd(x).Eigh()
+			return w
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fs := func(x ...*tensor.Tensor) []*tensor.Tensor { return []*tensor.Tensor{f(x[0])} }
+			_, ty := tensor.JVP(fs, []*tensor.Tensor{m}, []*tensor.Tensor{v})
+			const h = 1e-2
+			want := f(m.Add(v.Mul(tensor.Scalar[float32](h)))).Sub(f(m.Sub(v.Mul(tensor.Scalar[float32](h))))).Div(tensor.Scalar[float32](2 * h))
+			// Rules that compute their gradients with the factorizations
+			// themselves, which record nothing, cannot be transposed.
+			if err := ty[0].Err(); err != nil {
+				if !errors.Is(err, tensor.ErrNotDifferentiable) {
+					t.Fatalf("JVP: %v, want a tangent or ErrNotDifferentiable", err)
+				}
+				t.Logf("JVP: %v", err)
+			} else {
+				near(t, "JVP", ty[0], want, 5e-3, 1e-2)
+			}
+
+			loss := func(x ...*tensor.Tensor) *tensor.Tensor { return f(x[0]).Sum() }
+			if _, hv := tensor.JVP(tensor.Grad(loss), []*tensor.Tensor{m}, []*tensor.Tensor{v}); !errors.Is(hv[0].Err(), tensor.ErrNotDifferentiable) {
+				t.Errorf("Hessian-vector product: %v, want ErrNotDifferentiable", hv[0].Err())
+			}
+			if err := tensor.VMap(fs)(tensor.Stack(0, m, v))[0].Err(); !errors.Is(err, tensor.ErrNotBatchable) {
+				t.Errorf("VMap: %v, want ErrNotBatchable", err)
+			}
+			if err := tensor.VMap(tensor.Grad(loss))(tensor.Stack(0, m, v))[0].Err(); !errors.Is(err, tensor.ErrNotBatchable) {
+				t.Errorf("VMap of Grad: %v, want ErrNotBatchable", err)
+			}
+			// Batched cotangents of an unbatched matrix.
+			scaled := func(c ...*tensor.Tensor) []*tensor.Tensor {
+				return tensor.Grad(func(x ...*tensor.Tensor) *tensor.Tensor { return f(x[0]).Mul(c[0]).Sum() })(m)
+			}
+			if err := tensor.VMap(scaled)(tensor.FromSlice([]float32{1, 2}, 2))[0].Err(); !errors.Is(err, tensor.ErrNotBatchable) {
+				t.Errorf("VMap of Grad with batched cotangents: %v, want ErrNotBatchable", err)
+			}
+		})
+	}
+}
+
 // TestTransformsThroughCheckpoint differentiates checkpointed functions
 // twice and forward, nested and reading their surroundings' arguments,
 // and compares with the same functions without Checkpoint.
