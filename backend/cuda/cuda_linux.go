@@ -15,7 +15,7 @@ import (
 	"github.com/gsoultan/mimir/backend/internal/gen"
 )
 
-// Backend runs kernels on the first CUDA device. It is safe for concurrent
+// Backend runs kernels on one CUDA device. It is safe for concurrent
 // use.
 //
 // Run launches each kernel on the backend's stream and returns; the
@@ -48,6 +48,10 @@ type Backend struct {
 	// writes through errDev.
 	errWord *uint32
 	errDev  uint64
+
+	// groups counts the open NCCL communicators over the device, which
+	// make it asynchronous (see nccl_linux.go).
+	groups atomic.Int32
 }
 
 // buffer is device memory.
@@ -71,7 +75,12 @@ var _ backend.Backend = (*Backend)(nil)
 
 // New returns a backend for the first CUDA device, or an error wrapping
 // ErrUnavailable if there is none or its libraries are missing.
-func New() (*Backend, error) {
+func New() (*Backend, error) { return NewDevice(0) }
+
+// NewDevice returns a backend for the CUDA device of the given ordinal,
+// counted from 0 as DeviceCount counts them. Each call returns a new
+// backend with a stream of its own; tensor.GPUs keeps one per device.
+func NewDevice(ordinal int) (*Backend, error) {
 	if err := loadDriver(); err != nil {
 		return nil, fmt.Errorf("cuda: %v: %w", err, ErrUnavailable)
 	}
@@ -82,13 +91,16 @@ func New() (*Backend, error) {
 	if count == 0 {
 		return nil, fmt.Errorf("cuda: no device: %w", ErrUnavailable)
 	}
+	if ordinal < 0 || ordinal >= int(count) {
+		return nil, fmt.Errorf("cuda: device %d of %d: %w", ordinal, count, ErrUnavailable)
+	}
 	for _, load := range []func() error{loadNVRTC, loadBLAS} {
 		if err := load(); err != nil {
 			return nil, fmt.Errorf("cuda: %v: %w", err, ErrUnavailable)
 		}
 	}
 	b := &Backend{funcs: map[string]uintptr{}, disk: openDiskCache()}
-	if r := cuDeviceGet(&b.dev, 0); r != cudaSuccess {
+	if r := cuDeviceGet(&b.dev, int32(ordinal)); r != cudaSuccess {
 		return nil, check(r, "open device")
 	}
 	var name [256]byte
