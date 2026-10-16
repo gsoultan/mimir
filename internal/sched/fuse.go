@@ -64,6 +64,7 @@ type work struct {
 	stores []store         // the targets prog also writes
 	swap   bool            // a transposed product, computed from deps transposed
 	src    []*graph.Node   // the node each instruction of prog computes
+	conv   *conv           // a convolution kernel that computes the product or fold
 }
 
 // store is a target that a fused kernel computes for its group and writes
@@ -90,6 +91,12 @@ func (w *work) nodes(n *graph.Node) []*graph.Node {
 // n, when n is a view that needs no kernel. It is the one decision that
 // compile makes for each step of the plan.
 func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, backend.View, error) {
+	if w.conv != nil {
+		if w.conv.parts > 1 {
+			return w.conv.sum(n, views[0]), backend.View{}, nil
+		}
+		return w.conv.kernel(n, w, views), backend.View{}, nil
+	}
 	if w.swap {
 		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
 		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
@@ -129,6 +136,16 @@ func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, bac
 	return k, backend.View{}, nil
 }
 
+// parts returns the kernel that computes the parts of a weight gradient
+// that w splits, reading the results of w.deps through views, whose
+// output the kernel of n reads; or nil if w computes n in one kernel.
+func (w *work) parts(n *graph.Node, views []backend.View) *backend.Kernel {
+	if w.conv == nil || w.conv.parts <= 1 {
+		return nil
+	}
+	return w.conv.kernel(n, w, views)
+}
+
 // uses returns how many times the kernels of p read each node.
 func (p *plan) uses() map[*graph.Node]int {
 	uses := make(map[*graph.Node]int, len(p.order))
@@ -140,10 +157,10 @@ func (p *plan) uses() map[*graph.Node]int {
 	return uses
 }
 
-// newPlan plans the kernels for the unrealized nodes in order, which lists
-// every node before its consumers. over holds the storages that targets
-// may be written over; see candidates.
-func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph.Storage]bool) *plan {
+// newPlan plans the kernels that be runs for the unrealized nodes in
+// order, which lists every node before its consumers. over holds the
+// storages that targets may be written over; see candidates.
+func newPlan(be backend.Backend, order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph.Storage]bool) *plan {
 	users := make(map[*graph.Node][]*graph.Node, len(order))
 	for _, n := range order {
 		for i, in := range n.Inputs {
@@ -219,12 +236,13 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	// consumers' group computes and writes.
 	stored := func(n *graph.Node) bool { return member(n) && isTarget[n] }
 
-	p := &plan{work: make(map[*graph.Node]*work, len(order)), storer: map[*graph.Node]*graph.Node{}}
+	p := &plan{be: be, work: make(map[*graph.Node]*work, len(order)), storer: map[*graph.Node]*graph.Node{}}
 	for _, n := range order {
 		switch {
 		case member(n):
 		case summedProduct(n, private):
 			p.work[n] = &work{deps: factors(n), gemm: n}
+			p.convolve(n, p.work[n], private)
 		case transposes(n) && n.Inputs[0].Op == backend.OpMatMul && private(n.Inputs[0]):
 			mm := n.Inputs[0]
 			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true}
@@ -246,6 +264,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 				for i, x := range ins {
 					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType && n.DType == backend.Float32 {
 						w = epilogue(prog, nodes, ins, i, gemm)
+						p.convolve(n, w, private)
 						break
 					}
 				}
@@ -257,6 +276,15 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			p.work[n] = w
 		default:
 			p.work[n] = &work{deps: n.Inputs}
+			if n.Op == backend.OpMatMul || n.Op == backend.OpFold {
+				w := &work{deps: slices.Clone(n.Inputs)}
+				if n.Op == backend.OpMatMul {
+					w.gemm = n
+				}
+				if p.convolve(n, w, private) {
+					p.work[n] = w
+				}
+			}
 		}
 	}
 	// Keep the kernels the targets need: a constant read only by programs

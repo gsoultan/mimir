@@ -354,8 +354,7 @@ func (m *pool) program(w *walker, targets, dsts []*graph.Node) (*program, error)
 	for _, t := range targets {
 		isTarget[t] = true
 	}
-	p := newPlan(w.order, isTarget, candidates(m.be, targets, dsts))
-	p.be = m.be
+	p := newPlan(m.be, w.order, isTarget, candidates(m.be, targets, dsts))
 	prog, err := compile(p, w, targets, dsts, p.destinations(targets, dsts), isTarget)
 	if err != nil {
 		return nil, err

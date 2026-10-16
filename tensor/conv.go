@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
@@ -43,10 +44,16 @@ func (o ConvOptions) window(k int) graph.Window {
 }
 
 // windows returns the k×k sliding windows over the spatial dimensions of
-// an [N, C, H, W] tensor as [N, C, K, K, OH, OW], padding with pad.
+// an [N, C, H, W] tensor as [N, C, K, K, OH, OW], padding with pad. On a
+// device that runs convolution kernels they are always an unfold, which
+// the scheduler reads where the windows lie (see backend.Convolver),
+// even when they tile t and could be a view of it.
 func (t *Tensor) windows(k int, o ConvOptions, pad float64) *Tensor {
 	if err := t.checkWindows(k, o); err != nil {
 		return fail(err)
+	}
+	if _, ok := backendOf(t.node).(backend.Convolver); ok {
+		return t.trackUnfold(wrap(graph.Unfold(t.node, o.window(k), pad)), o.window(k))
 	}
 	return t.unfold(o.window(k), pad)
 }
@@ -97,6 +104,12 @@ func (t *Tensor) unfold(w graph.Window, value float64) *Tensor {
 		}
 		return t.tiles(w).permute(perm)
 	}
+	return t.trackUnfold(out, w)
+}
+
+// trackUnfold returns out, the unfold of t into the windows w, with the
+// fold of its gradient as t's.
+func (t *Tensor) trackUnfold(out *Tensor, w graph.Window) *Tensor {
 	if !tracked(t) || out.err != nil {
 		return out
 	}

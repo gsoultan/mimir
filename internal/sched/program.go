@@ -152,6 +152,18 @@ func compile(p *plan, w *walker, targets, dsts []*graph.Node, into map[*graph.No
 			r := lookup(in)
 			views[i], ins[i] = r.view, r.slot
 		}
+		// A weight gradient in parts sums them into a buffer that the
+		// kernel of n then adds up.
+		parts := int32(-1)
+		if pk := wk.parts(n, views); pk != nil {
+			size, err := elements(pk)
+			if err != nil {
+				return nil, err
+			}
+			parts = take(pk.DType, size)
+			prog.steps = append(prog.steps, kstep{k: pk, ins: ins, outs: []int32{parts}, argsOf: -1})
+			views, ins = []backend.View{backend.Contiguous(pk.Shape)}, []int32{parts}
+		}
 		k, view, err := wk.kernel(n, views)
 		if err != nil {
 			return nil, err
@@ -201,6 +213,9 @@ func compile(p *plan, w *walker, targets, dsts []*graph.Node, into map[*graph.No
 				}
 			}
 			prog.steps = append(prog.steps, s)
+			if parts >= 0 {
+				give(parts)
+			}
 		}
 		for _, in := range wk.deps {
 			release(in)

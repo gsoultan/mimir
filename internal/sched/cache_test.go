@@ -509,8 +509,7 @@ func BenchmarkSchedule(b *testing.B) {
 			isTarget[t] = true
 		}
 		for b.Loop() {
-			p := newPlan(w.order, isTarget, candidates(be, targets, dsts))
-			p.be = be
+			p := newPlan(be, w.order, isTarget, candidates(be, targets, dsts))
 			if _, err := compile(p, w, targets, dsts, p.destinations(targets, dsts), isTarget); err != nil {
 				b.Fatal(err)
 			}
