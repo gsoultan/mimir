@@ -13,6 +13,9 @@
 // inputs an element sums in the same order as the CPU backend, so sums
 // that one thread computes match it bit for bit.
 //
+// Block-quantized elements are bytes, uchar, in a buffer, which kernels
+// dequantize as they read them; see quant.go.
+//
 // Half elements, BFloat16 and Float16, are ushort in a buffer. Kernels
 // convert them to float as they load them, compute in float and round to
 // the nearest element as they store, with the prelude's bf2f, f2bf, h2f
@@ -58,14 +61,15 @@ const MaxElems = math.MaxInt32
 
 // gen builds the source of one kernel.
 type gen struct {
-	d      *Dialect
-	k      *backend.Kernel
-	outs   []backend.DType
-	ins    []backend.DType
-	body   strings.Builder
-	params []int32
-	vars   int
-	err    error
+	d       *Dialect
+	k       *backend.Kernel
+	outs    []backend.DType
+	ins     []backend.DType
+	body    strings.Builder
+	helpers string // functions the body calls, beyond the prelude's
+	params  []int32
+	vars    int
+	err     error
 }
 
 func newGen(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) *gen {
@@ -113,6 +117,7 @@ func (g *gen) finish(groups int, barriers bool) (*Launch, error) {
 	}
 	var s strings.Builder
 	s.WriteString(g.d.prelude)
+	s.WriteString(g.helpers)
 	g.d.signature(&s, g.outs, g.ins, len(g.params))
 	s.WriteString(g.body.String())
 	s.WriteString("}\n")
@@ -130,6 +135,9 @@ func typeName(dt backend.DType) string {
 
 // elemName returns the type of the elements of a buffer of dt.
 func elemName(dt backend.DType) string {
+	if dt.IsQuantized() {
+		return "uchar"
+	}
 	if dt.Size() == 2 {
 		return "ushort"
 	}
@@ -376,6 +384,9 @@ func indexable(n int, ins []backend.Buffer) error {
 		if b.Len() > MaxElems {
 			return fmt.Errorf("input of %d elements exceeds the %d a GPU kernel indexes: %w", b.Len(), MaxElems, backend.ErrShape)
 		}
+		if size, ok := b.DType().Bytes(b.Len()); b.DType().IsQuantized() && (!ok || size > MaxElems) {
+			return fmt.Errorf("%s input of %d elements exceeds the %d bytes a GPU kernel indexes: %w", b.DType(), b.Len(), MaxElems, backend.ErrShape)
+		}
 	}
 	return nil
 }
@@ -391,8 +402,14 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return nil, nil
 	}
 	g := newGen(d, k, outs, ins)
+	if k.Op == backend.OpQMatMul {
+		return g.qmatmul(n)
+	}
 	g.line("if (gid >= uint(%s)) return;", g.param(n))
 	g.line("int i = int(gid);")
+	if dequantizes(k, g.ins) {
+		return g.dequantize(n)
+	}
 	switch op := k.Op; {
 	case op == backend.OpFused:
 		return g.elementwise(n, k.Attrs.Program, k.Attrs.Stores)
@@ -612,7 +629,16 @@ func (g *gen) gather(n int) (*Launch, error) {
 	g.line("\to0[i] = 0;")
 	g.line("\treturn;")
 	g.line("}")
-	g.line("o0[i] = i0[%s + j * %s];", offs[1], g.param(vs.Strides[axis]))
+	at := fmt.Sprintf("%s + j * %s", offs[1], g.param(vs.Strides[axis]))
+	if dt := g.ins[0]; dt.IsQuantized() {
+		if g.k.DType != backend.Float32 {
+			return nil, fmt.Errorf("gather of %s into %s: %w", dt, g.k.DType, backend.ErrInternal)
+		}
+		g.helpers = quantHelpers(g.d, dt)
+		g.line("o0[i] = dq_%s(i0, %s);", quantName(dt), at)
+		return g.perElement(n)
+	}
+	g.line("o0[i] = i0[%s];", at)
 	return g.perElement(n)
 }
 

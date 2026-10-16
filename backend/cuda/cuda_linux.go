@@ -60,6 +60,12 @@ type buffer struct {
 func (b *buffer) DType() backend.DType { return b.dt }
 func (b *buffer) Len() int             { return b.n }
 
+// size returns the buffer's size in bytes.
+func (b *buffer) size() int {
+	n, _ := b.dt.Bytes(b.n)
+	return n
+}
+
 var _ backend.Backend = (*Backend)(nil)
 
 // New returns a backend for the first CUDA device, or an error wrapping
@@ -201,19 +207,23 @@ func (b *Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 	if n < 0 || n > gen.MaxElems {
 		return nil, fmt.Errorf("cuda: alloc %d elements: %w", n, backend.ErrShape)
 	}
-	if dt.Size() == 0 {
+	if dt.BlockBytes() == 0 {
 		return nil, fmt.Errorf("cuda: alloc %s: %w", dt, backend.ErrDType)
 	}
-	size := uintptr(max(n*dt.Size(), 4))
+	size, ok := dt.Bytes(n)
+	if !ok {
+		return nil, fmt.Errorf("cuda: alloc %d elements of %s, in blocks of %d: %w", n, dt, dt.BlockSize(), backend.ErrShape)
+	}
+	bytes := uintptr(max(size, 4))
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.enter()()
 	var ptr uint64
 	var r result
 	if b.pools {
-		r = cuMemAllocAsync(&ptr, size, b.stream)
+		r = cuMemAllocAsync(&ptr, bytes, b.stream)
 	} else {
-		r = cuMemAlloc(&ptr, size)
+		r = cuMemAlloc(&ptr, bytes)
 	}
 	if r != cudaSuccess {
 		return nil, check(r, fmt.Sprintf("alloc %d x %s", n, dt))
@@ -262,8 +272,8 @@ func (b *Backend) Upload(ctx context.Context, dst backend.Buffer, src []byte) er
 	if err != nil {
 		return err
 	}
-	if len(src) != cb.n*cb.dt.Size() {
-		return fmt.Errorf("cuda: upload %d bytes into %d-byte buffer: %w", len(src), cb.n*cb.dt.Size(), backend.ErrShape)
+	if len(src) != cb.size() {
+		return fmt.Errorf("cuda: upload %d bytes into %d-byte buffer: %w", len(src), cb.size(), backend.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -287,8 +297,8 @@ func (b *Backend) Download(ctx context.Context, dst []byte, src backend.Buffer) 
 	if err != nil {
 		return err
 	}
-	if len(dst) != cb.n*cb.dt.Size() {
-		return fmt.Errorf("cuda: download %d-byte buffer into %d bytes: %w", cb.n*cb.dt.Size(), len(dst), backend.ErrShape)
+	if len(dst) != cb.size() {
+		return fmt.Errorf("cuda: download %d-byte buffer into %d bytes: %w", cb.size(), len(dst), backend.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {
 		return err

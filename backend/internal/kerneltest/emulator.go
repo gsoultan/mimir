@@ -37,6 +37,7 @@ const metalShim = `#pragma once
 namespace metal {
 using uint = unsigned int;
 using ushort = unsigned short;
+using uchar = unsigned char;
 using atomic_uint = std::atomic<unsigned int>;
 enum memory_order { memory_order_relaxed };
 inline unsigned atomic_fetch_or_explicit(atomic_uint* a, unsigned v, memory_order) { return a->fetch_or(v); }
@@ -238,6 +239,8 @@ func (e *Emulator) binary(t *testing.T, l *gen.Launch, types []backend.DType) st
 			name = "float"
 		case dt.Size() == 2:
 			name = "unsigned short"
+		case dt.IsQuantized():
+			name = "unsigned char"
 		}
 		args = append(args, fmt.Sprintf("(%s*)bufs[%d].data()", name, i))
 	}

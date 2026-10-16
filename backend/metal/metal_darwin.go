@@ -70,8 +70,14 @@ type buffer struct {
 func (b *buffer) DType() backend.DType { return b.dt }
 func (b *buffer) Len() int             { return b.n }
 
+// size returns the buffer's size in bytes.
+func (b *buffer) size() int {
+	n, _ := b.dt.Bytes(b.n)
+	return n
+}
+
 // bytes returns the buffer's memory.
-func (b *buffer) bytes() []byte { return unsafe.Slice((*byte)(b.data), b.n*b.dt.Size()) }
+func (b *buffer) bytes() []byte { return unsafe.Slice((*byte)(b.data), b.size()) }
 
 var _ backend.Backend = (*Backend)(nil)
 
@@ -119,13 +125,17 @@ func (b *Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 	if n < 0 || n > gen.MaxElems {
 		return nil, fmt.Errorf("metal: alloc %d elements: %w", n, backend.ErrShape)
 	}
-	if dt.Size() == 0 {
+	if dt.BlockBytes() == 0 {
 		return nil, fmt.Errorf("metal: alloc %s: %w", dt, backend.ErrDType)
+	}
+	size, ok := dt.Bytes(n)
+	if !ok {
+		return nil, fmt.Errorf("metal: alloc %d elements of %s, in blocks of %d: %w", n, dt, dt.BlockSize(), backend.ErrShape)
 	}
 	const storageShared = 0 // MTLResourceStorageModeShared
 	var obj id
 	autoreleased(func() {
-		obj = id(send(b.dev, selNewBuffer, uintptr(max(n*dt.Size(), 4)), storageShared))
+		obj = id(send(b.dev, selNewBuffer, uintptr(max(size, 4)), storageShared))
 	})
 	if obj == 0 {
 		return nil, fmt.Errorf("metal: alloc %d x %s: %w", n, dt, backend.ErrOutOfMemory)
@@ -163,8 +173,8 @@ func (b *Backend) Upload(ctx context.Context, dst backend.Buffer, src []byte) er
 	if err != nil {
 		return err
 	}
-	if len(src) != mb.n*mb.dt.Size() {
-		return fmt.Errorf("metal: upload %d bytes into %d-byte buffer: %w", len(src), mb.n*mb.dt.Size(), backend.ErrShape)
+	if len(src) != mb.size() {
+		return fmt.Errorf("metal: upload %d bytes into %d-byte buffer: %w", len(src), mb.size(), backend.ErrShape)
 	}
 	if err := b.Sync(ctx); err != nil {
 		return err
@@ -179,8 +189,8 @@ func (b *Backend) Download(ctx context.Context, dst []byte, src backend.Buffer) 
 	if err != nil {
 		return err
 	}
-	if len(dst) != mb.n*mb.dt.Size() {
-		return fmt.Errorf("metal: download %d-byte buffer into %d bytes: %w", mb.n*mb.dt.Size(), len(dst), backend.ErrShape)
+	if len(dst) != mb.size() {
+		return fmt.Errorf("metal: download %d-byte buffer into %d bytes: %w", mb.size(), len(dst), backend.ErrShape)
 	}
 	if err := b.Sync(ctx); err != nil {
 		return err
