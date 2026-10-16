@@ -60,8 +60,52 @@ func main() {
 		scaleRow(v)
 		softmaxGrad(v)
 		dot(v)
+		exp2(v)
 	}
 	Generate()
+}
+
+// exp2Coeffs are those of Cephes' exp2f: 2^f = 1 + f·q(f) for f in
+// [-1/2, 1/2], with q of degree 5, within 2 ulp.
+var exp2Coeffs = []float32{1.535336188319500e-4, 1.339887440266574e-3, 9.618437357674640e-3, 5.550332471162809e-2, 2.402264791363012e-1, 6.931472028550421e-1}
+
+func exp2(v isa) {
+	name := "exp2" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, src *float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to 2 to the power of those at src, which it clamps to [-126, 127].", name, v.lanes))
+	pd := Load(Param("dst"), GP64())
+	ps := Load(Param("src"), GP64())
+	n := Load(Param("n"), GP64())
+	c := func(name string) Mem { return consts[name] }
+	TESTQ(n, n)
+	JZ(LabelRef(name + "_done"))
+	Label(name + "_loop")
+	x := v.vec()
+	VMOVUPS(Mem{Base: ps}, x)
+	VMAXPS(c("exp2lo"), x, x)
+	VMINPS(c("exp2hi"), x, x)
+	ni, nf := v.vec(), v.vec()
+	VCVTPS2DQ(x, ni)
+	VCVTDQ2PS(ni, nf)
+	VSUBPS(nf, x, x) // f = x - n, exactly
+	y := v.vec()
+	VMOVUPS(c("q0"), y)
+	for i := 1; i < len(exp2Coeffs); i++ {
+		VFMADD213PS(c(fmt.Sprintf("q%d", i)), x, y)
+	}
+	VFMADD213PS(c("one"), x, y) // 1 + f·q(f)
+	VPADDD(c("bias"), ni, ni)
+	VPSLLD(U8(23), ni, ni)
+	VMULPS(ni, y, y)
+	VMOVUPS(y, Mem{Base: pd})
+	ADDQ(U32(4*v.lanes), pd)
+	ADDQ(U32(4*v.lanes), ps)
+	SUBQ(U32(v.lanes), n)
+	JNZ(LabelRef(name + "_loop"))
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
 }
 
 func dot(v isa) {
@@ -136,7 +180,12 @@ func constants() {
 	for i, c := range coeffs {
 		f[fmt.Sprintf("p%d", i)] = c
 	}
-	names := []string{"log2e", "ln2hi", "ln2lo", "one", "lowest", "highest", "p0", "p1", "p2", "p3", "p4", "p5"}
+	f["exp2lo"], f["exp2hi"] = -126, 127
+	for i, c := range exp2Coeffs {
+		f[fmt.Sprintf("q%d", i)] = c
+	}
+	names := []string{"log2e", "ln2hi", "ln2lo", "one", "lowest", "highest", "p0", "p1", "p2", "p3", "p4", "p5",
+		"exp2lo", "exp2hi", "q0", "q1", "q2", "q3", "q4", "q5"}
 	for _, name := range names {
 		m := GLOBL("exp_"+name, RODATA|NOPTR)
 		for i := range 16 {

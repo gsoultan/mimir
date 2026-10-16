@@ -57,7 +57,7 @@ func refEvalExact(in backend.Instr, prog []backend.Instr, vals []refScalar, inpu
 	case backend.OpNeg:
 		return refScalar{-arg(0).f, -arg(0).i}
 	case backend.OpExp2:
-		return refScalar{f: float32(math.Exp2(float64(arg(0).f)))}
+		return refScalar{f: exp2Ref(arg(0).f)}
 	case backend.OpLog2:
 		return refScalar{f: float32(math.Log2(float64(arg(0).f)))}
 	case backend.OpSin:
