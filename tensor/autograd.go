@@ -102,8 +102,12 @@ type tape struct {
 	vjp func(g *Tensor) []*Tensor
 	// effects are computed in the same schedule as the gradients.
 	effects []*Tensor
+	// reads are the parameters that a checkpointed function read, with
+	// the values it read, on the tape of a checkpoint (see Checkpoint).
+	reads []paramRead
 
 	leaf     bool
+	param    *Param  // the parameter a leaf stands for, or nil
 	grad     *Tensor // accumulated gradient of a leaf
 	own      bool    // grad's memory is the tape's to reuse
 	released bool    // Backward has run through this node
@@ -259,7 +263,6 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	effects = append(effects, bwd.effects...)
 	// A leaf read only by a checkpointed function is not among order: its
 	// gradient came from the function's recompute.
 	leaves := bwd.leaves()
@@ -308,27 +311,25 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	}
 	for _, n := range order {
 		if !n.leaf {
-			n.parents, n.vjp, n.effects, n.released = nil, nil, nil, true
+			n.parents, n.vjp, n.effects, n.reads, n.released = nil, nil, nil, nil, true
 		}
 	}
 	return nil
 }
 
 // bwd is the state of the Backward that is running: the gradient
-// accumulated for each leaf reached, the order the leaves were reached in,
-// the effects of checkpointed functions recomputed on the way and the
-// first error one of them met. Gradient rules run while Backward holds
-// backwardMu, which guards it; the rule of a checkpoint (see Checkpoint)
-// propagates gradients through the function it recomputes into it, since
-// the parameters the function reads are leaves of this Backward, not
-// inputs of the checkpoint.
+// accumulated for each leaf reached, the order the leaves were reached in
+// and the first error a checkpointed function recomputed on the way met.
+// Gradient rules run while Backward holds backwardMu, which guards it; the
+// rule of a checkpoint (see Checkpoint) propagates gradients through the
+// function it recomputes into it, since the parameters the function reads
+// are leaves of this Backward, not inputs of the checkpoint.
 var bwd backwardState
 
 type backwardState struct {
-	acc     map[*tape]*Tensor
-	order   []*tape
-	effects []*Tensor
-	err     error
+	acc   map[*tape]*Tensor
+	order []*tape
+	err   error
 }
 
 // add adds g to the gradient accumulated for the leaf l.
@@ -529,10 +530,15 @@ func newParam(init *Tensor, trainable bool) *Param {
 			v = fail(err)
 		}
 	}
+	p := &Param{trainable: trainable}
 	if trainable {
 		v = v.RequiresGrad()
+		if v.tape != nil {
+			v.tape.param = p
+		}
 	}
-	return &Param{value: v, trainable: trainable}
+	p.value = v
+	return p
 }
 
 // Value returns the parameter's current value.
