@@ -22,6 +22,8 @@ Files:
                         blocks, dequantized and multiplied (package tensor)
     attention.safetensors  attention, transformer layers and blocks with their
                         gradients (package nn)
+    linalg.safetensors  sorts, top-k, Fourier transforms and linear algebra with
+                        their gradients (package tensor)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -1174,6 +1176,136 @@ def attention_cases(rng):
     return c
 
 
+# ---------------------------------------------------------------------------
+# Sorts, top-k, Fourier transforms and linear algebra (linalg.safetensors,
+# package tensor). Complex tensors are real ones with a last dimension of 2,
+# as torch.view_as_real shows them. Functions of eigenvectors and singular
+# vectors use their squares, which do not depend on their signs, and inputs
+# of Cholesky and eigh are made symmetric inside the case.
+
+
+def np_complex(x):
+    return x[..., 0] + 1j * x[..., 1]
+
+
+def np_real_view(c):
+    return np.stack([c.real, c.imag], axis=-1)
+
+
+def np_spd(x, shift):
+    return x @ np.swapaxes(x, -1, -2) + shift * np.eye(x.shape[-1])
+
+
+def torch_spd(T, x, shift):
+    return x @ x.mT + shift * T.eye(x.shape[-1], dtype=x.dtype)
+
+
+def np_shift(x, by):
+    return x + by * np.eye(x.shape[-1])
+
+
+def torch_shift(T, x, by):
+    return x + by * T.eye(x.shape[-1], dtype=x.dtype)
+
+
+def np_flat(*arrays):
+    return np.concatenate([np.ravel(a) for a in arrays])
+
+
+def torch_flat(T, *ts):
+    return T.cat([t.reshape(-1) for t in ts])
+
+
+def np_svd_parts(x):
+    u, s, vh = np.linalg.svd(x, full_matrices=False)
+    return np_flat(s, u * u, vh * vh)
+
+
+def torch_svd_parts(T, x):
+    u, s, vh = T.linalg.svd(x, full_matrices=False)
+    return torch_flat(T, s, u * u, vh * vh)
+
+
+def linalg_cases(rng):
+    """Cases as gradient cases. A case without differentiable inputs checks
+    its output alone."""
+    c = {}
+
+    def case(name, inputs, diff, np_fn, torch_fn):
+        c[name] = (inputs, diff, np_fn, torch_fn)
+
+    def distinct(*shape):
+        return (rng.permutation(int(np.prod(shape))).reshape(shape) * 0.25 - 2).astype(F32)
+
+    def ties(*shape):
+        return np.round(uniform(rng, shape, -2, 2)).astype(F32)
+
+    case("sort_values", [distinct(4, 7)], [0],
+         lambda x: np.sort(x, axis=1), lambda T, x: T.sort(x, dim=1, stable=True).values)
+    case("sort_descending_indices", [ties(4, 9)], [],
+         lambda x: np.argsort(-x, axis=1, kind="stable").astype(I32),
+         lambda T, x: T.sort(x, dim=1, descending=True, stable=True).indices.to(T.int32))
+    case("argsort_axis0", [ties(6, 3)], [],
+         lambda x: np.argsort(x, axis=0, kind="stable").astype(I32),
+         lambda T, x: T.argsort(x, dim=0, stable=True).to(T.int32))
+    case("topk_values", [distinct(5, 6)], [0],
+         lambda x: -np.sort(-x, axis=1)[:, :3], lambda T, x: T.topk(x, 3, dim=1).values)
+    case("topk_smallest_indices", [distinct(7, 4)], [],
+         lambda x: np.argsort(x, axis=0)[:2].astype(I32),
+         lambda T, x: T.topk(x, 2, dim=0, largest=False).indices.to(T.int32))
+
+    case("fft", [uniform(rng, (3, 8, 2), -1, 1)], [0],
+         lambda x: np_real_view(np.fft.fft(np_complex(x), axis=1)),
+         lambda T, x: T.view_as_real(T.fft.fft(T.view_as_complex(x), dim=1)))
+    case("fft_bluestein", [uniform(rng, (20, 3, 2), -1, 1)], [0],
+         lambda x: np_real_view(np.fft.fft(np_complex(x), axis=0)),
+         lambda T, x: T.view_as_real(T.fft.fft(T.view_as_complex(x), dim=0)))
+    case("ifft", [uniform(rng, (2, 6, 2), -1, 1)], [0],
+         lambda x: np_real_view(np.fft.ifft(np_complex(x), axis=-1)),
+         lambda T, x: T.view_as_real(T.fft.ifft(T.view_as_complex(x), dim=-1)))
+    case("rfft", [uniform(rng, (3, 10), -1, 1)], [0],
+         lambda x: np_real_view(np.fft.rfft(x, axis=-1)),
+         lambda T, x: T.view_as_real(T.fft.rfft(x, dim=-1)))
+    case("irfft", [uniform(rng, (2, 5, 2), -1, 1)], [0],
+         lambda x: np.fft.irfft(np_complex(x), n=8, axis=-1),
+         lambda T, x: T.fft.irfft(T.view_as_complex(x), n=8, dim=-1))
+    case("irfft_odd_padded", [uniform(rng, (4, 2, 2), -1, 1)], [0],
+         lambda x: np.fft.irfft(np_complex(x), n=9, axis=0),
+         lambda T, x: T.fft.irfft(T.view_as_complex(x), n=9, dim=0))
+
+    case("cholesky", [uniform(rng, (2, 4, 4), -1, 1)], [0],
+         lambda x: np.linalg.cholesky(np_spd(x, 2)), lambda T, x: T.linalg.cholesky(torch_spd(T, x, 2)))
+    case("solve", [uniform(rng, (2, 4, 4), -1, 1), uniform(rng, (2, 4, 3), -1, 1)], [0, 1],
+         lambda a, b: np.linalg.solve(np_shift(a, 3), b), lambda T, a, b: T.linalg.solve(torch_shift(T, a, 3), b))
+    case("solve_vector", [uniform(rng, (4, 4), -1, 1), uniform(rng, (4,), -1, 1)], [0, 1],
+         lambda a, b: np.linalg.solve(np_shift(a, 3), b), lambda T, a, b: T.linalg.solve(torch_shift(T, a, 3), b))
+    case("triangular_solve_lower", [uniform(rng, (3, 3), -1, 1), uniform(rng, (3, 2), -1, 1)], [0, 1],
+         lambda a, b: np.linalg.solve(np.tril(np_shift(a, 3)), b),
+         lambda T, a, b: T.linalg.solve_triangular(torch_shift(T, a, 3), b, upper=False))
+    case("triangular_solve_upper", [uniform(rng, (2, 3, 3), -1, 1), uniform(rng, (2, 3, 4), -1, 1)], [0, 1],
+         lambda a, b: np.linalg.solve(np.triu(np_shift(a, 3)), b),
+         lambda T, a, b: T.linalg.solve_triangular(torch_shift(T, a, 3), b, upper=True))
+    case("inv", [uniform(rng, (3, 3), -1, 1)], [0],
+         lambda x: np.linalg.inv(np_shift(x, 3)), lambda T, x: T.linalg.inv(torch_shift(T, x, 3)))
+    case("det", [uniform(rng, (2, 3, 3), -1, 1)], [0],
+         lambda x: np.linalg.det(np_shift(x, 1)), lambda T, x: T.linalg.det(torch_shift(T, x, 1)))
+    slog = uniform(rng, (2, 4, 4), -2, 2)
+    case("slogdet_sign", [slog], [],
+         lambda x: np.linalg.slogdet(x)[0].astype(F32), lambda T, x: T.linalg.slogdet(x)[0])
+    case("slogdet_logabsdet", [slog], [0],
+         lambda x: np.linalg.slogdet(x)[1], lambda T, x: T.linalg.slogdet(x)[1])
+    case("qr_tall", [uniform(rng, (5, 3), -1, 1)], [0],
+         lambda x: np_flat(*np.linalg.qr(x)), lambda T, x: torch_flat(T, *T.linalg.qr(x)))
+    case("qr_wide", [uniform(rng, (2, 3, 5), -1, 1)], [0],
+         lambda x: np_flat(*np.linalg.qr(x)), lambda T, x: torch_flat(T, *T.linalg.qr(x)))
+    case("svd_tall", [uniform(rng, (5, 3), -1, 1)], [0], np_svd_parts, torch_svd_parts)
+    case("svd_wide", [uniform(rng, (2, 3, 4), -1, 1)], [0], np_svd_parts, torch_svd_parts)
+    case("eigh", [uniform(rng, (4, 4), -2, 2)], [0],
+         lambda x: np_flat(*(lambda w, v: (w, v * v))(*np.linalg.eigh(x + x.T))),
+         lambda T, x: (lambda r: torch_flat(T, r.eigenvalues, r.eigenvectors ** 2))(T.linalg.eigh(x + x.mT)))
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--oracle", choices=["torch", "numpy"], default="torch")
@@ -1259,6 +1391,21 @@ def main():
         for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
             tensors[f"{name}/{part}"] = a
     files["attention"] = tensors
+
+    # Sorts, Fourier transforms and linear algebra, from their own streams at
+    # seed offset 8.
+    rng, gout_rng = np.random.default_rng(args.seed + 8), np.random.default_rng(args.seed + 108)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in linalg_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        if diff:
+            parts = evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng)
+        else:
+            parts = {"out": evaluate(args.oracle, inputs, np_fn, torch_fn)}
+        for part, a in parts.items():
+            tensors[f"{name}/{part}"] = a
+    files["linalg"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
