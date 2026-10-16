@@ -75,6 +75,13 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		return attentionGrad(ctx, b, k, o, ins)
 	case k.Op == backend.OpConv || k.Op == backend.OpConvWeight || k.Op == backend.OpConvInput:
 		return runConv(ctx, b, k, outs, ins)
+
+	case k.Op == backend.OpArgsort:
+		return runArgsort(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpFFT:
+		return runFFT(ctx, b, k, out, ins[0])
+	case k.Op >= backend.OpCholesky && k.Op <= backend.OpEigh:
+		return runLinalg(ctx, b, k, out, ins)
 	}
 	switch k.DType {
 	case backend.Float32:

@@ -34,6 +34,9 @@ var (
 	// ErrInternal reports a defect inside mimir, such as a recovered panic
 	// in a kernel. It is never expected; please report it.
 	ErrInternal = errors.New("internal error")
+	// ErrSingular reports a matrix that a solve cannot invert, or a
+	// Cholesky factorization of one that is not positive definite.
+	ErrSingular = errors.New("singular matrix")
 )
 
 // DType is the element type of a tensor.
@@ -165,7 +168,7 @@ type Kernel struct {
 // Each Op documents which fields it uses.
 type Attrs struct {
 	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
-	Axis   int      // Gather, ScatterAdd: the indexed axis. Scan: the scanned axis. Cat: the joined axis.
+	Axis   int      // Gather, ScatterAdd: the indexed axis. Scan: the scanned axis. Cat: the joined axis. Argsort, FFT: the transformed axis.
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension. SliceScatter: the block replaced.
 	Value  float64  // Const, Pad, Unfold: the fill value.
@@ -190,6 +193,14 @@ type Attrs struct {
 	Scale        float64
 	Causal       bool
 	CausalOffset int
+
+	// Argsort: whether to sort in descending order.
+	Descending bool
+	// FFT: whether to transform with e^(+2πijk/n), the inverse direction.
+	Inverse bool
+	// TriangularSolve: whether the matrix is upper triangular rather than
+	// lower, and whether its diagonal holds ones, which it does not read.
+	Upper, Unit bool
 }
 
 // Instr is one instruction of a fused program. Instruction i computes
