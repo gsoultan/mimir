@@ -48,6 +48,7 @@ type Optimizer struct {
 	params []*tensor.Param
 	rule   Rule
 	lr     float64
+	scale  float64 // the factor the gradients carry, which Step divides out
 	steps  int
 	states []State
 	err    error // a configuration error, reported by Step
@@ -56,7 +57,7 @@ type Optimizer struct {
 // New returns an optimizer that updates params with rule at learning rate
 // lr. SGD, Adam, AdamW and RMSprop are built on it.
 func New(params []*tensor.Param, lr float64, rule Rule) *Optimizer {
-	o := &Optimizer{params: params, rule: rule, lr: lr, states: make([]State, len(params))}
+	o := &Optimizer{params: params, rule: rule, lr: lr, scale: 1, states: make([]State, len(params))}
 	if lr < 0 || math.IsNaN(lr) {
 		o.err = fmt.Errorf("optim: learning rate %v: %w", lr, tensor.ErrShape)
 	}
@@ -69,6 +70,46 @@ func (o *Optimizer) LR() float64 { return o.lr }
 // SetLR sets the learning rate for later steps, as a Schedule does.
 func (o *Optimizer) SetLR(lr float64) { o.lr = lr }
 
+// GradScale returns the factor that the gradients carry; see SetGradScale.
+func (o *Optimizer) GradScale() float64 { return o.scale }
+
+// SetGradScale tells the optimizer that the gradients carry scale times
+// the gradient of the loss, as they do when the loss is multiplied by
+// scale before Backward to keep small gradients from underflowing (see
+// train.LossScale). Step divides each gradient by scale as it reads it,
+// folded into the rule's input, so the division fuses with the update
+// and costs no memory. The default is 1. A scale that is not positive
+// and finite is a configuration error that Step reports.
+func (o *Optimizer) SetGradScale(scale float64) { o.scale = scale }
+
+// GradsFinite reports whether every gradient that Step would use is
+// finite. It sums the gradients in one schedule and tests the sum on the
+// host: the sum is NaN or infinite exactly when a gradient is, or when
+// the gradients are so large that their sum overflows float32, which is
+// as good as infinite. train.DynamicLossScale skips such steps.
+func (o *Optimizer) GradsFinite(ctx context.Context) (bool, error) {
+	var total *tensor.Tensor
+	for _, p := range o.params {
+		g := p.Grad()
+		if g == nil || !p.Trainable() {
+			continue
+		}
+		if total == nil {
+			total = g.Sum()
+		} else {
+			total = total.Add(g.Sum())
+		}
+	}
+	if total == nil {
+		return true, nil
+	}
+	v, err := total.Item[float32](ctx)
+	if err != nil {
+		return false, err
+	}
+	return !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0), nil
+}
+
 // Steps returns the number of steps taken.
 func (o *Optimizer) Steps() int { return o.steps }
 
@@ -79,13 +120,17 @@ func (o *Optimizer) ZeroGrad() {
 	}
 }
 
-// Step updates every trainable parameter that has a gradient, writing the
-// new values and states over the old ones (see tensor.RealizeInto). If it
-// fails before it starts writing, nothing changes; cancelling ctx after
-// that does not stop it.
+// Step updates every trainable parameter that has a gradient, divided by
+// the gradient scale (see SetGradScale), writing the new values and
+// states over the old ones (see tensor.RealizeInto). If it fails before
+// it starts writing, nothing changes; cancelling ctx after that does not
+// stop it.
 func (o *Optimizer) Step(ctx context.Context) error {
 	if o.err != nil {
 		return o.err
+	}
+	if !(o.scale > 0) || math.IsInf(o.scale, 0) {
+		return fmt.Errorf("optim: gradient scale %v: %w", o.scale, tensor.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -102,6 +147,9 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		g := p.Grad()
 		if g == nil || !p.Trainable() {
 			continue
+		}
+		if o.scale != 1 {
+			g = g.Mul(f32(1 / o.scale))
 		}
 		cur := p.Value().Detach()
 		v, s := o.rule(o.lr, step, cur, g, o.states[i])
