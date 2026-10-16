@@ -184,7 +184,7 @@ func TestGenerate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 8 || st.PromptTokens != len(prompt) || st.Tokens != 7 || st.PromptTime <= 0 || st.Time <= 0 {
+	if len(out) != 8 || st.PromptTokens != len(prompt) || st.Tokens != 7 || st.PromptTime < 0 || st.Time < 0 {
 		t.Fatalf("generated %v with %+v", out, st)
 	}
 	seq := append(slices.Clone(prompt), out...)

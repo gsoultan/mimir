@@ -127,9 +127,18 @@ type Stats struct {
 }
 
 func (s Stats) String() string {
-	return fmt.Sprintf("prompt: %d tokens in %v, %.1f tokens/s; generation: %d tokens in %v, %.1f tokens/s",
-		s.PromptTokens, s.PromptTime.Round(time.Millisecond), float64(s.PromptTokens)/s.PromptTime.Seconds(),
-		s.Tokens, s.Time.Round(time.Millisecond), float64(s.Tokens)/s.Time.Seconds())
+	return fmt.Sprintf("prompt: %d tokens in %v, %s; generation: %d tokens in %v, %s",
+		s.PromptTokens, s.PromptTime.Round(time.Millisecond), rate(s.PromptTokens, s.PromptTime),
+		s.Tokens, s.Time.Round(time.Millisecond), rate(s.Tokens, s.Time))
+}
+
+// rate formats n tokens in d as tokens a second. Some clocks, such as
+// Windows', tick too coarsely to time a short phase, and read 0.
+func rate(n int, d time.Duration) string {
+	if d <= 0 {
+		return "too fast to time"
+	}
+	return fmt.Sprintf("%.1f tokens/s", float64(n)/d.Seconds())
 }
 
 // Generate runs prompt through m in one batched pass, then generates up
