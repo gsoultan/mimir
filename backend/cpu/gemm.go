@@ -238,7 +238,7 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a operand, of
 	defer gemmWorkspaces.Put(shared)
 	for jc := 0; jc < n; jc += g.nc {
 		nc := min(g.nc, n-jc)
-		p := planGEMM(g, m, nc, k, be.workers)
+		p := spreadRows(g, planGEMM(g, m, nc, k, be.workers), m, min(k, g.kc), be.workers)
 		for t := range offA {
 			at, bt := a, b
 			at.off, bt.off = offA[t], offB[t]
@@ -315,7 +315,7 @@ func (be *Backend) sgemmWide(ctx context.Context, g *gemmKernel, out []float32, 
 	defer gemmWorkspaces.Put(shared)
 	for q0 := 0; q0 < total; q0 += block {
 		q1 := min(q0+block, total)
-		p := planGEMM(g, m, (q1-q0)*g.nr, k, be.workers)
+		p := spreadRows(g, planGEMM(g, m, (q1-q0)*g.nr, k, be.workers), m, min(k, g.kc), be.workers)
 		for pc := 0; pc < k; pc += g.kc {
 			kc := min(g.kc, k-pc)
 			shared.b = grow(shared.b, (q1-q0)*g.nr*kc+packSlack)
@@ -384,6 +384,35 @@ type gemmPlan struct {
 // busiest worker, counting a packed element of A as packCost multiply-adds.
 func planGEMM(g *gemmKernel, m, n, k, workers int) gemmPlan {
 	return planSplit(g, m, n, k, workers, false)
+}
+
+// spreadParts is how many parts per worker spreadRows aims for.
+const spreadParts = 4
+
+// spreadFlops is the fewest multiply-adds, times two, that spreadRows
+// leaves in a part: enough that claiming it costs little.
+const spreadFlops = 32 * minUnitFlops
+
+// spreadRows splits the rows of the parts of plan p, of an m-row output
+// whose B panels are packed once for all parts, kc deep, into about
+// spreadParts parts per worker. Rows cost no extra packing to split, as
+// each part packs the rows of A it needs anyway, and the finer parts
+// balance the work: a worker that finishes early, or that other
+// processes on the machine leave more time, takes more of them instead of
+// waiting for the slowest.
+func spreadRows(g *gemmKernel, p gemmPlan, m, kc, workers int) gemmPlan {
+	parts := p.mParts * p.nParts
+	if parts < 2 {
+		return p
+	}
+	want := (spreadParts*workers + p.nParts - 1) / p.nParts
+	least := roundUp(max(1, spreadFlops/max(2*p.nStep*kc, 1)), g.mr)
+	step := max(roundUp((m+want-1)/want, g.mr), least)
+	if step >= p.mStep {
+		return p
+	}
+	p.mStep, p.mParts = step, (m+step-1)/step
+	return p
 }
 
 // planParts is planGEMM for parts that each pack the columns of B they
