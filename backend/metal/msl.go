@@ -153,6 +153,16 @@ func typeName(dt backend.DType) string {
 	return "int"
 }
 
+// constant returns an expression of the value v of type dt, read from the
+// parameters, so that kernels that differ only in their constants, such as
+// an optimizer's update at each step, share one compiled pipeline.
+func (g *gen) constant(v float64, dt backend.DType) string {
+	if dt == backend.Float32 {
+		return fmt.Sprintf("as_type<float>(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
+	}
+	return g.param(int(int32(v)))
+}
+
 // literal returns an exact MSL expression for v converted to dt, as the
 // CPU backend converts it.
 func literal(v float64, dt backend.DType) string {
@@ -233,7 +243,7 @@ func (g *gen) program(prog []backend.Instr, load func(a int) string) []string {
 		case backend.OpLoad:
 			e = load(in.Args[0])
 		case backend.OpConst:
-			e = literal(in.Value, in.DType)
+			e = g.constant(in.Value, in.DType)
 		case backend.OpNeg:
 			e = "-" + arg(0)
 		case backend.OpExp2:
@@ -332,16 +342,25 @@ func checkProgram(prog []backend.Instr, stores []int, out backend.DType, ins []b
 	return nil
 }
 
-// plan returns the dispatch that runs k, or nil if k has no elements.
-func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
-	n, _ := backend.NumElements(k.Shape)
+// indexable reports an error if a kernel cannot index an output of n
+// elements or one of the inputs in int.
+func indexable(n int, ins []backend.Buffer) error {
 	if n > maxElems {
-		return nil, fmt.Errorf("%d elements exceed the %d a Metal kernel indexes: %w", n, maxElems, backend.ErrShape)
+		return fmt.Errorf("%d elements exceed the %d a Metal kernel indexes: %w", n, maxElems, backend.ErrShape)
 	}
 	for _, b := range ins {
 		if b.Len() > maxElems {
-			return nil, fmt.Errorf("input of %d elements exceeds the %d a Metal kernel indexes: %w", b.Len(), maxElems, backend.ErrShape)
+			return fmt.Errorf("input of %d elements exceeds the %d a Metal kernel indexes: %w", b.Len(), maxElems, backend.ErrShape)
 		}
+	}
+	return nil
+}
+
+// plan returns the dispatch that runs k, or nil if k has no elements.
+func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
+	n, _ := backend.NumElements(k.Shape)
+	if err := indexable(n, ins); err != nil {
+		return nil, err
 	}
 	if n == 0 {
 		return nil, nil
@@ -364,7 +383,7 @@ func plan(k *backend.Kernel, outs, ins []backend.Buffer) (*launch, error) {
 		}
 		return g.elementwise(n, prog, nil)
 	case op == backend.OpConst:
-		g.line("o0[i] = %s;", literal(k.Attrs.Value, k.DType))
+		g.line("o0[i] = %s;", g.constant(k.Attrs.Value, k.DType))
 		return g.perElement(n)
 	case op == backend.OpRandUniform || op == backend.OpRandNormal:
 		return g.random(n)
@@ -540,7 +559,7 @@ func (g *gen) pad(n int) (*launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", s, s, g.param(v.Shape[d]))
 		g.line("off += %s * %s;", s, g.param(v.Strides[d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", literal(g.k.Attrs.Value, g.k.DType))
+	g.line("o0[i] = inside ? i0[off] : %s;", g.constant(g.k.Attrs.Value, g.k.DType))
 	return g.perElement(n)
 }
 
@@ -644,7 +663,7 @@ func (g *gen) unfold(n int) (*launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", x, x, g.param(v.Shape[lead+d]))
 		g.line("off += %s * %s;", x, g.param(v.Strides[lead+d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", literal(a.Value, g.k.DType))
+	g.line("o0[i] = inside ? i0[off] : %s;", g.constant(a.Value, g.k.DType))
 	return g.perElement(n)
 }
 
@@ -692,10 +711,7 @@ func (g *gen) fold(n int) (*launch, error) {
 
 // matmul computes [..., M, K] x [..., K, N] -> [..., M, N], summing the
 // products over the batch axes k.Attrs.Axes, one thread per output
-// element, and applies the epilogue program, if any, to the result. The
-// epilogue reads the product as input 0 and inputs 2 on as inputs 1 on,
-// through views of a shape that lists the output's elements in row-major
-// order.
+// element, and applies the epilogue program, if any, to the result.
 func (g *gen) matmul(n int) (*launch, error) {
 	k := g.k
 	vx, vy := k.In[0], k.In[1]
@@ -745,8 +761,17 @@ func (g *gen) matmul(n int) (*launch, error) {
 	for range sum {
 		g.line("}")
 	}
+	return g.epilogue(n, "acc")
+}
+
+// epilogue writes the product acc, after the epilogue program of the
+// product g.k if it has one. The epilogue reads the product as input 0 and
+// inputs 2 on as inputs 1 on, through views of a shape that lists the
+// output's elements in row-major order.
+func (g *gen) epilogue(n int, acc string) (*launch, error) {
+	k := g.k
 	if k.Attrs.Program == nil {
-		g.line("o0[i] = acc;")
+		g.line("o0[i] = %s;", acc)
 		return g.perElement(n)
 	}
 	// The epilogue's inputs: the product, then ins[2:].
@@ -771,7 +796,7 @@ func (g *gen) matmul(n int) (*launch, error) {
 	offs := g.offsets("i", cshape, cviews)
 	vals := g.program(k.Attrs.Program, func(a int) string {
 		if a == 0 {
-			return "acc"
+			return acc
 		}
 		return fmt.Sprintf("i%d[%s]", a+1, offs[a-1])
 	})

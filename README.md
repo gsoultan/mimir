@@ -4,11 +4,11 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestone 3.** mimir trains neural networks on the CPU with
-> SIMD matrix kernels, fused elementwise kernels and in-place updates:
-> autograd, layers, losses, optimizers, data loading and a training loop,
-> each checked against PyTorch. The Metal GPU backend arrives in milestone 4.
-> The API may change between 0.x releases.
+> **Status: milestone 4.** mimir trains neural networks on the CPU with
+> SIMD matrix kernels, fused elementwise kernels and in-place updates, and
+> runs the same code on Apple GPUs through Metal: autograd, layers, losses,
+> optimizers, data loading and a training loop, each checked against
+> PyTorch. The API may change between 0.x releases.
 
 ## Example
 
@@ -81,6 +81,32 @@ Set `MIMIR_EAGER=1` to compute every operation as soon as it is created, so a
 runtime error such as an out-of-range index surfaces at the line that caused
 it.
 
+## Devices
+
+The same program runs on the CPU or the GPU. `mimir.Auto` returns the GPU if
+there is one mimir can use and the CPU otherwise, so code written for a Mac
+still runs on a Linux server:
+
+```go
+dev := mimir.Auto()       // or mimir.CPU(), or mimir.GPU()
+err := nn.To(model, dev)  // parameters, buffers and gradients
+x = x.To(dev)             // a tensor; gradients flow back through the copy
+```
+
+`mimir.Devices` lists every device available. `train.Fit` moves each batch
+to the device the model is on. Tensors that `FromSlice` creates live on the
+default device, which `MIMIR_DEVICE` sets to `cpu`, `gpu` or `auto`; combining
+tensors on different devices returns `tensor.ErrDevice`. `go run
+./examples/mnist -device auto` trains on the GPU when there is one.
+
+On Apple silicon the GPU runs through Metal, called from Go with
+[purego](https://github.com/ebitengine/purego), so there is still no cgo and
+the binary cross-compiles. CPU and GPU share memory, so moving a tensor is a
+copy within RAM. Fused elementwise chains, reductions and matrix epilogues
+compile to Metal Shading Language kernels once each, and large float32
+matrix products run on Metal Performance Shaders. Every operation runs the
+same conformance tests on both devices.
+
 ## Gradients
 
 Tensors from `RequiresGrad` or a `tensor.Param` require gradients, and so does
@@ -118,6 +144,14 @@ only the loss it returns and the running statistics of batch normalization.
 PyTorch still trains 1.4 to 2.1 times faster: see
 [tools/bench](tools/bench/README.md) for the measurements and how to
 repeat them.
+
+On the GPU, Metal Performance Shaders multiplies 2048 × 2048 float32
+matrices at about 1,380 GFLOP/s on the M1 virtual machine GitHub's macOS
+runners provide, against about 100 GFLOP/s on its three CPU cores. Training
+the small MNIST networks is still slower there than on the CPU: a step of
+the MLP takes 4.4 ms on the GPU and 3.4 ms on the CPU, and the CNN 128 ms
+against 80 ms, because each step runs many small kernels and waits for the
+GPU to finish. The CI job `gpu` prints these numbers for every change.
 
 ## Requirements
 
@@ -184,12 +218,14 @@ train/               Fit, evaluation, checkpoints
 metrics/             accuracy
 backend/             Backend interface, DType, Op, View, Kernel
 backend/cpu/         pure-Go kernels and worker pool
+backend/metal/       Metal kernels and Metal Performance Shaders, through purego
 internal/graph/      lazy IR with shape and dtype checks
 internal/sched/      runs graphs: views, buffer reuse, freeing
 internal/goldentest/ golden-file loading and comparison
 io/safetensors/      safetensors reader and writer
 examples/mnist/      trains an MLP or CNN on MNIST
 testdata/golden/     expected results from PyTorch or NumPy
+tools/devices/       lists the devices mimir can use
 tools/bench/         PyTorch and NumPy counterparts of the benchmarks
 tools/golden/        golden-file generator (Python, development only)
 ```
@@ -199,6 +235,7 @@ tools/golden/        golden-file generator (Python, development only)
 ```sh
 go test -race ./...
 MIMIR_EAGER=1 go test ./...
+MIMIR_DEVICE=gpu go test ./...   # on a Mac: every test on the GPU
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 ```
 
@@ -226,7 +263,7 @@ against finite differences in Go.
 | M1 Tensors that compute | lazy graph, CPU kernels, composite ops (done) |
 | M2 Train MNIST | autograd, `nn` layers, losses, optimizers, data loading, `Fit`; first release v0.1.0 (done) |
 | M3 Fast on CPU | SIMD GEMM microkernels with fused epilogues, fused elementwise kernels, convolution as GEMM, in-place optimizer updates with no allocations per step (done) |
-| M4 Same code on GPU | Metal backend without cgo, unified memory, automatic device choice with CPU fallback |
+| M4 Same code on GPU | Metal backend without cgo, unified memory, MPS matrix products, fused kernels, automatic device choice with CPU fallback (done; Metal 4 tensor operations on M5 chips are not used yet) |
 | M4b CUDA | cuBLASLt, cuDNN and NVRTC through purego |
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, memory-mapped data, bf16 and f16 |
 | M6 Transformers and LLMs | attention and KV cache, RNN, LSTM and GRU, GGUF quantized matmul |
