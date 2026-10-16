@@ -379,9 +379,10 @@ func (r *parquetRows) Close() error {
 	return r.src.release(r.file)
 }
 
-// Read fills x and y with up to len(y) examples. It reads them in blocks
-// of rows, a column at a time, so that the X block a column is scattered
-// into stays in cache.
+// Read fills x and y with up to min(len(x)/features, len(y)) examples,
+// the lesser of the room in x and in y, as data.Rows says. It reads them
+// in blocks of rows, a column at a time, so that the X block a column is
+// scattered into stays in cache.
 func (r *parquetRows) Read(x, y []float32) (int, error) {
 	f := r.src.Features()
 	room := min(len(x)/f, len(y))
