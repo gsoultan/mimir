@@ -16,6 +16,7 @@ Files:
     grads.safetensors   gradients of tensor operations (package tensor)
     nn.safetensors      layers and losses with their gradients (packages nn, nn/loss)
     optim.safetensors   optimizer steps and learning-rate schedules (package optim)
+    scan.safetensors    running sums, maxima and log-sum-exps (package tensor)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -485,6 +486,46 @@ def nn_cases(rng):
     return c
 
 
+def np_cummax_indices(x, axis):
+    """torch.cummax's indices: a tie or a NaN takes the latest position."""
+    x = np.moveaxis(x, axis, -1)
+    idx = np.zeros(x.shape, dtype=I32)
+    best, at = x[..., 0], np.zeros(x.shape[:-1], dtype=I32)
+    for j in range(x.shape[-1]):
+        take = np.isnan(x[..., j]) | (~np.isnan(best) & (x[..., j] >= best))
+        best, at = np.where(take, x[..., j], best), np.where(take, j, at).astype(I32)
+        idx[..., j] = at
+    return np.moveaxis(idx, -1, axis)
+
+
+def scan_cases(rng):
+    """Scans, as gradient cases. A case without differentiable inputs checks
+    its output alone."""
+    c = {}
+
+    def case(name, inputs, diff, np_fn, torch_fn):
+        c[name] = (inputs, diff, np_fn, torch_fn)
+
+    case("cumsum_axis1", [uniform(rng, (3, 4, 5), -2, 2)], [0],
+         lambda x: np.cumsum(x, axis=1), lambda T, x: T.cumsum(x, dim=1))
+    case("cumsum_last", [uniform(rng, (4, 33), -2, 2)], [0],
+         lambda x: np.cumsum(x, axis=-1), lambda T, x: T.cumsum(x, dim=-1))
+    case("cumsum_int", [ints(rng, (3, 7), -1000, 1000)], [],
+         lambda x: np.cumsum(x, axis=1, dtype=I32), lambda T, x: T.cumsum(x, dim=1, dtype=T.int32))
+    case("cummax_axis1", [uniform(rng, (3, 6, 4), -2, 2)], [0],
+         lambda x: np.maximum.accumulate(x, axis=1), lambda T, x: T.cummax(x, dim=1).values)
+    case("cummax_axis0", [uniform(rng, (7, 3), -2, 2)], [0],
+         lambda x: np.maximum.accumulate(x, axis=0), lambda T, x: T.cummax(x, dim=0).values)
+    ties = np.round(uniform(rng, (4, 9), -2, 2)).astype(F32)
+    case("cummax_indices", [ties], [],
+         lambda x: np_cummax_indices(x, 1), lambda T, x: T.cummax(x, dim=1).indices.to(T.int32))
+    case("logcumsumexp_last", [uniform(rng, (3, 7), -5, 5)], [0],
+         lambda x: np.logaddexp.accumulate(x, axis=-1), lambda T, x: T.logcumsumexp(x, dim=-1))
+    case("logcumsumexp_large", [uniform(rng, (6, 4), -500, 500)], [0],
+         lambda x: np.logaddexp.accumulate(x, axis=0), lambda T, x: T.logcumsumexp(x, dim=0))
+    return c
+
+
 # ---------------------------------------------------------------------------
 # Optimizers minimize sum(scale * (p - target)^2) for STEPS steps from p0;
 # out is the final p. Schedules record the learning rate before each step.
@@ -703,6 +744,20 @@ def main():
                 tensors[f"{name}/{part}"] = a
         files[file] = tensors
     files["optim"] = optim_tensors(args.oracle, np.random.default_rng(args.seed + 3))
+
+    rng = np.random.default_rng(args.seed + 6)
+    gout_rng = np.random.default_rng(args.seed + 100 + 6)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in scan_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        if diff:
+            parts = evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng)
+        else:
+            parts = {"out": evaluate(args.oracle, inputs, np_fn, torch_fn)}
+        for part, a in parts.items():
+            tensors[f"{name}/{part}"] = a
+    files["scan"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():

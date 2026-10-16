@@ -127,6 +127,10 @@ func TestHalfPromotion(t *testing.T) {
 		"gather f16":            {h.Gather(1, cond), tensor.Float16},
 		"pad bf16":              {b.Pad([][2]int{{1, 1}, {0, 0}}, 0.5), tensor.BFloat16},
 		"cast chain":            {b.Cast(tensor.Float16).Cast(tensor.Int32), tensor.Int32},
+		"cumsum bf16":           {b.CumSum(1), tensor.BFloat16},
+		"cummax f16":            {firstOf(h.CumMax(0)), tensor.Float16},
+		"cummax indices bf16":   {secondOf(b.CumMax(0)), tensor.Int32},
+		"logcumsumexp f16":      {h.LogCumSumExp(1), tensor.Float16},
 	}
 	for name, c := range cases {
 		if err := c.got.Err(); err != nil {
@@ -143,6 +147,7 @@ func TestHalfPromotion(t *testing.T) {
 		"where int32 f16":     tensor.Where(cond, i, h),
 		"scatter_add f16 i":   h.ScatterAdd(0, cond, i),
 		"int32 requires grad": i.RequiresGrad(),
+		"logcumsumexp int32":  i.LogCumSumExp(0),
 	} {
 		if err := got.Err(); !errors.Is(err, tensor.ErrDType) {
 			t.Errorf("%s: %v, want ErrDType", name, err)

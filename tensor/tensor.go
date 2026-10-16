@@ -49,9 +49,11 @@
 // BFloat16 with Float16, computes in Float32 and returns Float32; Int32
 // combines with no float type. Reductions, and the operations built on
 // them (Sum, Max, Min, Mean, Var, Softmax, LogSoftmax), accumulate half
-// inputs in float32 and return Float32. Matrix products (MatMul, Conv2d)
-// of half operands run in Float32 and return the operands' type, so every
-// device multiplies in float32. Rand and Randn are Float32.
+// inputs in float32 and return Float32; scans (CumSum, CumMax,
+// LogCumSumExp) combine them in float32 and return their type, rounded
+// once. Matrix products (MatMul, Conv2d) of half operands run in Float32
+// and return the operands' type, so every device multiplies in float32.
+// Rand and Randn are Float32.
 //
 // FromSlice, Data and Item exchange float32 and int32 values: a half
 // tensor is read by casting it to Float32 first. Gradients have the type
