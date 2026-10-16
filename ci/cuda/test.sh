@@ -9,6 +9,7 @@ go test -count=1 -v -run 'Kernels|Device' ./backend/cuda
 MIMIR_DEVICE=gpu go test -count=1 ./...
 echo "## benchmarks"
 go test -run '^$' -bench MatMul ./backend/cuda
+MIMIR_DEVICE=gpu go test -run '^$' -bench Conv2d -benchtime 20x ./tensor
 for dev in cpu gpu; do
 	echo "MIMIR_DEVICE=$dev"
 	MIMIR_DEVICE=$dev go test -run '^$' -bench TrainStep -benchtime 3s ./train
