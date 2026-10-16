@@ -1,6 +1,10 @@
 package gen
 
-import "github.com/gsoultan/mimir/backend"
+import (
+	"slices"
+
+	"github.com/gsoultan/mimir/backend"
+)
 
 // Matrix is how a matrix library reads an operand: matrices of Rows ×
 // Cols elements in row-major order, rows LD elements apart and matrices
@@ -22,10 +26,18 @@ type GEMM struct {
 }
 
 // PlanGEMM returns the product k as a matrix library computes it, or
-// false if it reads its operands in a way the library cannot: not float32, a
-// sum over batches, a broadcast or reversed operand that cannot be folded
-// away, or a matrix whose rows are not equally spaced. lens are the
-// lengths of the input buffers.
+// false if it reads its operands in a way the library cannot: not
+// float32, a sum over batches that does not fold into the inner
+// dimension, a reversed operand, more than one batch dimension that
+// cannot be folded away, or a matrix whose rows are not equally spaced.
+// lens are the lengths of the input buffers.
+//
+// An operand that every batch shares has a Stride of 0, unless it folds
+// into the rows of one product. A sum over batch axes folds into the
+// inner dimension when both operands lay out each summed axis outside
+// the inner one, as the gradient of a layer's weights over a batch of
+// sequences, [B, T, F]ᵀ times [B, T, O] summed over B, reads them: the
+// sum is then one product over B·T.
 func PlanGEMM(k *backend.Kernel, lens []int) (GEMM, bool) {
 	r := len(k.Shape)
 	if k.Op != backend.OpMatMul || k.DType != backend.Float32 || r < 2 || len(k.In) < 2 {
@@ -35,8 +47,9 @@ func PlanGEMM(k *backend.Kernel, lens []int) (GEMM, bool) {
 	if len(vx.Shape) != r || len(vy.Shape) != r {
 		return GEMM{}, false
 	}
-	for _, d := range k.Attrs.Axes {
-		if vx.Shape[d] != 1 {
+	if len(k.Attrs.Axes) > 0 {
+		var ok bool
+		if vx, vy, ok = foldSums(vx, vy, k.Attrs.Axes); !ok {
 			return GEMM{}, false
 		}
 	}
@@ -84,17 +97,58 @@ func PlanGEMM(k *backend.Kernel, lens []int) (GEMM, bool) {
 		g.A.Stride, g.B.Stride = bviews[0].Strides[0], bviews[1].Strides[0]
 	}
 	// Libraries read whole rows of whole matrices, padding included, so
-	// they must lie inside the buffers and not overlap.
+	// they must lie inside the buffers, and not overlap unless they are
+	// one matrix that every batch shares.
 	for i, mat := range []*Matrix{&g.A, &g.B} {
 		size := mat.Rows * mat.LD
 		if g.Batch == 1 {
 			mat.Stride = size
 		}
-		if mat.Stride < size || mat.Offset+g.Batch*mat.Stride > lens[i] {
+		switch {
+		case mat.Stride == 0 && mat.Offset+size <= lens[i]:
+		case mat.Stride < size || mat.Offset+g.Batch*mat.Stride > lens[i]:
 			return GEMM{}, false
 		}
 	}
 	return g, true
+}
+
+// foldSums returns the operands of a product summed over the batch axes
+// axes with those axes folded into the inner dimension, or false if they
+// cannot be: unless each summed axis of each operand is spaced as the
+// inner dimension's elements times its length, outermost first, the
+// product's terms are not those of one longer product.
+func foldSums(vx, vy backend.View, axes []int) (backend.View, backend.View, bool) {
+	r := len(vx.Shape)
+	var shape, sx, sy []int
+	for d := range r - 2 {
+		if !slices.Contains(axes, d) {
+			continue
+		}
+		if vx.Shape[d] != vy.Shape[d] {
+			return vx, vy, false
+		}
+		shape = append(shape, vx.Shape[d])
+		sx, sy = append(sx, vx.Strides[d]), append(sy, vy.Strides[d])
+	}
+	inner := vx.Shape[r-1]
+	shape = append(shape, inner)
+	sx, sy = append(sx, vx.Strides[r-1]), append(sy, vy.Strides[r-2])
+	folded, views := backend.Coalesce(shape, []backend.View{{Shape: shape, Strides: sx}, {Shape: shape, Strides: sy}})
+	if len(folded) > 1 {
+		return vx, vy, false
+	}
+	vx = backend.View{Shape: slices.Clone(vx.Shape), Strides: slices.Clone(vx.Strides), Offset: vx.Offset}
+	vy = backend.View{Shape: slices.Clone(vy.Shape), Strides: slices.Clone(vy.Strides), Offset: vy.Offset}
+	for _, d := range axes {
+		vx.Shape[d], vx.Strides[d], vy.Shape[d], vy.Strides[d] = 1, 0, 1, 0
+	}
+	n, _ := backend.NumElements(shape)
+	vx.Shape[r-1], vy.Shape[r-2] = n, n
+	if len(folded) == 1 {
+		vx.Strides[r-1], vy.Strides[r-2] = views[0].Strides[0], views[1].Strides[0]
+	}
+	return vx, vy, true
 }
 
 // layout returns how a library reads a rows × cols matrix with the given
