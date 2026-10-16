@@ -18,6 +18,12 @@
 // Weights are initialized like PyTorch's defaults from a seeded
 // generator, so a program builds the same model on every run; ManualSeed
 // changes the seed.
+//
+// Checkpoint wraps a module so that training keeps only its inputs and
+// recomputes the rest during Backward, which trades compute for the
+// memory of its activations. Cast stores a model's weights in bfloat16 or
+// float16. Save and Load write and read safetensors files; Load reads a
+// mapped file in place.
 package nn
 
 import (
