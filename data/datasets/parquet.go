@@ -48,7 +48,10 @@ import (
 // once. The source thus keeps open, with their metadata, the files of
 // the shards being read, at most Prefetch of them for one epoch, and 4
 // more, however many files there are; the 4 stay open between epochs. A
-// file that changes while it is open is not noticed.
+// file that changes while it is open is not noticed. The source is an
+// io.Closer: Close closes the files that no shard is reading, and from
+// then on a file closes as soon as its last shard does, which a program
+// that deletes or replaces the files needs on Windows.
 func ParquetShards(paths []string, target string, opts ...CSVOption) (data.Source, []string, error) {
 	var cfg csvConfig
 	for _, o := range opts {
@@ -134,6 +137,7 @@ type parquetSource struct {
 	mu     sync.Mutex
 	open   map[string]*sharedFile
 	idle   []*sharedFile
+	closed bool         // Close ran: files no shard reads are closed, not kept
 	opened atomic.Int64 // footers parsed by Open, for the tests
 }
 
@@ -341,9 +345,11 @@ func (s *parquetSource) release(sf *sharedFile) error {
 		s.mu.Unlock()
 		return nil
 	}
-	s.idle = append(s.idle, sf)
 	var evicted *sharedFile
-	if len(s.idle) > maxIdleFiles {
+	if s.closed {
+		evicted = sf
+		delete(s.open, sf.path)
+	} else if s.idle = append(s.idle, sf); len(s.idle) > maxIdleFiles {
 		evicted = s.idle[0]
 		s.idle = slices.Delete(s.idle, 0, 1)
 		delete(s.open, evicted.path)
@@ -353,6 +359,28 @@ func (s *parquetSource) release(sf *sharedFile) error {
 		return evicted.f.Close()
 	}
 	return nil
+}
+
+// Close closes the files that no shard is reading, and makes the source
+// close every other file once its last shard is closed instead of keeping
+// it open. Shards may still be opened afterwards; each opens its file
+// again. Close returns the first error closing a file.
+func (s *parquetSource) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	idle := s.idle
+	s.idle = nil
+	for _, sf := range idle {
+		delete(s.open, sf.path)
+	}
+	s.mu.Unlock()
+	var err error
+	for _, sf := range idle {
+		if cerr := sf.f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // parquetRows reads the rows of one row group.
