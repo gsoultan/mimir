@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -138,6 +139,70 @@ func TestConstantsAreParameters(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSetArgsRunsTheKernelOfOtherArguments checks, for every kernel case,
+// that a launch whose arguments SetArgs replaced is the launch Plan
+// returns for the kernel with those arguments.
+func TestSetArgsRunsTheKernelOfOtherArguments(t *testing.T) {
+	var cases []kerneltest.Case
+	for _, f := range []func(*testing.T) []kerneltest.Case{
+		kerneltest.Elementwise, kerneltest.Random, kerneltest.Reduce,
+		kerneltest.Movement, kerneltest.Window, kerneltest.MatMul,
+		kerneltest.Scan, kerneltest.Quant, kerneltest.Attention, kerneltest.Conv,
+	} {
+		cases = append(cases, f(t)...)
+	}
+	// Each argument changes, to a value of the same sign so that an
+	// integer constant stays in range.
+	other := func(k backend.Kernel) *backend.Kernel {
+		k.Attrs.Value = k.Attrs.Value*2 + 3
+		k.Attrs.Seed = k.Attrs.Seed ^ 0x9e3779b97f4a7c15
+		k.Attrs.Program = slices.Clone(k.Attrs.Program)
+		for i, in := range k.Attrs.Program {
+			if in.Op == backend.OpConst {
+				k.Attrs.Program[i].Value = in.Value*3 + 1
+			}
+		}
+		return &k
+	}
+	plans := map[string]func(*gen.Dialect, *backend.Kernel, []backend.Buffer, []backend.Buffer) (*gen.Launch, error){
+		"plan": gen.Plan, "epilogue": gen.PlanEpilogue,
+	}
+	checked := 0
+	for _, c := range cases {
+		n, _ := backend.NumElements(c.K.Shape)
+		outs := make([]backend.Buffer, 1+len(c.K.Attrs.Stores))
+		for i := range outs {
+			outs[i] = kerneltest.HostBuffer(t, nil, c.K.DType, n, 0, 0)
+		}
+		k2 := other(c.K)
+		for _, d := range dialects {
+			for name, plan := range plans {
+				if name == "epilogue" && (c.K.Op != backend.OpMatMul || c.K.Attrs.Program == nil) {
+					continue
+				}
+				l, err := plan(d, &c.K, outs, c.Ins)
+				if err != nil || l == nil {
+					continue // the kernel cases check failures
+				}
+				want, err := plan(d, k2, outs, c.Ins)
+				if err != nil {
+					t.Fatalf("%s %s %s with other arguments: %v", d.Name, c.Name, name, err)
+				}
+				if l.Src != want.Src {
+					t.Errorf("%s %s %s: the source depends on the arguments", d.Name, c.Name, name)
+					continue
+				}
+				l.SetArgs(k2.AppendArgs(nil))
+				if !slices.Equal(l.Params, want.Params) {
+					t.Errorf("%s %s %s: SetArgs gives parameters %v, want %v", d.Name, c.Name, name, l.Params, want.Params)
+				}
+				checked++
+			}
+		}
+	}
+	t.Logf("checked %d launches", checked)
 }
 
 // TestHalfProductsAreRejected checks that no dialect generates a product
