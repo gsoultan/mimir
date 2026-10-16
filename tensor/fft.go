@@ -2,6 +2,10 @@ package tensor
 
 import (
 	"fmt"
+	"math"
+	"math/bits"
+	"math/cmplx"
+	"slices"
 
 	"github.com/gsoultan/mimir/internal/graph"
 )
@@ -121,8 +125,96 @@ func (t *Tensor) complexAxis(axis int) (*Tensor, int, error) {
 // exponent positive. Its gradient is the transform the other way: the
 // adjoint of the transform matrix is the other's.
 func (t *Tensor) dft(axis int, inverse bool) *Tensor {
+	if err := firstErr(t); err != nil {
+		return fail(err)
+	}
+	if n := t.node.Shape[axis]; n > gpuDirectDFT && n&(n-1) != 0 && t.Device().backend() != cpuBackend {
+		return t.bluestein(axis, inverse)
+	}
 	out := wrap(graph.FFT(t.node, axis, inverse))
 	return track(out, func(g *Tensor) []*Tensor { return grads(g.Cast(Float32).dft(axis, !inverse)) }, t)
+}
+
+// gpuDirectDFT is the longest transform of a length that is not a power
+// of two that a GPU computes by its definition, in O(n²); longer ones
+// are built from power-of-two transforms.
+const gpuDirectDFT = 64
+
+// bluestein is dft for any length n from transforms of a power of two m
+// ≥ 2n-1, Bluestein's algorithm: with w[j] = e^(∓πi·j²/n), X[k] =
+// w[k]·Σ (x[j]·w[j])·conj(w[k-j]), a circular convolution of length m,
+// which multiplies the transforms. The transform of the convolution's
+// filter is computed on the host.
+func (t *Tensor) bluestein(axis int, inverse bool) *Tensor {
+	n := t.node.Shape[axis]
+	m := 1 << bits.Len(uint(2*n-2))
+	sign := -1.0
+	if inverse {
+		sign = 1
+	}
+	w := make([]complex128, n)
+	for j := range w {
+		sq := int64(j) * int64(j) % int64(2*n)
+		w[j] = cmplx.Rect(1, sign*math.Pi*float64(sq)/float64(n))
+	}
+	filter := make([]complex128, m)
+	filter[0] = cmplx.Conj(w[0])
+	for j := 1; j < n; j++ {
+		filter[j], filter[m-j] = cmplx.Conj(w[j]), cmplx.Conj(w[j])
+	}
+	hostFFT(filter)
+	d := t.Device()
+	// constant returns the complex values c as a tensor that broadcasts
+	// along axis, on t's device.
+	constant := func(c []complex128) *Tensor {
+		v := make([]float32, 0, 2*len(c))
+		for _, x := range c {
+			v = append(v, float32(real(x)), float32(imag(x)))
+		}
+		shape := slices.Repeat([]int{1}, len(t.node.Shape))
+		shape[axis], shape[len(shape)-1] = len(c), 2
+		return FromSlice(v, shape...).To(d)
+	}
+	chirp := constant(w)
+	pads := make([][2]int, len(t.node.Shape))
+	pads[axis] = [2]int{0, m - n}
+	a := complexMul(t, chirp).Pad(pads, 0).dft(axis, false)
+	conv := complexMul(a, constant(filter)).dft(axis, true).Mul(Scalar(float32(1 / float64(m))))
+	return complexMul(conv.shrink(axisRange(conv.node.Shape, axis, 0, n)), chirp)
+}
+
+// complexMul returns the products of the complex tensors x and y, which
+// broadcast.
+func complexMul(x, y *Tensor) *Tensor {
+	last := len(x.node.Shape) - 1
+	part := func(t *Tensor, i int) *Tensor { return t.shrink(axisRange(t.node.Shape, last, i, i+1)) }
+	xr, xi, yr, yi := part(x, 0), part(x, 1), part(y, 0), part(y, 1)
+	return Cat(last, xr.Mul(yr).Sub(xi.Mul(yi)), xr.Mul(yi).Add(xi.Mul(yr)))
+}
+
+// hostFFT replaces x, whose length is a power of two, with its discrete
+// Fourier transform, by radix-2 butterflies.
+func hostFFT(x []complex128) {
+	n := len(x)
+	for i, j := 1, 0; i < n; i++ {
+		bit := n >> 1
+		for ; j&bit != 0; bit >>= 1 {
+			j ^= bit
+		}
+		j ^= bit
+		if i < j {
+			x[i], x[j] = x[j], x[i]
+		}
+	}
+	for size := 2; size <= n; size <<= 1 {
+		for k := range size / 2 {
+			w := cmplx.Rect(1, -2*math.Pi*float64(k)/float64(size))
+			for s := 0; s < n; s += size {
+				a, b := x[s+k], x[s+k+size/2]*w
+				x[s+k], x[s+k+size/2] = a+b, a-b
+			}
+		}
+	}
 }
 
 // axisRange returns the ranges of a shrink of shape to [lo, hi) along

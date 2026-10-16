@@ -52,7 +52,7 @@ using std::log2; using std::signbit; using std::sin; using std::sqrt;
 inline float cospi(float x) { return float(std::cos(3.14159265358979323846 * x)); }
 inline float sinpi(float x) { return float(std::sin(3.14159265358979323846 * x)); }
 inline uint mulhi(uint a, uint b) { return uint((uint64_t(a) * b) >> 32); }
-enum class mem_flags { mem_threadgroup };
+enum class mem_flags { mem_threadgroup, mem_device };
 inline std::barrier<>* group_barrier;
 inline void threadgroup_barrier(mem_flags) { group_barrier->arrive_and_wait(); }
 }
