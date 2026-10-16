@@ -367,6 +367,10 @@ type options struct {
 	layerDropout  float64
 	relu          bool
 	checkpoint    int
+
+	// Graph attention.
+	slope     float64
+	meanHeads bool
 }
 
 func resolve(opts []Option, base options) options {
@@ -403,6 +407,14 @@ func Momentum(m float64) Option { return func(o *options) { o.momentum = m } }
 // Seed initializes a layer's weights from seed instead of the next seed
 // after ManualSeed.
 func Seed(seed uint64) Option { return func(o *options) { o.seed = &seed } }
+
+// NegativeSlope sets the slope of the LeakyReLU that scores the edges of
+// a graph attention layer, 0.2 by default.
+func NegativeSlope(s float64) Option { return func(o *options) { o.slope = s } }
+
+// MeanHeads averages the heads of a graph attention layer rather than
+// concatenating them.
+func MeanHeads() Option { return func(o *options) { o.meanHeads = true } }
 
 func (o options) nextSeed() uint64 {
 	if o.seed != nil {
