@@ -20,6 +20,8 @@ Files:
     rnn.safetensors     recurrent layers with their gradients (package nn)
     quant.safetensors   block-quantized weights as ggml lays them out, U8
                         blocks, dequantized and multiplied (package tensor)
+    attention.safetensors  attention, transformer layers and blocks with their
+                        gradients (package nn)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -924,6 +926,254 @@ def evaluate_grad(oracle, inputs, diff, np_fn, torch_fn, gout_rng):
     return {k: v.astype(F32) if v.dtype == np.float64 else v for k, v in result.items()}
 
 
+# ---------------------------------------------------------------------------
+# Attention and transformer layers (attention.safetensors, package nn).
+
+def np_sdpa(q, k, v, mask=None, causal=False, offset=0, scale=None):
+    """Attention over [..., H, Q, D] queries and [..., HK, K, D] keys, with
+    each key head repeated for H/HK query heads; key j is hidden from query
+    i when causal and j > i + offset."""
+    if q.shape[-3] != k.shape[-3]:
+        g = q.shape[-3] // k.shape[-3]
+        k, v = np.repeat(k, g, axis=-3), np.repeat(v, g, axis=-3)
+    if scale is None:
+        scale = 1 / math.sqrt(q.shape[-1])
+    s = q @ np.swapaxes(k, -1, -2) * scale
+    if mask is not None:
+        s = s + mask
+    if causal:
+        i, j = np.arange(q.shape[-2])[:, None], np.arange(k.shape[-2])[None, :]
+        s = np.where(j > i + offset, -np.inf, s)
+    return np_softmax(s, -1) @ v
+
+
+def bool_mask(m):
+    """The additive form of a mask that is non-zero where a query attends."""
+    return np.where(m != 0, 0.0, -np.inf)
+
+
+def torch_causal(T, q, k, offset=0):
+    """The boolean attn_mask of F.scaled_dot_product_attention that lets query
+    i attend to keys j <= i + offset."""
+    return T.ones(q.shape[-2], k.shape[-2], dtype=T.bool).tril(diagonal=offset)
+
+
+def np_rope(x, dim, base, offset, interleaved=False, scaling=None):
+    half = dim // 2
+    inv = base ** (-np.arange(half) * 2.0 / dim)
+    if scaling is not None:
+        inv = scaling(inv)
+    ang = (offset + np.arange(x.shape[-2]))[:, None] * inv[None, :]
+    cos, sin = np.cos(ang), np.sin(ang)
+    rot, rest = x[..., :dim], x[..., dim:]
+    if interleaved:
+        a, b = rot[..., 0::2], rot[..., 1::2]
+        out = np.stack([a * cos - b * sin, a * sin + b * cos], axis=-1).reshape(rot.shape)
+    else:
+        a, b = rot[..., :half], rot[..., half:]
+        out = np.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1)
+    return np.concatenate([out, rest], axis=-1)
+
+
+def torch_rope(T, x, dim, base, offset, interleaved=False, scaling=None):
+    half = dim // 2
+    inv = base ** (-np.arange(half) * 2.0 / dim)
+    if scaling is not None:
+        inv = scaling(inv)
+    ang = T.from_numpy((offset + np.arange(x.shape[-2]))[:, None] * inv[None, :]).to(x.dtype)
+    cos, sin = ang.cos(), ang.sin()
+    rot, rest = x[..., :dim], x[..., dim:]
+    if interleaved:
+        a, b = rot[..., 0::2], rot[..., 1::2]
+        out = T.stack([a * cos - b * sin, a * sin + b * cos], dim=-1).reshape(rot.shape)
+    else:
+        a, b = rot[..., :half], rot[..., half:]
+        out = T.cat([a * cos - b * sin, b * cos + a * sin], dim=-1)
+    return T.cat([out, rest], dim=-1)
+
+
+def llama3_scaling(factor, low, high, original):
+    def scale(inv):
+        wave = 2 * math.pi / inv
+        smooth = (original / wave - low) / (high - low)
+        return np.where(wave < original / high, inv,
+                        np.where(wave > original / low, inv / factor, (1 - smooth) * inv / factor + smooth * inv))
+    return scale
+
+
+def np_rms_norm(x, w, eps):
+    return x / np.sqrt((x * x).mean(axis=-1, keepdims=True) + eps) * w
+
+
+def heads(x, n):
+    """[B, S, n*d] as [B, n, S, d]."""
+    b, s, e = x.shape
+    return np.swapaxes(x.reshape(b, s, n, e // n), 1, 2)
+
+
+def merge(x):
+    b, n, s, d = x.shape
+    return np.swapaxes(x, 1, 2).reshape(b, s, n * d)
+
+
+def np_mha(q, k, v, w, b, ow, ob, n, causal=False):
+    e = w.shape[1]
+    proj = [heads(x @ w[i * e:(i + 1) * e].T + b[i * e:(i + 1) * e], n) for i, x in enumerate((q, k, v))]
+    return merge(np_sdpa(*proj, causal=causal)) @ ow.T + ob
+
+
+def torch_mha(T, q, k, v, w, b, ow, ob, n, causal=False):
+    m = T.nn.MultiheadAttention(w.shape[1], n, batch_first=True, dtype=q.dtype)
+    params = {"in_proj_weight": w, "in_proj_bias": b, "out_proj.weight": ow, "out_proj.bias": ob}
+    # The boolean attn_mask of nn.MultiheadAttention is True where a query
+    # may not attend.
+    mask = ~torch_causal(T, q, k) if causal else None
+    return T.func.functional_call(m, params, (q, k, v), {"attn_mask": mask, "need_weights": False})[0]
+
+
+def np_gpt2_block(x, ln1w, ln1b, wqkv, bqkv, wo, bo, ln2w, ln2b, w1, b1, w2, b2, n=2):
+    e = x.shape[-1]
+    qkv = np_layer_norm(x, ln1w, ln1b) @ wqkv.T + bqkv
+    q, k, v = (heads(qkv[..., i * e:(i + 1) * e], n) for i in range(3))
+    x = x + merge(np_sdpa(q, k, v, causal=True)) @ wo.T + bo
+    h = np_layer_norm(x, ln2w, ln2b)
+    return x + np_gelu(h @ w1.T + b1) @ w2.T + b2
+
+
+def torch_gpt2_block(T, x, ln1w, ln1b, wqkv, bqkv, wo, bo, ln2w, ln2b, w1, b1, w2, b2, n=2):
+    F = T.nn.functional
+    e = x.shape[-1]
+    split = lambda y: y.unflatten(-1, (n, e // n)).transpose(1, 2)  # noqa: E731
+    qkv = F.linear(F.layer_norm(x, (e,), ln1w, ln1b, eps=1e-5), wqkv, bqkv)
+    q, k, v = (split(qkv[..., i * e:(i + 1) * e]) for i in range(3))
+    a = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).flatten(-2)
+    x = x + F.linear(a, wo, bo)
+    h = F.layer_norm(x, (e,), ln2w, ln2b, eps=1e-5)
+    return x + F.linear(F.gelu(F.linear(h, w1, b1), approximate="tanh"), w2, b2)
+
+
+def np_llama_block(x, n1, wqkv, wo, n2, wg, wu, wd, n=4, nkv=2, eps=1e-5, base=10000.0):
+    d = x.shape[-1] // n
+    qkv = np_rms_norm(x, n1, eps) @ wqkv.T
+    q = heads(qkv[..., :n * d], n)
+    k = heads(qkv[..., n * d:(n + nkv) * d], nkv)
+    v = heads(qkv[..., (n + nkv) * d:], nkv)
+    q, k = np_rope(q, d, base, 0), np_rope(k, d, base, 0)
+    x = x + merge(np_sdpa(q, k, v, causal=True)) @ wo.T
+    h = np_rms_norm(x, n2, eps)
+    g = h @ wg.T
+    return x + (g * np_sigmoid(g) * (h @ wu.T)) @ wd.T
+
+
+def torch_llama_block(T, x, n1, wqkv, wo, n2, wg, wu, wd, n=4, nkv=2, eps=1e-5, base=10000.0):
+    F = T.nn.functional
+    e = x.shape[-1]
+    d = e // n
+    split = lambda y, m: y.unflatten(-1, (m, d)).transpose(1, 2)  # noqa: E731
+    qkv = F.linear(F.rms_norm(x, (e,), n1, eps=eps), wqkv)
+    q = split(qkv[..., :n * d], n)
+    k = split(qkv[..., n * d:(n + nkv) * d], nkv)
+    v = split(qkv[..., (n + nkv) * d:], nkv)
+    q, k = torch_rope(T, q, d, base, 0), torch_rope(T, k, d, base, 0)
+    k, v = k.repeat_interleave(n // nkv, dim=1), v.repeat_interleave(n // nkv, dim=1)
+    a = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).flatten(-2)
+    x = x + F.linear(a, wo)
+    h = F.rms_norm(x, (e,), n2, eps=eps)
+    return x + F.linear(F.silu(F.linear(h, wg)) * F.linear(h, wu), wd)
+
+
+def np_encoder_layer(x, w, b, ow, ob, w1, b1, w2, b2, n1w, n1b, n2w, n2b, n=2):
+    x = np_layer_norm(x + np_mha(x, x, x, w, b, ow, ob, n), n1w, n1b)
+    return np_layer_norm(x + np.maximum(x @ w1.T + b1, 0) @ w2.T + b2, n2w, n2b)
+
+
+def torch_encoder_layer(T, x, w, b, ow, ob, w1, b1, w2, b2, n1w, n1b, n2w, n2b, n=2):
+    layer = T.nn.TransformerEncoderLayer(x.shape[-1], n, w1.shape[0], dropout=0.0, batch_first=True, dtype=x.dtype)
+    layer.eval()
+    params = {"self_attn.in_proj_weight": w, "self_attn.in_proj_bias": b, "self_attn.out_proj.weight": ow,
+              "self_attn.out_proj.bias": ob, "linear1.weight": w1, "linear1.bias": b1, "linear2.weight": w2,
+              "linear2.bias": b2, "norm1.weight": n1w, "norm1.bias": n1b, "norm2.weight": n2w, "norm2.bias": n2b}
+    return T.func.functional_call(layer, params, (x,))
+
+
+def attention_cases(rng):
+    """Attention, its layers and transformer blocks, as gradient cases."""
+    c = {}
+
+    def case(name, inputs, diff, np_fn, torch_fn):
+        c[name] = (inputs, diff, np_fn, torch_fn)
+
+    def u(*shape, lo=-1.0, hi=1.0):
+        return uniform(rng, shape, lo, hi)
+
+    F = lambda T: T.nn.functional  # noqa: E731
+    case("sdpa", [u(2, 3, 4, 8), u(2, 3, 6, 8), u(2, 3, 6, 5)], [0, 1, 2],
+         lambda q, k, v: np_sdpa(q, k, v), lambda T, q, k, v: F(T).scaled_dot_product_attention(q, k, v))
+    case("sdpa_causal", [u(2, 2, 5, 4), u(2, 2, 5, 4), u(2, 2, 5, 4)], [0, 1, 2],
+         lambda q, k, v: np_sdpa(q, k, v, causal=True),
+         lambda T, q, k, v: F(T).scaled_dot_product_attention(q, k, v, is_causal=True))
+    mask = u(1, 1, 4, 6, lo=-2, hi=2)
+    mask[..., 2] = -np.inf  # every row keeps other keys
+    case("sdpa_mask", [u(2, 2, 4, 8), u(2, 2, 6, 8), u(2, 2, 6, 8), mask], [0, 1, 2],
+         lambda q, k, v, m: np_sdpa(q, k, v, mask=m),
+         lambda T, q, k, v, m: F(T).scaled_dot_product_attention(q, k, v, attn_mask=m))
+    keep = (rng.uniform(size=(2, 1, 4, 6)) < 0.6).astype(F32)
+    keep[..., 0] = 1
+    case("sdpa_bool_mask", [u(2, 2, 4, 8), u(2, 2, 6, 8), u(2, 2, 6, 8), keep], [0, 1, 2],
+         lambda q, k, v, m: np_sdpa(q, k, v, mask=bool_mask(m)),
+         lambda T, q, k, v, m: F(T).scaled_dot_product_attention(q, k, v, attn_mask=m != 0))
+    case("sdpa_gqa", [u(2, 4, 3, 8), u(2, 2, 5, 8), u(2, 2, 5, 8)], [0, 1, 2],
+         lambda q, k, v: np_sdpa(q, k, v, causal=True, offset=2),
+         lambda T, q, k, v: F(T).scaled_dot_product_attention(
+             q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1), attn_mask=torch_causal(T, q, k, 2)))
+    case("sdpa_scale", [u(1, 2, 4, 8), u(1, 2, 6, 8), u(1, 2, 6, 3)], [0, 1, 2],
+         lambda q, k, v: np_sdpa(q, k, v, scale=0.3),
+         lambda T, q, k, v: F(T).scaled_dot_product_attention(q, k, v, scale=0.3))
+    case("sdpa_causal_offset", [u(1, 2, 3, 4), u(1, 2, 7, 4), u(1, 2, 7, 4)], [0, 1, 2],
+         lambda q, k, v: np_sdpa(q, k, v, causal=True, offset=4),
+         lambda T, q, k, v: F(T).scaled_dot_product_attention(q, k, v, attn_mask=torch_causal(T, q, k, 4)))
+
+    case("multihead_attention", [u(2, 5, 8), u(24, 8, lo=-0.5, hi=0.5), u(24), u(8, 8, lo=-0.5, hi=0.5), u(8)],
+         [0, 1, 2, 3, 4],
+         lambda x, w, b, ow, ob: np_mha(x, x, x, w, b, ow, ob, 2),
+         lambda T, x, w, b, ow, ob: torch_mha(T, x, x, x, w, b, ow, ob, 2))
+    case("multihead_attention_causal",
+         [u(2, 4, 8), u(2, 6, 8), u(2, 6, 8), u(24, 8, lo=-0.5, hi=0.5), u(24), u(8, 8, lo=-0.5, hi=0.5), u(8)],
+         [0, 1, 2, 3, 4, 5, 6],
+         lambda q, k, v, w, b, ow, ob: np_mha(q, k, v, w, b, ow, ob, 4, causal=True),
+         lambda T, q, k, v, w, b, ow, ob: torch_mha(T, q, k, v, w, b, ow, ob, 4, causal=True))
+
+    case("rms_norm", [u(3, 4, 8, lo=-2, hi=2), u(8, lo=0.5, hi=1.5)], [0, 1],
+         lambda x, w: np_rms_norm(x, w, 1e-6), lambda T, x, w: F(T).rms_norm(x, (8,), w, eps=1e-6))
+    case("rms_norm_default_eps", [u(2, 6, lo=-0.01, hi=0.01), u(6, lo=0.5, hi=1.5)], [0, 1],
+         lambda x, w: np_rms_norm(x, w, 2.0**-23), lambda T, x, w: F(T).rms_norm(x, (6,), w, eps=2.0**-23))
+    case("rope_neox", [u(2, 3, 5, 8, lo=-2, hi=2)], [0],
+         lambda x: np_rope(x, 8, 10000.0, 3), lambda T, x: torch_rope(T, x, 8, 10000.0, 3))
+    case("rope_interleaved", [u(2, 3, 5, 8, lo=-2, hi=2)], [0],
+         lambda x: np_rope(x, 8, 10000.0, 3, interleaved=True),
+         lambda T, x: torch_rope(T, x, 8, 10000.0, 3, interleaved=True))
+    scaling = llama3_scaling(8.0, 1.0, 4.0, 64)
+    case("rope_partial_scaled", [u(1, 2, 4, 12, lo=-2, hi=2)], [0],
+         lambda x: np_rope(x, 8, 10000.0, 2, scaling=scaling),
+         lambda T, x: torch_rope(T, x, 8, 10000.0, 2, scaling=scaling))
+
+    def ln():
+        return [u(8, lo=0.5, hi=1.5), u(8, lo=-0.5, hi=0.5)]
+
+    gpt2 = [u(2, 5, 8), *ln(), u(24, 8, lo=-0.5, hi=0.5), u(24, lo=-0.2, hi=0.2), u(8, 8, lo=-0.5, hi=0.5),
+            u(8, lo=-0.2, hi=0.2), *ln(), u(32, 8, lo=-0.5, hi=0.5), u(32, lo=-0.2, hi=0.2),
+            u(8, 32, lo=-0.3, hi=0.3), u(8, lo=-0.2, hi=0.2)]
+    case("decoder_block_gpt2", gpt2, list(range(len(gpt2))), np_gpt2_block, torch_gpt2_block)
+    llama = [u(2, 5, 16), u(16, lo=0.5, hi=1.5), u(32, 16, lo=-0.4, hi=0.4), u(16, 16, lo=-0.4, hi=0.4),
+             u(16, lo=0.5, hi=1.5), u(24, 16, lo=-0.4, hi=0.4), u(24, 16, lo=-0.4, hi=0.4), u(16, 24, lo=-0.3, hi=0.3)]
+    case("decoder_block_llama", llama, list(range(len(llama))), np_llama_block, torch_llama_block)
+    enc = [u(2, 5, 8), u(24, 8, lo=-0.5, hi=0.5), u(24, lo=-0.2, hi=0.2), u(8, 8, lo=-0.5, hi=0.5),
+           u(8, lo=-0.2, hi=0.2), u(16, 8, lo=-0.5, hi=0.5), u(16, lo=-0.2, hi=0.2), u(8, 16, lo=-0.4, hi=0.4),
+           u(8, lo=-0.2, hi=0.2), *ln(), *ln()]
+    case("transformer_encoder_layer", enc, list(range(len(enc))), np_encoder_layer, torch_encoder_layer)
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--oracle", choices=["torch", "numpy"], default="torch")
@@ -999,6 +1249,16 @@ def main():
         for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
             tensors[f"{name}/{part}"] = a
     files["quant"] = tensors
+
+    # Attention and transformer layers, from their own streams at seed offset 4.
+    rng, gout_rng = np.random.default_rng(args.seed + 4), np.random.default_rng(args.seed + 100 + 4)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in attention_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
+            tensors[f"{name}/{part}"] = a
+    files["attention"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
