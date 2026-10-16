@@ -1,3 +1,5 @@
+//go:build darwin
+
 package metal
 
 import (
@@ -6,13 +8,14 @@ import (
 	"strings"
 
 	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/internal/gen"
 )
 
 // A float32 product runs on Metal 4 tensor operations, on GPUs that run
 // them in hardware, as a kernel the backend generates around the matmul2d
 // operation of Metal Performance Primitives. Each threadgroup of
 // tensorSIMDGroups SIMD groups computes one tensorTile × tensorTile tile
-// of one result matrix, reading its operands where planGEMM found them.
+// of one result matrix, reading its operands where gen.PlanGEMM found them.
 //
 // Unlike Metal Performance Shaders, the kernel runs inside the open
 // compute encoder, so it neither ends it nor makes the next kernel open
@@ -45,12 +48,12 @@ const (
 // planTensorGEMM returns the kernel that computes the product g with
 // tensor operations, from inputs 0 and 1 of ins into output 0. Its
 // parameters follow the ins inputs, as for every kernel.
-func planTensorGEMM(g gemm, ins int) (*launch, error) {
+func planTensorGEMM(g gen.GEMM, ins int) (*gen.Launch, error) {
 	vals := [tpCount]int{
-		tpM: g.m, tpN: g.n, tpK: g.k,
-		tpAOffset: g.a.offset, tpALd: g.a.ld, tpAStride: g.a.stride,
-		tpBOffset: g.b.offset, tpBLd: g.b.ld, tpBStride: g.b.stride,
-		tpResultSize: g.resultSize,
+		tpM: g.M, tpN: g.N, tpK: g.K,
+		tpAOffset: g.A.Offset, tpALd: g.A.LD, tpAStride: g.A.Stride,
+		tpBOffset: g.B.Offset, tpBLd: g.B.LD, tpBStride: g.B.Stride,
+		tpResultSize: g.ResultSize,
 	}
 	params := make([]int32, tpCount)
 	for i, v := range vals {
@@ -59,16 +62,15 @@ func planTensorGEMM(g gemm, ins int) (*launch, error) {
 		}
 		params[i] = int32(v)
 	}
-	tiles := ceilDiv(g.m, tensorTile) * ceilDiv(g.n, tensorTile)
-	if g.batch > math.MaxInt32/tiles {
-		return nil, fmt.Errorf("%d tiles of %d matrices: %w", tiles, g.batch, backend.ErrShape)
+	tiles := ceilDiv(g.M, tensorTile) * ceilDiv(g.N, tensorTile)
+	if g.Batch > math.MaxInt32/tiles {
+		return nil, fmt.Errorf("%d tiles of %d matrices: %w", tiles, g.Batch, backend.ErrShape)
 	}
-	return &launch{
-		src:     tensorSource(g.a.trans, g.b.trans, ins),
-		groups:  g.batch * tiles,
-		threads: tensorSIMDGroups * simdWidth,
-		params:  params,
-		metal4:  true,
+	return &gen.Launch{
+		Src:     tensorSource(g.A.Trans, g.B.Trans, ins),
+		Groups:  g.Batch * tiles,
+		Threads: tensorSIMDGroups * simdWidth,
+		Params:  params,
 	}, nil
 }
 
