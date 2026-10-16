@@ -112,7 +112,7 @@ var (
 	selDispatch, selEndEncoding, selCommit, selWait, selStatus, selError           sel
 	selHasUnifiedMemory, selRecommendedWorkingSetSize, selSupportsFamily           sel
 	selMatrixDescriptor, selInitMatrix, selInitMatMul, selEncodeMatMul             sel
-	selSetBatchStart, selSetBatchSize                                              sel
+	selSetBatchStart, selSetBatchSize, selSetLanguageVersion                       sel
 )
 
 func initSelectors() {
@@ -154,6 +154,7 @@ func initSelectors() {
 		&selEncodeMatMul:              "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:",
 		&selSetBatchStart:             "setBatchStart:",
 		&selSetBatchSize:              "setBatchSize:",
+		&selSetLanguageVersion:        "setLanguageVersion:",
 	} {
 		*p = selRegName(name)
 	}

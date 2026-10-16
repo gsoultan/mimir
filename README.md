@@ -104,8 +104,9 @@ On Apple silicon the GPU runs through Metal, called from Go with
 the binary cross-compiles. CPU and GPU share memory, so moving a tensor is a
 copy within RAM. Fused elementwise chains, reductions and matrix epilogues
 compile to Metal Shading Language kernels once each, and large float32
-matrix products run on Metal Performance Shaders. Every operation runs the
-same conformance tests on both devices.
+matrix products run on Metal Performance Shaders, or on Metal 4 tensor
+operations on M5 GPUs under macOS 26. Every operation runs the same
+conformance tests on both devices.
 
 ## Gradients
 
@@ -152,6 +153,12 @@ the small MNIST networks is still slower there than on the CPU: a step of
 the MLP takes 4.4 ms on the GPU and 3.4 ms on the CPU, and the CNN 128 ms
 against 80 ms, because each step runs many small kernels and waits for the
 GPU to finish. The CI job `gpu` prints these numbers for every change.
+
+On an M5 Pro under macOS 26, the GPU's neural accelerators run float32
+products through Metal 4 tensor operations at 5,790 GFLOP/s for 2048 × 2048
+and 6,050 for 4096 × 4096, 3 to 11% faster than Metal Performance Shaders
+at every size measured and with the same results bit for bit, against
+about 940 GFLOP/s on its CPU cores. Older GPUs and systems keep using MPS.
 
 ## Requirements
 
@@ -263,7 +270,7 @@ against finite differences in Go.
 | M1 Tensors that compute | lazy graph, CPU kernels, composite ops (done) |
 | M2 Train MNIST | autograd, `nn` layers, losses, optimizers, data loading, `Fit`; first release v0.1.0 (done) |
 | M3 Fast on CPU | SIMD GEMM microkernels with fused epilogues, fused elementwise kernels, convolution as GEMM, in-place optimizer updates with no allocations per step (done) |
-| M4 Same code on GPU | Metal backend without cgo, unified memory, MPS matrix products, fused kernels, automatic device choice with CPU fallback (done; Metal 4 tensor operations on M5 chips are not used yet) |
+| M4 Same code on GPU | Metal backend without cgo, unified memory, MPS matrix products, fused kernels, automatic device choice with CPU fallback and Metal 4 tensor operations on M5 GPUs (done) |
 | M4b CUDA | cuBLASLt, cuDNN and NVRTC through purego |
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, memory-mapped data, bf16 and f16 |
 | M6 Transformers and LLMs | attention and KV cache, RNN, LSTM and GRU, GGUF quantized matmul |
