@@ -118,6 +118,9 @@ func (p *plan) convolve(n *graph.Node, w *work, private func(*graph.Node) bool) 
 		if summed {
 			mm = mm.Inputs[0]
 		} else if u := convWindows(mm, mm.Inputs[1], false); u != nil {
+			if windowed(cv, backend.OpConv, mm.Shape, windowAttrs(u), mm.Inputs[0].Shape, u.Inputs[0].Shape) {
+				return false
+			}
 			w.conv = &conv{op: backend.OpConv, window: windowAttrs(u)}
 			w.deps[1] = u.Inputs[0]
 			return true
@@ -161,11 +164,34 @@ func (p *plan) convolve(n *graph.Node, w *work, private func(*graph.Node) bool) 
 			x.Shape[0] != image[0] || x.Shape[2]*g != image[1]*windowSize(n) {
 			return false
 		}
+		if windowed(cv, backend.OpConvInput, n.Shape, windowAttrs(n), x.Inputs[0].Shape, x.Inputs[1].Shape) {
+			return false
+		}
 		w.deps = slices.Clone(x.Inputs)
 		w.conv = &conv{op: backend.OpConvInput, window: windowAttrs(n)}
 		return true
 	}
 	return false
+}
+
+// windowed reports whether the backend cv chooses to run the convolution
+// kernel of op over the window a, from inputs of shapes x and y into
+// shape, as the product of its windows (see backend.WindowChooser). It
+// asks about the kernel of a layer, whose weights, input 0, every item
+// shares.
+func windowed(cv backend.Convolver, op backend.Op, shape []int, a backend.Attrs, x, y []int) bool {
+	wc, ok := cv.(backend.WindowChooser)
+	if !ok || len(x) == 0 {
+		return false
+	}
+	one := slices.Clone(x)
+	one[0] = 1
+	vx := backend.Contiguous(one).Expand(x)
+	k := &backend.Kernel{Op: op, DType: backend.Float32, Shape: shape, Attrs: a, In: []backend.View{vx, backend.Contiguous(y)}}
+	if _, err := backend.ConvOf(k); err != nil {
+		return false
+	}
+	return wc.Windowed(k)
 }
 
 // windowSize returns the elements of a window of the unfold or fold n.

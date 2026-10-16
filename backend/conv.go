@@ -18,6 +18,16 @@ type Convolver interface {
 	ConvParts(k *Kernel) int
 }
 
+// WindowChooser is a Convolver that runs some convolutions faster as the
+// products of their windows. The scheduler runs a convolution that would
+// be the kernel k, of OpConv or OpConvInput, as the product of the
+// windows that OpUnfold copies out, or a product that OpFold folds, as on
+// a backend without convolution kernels, when Windowed(k) reports true.
+type WindowChooser interface {
+	Convolver
+	Windowed(k *Kernel) bool
+}
+
 // Conv is the geometry of a convolution kernel: an image of N items of
 // G groups of C channels over the windowed dimensions Image, read
 // through windows of Window elements at Positions along each dimension,
