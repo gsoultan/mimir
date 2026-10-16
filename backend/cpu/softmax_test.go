@@ -3,8 +3,57 @@ package cpu
 import (
 	"math"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
+
+func TestExp2Floats(t *testing.T) {
+	withRoutines(t, func(t *testing.T) {
+		if rowVector == nil {
+			t.Skip("exp2Floats needs vector routines")
+		}
+		r := rand.New(rand.NewPCG(3, 4))
+		x := make([]float32, 1000)
+		for i := range x {
+			x[i] = r.Float32()*300 - 150
+		}
+		specials := []float32{0, -126, 127, 127.5, -126.5, -149.5, -1e9, 1e9, 0.5, -0.5,
+			float32(math.NaN()), float32(math.Inf(1)), float32(math.Inf(-1))}
+		copy(x[100:], specials)
+		for _, inPlace := range []bool{false, true} {
+			src := slices.Clone(x)
+			dst := make([]float32, len(x))
+			if inPlace {
+				dst = src
+			}
+			exp2Floats(dst, src)
+			for i, v := range x {
+				want := float32(math.Exp2(float64(v)))
+				got := dst[i]
+				switch {
+				case math.IsNaN(float64(want)):
+					if !math.IsNaN(float64(got)) {
+						t.Fatalf("2^%v = %v, want NaN", v, got)
+					}
+				case math.Abs(float64(got-want)) > 2.5e-7*math.Abs(float64(want)):
+					t.Fatalf("2^%v = %v, want %v (in place %v)", v, got, want, inPlace)
+				}
+			}
+		}
+	})
+}
+
+// exp2Ref is 2^x as the elementwise kernels compute it: with exp2Floats
+// where the CPU has vector routines, which TestExp2Floats checks against
+// math.Exp2, and with math.Exp2 elsewhere.
+func exp2Ref(x float32) float32 {
+	if rowVector == nil {
+		return float32(math.Exp2(float64(x)))
+	}
+	var y [1]float32
+	exp2Floats(y[:], []float32{x})
+	return y[0]
+}
 
 // withRoutines runs f with each set of row routines this CPU has, and
 // with none, under its name.

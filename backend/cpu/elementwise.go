@@ -809,6 +809,10 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 			dst[i] = T(math.Sqrt(float64(x)))
 		}
 	case backend.OpExp2:
+		if d, ok := any(dst).([]float32); ok && rowVector != nil {
+			exp2Floats(d, any(a).([]float32))
+			return
+		}
 		for i, x := range a {
 			dst[i] = T(exp2f(float32(x)))
 		}

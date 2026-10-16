@@ -29,6 +29,11 @@ func softmaxGradAVX512(p *float32, dp *float32, n int, d float32)
 //go:noescape
 func dotAVX512(x *float32, y *float32, n int) float32
 
+// exp2AVX512 sets the n elements at dst, a multiple of 16, to 2 to the power of those at src, which it clamps to [-126, 127].
+//
+//go:noescape
+func exp2AVX512(dst *float32, src *float32, n int)
+
 // rowMaxAVX2 returns the largest of the n elements at x, a positive multiple of 8.
 //
 //go:noescape
@@ -53,3 +58,8 @@ func softmaxGradAVX2(p *float32, dp *float32, n int, d float32)
 //
 //go:noescape
 func dotAVX2(x *float32, y *float32, n int) float32
+
+// exp2AVX2 sets the n elements at dst, a multiple of 8, to 2 to the power of those at src, which it clamps to [-126, 127].
+//
+//go:noescape
+func exp2AVX2(dst *float32, src *float32, n int)

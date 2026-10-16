@@ -220,6 +220,150 @@ DATA exp_p5<>+56(SB)/4, $0x3f000000
 DATA exp_p5<>+60(SB)/4, $0x3f000000
 GLOBL exp_p5<>(SB), RODATA|NOPTR, $64
 
+DATA exp_exp2lo<>+0(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+4(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+8(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+12(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+16(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+20(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+24(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+28(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+32(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+36(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+40(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+44(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+48(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+52(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+56(SB)/4, $0xc2fc0000
+DATA exp_exp2lo<>+60(SB)/4, $0xc2fc0000
+GLOBL exp_exp2lo<>(SB), RODATA|NOPTR, $64
+
+DATA exp_exp2hi<>+0(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+4(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+8(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+12(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+16(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+20(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+24(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+28(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+32(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+36(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+40(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+44(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+48(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+52(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+56(SB)/4, $0x42fe0000
+DATA exp_exp2hi<>+60(SB)/4, $0x42fe0000
+GLOBL exp_exp2hi<>(SB), RODATA|NOPTR, $64
+
+DATA exp_q0<>+0(SB)/4, $0x3920fdde
+DATA exp_q0<>+4(SB)/4, $0x3920fdde
+DATA exp_q0<>+8(SB)/4, $0x3920fdde
+DATA exp_q0<>+12(SB)/4, $0x3920fdde
+DATA exp_q0<>+16(SB)/4, $0x3920fdde
+DATA exp_q0<>+20(SB)/4, $0x3920fdde
+DATA exp_q0<>+24(SB)/4, $0x3920fdde
+DATA exp_q0<>+28(SB)/4, $0x3920fdde
+DATA exp_q0<>+32(SB)/4, $0x3920fdde
+DATA exp_q0<>+36(SB)/4, $0x3920fdde
+DATA exp_q0<>+40(SB)/4, $0x3920fdde
+DATA exp_q0<>+44(SB)/4, $0x3920fdde
+DATA exp_q0<>+48(SB)/4, $0x3920fdde
+DATA exp_q0<>+52(SB)/4, $0x3920fdde
+DATA exp_q0<>+56(SB)/4, $0x3920fdde
+DATA exp_q0<>+60(SB)/4, $0x3920fdde
+GLOBL exp_q0<>(SB), RODATA|NOPTR, $64
+
+DATA exp_q1<>+0(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+4(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+8(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+12(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+16(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+20(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+24(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+28(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+32(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+36(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+40(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+44(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+48(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+52(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+56(SB)/4, $0x3aaf9f29
+DATA exp_q1<>+60(SB)/4, $0x3aaf9f29
+GLOBL exp_q1<>(SB), RODATA|NOPTR, $64
+
+DATA exp_q2<>+0(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+4(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+8(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+12(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+16(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+20(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+24(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+28(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+32(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+36(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+40(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+44(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+48(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+52(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+56(SB)/4, $0x3c1d96a6
+DATA exp_q2<>+60(SB)/4, $0x3c1d96a6
+GLOBL exp_q2<>(SB), RODATA|NOPTR, $64
+
+DATA exp_q3<>+0(SB)/4, $0x3d635774
+DATA exp_q3<>+4(SB)/4, $0x3d635774
+DATA exp_q3<>+8(SB)/4, $0x3d635774
+DATA exp_q3<>+12(SB)/4, $0x3d635774
+DATA exp_q3<>+16(SB)/4, $0x3d635774
+DATA exp_q3<>+20(SB)/4, $0x3d635774
+DATA exp_q3<>+24(SB)/4, $0x3d635774
+DATA exp_q3<>+28(SB)/4, $0x3d635774
+DATA exp_q3<>+32(SB)/4, $0x3d635774
+DATA exp_q3<>+36(SB)/4, $0x3d635774
+DATA exp_q3<>+40(SB)/4, $0x3d635774
+DATA exp_q3<>+44(SB)/4, $0x3d635774
+DATA exp_q3<>+48(SB)/4, $0x3d635774
+DATA exp_q3<>+52(SB)/4, $0x3d635774
+DATA exp_q3<>+56(SB)/4, $0x3d635774
+DATA exp_q3<>+60(SB)/4, $0x3d635774
+GLOBL exp_q3<>(SB), RODATA|NOPTR, $64
+
+DATA exp_q4<>+0(SB)/4, $0x3e75fdee
+DATA exp_q4<>+4(SB)/4, $0x3e75fdee
+DATA exp_q4<>+8(SB)/4, $0x3e75fdee
+DATA exp_q4<>+12(SB)/4, $0x3e75fdee
+DATA exp_q4<>+16(SB)/4, $0x3e75fdee
+DATA exp_q4<>+20(SB)/4, $0x3e75fdee
+DATA exp_q4<>+24(SB)/4, $0x3e75fdee
+DATA exp_q4<>+28(SB)/4, $0x3e75fdee
+DATA exp_q4<>+32(SB)/4, $0x3e75fdee
+DATA exp_q4<>+36(SB)/4, $0x3e75fdee
+DATA exp_q4<>+40(SB)/4, $0x3e75fdee
+DATA exp_q4<>+44(SB)/4, $0x3e75fdee
+DATA exp_q4<>+48(SB)/4, $0x3e75fdee
+DATA exp_q4<>+52(SB)/4, $0x3e75fdee
+DATA exp_q4<>+56(SB)/4, $0x3e75fdee
+DATA exp_q4<>+60(SB)/4, $0x3e75fdee
+GLOBL exp_q4<>(SB), RODATA|NOPTR, $64
+
+DATA exp_q5<>+0(SB)/4, $0x3f317218
+DATA exp_q5<>+4(SB)/4, $0x3f317218
+DATA exp_q5<>+8(SB)/4, $0x3f317218
+DATA exp_q5<>+12(SB)/4, $0x3f317218
+DATA exp_q5<>+16(SB)/4, $0x3f317218
+DATA exp_q5<>+20(SB)/4, $0x3f317218
+DATA exp_q5<>+24(SB)/4, $0x3f317218
+DATA exp_q5<>+28(SB)/4, $0x3f317218
+DATA exp_q5<>+32(SB)/4, $0x3f317218
+DATA exp_q5<>+36(SB)/4, $0x3f317218
+DATA exp_q5<>+40(SB)/4, $0x3f317218
+DATA exp_q5<>+44(SB)/4, $0x3f317218
+DATA exp_q5<>+48(SB)/4, $0x3f317218
+DATA exp_q5<>+52(SB)/4, $0x3f317218
+DATA exp_q5<>+56(SB)/4, $0x3f317218
+DATA exp_q5<>+60(SB)/4, $0x3f317218
+GLOBL exp_q5<>(SB), RODATA|NOPTR, $64
+
 DATA exp_bias<>+0(SB)/4, $0x0000007f
 DATA exp_bias<>+4(SB)/4, $0x0000007f
 DATA exp_bias<>+8(SB)/4, $0x0000007f
@@ -423,6 +567,42 @@ dotAVX512_done:
 	VZEROUPPER
 	RET
 
+// func exp2AVX512(dst *float32, src *float32, n int)
+// Requires: AVX, AVX512F
+TEXT ·exp2AVX512(SB), NOSPLIT, $0-24
+	MOVQ  dst+0(FP), AX
+	MOVQ  src+8(FP), CX
+	MOVQ  n+16(FP), DX
+	TESTQ DX, DX
+	JZ    exp2AVX512_done
+
+exp2AVX512_loop:
+	VMOVUPS     (CX), Z0
+	VMAXPS      exp_exp2lo<>+0(SB), Z0, Z0
+	VMINPS      exp_exp2hi<>+0(SB), Z0, Z0
+	VCVTPS2DQ   Z0, Z1
+	VCVTDQ2PS   Z1, Z2
+	VSUBPS      Z2, Z0, Z0
+	VMOVUPS     exp_q0<>+0(SB), Z2
+	VFMADD213PS exp_q1<>+0(SB), Z0, Z2
+	VFMADD213PS exp_q2<>+0(SB), Z0, Z2
+	VFMADD213PS exp_q3<>+0(SB), Z0, Z2
+	VFMADD213PS exp_q4<>+0(SB), Z0, Z2
+	VFMADD213PS exp_q5<>+0(SB), Z0, Z2
+	VFMADD213PS exp_one<>+0(SB), Z0, Z2
+	VPADDD      exp_bias<>+0(SB), Z1, Z1
+	VPSLLD      $0x17, Z1, Z1
+	VMULPS      Z1, Z2, Z2
+	VMOVUPS     Z2, (AX)
+	ADDQ        $0x00000040, AX
+	ADDQ        $0x00000040, CX
+	SUBQ        $0x00000010, DX
+	JNZ         exp2AVX512_loop
+
+exp2AVX512_done:
+	VZEROUPPER
+	RET
+
 // func rowMaxAVX2(x *float32, n int) float32
 // Requires: AVX, SSE
 TEXT ·rowMaxAVX2(SB), NOSPLIT, $0-20
@@ -598,5 +778,41 @@ dotAVX2_done:
 	VPERMILPS    $0xb1, X0, X1
 	VADDPS       X1, X0, X0
 	MOVSS        X0, ret+24(FP)
+	VZEROUPPER
+	RET
+
+// func exp2AVX2(dst *float32, src *float32, n int)
+// Requires: AVX, AVX2, FMA3
+TEXT ·exp2AVX2(SB), NOSPLIT, $0-24
+	MOVQ  dst+0(FP), AX
+	MOVQ  src+8(FP), CX
+	MOVQ  n+16(FP), DX
+	TESTQ DX, DX
+	JZ    exp2AVX2_done
+
+exp2AVX2_loop:
+	VMOVUPS     (CX), Y0
+	VMAXPS      exp_exp2lo<>+0(SB), Y0, Y0
+	VMINPS      exp_exp2hi<>+0(SB), Y0, Y0
+	VCVTPS2DQ   Y0, Y1
+	VCVTDQ2PS   Y1, Y2
+	VSUBPS      Y2, Y0, Y0
+	VMOVUPS     exp_q0<>+0(SB), Y2
+	VFMADD213PS exp_q1<>+0(SB), Y0, Y2
+	VFMADD213PS exp_q2<>+0(SB), Y0, Y2
+	VFMADD213PS exp_q3<>+0(SB), Y0, Y2
+	VFMADD213PS exp_q4<>+0(SB), Y0, Y2
+	VFMADD213PS exp_q5<>+0(SB), Y0, Y2
+	VFMADD213PS exp_one<>+0(SB), Y0, Y2
+	VPADDD      exp_bias<>+0(SB), Y1, Y1
+	VPSLLD      $0x17, Y1, Y1
+	VMULPS      Y1, Y2, Y2
+	VMOVUPS     Y2, (AX)
+	ADDQ        $0x00000020, AX
+	ADDQ        $0x00000020, CX
+	SUBQ        $0x00000008, DX
+	JNZ         exp2AVX2_loop
+
+exp2AVX2_done:
 	VZEROUPPER
 	RET

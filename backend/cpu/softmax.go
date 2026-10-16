@@ -18,6 +18,7 @@ type rowRoutines struct {
 	scale       func(x *float32, n int, a float32)
 	softmaxGrad func(p, dp *float32, n int, d float32)
 	dot         func(x, y *float32, n int) float32
+	exp2        func(dst, src *float32, n int)
 }
 
 // vectorPart returns how many leading elements of a row of n the vector
@@ -55,6 +56,38 @@ func expShift(x []float32, shift float32) float32 {
 		sum += e
 	}
 	return sum
+}
+
+// exp2Floats sets each element of dst to 2 to the power of the element of
+// a, which may be dst, within 2 ulp of math.Exp2, with the vector routines,
+// which must exist. They compute arguments in [-126, 127], whose powers
+// are normal floats, and the rest, and NaNs, take math.Exp2. Every
+// element takes the same path wherever it is in a, so the result does
+// not depend on how a kernel splits its elements.
+func exp2Floats(dst, a []float32) {
+	var buf [256]float32
+	for len(a) > 0 {
+		c := min(len(a), len(buf))
+		src := buf[:c]
+		copy(src, a[:c])
+		n := vectorPart(c)
+		if n > 0 {
+			rowVector.exp2(&dst[0], &src[0], n)
+		}
+		if n < c {
+			// The rest, padded to a vector.
+			var tail [16]float32
+			copy(tail[:], src[n:])
+			rowVector.exp2(&tail[0], &tail[0], rowVector.lanes)
+			copy(dst[n:c], tail[:])
+		}
+		for i, x := range src {
+			if !(x >= -126 && x <= 127) {
+				dst[i] = float32(math.Exp2(float64(x)))
+			}
+		}
+		dst, a = dst[c:], a[c:]
+	}
 }
 
 // scaleRow multiplies every element of x by a.
