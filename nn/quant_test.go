@@ -23,7 +23,7 @@ func TestQuantizedLinearAndEmbedding(t *testing.T) {
 	const in, out = 512, 6
 	for _, dt := range []tensor.DType{tensor.Q8_0, tensor.Q4_K, tensor.Q6_K} {
 		raw := quanttest.Random(rng, dt, out*in)
-		q := tensor.FromBytes(dt, raw, out, in)
+		q := tensor.FromBytes(dt, raw, out, in).To(tensor.DefaultDevice())
 		deq := tensor.FromSlice(quanttest.Dequantize(dt, raw), out, in)
 
 		lin := &nn.Linear{Weight: tensor.NewBuffer(q), Bias: tensor.NewParam(tensor.Randn(1, out))}
