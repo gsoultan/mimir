@@ -273,6 +273,16 @@ func planAttention(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*
 }
 
 // planAttentionGrad returns the backward attention kernel.
+//
+// Both kinds of group compute a tile of scores, keys by queries in a key
+// group and queries by keys in a query group, and then multiply it by a
+// block of rows: the probabilities and their gradients by the result
+// gradients and the queries in a key group, the probabilities' gradients
+// by the keys in a query group. Each thread computes a few scores, and a
+// few rows and columns of the products, in registers, so that it reads
+// group memory less than once per multiply-add. The sums of the result
+// gradients times the results, which the probabilities' gradients
+// subtract, are summed by all the group's threads, a few per query.
 func planAttentionGrad(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, error) {
 	l, err := newAttnLayout(k, ins, 6)
 	if err != nil {
@@ -280,14 +290,16 @@ func planAttentionGrad(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer
 	}
 	s := l.s
 	dk, dv := s.D, s.DV
-	// A key group: a block of keys, the rows, and a tile of queries.
-	kt, ok := pickTile(rowCap(s.K), func(r, c int) int {
-		return (r+c)*(dk+1) + (r+c)*(dv+1) + 2*r*(c+1) + 2*c
-	})
-	// A query group: a tile of queries, the rows, and a block of keys.
-	qt, ok2 := pickTile(rowCap(s.Q), func(r, c int) int {
-		return (r+c)*(dk+1) + (r+c)*(dv+1) + r*(c+1) + 2*r
-	})
+	const nt = GroupSize
+	// A tile of rows × cols scores stages both blocks of rows of the two
+	// products that make them, and the scores, which also hold the
+	// partial sums of the queries' statistics, and the statistics of the
+	// queries, the rows of a query group and the cols of a key group.
+	need := func(rows, cols, queries int) int {
+		return (rows+cols)*(dk+dv+2) + max(rows*cols, nt) + 2*queries
+	}
+	kt, ok := pickTile(rowCap(s.K), func(r, c int) int { return need(r, c, c) })
+	qt, ok2 := pickTile(rowCap(s.Q), func(r, c int) int { return need(r, c, r) })
 	if !ok || !ok2 {
 		return nil, fmt.Errorf("attention gradient of head size %d and %d exceeds the group memory of a GPU kernel: %w", dk, dv, backend.ErrShape)
 	}
@@ -304,73 +316,163 @@ func planAttentionGrad(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer
 	if l.masked {
 		maskIn = l.in[6]
 	}
-	// score emits the probability pr and its gradient ds of query ii
-	// (row qr of the query tile at qs, the result gradients' at os) and
-	// key j (row kr of the key block at ks, the values' at vs).
-	score := func(indent, qr, kr, ii, j, valid string, qs, os, ks, vs, ls, ds int) {
-		line := func(format string, args ...any) { g.line(indent+format, args...) }
-		line("float s = 0.0f, dp = 0.0f;")
-		line("for (int dd = 0; dd < %d; dd++) s = fma(sh[%d + %s * %d + dd], sh[%d + %s * %d + dd], s);", dk, ks, kr, dk+1, qs, qr, dk+1)
-		line("for (int dd = 0; dd < %d; dd++) dp = fma(sh[%d + %s * %d + dd], sh[%d + %s * %d + dd], dp);", dv, vs, kr, dv+1, os, qr, dv+1)
-		line("float lse = sh[%d + %s];", ls, qr)
-		line("bool vis = %s && lse != %s && %s;", valid, negInf, g.attnVisible(ii, j))
-		if maskIn != nil {
-			line("if (vis) s += %s * %s;", maskIn.at("gq", ii, j), log2e)
-		}
-		line("float pr = vis ? exp2(s - lse) : 0.0f;")
-		line("float ds = pr * (dp - sh[%d + %s]);", ds, qr)
-	}
 	// stage emits the loads of rows [x0, x0+n) of in, of cols columns, into
 	// the tile at off, scaled by mul, with rows width+1 apart.
 	stage := func(in *attnIn, x0 string, n, cols, off int, limit, mul string) {
-		g.line("for (int e = int(tid); e < %d; e += %d) {", n*cols, GroupSize)
+		g.line("for (int e = int(tid); e < %d; e += %d) {", n*cols, nt)
 		g.line("\tint rr = e / %d, c = e %% %d, x = %s + rr;", max(cols, 1), max(cols, 1), x0)
 		g.line("\tsh[%d + rr * %d + c] = x < %s ? %s%s : 0.0f;", off, cols+1, limit, in.at("gq", "x", "c"), mul)
 		g.line("}")
 	}
-	// rowStats emits the loads of the logsumexps, in base 2, of rows
-	// [x0, x0+n) of the query tile, into ls, and, after a barrier, the
-	// sums of their result gradients times results into ds.
-	rowStats := func(x0 string, n, os, ls, ds int) {
-		g.line("for (int e = int(tid); e < %d; e += %d) {", n, GroupSize)
-		g.line("\tint x = %s + e;", x0)
-		g.line("\tsh[%d + e] = x < nq ? %s * %s : %s;", ls, lseIn.at("gq", "x", "0"), log2e, negInf)
+	// stats emits the loads of the logsumexps, in base 2, of the n
+	// queries from x0 into ls, and the sums of their result gradients
+	// times their results into ds, which the group's threads sum in parts
+	// in the scratch at part, followed by a barrier.
+	stats := func(x0 string, n, part, ls, ds int) {
+		tpd := nt / n
+		g.line("{")
+		g.line("\tint e = int(tid) / %d, w = int(tid) %% %d, x = %s + e;", tpd, tpd, x0)
+		g.line("\tfloat a = 0.0f;")
+		g.line("\tif (x < nq) for (int dd = w; dd < %d; dd += %d) a = fma(%s, %s, a);", dv, tpd, goIn.at("gq", "x", "dd"), oIn.at("gq", "x", "dd"))
+		g.line("\tsh[%d + int(tid)] = a;", part)
+		g.line("\tif (w == 0) sh[%d + e] = x < nq ? %s * %s : %s;", ls, lseIn.at("gq", "x", "0"), log2e, negInf)
 		g.line("}")
 		g.line("%s;", d.sync)
-		g.line("for (int e = int(tid); e < %d; e += %d) {", n, GroupSize)
-		g.line("\tint x = %s + e;", x0)
+		g.line("for (int e = int(tid); e < %d; e += %d) {", n, nt)
 		g.line("\tfloat a = 0.0f;")
-		g.line("\tif (x < nq) for (int dd = 0; dd < %d; dd++) a = fma(sh[%d + e * %d + dd], %s, a);", dv, os, dv+1, oIn.at("gq", "x", "dd"))
+		g.line("\tfor (int w = 0; w < %d; w++) a += sh[%d + e * %d + w];", tpd, part, tpd)
 		g.line("\tsh[%d + e] = a;", ds)
+		g.line("}")
+		g.line("%s;", d.sync)
+	}
+	// scores emits the scores of the thread's tile of t, which holds its
+	// rows at rowK and rowV and its cols at colK and colV; their
+	// probabilities end in sv and their gradients in pv. The query and key
+	// of row i and col j are those query(i, j) and key(i, j) return,
+	// with qx the query's place in the statistics at ls and ds.
+	scores := func(t scoreTile, rowK, rowV, colK, colV, ls, ds int, keysAreRows bool, q0, k0 string) {
+		n := t.tr * t.tc
+		g.line("float sv[%d], pv[%d];", n, n)
+		g.line("for (int t = 0; t < %d; t++) { sv[t] = 0.0f; pv[t] = 0.0f; }", n)
+		g.line("int a = int(tid) / %d, b = int(tid) %% %d;", t.gc(), t.gc())
+		g.line("bool act = int(tid) < %d;", t.gr()*t.gc())
+		g.line("if (act) {")
+		dot := func(rows, cols, width int, acc string) {
+			g.line("\tfor (int dd = 0; dd < %d; dd++) {", width)
+			for i := range t.tr {
+				g.line("\t\tfloat x%d = sh[%d + (a + %d) * %d + dd];", i, rows, i*t.gr(), width+1)
+			}
+			for j := range t.tc {
+				g.line("\t\tfloat y%d = sh[%d + (b + %d) * %d + dd];", j, cols, j*t.gc(), width+1)
+			}
+			for i := range t.tr {
+				for j := range t.tc {
+					g.line("\t\t%s[%d] = fma(x%d, y%d, %s[%d]);", acc, i*t.tc+j, i, j, acc, i*t.tc+j)
+				}
+			}
+			g.line("\t}")
+		}
+		dot(rowK, colK, dk, "sv")
+		dot(rowV, colV, dv, "pv")
+		g.line("}")
+		for i := range t.tr {
+			for j := range t.tc {
+				row, col := fmt.Sprintf("(a + %d)", i*t.gr()), fmt.Sprintf("(b + %d)", j*t.gc())
+				qx, kx := col, row
+				if !keysAreRows {
+					qx, kx = row, col
+				}
+				e := i*t.tc + j
+				g.line("{")
+				g.line("\tint ii = %s + %s, jj = %s + %s;", q0, qx, k0, kx)
+				g.line("\tfloat lse = act ? sh[%d + %s] : %s;", ls, qx, negInf)
+				g.line("\tbool vis = act && ii < nq && jj < nk && lse != %s && %s;", negInf, g.attnVisible("ii", "jj"))
+				g.line("\tfloat s = sv[%d];", e)
+				if maskIn != nil {
+					g.line("\tif (vis) s += %s * %s;", maskIn.at("gq", "ii", "jj"), log2e)
+				}
+				g.line("\tfloat pr = vis ? exp2(s - lse) : 0.0f;")
+				g.line("\tpv[%d] = vis ? pr * (pv[%d] - sh[%d + %s]) : 0.0f;", e, e, ds, qx)
+				g.line("\tsv[%d] = pr;", e)
+				g.line("}")
+			}
+		}
+	}
+	// store emits the stores of the values v of the thread's tile of t
+	// into the scores at off, rows cols apart.
+	store := func(t scoreTile, v string, off int) {
+		g.line("if (act) {")
+		for i := range t.tr {
+			for j := range t.tc {
+				g.line("\tsh[%d + (a + %d) * %d + b + %d] = %s[%d];", off, i*t.gr(), t.cols, j*t.gc(), v, i*t.tc+j)
+			}
+		}
+		g.line("}")
+	}
+	// product emits acc += the scores at off, rows of a, times the block of
+	// cols-rows of width+1 at y, for the thread's part of a, named name.
+	product := func(a accTile, name string, off, y int) {
+		g.line("if (%s) for (int c = 0; c < %d; c++) {", a.active(name), a.inner)
+		for i := range a.tr {
+			g.line("\tfloat x%d = sh[%d + (%sr + %d) * %d + c];", i, off, name, i*a.gr(), a.inner)
+		}
+		for t := range a.td {
+			col := fmt.Sprintf("%sd + %d", name, t*a.gd)
+			if a.width%a.gd != 0 {
+				g.line("\tfloat y%d = %s < %d ? sh[%d + c * %d + %s] : 0.0f;", t, col, a.width, y, a.width+1, col)
+			} else {
+				g.line("\tfloat y%d = sh[%d + c * %d + %s];", t, y, a.width+1, col)
+			}
+		}
+		for i := range a.tr {
+			for t := range a.td {
+				g.line("\t%s[%d] = fma(x%d, y%d, %s[%d]);", name, i*a.td+t, i, t, name, i*a.td+t)
+			}
+		}
+		g.line("}")
+	}
+	// declare emits the accumulators of a, named name, and the thread's
+	// row and column in it.
+	declare := func(a accTile, name string) {
+		g.line("float %s[%d];", name, a.tr*a.td)
+		g.line("for (int t = 0; t < %d; t++) %s[t] = 0.0f;", a.tr*a.td, name)
+		g.line("int %sr = int(tid) / %d, %sd = int(tid) %% %d;", name, a.gd, name, a.gd)
+	}
+	// write emits the stores of the accumulators of a, named name, of rows
+	// from x0 of at most limit, into the output from base, times mul.
+	write := func(a accTile, name, x0, limit, base, mul string) {
+		g.line("if (%s) {", a.active(name))
+		for i := range a.tr {
+			for t := range a.td {
+				g.line("\t{")
+				g.line("\t\tint x = %s + %sr + %d, col = %sd + %d;", x0, name, i*a.gr(), name, t*a.gd)
+				g.line("\t\tif (x < %s && col < %d) o0[%s + x * %d + col] = %s[%d]%s;", limit, a.width, base, a.width, name, i*a.td+t, mul)
+				g.line("\t}")
+			}
+		}
 		g.line("}")
 	}
 
-	g.line("%s float sh[%d];", d.shared, max(
-		(kt.rows+kt.cols)*(dk+dv+2)+2*kt.rows*(kt.cols+1)+2*kt.cols,
-		(qt.rows+qt.cols)*(dk+dv+2)+qt.rows*(qt.cols+1)+2*qt.rows))
+	g.line("%s float sh[%d];", d.shared, max(need(kt.rows, kt.cols, kt.cols), need(qt.rows, qt.cols, qt.rows)))
 	g.line("float sc = %s;", g.constant(k.Attrs.Scale*math.Log2E, backend.Float32))
 	g.line("int nq = %s, nk = %s;", g.param(s.Q), g.param(s.K))
 	g.line("if (int(bid) < %s) {", g.param(keyGroups))
 	{
 		br, bc := kt.rows, kt.cols
-		tpc := GroupSize / br
-		ck, cv := max(ceilDiv(dk, tpc), 1), max(ceilDiv(dv, tpc), 1)
+		t := newScoreTile(br, bc, nt)
+		av, ak := newAccTile(br, dv, bc, nt), newAccTile(br, dk, bc, nt)
 		ks := 0
 		vs := ks + br*(dk+1)
 		qs := vs + br*(dv+1)
 		os := qs + bc*(dk+1)
 		ps := os + bc*(dv+1)
-		dss := ps + br*(bc+1)
-		ls := dss + br*(bc+1)
+		ls := ps + max(br*bc, nt)
 		ds := ls + bc
 		g.line("int kb = int(bid) %% %s, pb = int(bid) / %s;", g.param(nkb), g.param(nkb))
 		g.attnBases(l, "pb")
-		g.line("int c = int(tid) / %d, lane = int(tid) %% %d;", tpc, tpc)
-		g.line("int j = kb * %d + c;", br)
-		g.line("float dk[%d], dv[%d];", ck, cv)
-		g.line("for (int t = 0; t < %d; t++) dk[t] = 0.0f;", ck)
-		g.line("for (int t = 0; t < %d; t++) dv[t] = 0.0f;", cv)
 		g.line("int gq = 0;")
+		declare(av, "gv")
+		declare(ak, "gk")
 		stage(kIn, fmt.Sprintf("kb * %d", br), br, dk, ks, "nk", "")
 		stage(vIn, fmt.Sprintf("kb * %d", br), br, dv, vs, "nk", "")
 		g.line("int qlo = 0;")
@@ -383,96 +485,107 @@ func planAttentionGrad(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer
 		g.line("%s;", d.sync)
 		stage(qIn, fmt.Sprintf("qb * %d", bc), bc, dk, qs, "nq", " * sc")
 		stage(goIn, fmt.Sprintf("qb * %d", bc), bc, dv, os, "nq", "")
-		rowStats(fmt.Sprintf("qb * %d", bc), bc, os, ls, ds)
+		stats(fmt.Sprintf("qb * %d", bc), bc, ps, ls, ds)
+		g.line("{")
+		scores(t, ks, vs, qs, os, ls, ds, true, fmt.Sprintf("qb * %d", bc), fmt.Sprintf("kb * %d", br))
+		store(t, "sv", ps)
 		g.line("%s;", d.sync)
-		g.line("for (int rr = lane; rr < %d; rr += %d) {", bc, tpc)
-		g.line("\tint ii = qb * %d + rr;", bc)
-		score("\t", "rr", "c", "ii", "j", "j < nk && ii < nq", qs, os, ks, vs, ls, ds)
-		g.line("\tsh[%d + c * %d + rr] = pr;", ps, bc+1)
-		g.line("\tsh[%d + c * %d + rr] = ds;", dss, bc+1)
-		g.line("}")
+		product(av, "gv", ps, os)
 		g.line("%s;", d.sync)
-		g.line("for (int t = 0; t < %d; t++) {", cv)
-		g.line("\tint col = lane + t * %d;", tpc)
-		g.line("\tif (col >= %d) break;", dv)
-		g.line("\tfloat a = dv[t];")
-		g.line("\tfor (int rr = 0; rr < %d; rr++) a = fma(sh[%d + c * %d + rr], sh[%d + rr * %d + col], a);", bc, ps, bc+1, os, dv+1)
-		g.line("\tdv[t] = a;")
-		g.line("}")
-		g.line("for (int t = 0; t < %d; t++) {", ck)
-		g.line("\tint col = lane + t * %d;", tpc)
-		g.line("\tif (col >= %d) break;", dk)
-		g.line("\tfloat a = dk[t];")
-		g.line("\tfor (int rr = 0; rr < %d; rr++) a = fma(sh[%d + c * %d + rr], sh[%d + rr * %d + col], a);", bc, dss, bc+1, qs, dk+1)
-		g.line("\tdk[t] = a;")
+		store(t, "pv", ps)
+		g.line("%s;", d.sync)
+		product(ak, "gk", ps, qs)
 		g.line("}")
 		g.line("}")
 		g.line("}")
-		g.line("if (j < nk) {")
-		g.line("\tint o = pb * nk + j;")
-		g.line("\tfor (int t = 0; t < %d; t++) {", ck)
-		g.line("\t\tint col = lane + t * %d;", tpc)
-		g.line("\t\tif (col < %d) o0[%s + o * %d + col] = dk[t] * %s;", dk, g.param(nq), dk, ln2)
-		g.line("\t}")
-		g.line("\tfor (int t = 0; t < %d; t++) {", cv)
-		g.line("\t\tint col = lane + t * %d;", tpc)
-		g.line("\t\tif (col < %d) o0[%s + o * %d + col] = dv[t];", dv, g.param(nq+nk), dv)
-		g.line("\t}")
-		g.line("}")
+		write(ak, "gk", fmt.Sprintf("kb * %d", br), "nk", fmt.Sprintf("%s + pb * nk * %d", g.param(nq), dk), " * "+ln2)
+		write(av, "gv", fmt.Sprintf("kb * %d", br), "nk", fmt.Sprintf("%s + pb * nk * %d", g.param(nq+nk), dv), "")
 	}
 	g.line("} else {")
 	{
 		br, bc := qt.rows, qt.cols
-		tpr := GroupSize / br
-		cq := max(ceilDiv(dk, tpr), 1)
+		t := newScoreTile(br, bc, nt)
+		aq := newAccTile(br, dk, bc, nt)
 		qs := 0
 		os := qs + br*(dk+1)
 		ks := os + br*(dv+1)
 		vs := ks + bc*(dk+1)
 		dss := vs + bc*(dv+1)
-		ls := dss + br*(bc+1)
+		ls := dss + max(br*bc, nt)
 		ds := ls + br
-		g.line("int b = int(bid) - %s;", g.param(keyGroups))
-		g.line("int qb = b %% %s, pg = b / %s;", g.param(nqb), g.param(nqb))
+		g.line("int b0 = int(bid) - %s;", g.param(keyGroups))
+		g.line("int qb = b0 %% %s, pg = b0 / %s;", g.param(nqb), g.param(nqb))
 		g.line("int gq = pg %% %s, pb = pg / %s;", g.param(s.Group()), g.param(s.Group()))
 		g.attnBases(l, "pb")
-		g.line("int r = int(tid) / %d, lane = int(tid) %% %d;", tpr, tpr)
-		g.line("int i = qb * %d + r;", br)
-		g.line("float dq[%d];", cq)
-		g.line("for (int t = 0; t < %d; t++) dq[t] = 0.0f;", cq)
+		declare(aq, "gd")
 		stage(qIn, fmt.Sprintf("qb * %d", br), br, dk, qs, "nq", " * sc")
 		stage(goIn, fmt.Sprintf("qb * %d", br), br, dv, os, "nq", "")
-		rowStats(fmt.Sprintf("qb * %d", br), br, os, ls, ds)
+		stats(fmt.Sprintf("qb * %d", br), br, dss, ls, ds)
 		g.attnHi(fmt.Sprintf("qb * %d", br), br, l)
 		g.line("for (int j0 = 0; j0 < hi; j0 += %d) {", bc)
 		g.line("%s;", d.sync)
 		stage(kIn, "j0", bc, dk, ks, "nk", "")
 		stage(vIn, "j0", bc, dv, vs, "nk", "")
 		g.line("%s;", d.sync)
-		g.line("for (int c = lane; c < %d; c += %d) {", bc, tpr)
-		g.line("\tint j = j0 + c;")
-		score("\t", "r", "c", "i", "j", "i < nq && j < nk", qs, os, ks, vs, ls, ds)
-		g.line("\tsh[%d + r * %d + c] = ds;", dss, bc+1)
-		g.line("}")
+		g.line("{")
+		scores(t, qs, os, ks, vs, ls, ds, false, fmt.Sprintf("qb * %d", br), "j0")
+		store(t, "pv", dss)
 		g.line("%s;", d.sync)
-		g.line("for (int t = 0; t < %d; t++) {", cq)
-		g.line("\tint col = lane + t * %d;", tpr)
-		g.line("\tif (col >= %d) break;", dk)
-		g.line("\tfloat a = dq[t];")
-		g.line("\tfor (int c = 0; c < %d; c++) a = fma(sh[%d + r * %d + c], sh[%d + c * %d + col], a);", bc, dss, bc+1, ks, dk+1)
-		g.line("\tdq[t] = a;")
+		product(aq, "gd", dss, ks)
 		g.line("}")
 		g.line("}")
-		g.line("if (i < nq) {")
-		g.line("\tfloat scale = %s;", g.constant(k.Attrs.Scale, backend.Float32))
-		g.line("\tfor (int t = 0; t < %d; t++) {", cq)
-		g.line("\t\tint col = lane + t * %d;", tpr)
-		g.line("\t\tif (col < %d) o0[(pg * nq + i) * %d + col] = dq[t] * scale;", dk, dk)
-		g.line("\t}")
-		g.line("}")
+		g.line("float scale = %s;", g.constant(k.Attrs.Scale, backend.Float32))
+		write(aq, "gd", fmt.Sprintf("qb * %d", br), "nq", fmt.Sprintf("pg * nq * %d", dk), " * scale")
 	}
 	g.line("}")
 	return g.finish(groups, true)
+}
+
+// scoreTile is how the threads of a group split a tile of rows × cols
+// scores: thread (a, b) computes the tr × tc scores of rows a, a+gr, ...
+// and cols b, b+gc, ..., so that it reads tr + tc elements of group
+// memory for every tr·tc multiply-adds.
+type scoreTile struct{ rows, cols, tr, tc int }
+
+func newScoreTile(rows, cols, threads int) scoreTile {
+	t := scoreTile{rows: rows, cols: cols, tr: 1, tc: 1}
+	for t.tr*t.tc*threads < rows*cols {
+		if t.tr <= t.tc && t.tr < rows || t.tc >= cols {
+			t.tr *= 2
+		} else {
+			t.tc *= 2
+		}
+	}
+	return t
+}
+
+func (t scoreTile) gr() int { return t.rows / t.tr }
+func (t scoreTile) gc() int { return t.cols / t.tc }
+
+// accTile is how the threads of a group split the product of rows ×
+// inner scores and an inner × width block: thread (r, d) accumulates the
+// tr × td elements of rows r, r+gr, ... and columns d, d+gd, ...
+type accTile struct{ rows, width, inner, gd, tr, td int }
+
+func newAccTile(rows, width, inner, threads int) accTile {
+	gd := 1
+	for gd < 16 && gd < width {
+		gd *= 2
+	}
+	a := accTile{rows: rows, width: width, inner: inner, gd: gd}
+	a.tr, a.td = max(ceilDiv(rows, a.gr()), 1), max(ceilDiv(width, gd), 1)
+	return a
+}
+
+func (a accTile) gr() int { return GroupSize / a.gd }
+
+// active returns the condition that the thread has rows of a, whose row
+// in a is the variable name+"r".
+func (a accTile) active(name string) string {
+	if a.rows >= a.gr() {
+		return "true"
+	}
+	return fmt.Sprintf("%sr < %d", name, a.rows)
 }
 
 // planSliceScatter copies input 0 with the block Attrs.Ranges replaced by
