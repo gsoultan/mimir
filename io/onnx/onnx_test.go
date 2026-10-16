@@ -381,6 +381,13 @@ func TestErrors(t *testing.T) {
 	if _, err := unsupported.Run(ctx, map[string]*tensor.Tensor{"x": tensor.Zeros(tensor.Float32, 1, 1, 2, 2)}); !errors.As(err, &u) || u.Op != "Resize" {
 		t.Errorf("cubic resize: %v", err)
 	}
+	// A constant larger than the file is not computed when the model
+	// opens.
+	huge := open(t, newGraph().initInts("s", []int{2}, []int64{1 << 20, 1 << 20}).
+		node("ConstantOfShape", []string{"s", "->", "z"}).node("Exp", []string{"z", "->", "y"}).output("y"))
+	if len(huge.nodes) != 2 {
+		t.Errorf("%d nodes of a huge constant kept, want 2", len(huge.nodes))
+	}
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -441,6 +448,44 @@ func g0WithInit(tp *pb) []byte {
 	g := newGraph().input("x", Float, 2, 3).node("Add", []string{"x", "w", "->", "y"}).output("y")
 	g.inits = append(g.inits, tp)
 	return g.model()
+}
+
+// TestLargeValues checks values past hostLimit, which are tensors from
+// the start: a float weight in typed fields, an int64 initializer, and a
+// long Range.
+func TestLargeValues(t *testing.T) {
+	const n = hostLimit + 3
+	w := make([]float32, n)
+	ints := make([]int64, n)
+	for i := range n {
+		w[i] = float32(i%7) - 3
+		ints[i] = int64(i % 5)
+	}
+	typed := (&pb{}).varint(1, n).varint(2, int64(Float))
+	raw := make([]byte, 0, 4*n)
+	for _, f := range w {
+		raw = append(raw, byte(math.Float32bits(f)), byte(math.Float32bits(f)>>8), byte(math.Float32bits(f)>>16), byte(math.Float32bits(f)>>24))
+	}
+	typed.bytes(4, raw).str(8, "w")
+	g := newGraph().input("x", Float, n).initInts("i", []int{n}, ints).
+		initInts("zero", []int{}, []int64{0}).initInts("len", []int{}, []int64{n}).initInts("one", []int{}, []int64{1}).
+		node("Add", []string{"x", "w", "->", "a"}).
+		node("Cast", []string{"i", "->", "fi"}, aInt("to", int64(Float))).
+		node("Range", []string{"zero", "len", "one", "->", "r"}).
+		node("Cast", []string{"r", "->", "fr"}, aInt("to", int64(Float))).
+		node("Add", []string{"a", "fi", "->", "b"}).node("Add", []string{"b", "fr", "->", "y"}).output("y")
+	g.inits = append(g.inits, typed)
+	m := open(t, g)
+	if !m.consts["w"].constant || m.consts["w"].host {
+		t.Error("a large weight is a host value")
+	}
+	x := random(180, n)
+	got, shape := runOne(t, g, map[string]*tensor.Tensor{"x": x.tensor()}, "y")
+	want := newArr(n)
+	for i := range n {
+		want.data[i] = x.data[i] + float64(w[i]) + float64(ints[i]) + float64(i)
+	}
+	expect(t, got, shape, want, 1e-6)
 }
 
 func TestInputs(t *testing.T) {

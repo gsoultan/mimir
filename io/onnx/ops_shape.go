@@ -1,6 +1,7 @@
 package onnx
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"slices"
@@ -528,6 +529,9 @@ func (c *call) tensorOf(v *value) *tensor.Tensor {
 
 // takeTensor returns the elements of t at positions idx along axis.
 func takeTensor(c *call, t *tensor.Tensor, axis int, idx []int) (*tensor.Tensor, error) {
+	if err := t.Err(); err != nil {
+		return nil, err
+	}
 	shape := t.Shape()
 	contiguous := true
 	for i := 1; i < len(idx); i++ {
@@ -579,6 +583,12 @@ func whole(shape []int) [][2]int {
 // gatherAxis returns t's elements at the Int32 positions idx, of any
 // shape, along axis, like numpy.take: idx's dimensions replace axis.
 func gatherAxis(t, idx *tensor.Tensor, axis int) *tensor.Tensor {
+	if err := cmp.Or(t.Err(), idx.Err()); err != nil {
+		return tensor.Failed(err)
+	}
+	if axis < 0 || axis >= t.Rank() {
+		return tensor.Failed(fmt.Errorf("onnx: gather along axis %d of %v: %w", axis, t.Shape(), tensor.ErrShape))
+	}
 	shape, ishape := t.Shape(), idx.Shape()
 	p, q := 1, 1
 	for d, s := range shape {
