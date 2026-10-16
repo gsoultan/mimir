@@ -215,8 +215,12 @@ func Save(ctx context.Context, w io.Writer, m Module) error {
 // the mapping, so loading costs no memory of its own and the file's pages
 // stream in from disk as the values are read. An optimizer step then
 // writes over the parameter's private copy of its pages, never the file.
-// f must stay open while the model is in use. A file parsed from a []byte
-// is copied, so the slice may be changed or reused afterwards.
+// The parameters hold the mapping (see safetensors.File.Hold), so f may
+// be closed once Load returns; the file is unmapped when no parameter
+// reads it any more. A tensor whose bytes do not start at a multiple of
+// its element size, which safetensors.Write never makes, is copied
+// instead. A file parsed from a []byte is copied, so the slice may be
+// changed or reused afterwards.
 func Load(f *safetensors.File, m Module) error {
 	return LoadPrefixed(f, "", m)
 }
@@ -225,7 +229,7 @@ func Load(f *safetensors.File, m Module) error {
 func LoadPrefixed(f *safetensors.File, prefix string, m Module) error {
 	decode := Decode
 	if f.Mapped() {
-		decode = decodeInPlace
+		decode = func(st safetensors.Tensor) (*tensor.Tensor, error) { return decodeInPlace(f, st) }
 	}
 	for name, p := range NamedParams(m) {
 		st, ok := f.Tensor(prefix + name)
@@ -246,15 +250,16 @@ func LoadPrefixed(f *safetensors.File, prefix string, m Module) error {
 	return nil
 }
 
-// decodeInPlace returns a safetensors tensor as a tensor of the dtype
+// decodeInPlace returns a safetensors tensor of f as a tensor of the dtype
 // DTypeOf gives over its bytes on the default device: in place on the
-// CPU, as tensor.FromBytes reads them, and as a copy on any other device.
-func decodeInPlace(st safetensors.Tensor) (*tensor.Tensor, error) {
+// CPU, as tensor.FromBytes reads them, holding f's mapping for as long as
+// it does, and as a copy on any other device.
+func decodeInPlace(f *safetensors.File, st safetensors.Tensor) (*tensor.Tensor, error) {
 	dt, ok := DTypeOf(st.DType)
 	if !ok {
 		return nil, fmt.Errorf("nn: dtype %s: %w", st.DType, tensor.ErrDType)
 	}
-	return tensor.FromBytes(dt, st.Data, st.Shape...).To(tensor.DefaultDevice()), nil
+	return tensor.FromBytesFunc(dt, st.Data, f.Hold(), st.Shape...).To(tensor.DefaultDevice()), nil
 }
 
 // Encode computes t and returns it as a safetensors tensor of the dtype

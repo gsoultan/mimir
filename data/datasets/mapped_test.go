@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -118,5 +119,35 @@ func TestMappedRejectsBadFiles(t *testing.T) {
 	}
 	if _, err := Mapped(path, "x", "y"); !errors.Is(err, safetensors.ErrFormat) {
 		t.Errorf("corrupt file: %v, want safetensors.ErrFormat", err)
+	}
+}
+
+// TestMappedBatchesOutliveTheDataset checks that a batch holds the mapping
+// it reads: the dataset may be garbage while a batch is still in use.
+func TestMappedBatchesOutliveTheDataset(t *testing.T) {
+	path := writeExamples(t, t.TempDir(), 4096, nil)
+	batch := func() data.Batch {
+		d, err := Mapped(path, "x", "y", data.BatchSize(4096))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for b, err := range d.All(t.Context()) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b
+		}
+		t.Fatal("no batch")
+		return data.Batch{}
+	}()
+	for range 3 {
+		runtime.GC()
+	}
+	y, err := batch.Y.Data[int32](t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(y) != 4096 || y[4095] != 4095 {
+		t.Fatalf("batch read %d labels after the dataset was dropped", len(y))
 	}
 }
