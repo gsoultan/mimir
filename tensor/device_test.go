@@ -89,3 +89,12 @@ func TestDevicesListTheCPUFirst(t *testing.T) {
 		t.Errorf("Auto() = %v without a GPU, want the CPU", a)
 	}
 }
+
+func TestArgmaxRunsOnTheTensorsDevice(t *testing.T) {
+	other := tensor.DeviceOn(cpu.New())
+	y := tensor.FromSlice([]float32{3, 7, 7, 1}, 2, 2).To(other)
+	got, err := y.Argmax(1).Data[int32](t.Context())
+	if err != nil || !slices.Equal(got, []int32{1, 0}) {
+		t.Errorf("Argmax on another device = %v, %v; want [1 0]", got, err)
+	}
+}

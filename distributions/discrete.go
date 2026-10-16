@@ -217,7 +217,7 @@ func (d *Poisson) Entropy() *tensor.Tensor {
 	// Each branch sees a rate in its own range, so the other's NaN or
 	// infinity never reaches the gradient.
 	lo := tensor.Where(small, rate, scalar(1))
-	k := tensor.Arange[float32](0, poissonTerms, 1).Reshape(onesThen(len(d.batch), poissonTerms)...)
+	k := tensor.Arange[float32](0, poissonTerms, 1).To(rate.Device()).Reshape(onesThen(len(d.batch), poissonTerms)...)
 	lp := xlogy(k, lo.Unsqueeze(-1)).Sub(lo.Unsqueeze(-1)).Sub(k.Add(scalar(1)).Lgamma())
 	sum := lp.Exp().Mul(lp).Sum(-1).Neg()
 	hi := tensor.Where(small, scalar(poissonSmall), rate)
