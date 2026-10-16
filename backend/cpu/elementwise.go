@@ -110,7 +110,7 @@ func floatOnly(op backend.Op) bool {
 	case backend.OpExp2, backend.OpLog2, backend.OpSin, backend.OpSqrt, backend.OpRecip:
 		return true
 	}
-	return false
+	return op.IsSpecial()
 }
 
 // singleOp returns the program of a kernel that applies one elementwise op
@@ -344,6 +344,8 @@ func programGrain(prog []backend.Instr) int {
 		switch in.Op {
 		case backend.OpExp2, backend.OpLog2, backend.OpSin:
 			cost += 16
+		case backend.OpLog1p, backend.OpExpm1, backend.OpErf, backend.OpErfinv, backend.OpLgamma, backend.OpDigamma, backend.OpTrigamma:
+			cost += 48
 		default:
 			cost++
 		}
@@ -831,6 +833,8 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 		for i, x := range a {
 			dst[i] = T(math.Sin(float64(x)))
 		}
+	default:
+		specialLoop(op, dst, a)
 	}
 }
 

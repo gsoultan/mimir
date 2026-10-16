@@ -172,7 +172,7 @@ type Attrs struct {
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension. SliceScatter: the block replaced.
 	Value  float64  // Const, Pad, Unfold: the fill value.
-	Seed   uint64   // RandUniform, RandNormal: the Philox key.
+	Seed   uint64   // RandUniform, RandNormal, RandGamma, RandPoisson: the Philox key.
 
 	// Unfold, Fold: the window size, step and spacing of its elements in
 	// each windowed dimension.

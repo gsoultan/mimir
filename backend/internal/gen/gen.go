@@ -361,6 +361,8 @@ func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 			e = fmt.Sprintf("md(%s, %s, err)", arg(0), arg(1))
 		case backend.OpWhere:
 			e = fmt.Sprintf("%s != 0 ? %s : %s", arg(0), arg(1), arg(2))
+		case backend.OpLog1p, backend.OpExpm1, backend.OpErf, backend.OpErfinv, backend.OpLgamma, backend.OpDigamma, backend.OpTrigamma:
+			e = g.special(op, arg(0))
 		default:
 			g.err = fmt.Errorf("instruction %d: %s is not elementwise: %w", j, op, backend.ErrInternal)
 			e = "0"
@@ -429,6 +431,9 @@ func checkProgram(prog []backend.Instr, stores []int, out backend.DType, ins []b
 			if !in.DType.IsFloat() {
 				return backend.ErrDType
 			}
+		}
+		if in.Op.IsSpecial() && !in.DType.IsFloat() {
+			return backend.ErrDType
 		}
 	}
 	return nil

@@ -87,7 +87,8 @@ func Elementwise(t *testing.T) []Case {
 		Case{Name: "const", K: backend.Kernel{Op: backend.OpConst, DType: i, Shape: shape, Attrs: backend.Attrs{Value: -7}}},
 		Case{Name: "empty", K: backend.Kernel{Op: backend.OpConst, DType: f, Shape: []int{0, 3}, Attrs: backend.Attrs{Value: 1}}},
 	)
-	return append(cases, halfElementwise(t, rng)...)
+	cases = append(cases, halfElementwise(t, rng)...)
+	return append(cases, specialFunctions(t)...)
 }
 
 // halfElementwise returns cases of elementwise kernels on half elements:

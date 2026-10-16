@@ -192,8 +192,8 @@ func Rand(shape []int, seed uint64, normal bool) (*Node, error) {
 	return &Node{Op: op, DType: backend.Float32, Shape: slices.Clone(shape), Attrs: backend.Attrs{Seed: seed}}, nil
 }
 
-// Unary applies an elementwise op. Exp2, Log2, Sin, Sqrt and Recip accept
-// only float types.
+// Unary applies an elementwise op. Every op but Neg accepts only float
+// types.
 func Unary(op backend.Op, x *Node) (*Node, error) {
 	if !op.IsUnary() || op == backend.OpCast {
 		return nil, errorf(op, backend.ErrInternal, "not a unary op")
@@ -731,4 +731,29 @@ func TriangularSolve(a, b *Node, upper, unit bool) (*Node, error) {
 		return nil, errorf(backend.OpTriangularSolve, backend.ErrShape, "%v by %v", a.Shape, b.Shape)
 	}
 	return newNode(&Node{Op: backend.OpTriangularSolve, DType: backend.Float32, Shape: b.Shape, Inputs: []*Node{a, b}, Attrs: backend.Attrs{Upper: upper, Unit: unit}})
+}
+
+// Sample draws a Float32 sample for each element of the Float32
+// parameters x by op, backend.OpRandGamma or backend.OpRandPoisson, keyed
+// by seed.
+func Sample(op backend.Op, x *Node, seed uint64) (*Node, error) {
+	if op != backend.OpRandGamma && op != backend.OpRandPoisson {
+		return nil, errorf(op, backend.ErrInternal, "not a sampler")
+	}
+	if x.DType != backend.Float32 {
+		return nil, errorf(op, backend.ErrDType, "%s input", x.DType)
+	}
+	return newNode(&Node{Op: op, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Seed: seed}})
+}
+
+// GammaGrad is the derivative of the samples x of Gamma(alpha, 1) with
+// respect to alpha, both Float32 of one shape; see backend.OpGammaGrad.
+func GammaGrad(alpha, x *Node) (*Node, error) {
+	if alpha.DType != backend.Float32 || x.DType != backend.Float32 {
+		return nil, errorf(backend.OpGammaGrad, backend.ErrDType, "%s and %s", alpha.DType, x.DType)
+	}
+	if !slices.Equal(alpha.Shape, x.Shape) {
+		return nil, errorf(backend.OpGammaGrad, backend.ErrShape, "%v and %v", alpha.Shape, x.Shape)
+	}
+	return newNode(&Node{Op: backend.OpGammaGrad, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{alpha, x}})
 }
