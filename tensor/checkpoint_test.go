@@ -318,36 +318,9 @@ func TestCheckpointedFunctionMayUseGradients(t *testing.T) {
 	}
 }
 
-func TestCheckpointedFunctionCallingBackwardFails(t *testing.T) {
-	ctx := t.Context()
-	w := tensor.NewParam(tensor.FromSlice([]float32{1, 2, 3}))
-	calls := 0
-	var nested error
-	f := func(in ...*tensor.Tensor) *tensor.Tensor {
-		if calls++; calls == 2 { // the recompute
-			nested = in[0].Mul(w.Value()).Sum().Backward(ctx)
-		}
-		return in[0].Mul(w.Value())
-	}
-	x := tensor.FromSlice([]float32{4, 5, 6}).RequiresGrad()
-	if err := within(t, func() error { return tensor.Checkpoint(f, x).Sum().Backward(ctx) }); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 2 {
-		t.Fatalf("f ran %d times, want 2", calls)
-	}
-	if !errors.Is(nested, tensor.ErrCheckpoint) {
-		t.Errorf("Backward inside the recompute: %v, want ErrCheckpoint", nested)
-	}
-	// The nested Backward added nothing.
-	if got := data[float32](t, w.Grad()); !slices.Equal(got, []float32{4, 5, 6}) {
-		t.Errorf("w gradient %v, want x = [4 5 6]", got)
-	}
-}
-
 func TestCheckpointBackwardsOnManyGoroutinesTakeTurns(t *testing.T) {
-	// Backward on another goroutine while one recomputes a checkpoint is
-	// not a Backward inside the recompute: it waits its turn.
+	// Backwards on several goroutines, each recomputing a checkpoint, take
+	// turns rather than deadlock.
 	ctx := t.Context()
 	w := tensor.NewParam(tensor.Ones(tensor.Float32, 3))
 	f := func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].Mul(w.Value()) }

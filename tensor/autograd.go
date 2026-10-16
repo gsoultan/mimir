@@ -1,13 +1,10 @@
 package tensor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"weak"
@@ -36,56 +33,6 @@ var gradMu sync.Mutex
 // graph happens under both backwardMu and gradMu, so walking tapes under
 // either one sees it whole.
 var backwardMu sync.Mutex
-
-// backwardG is the id of the goroutine that holds backwardMu, or 0. A
-// Backward called by user code that a Backward runs on the same goroutine
-// would wait for itself on backwardMu forever; lockBackward tells it from
-// a Backward of another goroutine, which waits its turn, with this.
-var backwardG atomic.Uint64
-
-// lockBackward takes backwardMu for the calling goroutine, or fails with
-// ErrCheckpoint if that goroutine already holds it: Backward was called
-// from a function that a running Backward called, such as a checkpointed
-// function it recomputes.
-func lockBackward() error {
-	g := goid()
-	if !backwardMu.TryLock() {
-		// The holder stores its id after taking the lock and clears it
-		// before letting go, so only its own goroutine can read its id
-		// here while it holds the lock.
-		if g != 0 && backwardG.Load() == g {
-			return fmt.Errorf("tensor: Backward called from a function that a running Backward called, such as a checkpointed function it recomputes: %w", ErrCheckpoint)
-		}
-		backwardMu.Lock()
-	}
-	backwardG.Store(g)
-	return nil
-}
-
-func unlockBackward() {
-	backwardG.Store(0)
-	backwardMu.Unlock()
-}
-
-// goid returns the id of the calling goroutine, read from the first line
-// of its stack trace, "goroutine 7 [running]:", or 0 if that cannot be
-// read. Go gives goroutines no other identity; Backward reads it once.
-func goid() uint64 {
-	var buf [64]byte
-	line := buf[:runtime.Stack(buf[:], false)]
-	line, ok := bytes.CutPrefix(line, []byte("goroutine "))
-	if !ok {
-		return 0
-	}
-	if i := bytes.IndexByte(line, ' '); i >= 0 {
-		line = line[:i]
-	}
-	id, err := strconv.ParseUint(string(line), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return id
-}
 
 // tape records how a tracked tensor was computed so Backward can apply the
 // chain rule. A leaf's tape has no rule and instead holds the gradient
@@ -235,8 +182,8 @@ func (t *Tensor) ZeroGrad() {
 // it.
 //
 // Backwards on different goroutines run one at a time. A function that
-// Backward recomputes may read gradients; one that calls Backward fails
-// that call with ErrCheckpoint.
+// Backward recomputes, or a gradient rule of Func, may read gradients but
+// must not call Backward, which would wait for the Backward running it.
 func (t *Tensor) Backward(ctx context.Context) error {
 	if err := firstErr(t); err != nil {
 		return err
@@ -250,10 +197,8 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := lockBackward(); err != nil {
-		return err
-	}
-	defer unlockBackward()
+	backwardMu.Lock()
+	defer backwardMu.Unlock()
 	bwd = backwardState{acc: map[*tape]*Tensor{}}
 	defer func() { bwd = backwardState{} }()
 
