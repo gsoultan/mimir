@@ -165,32 +165,22 @@ func (r *RotaryEmbedding) Apply(x *tensor.Tensor, offset int) *tensor.Tensor {
 	if dt := x.DType(); dt != tensor.Float32 {
 		cos, sin = cos.Cast(dt), sin.Cast(dt)
 	}
-	rot, rest := narrow(x, 0, r.Dim), narrow(x, r.Dim, shape[rank-1])
+	parts := x.Split(-1, r.Dim, shape[rank-1]-r.Dim)
+	rot, rest := parts[0], parts[1]
 	var out *tensor.Tensor
 	if r.Interleaved {
-		pairs := rot.Reshape(slices.Concat(shape[:rank-1], []int{half, 2})...)
-		a := narrow(pairs, 0, 1).Squeeze(-1)
-		b := narrow(pairs, 1, 2).Squeeze(-1)
+		pairs := rot.Reshape(slices.Concat(shape[:rank-1], []int{half, 2})...).Split(-1, 1, 1)
+		a, b := pairs[0].Squeeze(-1), pairs[1].Squeeze(-1)
 		out = tensor.Stack(-1, a.Mul(cos).Sub(b.Mul(sin)), a.Mul(sin).Add(b.Mul(cos))).Reshape(rot.Shape()...)
 	} else {
-		a, b := narrow(rot, 0, half), narrow(rot, half, r.Dim)
+		halves := rot.Split(-1, half, half)
+		a, b := halves[0], halves[1]
 		out = tensor.Cat(-1, a.Mul(cos).Sub(b.Mul(sin)), b.Mul(cos).Add(a.Mul(sin)))
 	}
 	if r.Dim == shape[rank-1] {
 		return out
 	}
 	return tensor.Cat(-1, out, rest)
-}
-
-// narrow returns features [lo, hi) of the last dimension of x.
-func narrow(x *tensor.Tensor, lo, hi int) *tensor.Tensor {
-	shape := x.Shape()
-	ranges := make([][2]int, len(shape))
-	for d, n := range shape {
-		ranges[d] = [2]int{0, n}
-	}
-	ranges[len(shape)-1] = [2]int{lo, hi}
-	return x.Shrink(ranges)
 }
 
 // splitHeads maps [B, S, heads·dim] to [B, heads, S, dim].
@@ -390,9 +380,10 @@ func (a *SelfAttention) project(x *tensor.Tensor, offset int) (q, k, v *tensor.T
 	}
 	qkv := a.QKV.Forward(x)
 	hq, hk := a.Heads*a.HeadDim, a.KVHeads*a.HeadDim
-	q = splitHeads(narrow(qkv, 0, hq), a.Heads, a.HeadDim)
-	k = splitHeads(narrow(qkv, hq, hq+hk), a.KVHeads, a.HeadDim)
-	v = splitHeads(narrow(qkv, hq+hk, hq+2*hk), a.KVHeads, a.HeadDim)
+	parts := qkv.Split(-1, hq, hk, hk)
+	q = splitHeads(parts[0], a.Heads, a.HeadDim)
+	k = splitHeads(parts[1], a.KVHeads, a.HeadDim)
+	v = splitHeads(parts[2], a.KVHeads, a.HeadDim)
 	if a.Rotary != nil {
 		q, k = a.Rotary.Apply(q, offset), a.Rotary.Apply(k, offset)
 	}

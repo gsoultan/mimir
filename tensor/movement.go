@@ -582,6 +582,39 @@ func catPrim(a int, ts []*Tensor) *Tensor {
 	}, ts...)
 }
 
+// Split cuts t along axis into parts of the given sizes, which must add up
+// to its length there, like torch.split with a list of sizes. The parts
+// are views of t. Backward joins their gradients into t's with one copy,
+// where Shrink would pad each part's gradient to t's shape and add them.
+func (t *Tensor) Split(axis int, sizes ...int) []*Tensor {
+	failed := func(err error) []*Tensor {
+		parts := make([]*Tensor, len(sizes))
+		for i := range parts {
+			parts[i] = fail(err)
+		}
+		return parts
+	}
+	if err := firstErr(t); err != nil {
+		return failed(err)
+	}
+	a, err := normAxis(axis, len(t.node.Shape))
+	if err != nil {
+		return failed(err)
+	}
+	total := 0
+	for _, n := range sizes {
+		if n < 0 {
+			total = -1
+			break
+		}
+		total += n
+	}
+	if total != t.node.Shape[a] {
+		return failed(fmt.Errorf("tensor: split %v into %v along %d: %w", t.node.Shape, sizes, a, ErrShape))
+	}
+	return t.split(a, sizes)
+}
+
 // split cuts t along the axis a into parts of the given sizes, which add
 // up to its length there, like torch.split. The parts are views of t.
 // Backward joins their gradients into t's with one Cat, where the

@@ -181,6 +181,35 @@ func TestShapes(t *testing.T) {
 	}
 }
 
+func TestSplit(t *testing.T) {
+	x := tensor.Arange[float32](0, 12, 1).Reshape(2, 6)
+	parts := x.Split(-1, 1, 3, 2)
+	want := [][]float32{{0, 6}, {1, 2, 3, 7, 8, 9}, {4, 5, 10, 11}}
+	for i, p := range parts {
+		got, err := p.Data[float32](t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want[i]) {
+			t.Errorf("part %d = %v, want %v", i, got, want[i])
+		}
+	}
+	for _, sizes := range [][]int{{1, 2}, {7, -1}, {}} {
+		parts := x.Split(1, sizes...)
+		if len(parts) != len(sizes) {
+			t.Errorf("split into %v: %d parts", sizes, len(parts))
+		}
+		for _, p := range parts {
+			if err := p.Err(); !errors.Is(err, tensor.ErrShape) {
+				t.Errorf("split into %v: %v, want ErrShape", sizes, err)
+			}
+		}
+	}
+	if err := x.Split(2, 6)[0].Err(); err == nil {
+		t.Error("split along a missing axis succeeded")
+	}
+}
+
 func TestRealizeSharesWorkAndKeepsResults(t *testing.T) {
 	x := tensor.Randn(3, 64, 64)
 	h := x.MatMul(x).ReLU()
