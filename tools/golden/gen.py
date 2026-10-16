@@ -17,6 +17,7 @@ Files:
     nn.safetensors      layers and losses with their gradients (packages nn, nn/loss)
     optim.safetensors   optimizer steps and learning-rate schedules (package optim)
     scan.safetensors    running sums, maxima and log-sum-exps (package tensor)
+    rnn.safetensors     recurrent layers with their gradients (package nn)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -624,6 +625,134 @@ def optim_tensors(oracle, rng):
     return tensors
 
 
+# ---------------------------------------------------------------------------
+# Recurrent layers (rnn.safetensors). The inputs of a case are x, the
+# initial states (h0, and c0 for an LSTM) and the parameters in the order
+# of torch's named_parameters. out joins the flattened output, h_n and, for
+# an LSTM, c_n, so the gradients cover all three; they are also stored on
+# their own as output, h_n and c_n.
+
+RNN_CASES = {
+    # name: (kind, input size, hidden size, layers, bidirectional, batch_first, relu, bias, batched, T, B)
+    "rnn_tanh": ("rnn", 3, 4, 1, False, False, False, True, True, 4, 2),
+    "rnn_relu_2layer_bidir": ("rnn", 3, 4, 2, True, False, True, True, True, 4, 2),
+    "lstm": ("lstm", 3, 4, 1, False, False, False, True, True, 4, 2),
+    "lstm_2layer_bidir": ("lstm", 3, 4, 2, True, False, False, True, True, 4, 2),
+    "lstm_batch_first_unbiased": ("lstm", 3, 4, 1, False, True, False, False, True, 5, 2),
+    "lstm_unbatched": ("lstm", 3, 4, 1, False, False, False, True, False, 4, 1),
+    "gru": ("gru", 3, 4, 1, False, False, False, True, True, 4, 2),
+    "gru_2layer_bidir_batch_first": ("gru", 3, 4, 2, True, True, False, True, True, 4, 2),
+}
+
+
+def rnn_param_shapes(kind, n_in, hidden, layers, bidir, bias):
+    gates = {"rnn": 1, "lstm": 4, "gru": 3}[kind] * hidden
+    dirs = 2 if bidir else 1
+    shapes = []
+    for layer in range(layers):
+        width = n_in if layer == 0 else dirs * hidden
+        for _ in range(dirs):
+            shapes += [(gates, width), (gates, hidden)]
+            if bias:
+                shapes += [(gates,), (gates,)]
+    return shapes
+
+
+def np_recurrent(kind, layers, bidir, batch_first, relu, bias, batched):
+    lstm = kind == "lstm"
+
+    def fn(x, *rest):
+        nstates = 2 if lstm else 1
+        states, params = list(rest[:nstates]), iter(rest[nstates:])
+        if not batched:
+            x, states = x[:, None], [s[:, None] for s in states]
+        elif batch_first:
+            x = x.swapaxes(0, 1)
+        dirs = 2 if bidir else 1
+        inp, hs, cs = x, [], []
+        for layer in range(layers):
+            outs = []
+            for d in range(dirs):
+                w_ih, w_hh = next(params), next(params)
+                b_ih, b_hh = (next(params), next(params)) if bias else (0.0, 0.0)
+                at = layer * dirs + d
+                h = states[0][at]
+                c = states[1][at] if lstm else None
+                ys = [None] * inp.shape[0]
+                for t in (reversed(range(inp.shape[0])) if d else range(inp.shape[0])):
+                    gi, gh = inp[t] @ w_ih.T + b_ih, h @ w_hh.T + b_hh
+                    if kind == "rnn":
+                        h = np.maximum(gi + gh, 0) if relu else np.tanh(gi + gh)
+                    elif lstm:
+                        i, f, g, o = np.split(gi + gh, 4, axis=-1)
+                        c = np_sigmoid(f) * c + np_sigmoid(i) * np.tanh(g)
+                        h = np_sigmoid(o) * np.tanh(c)
+                    else:
+                        ir, iz, inn = np.split(gi, 3, axis=-1)
+                        hr, hz, hn = np.split(gh, 3, axis=-1)
+                        r, z = np_sigmoid(ir + hr), np_sigmoid(iz + hz)
+                        n = np.tanh(inn + r * hn)
+                        h = (1 - z) * n + z * h
+                    ys[t] = h
+                outs.append(np.stack(ys))
+                hs.append(h)
+                cs.append(c)
+            inp = np.concatenate(outs, axis=-1)
+        out, extra = inp, {"h_n": np.stack(hs)}
+        if lstm:
+            extra["c_n"] = np.stack(cs)
+        if not batched:
+            out, extra = out[:, 0], {k: v[:, 0] for k, v in extra.items()}
+        elif batch_first:
+            out = out.swapaxes(0, 1)
+        extra["output"] = out
+        joined = np.concatenate([out.ravel()] + [extra[k].ravel() for k in ("h_n", "c_n") if k in extra])
+        return joined, extra
+
+    return fn
+
+
+def torch_recurrent(kind, n_in, hidden, layers, bidir, batch_first, relu, bias):
+    lstm = kind == "lstm"
+
+    def fn(T, x, *rest):
+        nstates = 2 if lstm else 1
+        states, params = rest[:nstates], rest[nstates:]
+        kw = dict(num_layers=layers, bidirectional=bidir, batch_first=batch_first, bias=bias, dtype=x.dtype)
+        if kind == "rnn":
+            kw["nonlinearity"] = "relu" if relu else "tanh"
+        m = {"rnn": T.nn.RNN, "lstm": T.nn.LSTM, "gru": T.nn.GRU}[kind](n_in, hidden, **kw)
+        names = [name for name, _ in m.named_parameters()]
+        hx = tuple(states) if lstm else states[0]
+        out, hn = T.func.functional_call(m, dict(zip(names, params)), (x, hx))
+        extra = {"output": out, "h_n": hn[0] if lstm else hn}
+        if lstm:
+            extra["c_n"] = hn[1]
+        joined = T.cat([out.reshape(-1)] + [extra[k].reshape(-1) for k in ("h_n", "c_n") if k in extra])
+        return joined, extra
+
+    return fn
+
+
+def rnn_cases(rng):
+    c = {}
+    for name, (kind, n_in, hidden, layers, bidir, batch_first, relu, bias, batched, steps, batch) in RNN_CASES.items():
+        dirs = 2 if bidir else 1
+        if not batched:
+            x_shape, state_shape = (steps, n_in), (layers * dirs, hidden)
+        elif batch_first:
+            x_shape, state_shape = (batch, steps, n_in), (layers * dirs, batch, hidden)
+        else:
+            x_shape, state_shape = (steps, batch, n_in), (layers * dirs, batch, hidden)
+        inputs = [uniform(rng, x_shape, -1, 1)]
+        inputs += [uniform(rng, state_shape, -0.5, 0.5) for _ in range(2 if kind == "lstm" else 1)]
+        inputs += [uniform(rng, s, -0.5, 0.5) for s in rnn_param_shapes(kind, n_in, hidden, layers, bidir, bias)]
+        c[name] = (inputs, list(range(len(inputs))),
+                   np_recurrent(kind, layers, bidir, batch_first, relu, bias, batched),
+                   torch_recurrent(kind, n_in, hidden, layers, bidir, batch_first, relu, bias))
+    return c
+
+
 def evaluate(oracle, inputs, np_fn, torch_fn):
     if oracle == "torch" and torch_fn is not None:
         import torch
@@ -758,6 +887,16 @@ def main():
         for part, a in parts.items():
             tensors[f"{name}/{part}"] = a
     files["scan"] = tensors
+
+    # Recurrent layers, from their own streams at seed offset 5.
+    rng, gout_rng = np.random.default_rng(args.seed + 5), np.random.default_rng(args.seed + 105)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in rnn_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
+            tensors[f"{name}/{part}"] = a
+    files["rnn"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():

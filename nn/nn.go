@@ -67,7 +67,10 @@ func Parameters(m Module) []*tensor.Param {
 
 // NamedParams yields every parameter and buffer of m with its path, such
 // as "Layers.0.Weight". A parameter reachable by several paths is yielded
-// once, under the first.
+// once, under the first. A struct field tagged `nn:"-"` is skipped, and
+// one tagged `nn:"inline"` adds nothing to the paths below it, so the
+// parameters of an RNN, held in a map, are named by their keys alone, as
+// "weight_ih_l0".
 func NamedParams(m Module) iter.Seq2[string, *tensor.Param] {
 	return func(yield func(string, *tensor.Param) bool) {
 		w := walker{seen: map[unsafe.Pointer]bool{}}
@@ -155,7 +158,8 @@ func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Val
 	case reflect.Struct:
 		for i := range v.NumField() {
 			f := v.Field(i)
-			if v.Type().Field(i).Tag.Get("nn") == "-" {
+			tag := v.Type().Field(i).Tag.Get("nn")
+			if tag == "-" {
 				continue
 			}
 			if !f.CanInterface() {
@@ -164,7 +168,11 @@ func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Val
 				}
 				f = reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
 			}
-			if !w.visit(f, join(path, v.Type().Field(i).Name), fn) {
+			name := join(path, v.Type().Field(i).Name)
+			if tag == "inline" {
+				name = path
+			}
+			if !w.visit(f, name, fn) {
 				return false
 			}
 		}
@@ -342,6 +350,14 @@ type options struct {
 	eps      float64
 	momentum float64
 	seed     *uint64
+
+	// Recurrent layers.
+	layers        int
+	bidirectional bool
+	batchFirst    bool
+	layerDropout  float64
+	relu          bool
+	checkpoint    int
 }
 
 func resolve(opts []Option, base options) options {
