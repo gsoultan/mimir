@@ -100,6 +100,29 @@ const (
 	// quantization error.
 	OpQMatMul
 
+	// Attention. Queries In[0] are [B..., H, Q, D], keys In[1] [B..., HK,
+	// K, D] and values In[2] [B..., HK, K, DV], where HK divides H and
+	// query head h reads key head h/(H/HK). See AttentionShape.
+	//
+	// OpAttention computes softmax(Attrs.Scale·q·kᵀ + mask)·v without
+	// materializing the scores, adding the optional mask In[3], shaped
+	// [B..., H, Q, K], and hiding key j from query i when Attrs.Causal is
+	// set and j > i + Attrs.CausalOffset. Its Float32 output holds the
+	// result, [B..., H, Q, DV], followed by the natural log of each
+	// softmax's denominator, [B..., H, Q], whose maximum term is factored
+	// out first: the logsumexp of the row's scores. A query that may
+	// attend to no key gets zeros and a logsumexp of -Inf.
+	OpAttention
+	// OpAttentionGrad computes the gradients of an OpAttention from its
+	// inputs, its result In[3] and logsumexp In[4] (views of its output),
+	// and the gradient of its result In[5], with the forward kernel's
+	// mask, if any, as In[6]. Its Float32 output holds the gradients of
+	// the queries, keys and values in turn, each shaped like its input.
+	OpAttentionGrad
+	// OpSliceScatter copies In[0] with the block Attrs.Ranges replaced
+	// by In[1], which has the block's shape.
+	OpSliceScatter
+
 	numOps
 )
 
@@ -171,6 +194,10 @@ var opNames = [numOps]string{
 	OpScan:        "scan",
 	OpCat:         "cat",
 	OpQMatMul:     "qmatmul",
+
+	OpAttention:     "attention",
+	OpAttentionGrad: "attention_grad",
+	OpSliceScatter:  "slice_scatter",
 }
 
 func (o Op) String() string {

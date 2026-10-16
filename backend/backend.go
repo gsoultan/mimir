@@ -143,7 +143,10 @@ type Backend interface {
 	// OpWhere or OpContiguous) may write an output over an input it reads
 	// through Contiguous(k.Shape): it reads every element of that input
 	// before it writes any element of that output, as an in-place update
-	// needs. No other kernel shares memory between its inputs and outputs.
+	// needs. An OpSliceScatter kernel may write its output over input 0
+	// when it reads it through Contiguous(k.Shape): it then writes only
+	// the block, which leaves the rest of input 0 as the output's values.
+	// No other kernel shares memory between its inputs and outputs.
 	Run(ctx context.Context, k *Kernel, outs []Buffer, ins []Buffer) error
 	// Sync waits until all submitted work has finished.
 	Sync(ctx context.Context) error
@@ -164,7 +167,7 @@ type Attrs struct {
 	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
 	Axis   int      // Gather, ScatterAdd: the indexed axis. Scan: the scanned axis. Cat: the joined axis.
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
-	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension.
+	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension. SliceScatter: the block replaced.
 	Value  float64  // Const, Pad, Unfold: the fill value.
 	Seed   uint64   // RandUniform, RandNormal: the Philox key.
 
@@ -181,6 +184,12 @@ type Attrs struct {
 
 	// Scan: how the elements along Axis combine.
 	Combine Combine
+
+	// Attention, AttentionGrad: the factor applied to the scores q·k, and
+	// whether to hide key j from query i when j > i + CausalOffset.
+	Scale        float64
+	Causal       bool
+	CausalOffset int
 }
 
 // Instr is one instruction of a fused program. Instruction i computes

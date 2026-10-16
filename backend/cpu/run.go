@@ -64,6 +64,15 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		return runReduce(ctx, b, k, out, ins[0])
 	case k.Op == backend.OpScan:
 		return runScan(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpAttention || k.Op == backend.OpAttentionGrad:
+		o, err := data[float32](out)
+		if err != nil {
+			return err
+		}
+		if k.Op == backend.OpAttention {
+			return attention(ctx, b, k, o, ins)
+		}
+		return attentionGrad(ctx, b, k, o, ins)
 	}
 	switch k.DType {
 	case backend.Float32:
@@ -129,6 +138,8 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 		return fold(ctx, b, k, out, in[0])
 	case op == backend.OpCat:
 		return cat(ctx, b, k, out, in)
+	case op == backend.OpSliceScatter:
+		return sliceScatter(ctx, b, k, out, in[0], in[1], outBuf == ins[0])
 	default:
 		return fmt.Errorf("no cpu kernel: %w", backend.ErrInternal)
 	}

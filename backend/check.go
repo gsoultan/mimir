@@ -10,7 +10,8 @@ import (
 // elements of k.Shape in k.DType; one buffer per input view, every element
 // of which lies inside its buffer; and an output that is also an input
 // only where an elementwise kernel reads that input as the output is
-// written. Kernels can then index without further bounds checks.
+// written, or a slice scatter writes its block into input 0. Kernels can
+// then index without further bounds checks.
 func CheckRun(k *Kernel, outs, ins []Buffer) error {
 	if len(ins) != len(k.In) {
 		return fmt.Errorf("%s: %d buffers for %d views: %w", k.Op, len(ins), len(k.In), ErrInternal)
@@ -50,7 +51,8 @@ func CheckRun(k *Kernel, outs, ins []Buffer) error {
 		if !slices.Contains(outs, in) {
 			continue
 		}
-		if v := k.In[i]; !k.Op.RunsElementwise() || !v.IsContiguous() || v.Offset != 0 || !slices.Equal(v.Shape, k.Shape) {
+		inPlace := k.Op.RunsElementwise() || k.Op == OpSliceScatter && i == 0
+		if v := k.In[i]; !inPlace || !v.IsContiguous() || v.Offset != 0 || !slices.Equal(v.Shape, k.Shape) {
 			return fmt.Errorf("%s: input %d is also an output: %w", k.Op, i, ErrInternal)
 		}
 	}

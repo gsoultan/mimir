@@ -542,3 +542,91 @@ func Cat(xs []*Node, axis int) (*Node, error) {
 	}
 	return newNode(&Node{Op: backend.OpCat, DType: first.DType, Shape: shape, Inputs: slices.Clone(xs), Attrs: backend.Attrs{Axis: axis}})
 }
+
+// AttentionAttrs configures an attention: the factor applied to the
+// scores, and whether to hide key j from query i when j > i + Offset.
+type AttentionAttrs struct {
+	Scale  float64
+	Causal bool
+	Offset int
+}
+
+func (a AttentionAttrs) attrs() backend.Attrs {
+	return backend.Attrs{Scale: a.Scale, Causal: a.Causal, CausalOffset: a.Offset}
+}
+
+// attentionShape checks the float inputs of an attention, and its mask
+// unless it is nil, and returns its geometry.
+func attentionShape(op backend.Op, q, k, v, mask *Node) (backend.AttentionShape, error) {
+	ins := []*Node{q, k, v}
+	var m []int
+	if mask != nil {
+		ins, m = append(ins, mask), mask.Shape
+	}
+	for _, in := range ins {
+		if !in.DType.IsFloat() {
+			return backend.AttentionShape{}, errorf(op, backend.ErrDType, "%s input", in.DType)
+		}
+	}
+	s, err := backend.NewAttentionShape(q.Shape, k.Shape, v.Shape, m)
+	if err != nil {
+		return s, fmt.Errorf("%s: %w", op, err)
+	}
+	return s, nil
+}
+
+// Attention computes softmax(scale·q·kᵀ + mask)·v over queries
+// [B..., H, Q, D], keys [B..., HK, K, D] and values [B..., HK, K, DV] of
+// any float dtypes, adding mask, [B..., H, Q, K], unless it is nil. The
+// Float32 result is one-dimensional: the attention's result, followed by
+// the logsumexp of each query's scores (see backend.OpAttention).
+func Attention(q, k, v, mask *Node, a AttentionAttrs) (*Node, error) {
+	s, err := attentionShape(backend.OpAttention, q, k, v, mask)
+	if err != nil {
+		return nil, err
+	}
+	ins := []*Node{q, k, v}
+	if mask != nil {
+		ins = append(ins, mask)
+	}
+	return newNode(&Node{Op: backend.OpAttention, DType: backend.Float32, Shape: []int{s.Size()}, Inputs: ins, Attrs: a.attrs()})
+}
+
+// AttentionGrad computes the gradients of the attention of q, k and v
+// with mask and a, from its result out, its logsumexp lse and the
+// gradient of its result gout, which have float dtypes. The Float32
+// result is one-dimensional: the gradients of q, k and v in turn.
+func AttentionGrad(q, k, v, mask, out, lse, gout *Node, a AttentionAttrs) (*Node, error) {
+	s, err := attentionShape(backend.OpAttentionGrad, q, k, v, mask)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(out.Shape, s.OutShape()) || !slices.Equal(gout.Shape, s.OutShape()) || !slices.Equal(lse.Shape, s.LSEShape()) {
+		return nil, errorf(backend.OpAttentionGrad, backend.ErrShape, "result %v, logsumexp %v and gradient %v for %v", out.Shape, lse.Shape, gout.Shape, s.OutShape())
+	}
+	if !out.DType.IsFloat() || !gout.DType.IsFloat() || lse.DType != backend.Float32 {
+		return nil, errorf(backend.OpAttentionGrad, backend.ErrDType, "result %s, logsumexp %s and gradient %s", out.DType, lse.DType, gout.DType)
+	}
+	ins := []*Node{q, k, v, out, lse, gout}
+	if mask != nil {
+		ins = append(ins, mask)
+	}
+	return newNode(&Node{Op: backend.OpAttentionGrad, DType: backend.Float32, Shape: []int{s.GradSize()}, Inputs: ins, Attrs: a.attrs()})
+}
+
+// SliceScatter returns x with the block ranges, half-open in each
+// dimension, replaced by src, which has the block's shape and x's dtype.
+func SliceScatter(x, src *Node, ranges [][2]int) (*Node, error) {
+	if len(ranges) != len(x.Shape) || len(src.Shape) != len(x.Shape) {
+		return nil, errorf(backend.OpSliceScatter, backend.ErrShape, "%v into %v at %v", src.Shape, x.Shape, ranges)
+	}
+	for i, r := range ranges {
+		if r[0] < 0 || r[0] > r[1] || r[1] > x.Shape[i] || src.Shape[i] != r[1]-r[0] {
+			return nil, errorf(backend.OpSliceScatter, backend.ErrShape, "%v into %v at %v", src.Shape, x.Shape, ranges)
+		}
+	}
+	if x.DType != src.DType {
+		return nil, errorf(backend.OpSliceScatter, backend.ErrDType, "%s into %s", src.DType, x.DType)
+	}
+	return newNode(&Node{Op: backend.OpSliceScatter, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, src}, Attrs: backend.Attrs{Ranges: slices.Clone(ranges)}})
+}

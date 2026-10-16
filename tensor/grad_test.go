@@ -175,6 +175,17 @@ func gradCases() []gradCase {
 	add("cummax_outer", func(x []*tensor.Tensor) *tensor.Tensor { v, _ := x[0].CumMax(0); return v }, distinct(5, 3))
 	add("logcumsumexp", func(x []*tensor.Tensor) *tensor.Tensor { return x[0].LogCumSumExp(-1) }, u(-3, 3, 2, 3, 5))
 	add("logcumsumexp_outer", func(x []*tensor.Tensor) *tensor.Tensor { return x[0].LogCumSumExp(0) }, u(-3, 3, 4, 3))
+
+	add("attention", func(x []*tensor.Tensor) *tensor.Tensor {
+		mask := tensor.FromSlice([]float32{0, -1, 0.5, 0, 2, -3, 0, 0, 1, 0, 0, 0.3, -0.2, 0, 1}, 3, 5)
+		return tensor.ScaledDotProductAttention(x[0], x[1], x[2], tensor.AdditiveMask(mask))
+	}, u(-1, 1, 2, 2, 3, 4), u(-1, 1, 2, 2, 5, 4), u(-1, 1, 2, 2, 5, 3))
+	add("attention_grouped_causal", func(x []*tensor.Tensor) *tensor.Tensor {
+		return tensor.ScaledDotProductAttention(x[0], x[1], x[2], tensor.CausalOffset(1), tensor.AttentionScale(0.7))
+	}, u(-1, 1, 1, 4, 3, 4), u(-1, 1, 1, 2, 4, 4), u(-1, 1, 1, 2, 4, 2))
+	add("slice_scatter", func(x []*tensor.Tensor) *tensor.Tensor {
+		return x[0].Exp().SliceScatter(x[1].Mul(x[1]), [][2]int{{1, 3}, {0, 2}})
+	}, u(-1, 1, 3, 4), u(-1, 1, 2, 2))
 	return cases
 }
 

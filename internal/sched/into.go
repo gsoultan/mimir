@@ -14,7 +14,9 @@ import (
 // fails instead of computing with the new values. Within the schedule, the
 // kernels that read the old values must run before that kernel, or be it:
 // an elementwise kernel reads each element before writing it, so it may
-// read the old values contiguously, as an optimizer's update does.
+// read the old values contiguously, as an optimizer's update does, and a
+// slice scatter may read them as the tensor it writes a block into, which
+// it then leaves in place.
 
 // destinations returns the targets that can be computed into the memory
 // of their destination, each mapped to it. dsts is nil or holds the
@@ -79,7 +81,8 @@ func ownBuffer(n *graph.Node) bool {
 
 // overwrites reports whether the kernel of writer can write over the
 // memory of d: no target reads d's values, and no kernel reads them after
-// writer, which reads them only elementwise and contiguously, if at all.
+// writer, which reads them only elementwise and contiguously, or as the
+// tensor a slice scatter writes into, if at all.
 func (p *plan) overwrites(writer, d *graph.Node, targets []*graph.Node, pos map[*graph.Node]int) bool {
 	// reads reports whether n's values are d's values, or a view of them.
 	known := map[*graph.Node]bool{}
@@ -100,14 +103,15 @@ func (p *plan) overwrites(writer, d *graph.Node, targets []*graph.Node, pos map[
 	}
 	w := p.work[writer]
 	elementwise := w.prog != nil && w.gemm == nil || w.prog == nil && !w.swap && writer.Op.IsElementwise()
+	scatter := writer.Op == backend.OpSliceScatter && w.prog == nil
 	for _, n := range p.order {
-		for _, in := range p.work[n].deps {
+		for i, in := range p.work[n].deps {
 			if !reads(in) {
 				continue
 			}
 			switch {
 			case pos[n] < pos[writer]:
-			case n != writer || !elementwise:
+			case n != writer || !elementwise && !(scatter && i == 0):
 				return false
 			case !in.Realized() || !ownBuffer(in) || !slices.Equal(in.Shape, writer.Shape):
 				return false

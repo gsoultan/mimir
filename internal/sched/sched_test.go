@@ -516,6 +516,49 @@ func realized(t *testing.T, be backend.Backend, shape []int, seed uint64) *graph
 	return n
 }
 
+func TestRealizeIntoScattersInPlace(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	cache := realized(t, be, []int{2, 8, 3}, 1)
+	step := realized(t, be, []int{2, 1, 3}, 2)
+	old, add := floats(t, be, cache), floats(t, be, step)
+	ranges := [][2]int{{0, 2}, {5, 6}, {0, 3}}
+	next := must(graph.SliceScatter(cache, step, ranges))
+	buf, allocs := cache.Buf(), be.allocs
+	be.ops = nil
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{cache}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpSliceScatter}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	if next.Buf() != buf || be.allocs != allocs {
+		t.Errorf("scatter not written over its destination (%d buffers allocated)", be.allocs-allocs)
+	}
+	for i, v := range floats(t, be, next) {
+		want := old[i]
+		if row := i / 3 % 8; row == 5 {
+			want = add[i/24*3+i%3]
+		}
+		if v != want {
+			t.Fatalf("element %d = %v, want %v", i, v, want)
+		}
+	}
+
+	// A value read after the scatter keeps the destination's old values.
+	cache = realized(t, be, []int{2, 8, 3}, 3)
+	old = floats(t, be, cache)
+	next = must(graph.SliceScatter(cache, step, ranges))
+	after := must(graph.Unary(backend.OpNeg, cache))
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next, after}, []*graph.Node{cache, nil}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range floats(t, be, after) {
+		if v != -old[i] {
+			t.Fatalf("value read after the scatter: element %d = %v, want %v", i, v, -old[i])
+		}
+	}
+}
+
 func TestRealizeIntoWritesOverTheDestinations(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	const n = 3000
