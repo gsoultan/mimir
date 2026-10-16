@@ -4,12 +4,14 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestone 4b.** mimir trains neural networks on the CPU with
+> **Status: milestone 5.** mimir trains neural networks on the CPU with
 > SIMD matrix kernels, fused elementwise kernels and in-place updates, and
 > runs the same code on Apple GPUs through Metal and on NVIDIA GPUs through
 > CUDA: autograd, layers, losses, optimizers, data loading and a training
-> loop, each checked against PyTorch. The API may change between 0.x
-> releases.
+> loop, each checked against PyTorch. It streams training sets larger than
+> memory from Parquet and CSV shards in flat memory, plans every
+> computation against a memory budget, and stores tensors in bfloat16 and
+> float16. The API may change between 0.x releases.
 
 ## Example
 
@@ -174,9 +176,64 @@ and 6,050 for 4096 × 4096, 3 to 11% faster than Metal Performance Shaders
 at every size measured and with the same results bit for bit, against
 about 940 GFLOP/s on its CPU cores. Older GPUs and systems keep using MPS.
 
+## Scale
+
+A training set larger than memory streams from shards: the row groups of
+Parquet files, CSV files, or any `data.Source`. A `data.Stream` reads a few
+shards ahead of the batches it yields, shuffles the shard order and a
+buffer of examples every epoch, and holds the same few megabytes whatever
+the number of rows. `data.Statistics` reads the source once, in parallel,
+for the per-feature mean and deviation that `data.Normalize` applies:
+
+```go
+src, features, err := datasets.ParquetShards(paths, "label", datasets.Classes("no", "yes"))
+if err != nil {
+	return err
+}
+stats, err := data.Statistics(ctx, src)
+if err != nil {
+	return err
+}
+trainSet, err := data.NewStream(src, data.BatchSize(4096), data.Shuffle(42),
+	data.ClassTargets(), data.Normalize(stats))
+```
+
+CI trains a small network over a billion synthetic rows on every change.
+On a GitHub-hosted Linux runner it takes about 19 minutes, 895,000 rows a
+second, and the process stays at 32 MiB resident from the first tenth of
+the epoch to the last.
+
+Memory is planned before it is spent. `tensor.SetMemoryBudget` caps what
+computations on a device may hold: a schedule that would go past it fails
+with `tensor.ErrMemoryBudget` before it allocates or computes anything.
+`train.MemoryBudget` trains within such a budget by splitting each batch
+that does not fit into smaller chunks and accumulating their gradients,
+and `train.MicroBatch` does the same with a fixed chunk size.
+`nn.Checkpoint` and `tensor.Checkpoint` keep only the inputs of a block
+during the forward pass and recompute the rest in `Backward`, trading
+compute for activation memory.
+
+CPU buffers of a megabyte or more live in anonymous memory mappings
+outside the Go heap, returned to the operating system as soon as they are
+freed. `safetensors.Open` maps a file instead of reading it, so
+`nn.Load` and `datasets.Mapped` read weights and examples in place, and the
+file's pages stream in from disk as they are used.
+
+Tensors can be stored as `tensor.BFloat16` or `tensor.Float16`, which
+halves their memory; operations compute in float32 and round on the way
+out. `nn.Cast` converts a model, `optim.MasterWeights` keeps a float32
+copy of each half parameter for the optimizer to update, and
+`train.LossScale` or `train.DynamicLossScale` scale the loss so small
+gradients survive float16.
+
 ## Requirements
 
 Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
+mimir depends on two modules: [purego](https://github.com/ebitengine/purego)
+to call Metal and CUDA without cgo, and
+[klauspost/compress](https://github.com/klauspost/compress) for the
+Snappy and zstd pages of Parquet files, which the standard library cannot
+read.
 
 ## Goals
 
@@ -185,9 +242,10 @@ Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
 - **Never panic, never run out of memory.** Shape and dtype errors are
   values; kernels recover internal faults as `ErrInternal`; requests larger
   than the runtime can address return `ErrOutOfMemory`; intermediate buffers
-  are freed as soon as their last reader finishes. The memory budget planner
-  in milestone 5 will refuse work that does not fit in RAM before it starts.
-- **Billion-row data.** Streaming datasets and memory budgets (milestone 5).
+  are freed as soon as their last reader finishes; `tensor.SetMemoryBudget`
+  refuses work that does not fit before it starts.
+- **Billion-row data.** Training sets stream from Parquet and CSV shards in
+  flat memory, and CI trains over a billion rows on every change.
 - **PyTorch parity.** Every operation is tested against PyTorch outputs, and
   random numbers are reproducible across devices (counter-based Philox).
 - **Small core.** About 30 primitive operations. Everything else, including
@@ -198,6 +256,8 @@ Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
 
 - A Python API or Python interop at run time.
 - Dynamic dtype promotion. Mixing float32 and int32 is an error; cast first.
+  The one exception is the half types: an operation on bfloat16 or float16
+  and float32 computes in float32.
 - Matching every PyTorch operator name. mimir follows PyTorch semantics where
   it has the same operation.
 
@@ -214,14 +274,15 @@ Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
 | Indexing | `Gather`, `ScatterAdd`, `Argmax` |
 | Joining and windows | `Cat`, `Stack`, `Flatten`, `Unfold` |
 | Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
-| Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func` |
-| Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `Dropout`, `Sequential`, activations, pooling, `Flatten` |
+| Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
+| Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `FromBytes` over mapped files |
+| Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `Flatten`, `Cast` |
 | Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `MSE`, `L1`, `Huber` |
-| Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`; `StepDecay`, `Cosine`, `Warmup` schedules |
-| Data (`data`, `data/datasets`) | batching, shuffling, MNIST, CSV |
-| Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume; `Accuracy` |
+| Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
+| Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
+| Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`; `Accuracy` |
 
-Element types are `float32` and `int32`. Broadcasting follows NumPy.
+Element types are `float32`, `int32`, `bfloat16` and `float16`. Broadcasting follows NumPy.
 Modules are plain structs: `nn.Parameters` finds every `*tensor.Param` a model
 holds, in exported or unexported fields, so custom layers need no
 registration.
@@ -233,8 +294,8 @@ tensor/              public Tensor API and autograd
 nn/                  layers, parameter discovery, save and load
 nn/loss/             loss functions
 optim/               optimizers and learning-rate schedules
-data/                datasets and batching
-data/datasets/       MNIST and CSV
+data/                datasets, batching, streams of shards and their statistics
+data/datasets/       MNIST, CSV, CSV and Parquet shards, mapped safetensors, synthetic rows
 train/               Fit, evaluation, checkpoints
 metrics/             accuracy
 backend/             Backend interface, DType, Op, View, Kernel
@@ -246,12 +307,14 @@ backend/internal/kerneltest/ kernel cases for every device, and a CPU emulator f
 internal/graph/      lazy IR with shape and dtype checks
 internal/sched/      runs graphs: views, buffer reuse, freeing
 internal/goldentest/ golden-file loading and comparison
-io/safetensors/      safetensors reader and writer
+io/safetensors/      safetensors reader, writer and file mapping
+io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
 examples/mnist/      trains an MLP or CNN on MNIST
 testdata/golden/     expected results from PyTorch or NumPy
 tools/devices/       lists the devices mimir can use
 tools/bench/         PyTorch and NumPy counterparts of the benchmarks
 tools/golden/        golden-file generator (Python, development only)
+tools/parquet/       Parquet test-file generator (Python, development only)
 ```
 
 ## Testing
@@ -263,7 +326,13 @@ MIMIR_DEVICE=gpu go test ./...   # on a Mac or an NVIDIA machine: every test on 
 MIMIR_EMULATE=1 go test -run Kernels ./backend/...   # the GPU kernels on the CPU, with clang++
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
+MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train   # the billion-row run
 ```
+
+The scale test trains over a million rows by default; `MIMIR_SCALE_ROWS`
+sets another number. The Parquet test files in `io/parquet/testdata` and
+`data/datasets/testdata` were written by pyarrow; `python3
+tools/parquet/gen.py` writes them again.
 
 `testdata/golden/` holds inputs and expected results: every operation's
 output, the gradients of operations and layers, every layer and loss, and
@@ -301,7 +370,7 @@ NVRTC on every change, which needs no GPU.
 | M3 Fast on CPU | SIMD GEMM microkernels with fused epilogues, fused elementwise kernels, convolution as GEMM, in-place optimizer updates with no allocations per step (done) |
 | M4 Same code on GPU | Metal backend without cgo, unified memory, MPS matrix products, fused kernels, automatic device choice with CPU fallback and Metal 4 tensor operations on M5 GPUs (done) |
 | M4b CUDA | CUDA driver, NVRTC and cuBLAS through purego, stream-ordered memory pool, on-disk kernel cache, conformance tests on a Modal T4 (done; convolution runs through unfold and GEMM, not cuDNN) |
-| M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, memory-mapped data, bf16 and f16 |
+| M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M6 Transformers and LLMs | attention and KV cache, RNN, LSTM and GRU, GGUF quantized matmul |
 | M7 Full coverage | distributions, linear algebra, function transforms, ONNX import |
 
