@@ -143,8 +143,10 @@ func (p *plan) forecast(m *pool, uses map[*graph.Node]int, into map[*graph.Node]
 			if _, ok := moved[in]; ok || !in.Realized() || in.Mem.Dev == m.be {
 				continue
 			}
+			// The schedule holds the copy until its end, which gives
+			// nothing that a kernel could take.
 			buf := take(in.DType, in.Size())
-			refs[buf] = 0
+			refs[buf] = 1
 			moved[in] = result{buf, backend.Contiguous(in.Shape)}
 		}
 	}
