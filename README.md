@@ -151,6 +151,27 @@ built from it, returns `tensor.ErrOverwritten`. Realize what you read after a
 step, such as predictions, before it, or realize a `Clone` to keep a copy.
 `tensor.RealizeInto` writes your own results over existing tensors.
 
+Function transforms in the manner of JAX work on top of the same graph.
+`tensor.Grad`, `VJP` and `JVP` give gradients, vector-Jacobian and
+Jacobian-vector products of a Go function; `Jacobian` and `Hessian` build on
+them. Their gradients are lazy and themselves differentiable
+(`tensor.Gradients`), so `JVP` of `Grad` is a Hessian-vector product. `VMap`
+runs a function over a batch axis without a loop, which gives per-example
+gradients in one pass, about twelve times as fast as looping over a batch of
+64:
+
+```go
+loss := func(x ...*tensor.Tensor) *tensor.Tensor { return x[0].MatMul(w).Tanh().Sum() }
+perExample := tensor.VMap(func(x ...*tensor.Tensor) []*tensor.Tensor {
+	return tensor.Gradients(loss(x...), w)
+})(batch) // one gradient of w for each row of batch
+```
+
+An operation without a rule returns `tensor.ErrNotDifferentiable` or
+`tensor.ErrNotBatchable` rather than a wrong result: the factorizations have
+no batching or second derivatives yet, and random operations inside `VMap`
+draw the same values for every example.
+
 ## Performance
 
 On the CPU, mimir multiplies float32 matrices at 77 to 99 percent of the
@@ -461,7 +482,7 @@ NVRTC on every change, which needs no GPU.
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
 | M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
-| M7 Full coverage | distributions and generative models, linear algebra, differentiable gradients, forward mode and vmap, ONNX import, ROCm (in progress: sorting, FFT and linear algebra done) |
+| M7 Full coverage | distributions and generative models, linear algebra, differentiable gradients, forward mode and vmap, ONNX import, ROCm (in progress: function transforms, sorting, FFT and linear algebra done) |
 | M8 Multiple devices | data parallelism over NCCL, then tensor sharding modeled on `jax.sharding` |
 
 ## License
