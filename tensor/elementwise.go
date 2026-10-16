@@ -472,32 +472,85 @@ func reluRule() rule {
 	}
 }
 
+// The activations below have gradient rules of their own, computed from
+// the input: the rules their compositions give would keep every
+// intermediate value of the forward pass for the backward pass, each
+// written to memory and read back, where these recompute what they need
+// in the one kernel that reads the input and the gradient.
+
 // Sigmoid returns 1 / (1 + e^-t).
 func (t *Tensor) Sigmoid() *Tensor {
 	return t.inFloat32(func(x *Tensor) *Tensor {
-		one := x.scalar(1)
-		return one.Div(one.Add(x.Neg().Exp()))
+		d := x.detached()
+		return track(sigmoid(d), func(g *Tensor) []*Tensor {
+			s := sigmoid(d)
+			return grads(g.Mul(s.Mul(s.scalar(1).Sub(s))))
+		}, x)
 	})
+}
+
+// sigmoid is 1 / (1 + 2^(-x·log2 e)), which is 0 or 1, not NaN, where the
+// power overflows.
+func sigmoid(x *Tensor) *Tensor {
+	one := x.scalar(1)
+	return one.Add(x.Mul(x.scalar(-math.Log2E)).Exp2()).Recip()
+}
+
+// tanh is 2·sigmoid(2x) - 1.
+func tanh(x *Tensor) *Tensor {
+	two := x.scalar(2)
+	return two.Mul(sigmoid(x.Mul(two))).Sub(x.scalar(1))
 }
 
 // Tanh returns the hyperbolic tangent of t, computed as 2*sigmoid(2t) - 1.
 func (t *Tensor) Tanh() *Tensor {
 	return t.inFloat32(func(x *Tensor) *Tensor {
-		two := x.scalar(2)
-		return two.Mul(x.Mul(two).Sigmoid()).Sub(x.scalar(1))
+		d := x.detached()
+		return track(tanh(d), func(g *Tensor) []*Tensor {
+			th := tanh(d)
+			return grads(g.Mul(th.scalar(1).Sub(th.Mul(th))))
+		}, x)
 	})
+}
+
+// GELU's tanh approximation is x/2 · (1 + tanh(c·(x + a·x³))).
+const (
+	geluA = 0.044715
+	geluC = 0.7978845608028654 // √(2/π)
+)
+
+// geluTanh returns tanh(c·(x + a·x³)).
+func geluTanh(x *Tensor) *Tensor {
+	inner := x.Add(x.scalar(geluA).Mul(x).Mul(x).Mul(x)).Mul(x.scalar(geluC))
+	return tanh(inner)
 }
 
 // GELU returns the Gaussian error linear unit with the tanh approximation,
 // like torch.nn.functional.gelu(x, approximate="tanh").
 func (t *Tensor) GELU() *Tensor {
 	return t.inFloat32(func(x *Tensor) *Tensor {
-		inner := x.Add(x.scalar(0.044715).Mul(x).Mul(x).Mul(x)).Mul(x.scalar(math.Sqrt(2 / math.Pi)))
-		return x.scalar(0.5).Mul(x).Mul(x.scalar(1).Add(inner.Tanh()))
+		d := x.detached()
+		out := d.scalar(0.5).Mul(d).Mul(d.scalar(1).Add(geluTanh(d)))
+		return track(out, func(g *Tensor) []*Tensor {
+			// d/dx = (1 + th)/2 + x/2 · (1 - th²) · c·(1 + 3a·x²)
+			th := geluTanh(d)
+			half, one := d.scalar(0.5), d.scalar(1)
+			slope := d.scalar(geluC).Mul(one.Add(d.scalar(3 * geluA).Mul(d).Mul(d)))
+			dx := half.Mul(one.Add(th)).Add(half.Mul(d).Mul(one.Sub(th.Mul(th))).Mul(slope))
+			return grads(g.Mul(dx))
+		}, x)
 	})
 }
 
 // SiLU returns t * sigmoid(t), also called swish.
 func (t *Tensor) SiLU() *Tensor {
-	return t.inFloat32(func(x *Tensor) *Tensor { return x.Mul(x.Sigmoid()) })
+	return t.inFloat32(func(x *Tensor) *Tensor {
+		d := x.detached()
+		return track(d.Mul(sigmoid(d)), func(g *Tensor) []*Tensor {
+			// d/dx = s + x·s·(1 - s) = s·(1 + x·(1 - s))
+			s := sigmoid(d)
+			one := d.scalar(1)
+			return grads(g.Mul(s.Mul(one.Add(d.Mul(one.Sub(s))))))
+		}, x)
+	})
 }
