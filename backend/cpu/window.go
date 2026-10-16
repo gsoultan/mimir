@@ -91,7 +91,7 @@ func unfold[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x [
 	w := planWindows(k.Attrs, spatial, win[s:], v.Strides[r-s:], backend.ContiguousStrides(win))
 	per, _ := backend.NumElements(win)
 	bases := batchOffsets(lead, v)
-	fill := T(k.Attrs.Value)
+	fill := valueOf[T](k.Attrs.Value)
 	return b.parallelFor(ctx, len(bases), max(1, elementGrain/max(per, 1)), func(lo, hi int) error {
 		for p := lo; p < hi; p++ {
 			plane := out[p*per:][:per]
@@ -121,7 +121,8 @@ func unfold[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x [
 	})
 }
 
-// fold sums the windows of the input into out; see backend.OpFold.
+// fold sums the windows of the input into out; see backend.OpFold. Half
+// elements are summed in float32 and rounded once.
 func fold[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x []T) error {
 	v := k.In[0]
 	s, r := len(k.Attrs.Kernel), len(k.Shape)
@@ -129,19 +130,38 @@ func fold[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x []T
 	w := planWindows(k.Attrs, spatial, v.Shape[r:], backend.ContiguousStrides(spatial), v.Strides[r-s:])
 	per, _ := backend.NumElements(spatial)
 	bases := batchOffsets(lead, v)
+	half := dtypeOf[T]().Size() == 2
 	return b.parallelFor(ctx, len(bases), max(1, elementGrain/max(len(w.rows)*w.n, 1)), func(lo, hi int) error {
+		var sums []float32
+		if half {
+			sums = make([]float32, per)
+		}
 		for p := lo; p < hi; p++ {
-			plane := out[p*per:][:per]
-			clear(plane)
-			for _, row := range w.rows {
-				src, dst := bases[p]+row.win+row.lo*w.winStep, row.in
-				for range row.hi - row.lo {
-					plane[dst] += x[src]
-					src += w.winStep
-					dst += w.inStep
+			switch plane := any(out[p*per:][:per]).(type) {
+			case []float32:
+				foldRows(plane, x, bases[p], w)
+			case []int32:
+				foldRows(plane, x, bases[p], w)
+			default:
+				foldRows(sums, x, bases[p], w)
+				for i, v := range sums {
+					out[p*per+i] = ofF32[T](v)
 				}
 			}
 		}
 		return nil
 	})
+}
+
+// foldRows sums the rows of the windows of x at base into plane.
+func foldRows[A number, S elem](plane []A, x []S, base int, w windowRows) {
+	clear(plane)
+	for _, row := range w.rows {
+		src, dst := base+row.win+row.lo*w.winStep, row.in
+		for range row.hi - row.lo {
+			plane[dst] += conv[A](x[src])
+			src += w.winStep
+			dst += w.inStep
+		}
+	}
 }
