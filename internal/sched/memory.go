@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sync"
 	"unsafe"
+	"weak"
 
 	"github.com/gsoultan/mimir/backend"
 )
@@ -26,7 +27,10 @@ import (
 // nothing references any more but the garbage collector has not reclaimed
 // yet. A result that its tensor drops never comes back to the pool, so
 // each buffer carries a cleanup that settles its account when the buffer
-// is collected. A budget caps the memory held (see budget.go).
+// is collected. The account knows each buffer by a weak pointer to it,
+// not by its address: a collected buffer's account may wait for its
+// cleanup while a newer buffer lives at the same address, and the two
+// must not be confused. A budget caps the memory held (see budget.go).
 
 // poolAge is how many schedules a pooled buffer waits before it is freed.
 const poolAge = 16
@@ -45,8 +49,8 @@ type pool struct {
 	obtained, predicted int64
 
 	acct      sync.Mutex
-	allocated int64              // bytes obtained from be whose buffers are alive
-	owned     map[uintptr]*entry // the alive buffers obtained from be, by address
+	allocated int64                         // bytes obtained from be whose buffers are alive
+	owned     map[weak.Pointer[byte]]*entry // the alive buffers obtained from be
 }
 
 type poolKey struct {
@@ -62,11 +66,11 @@ type pooled struct {
 	clock int // when the buffer was freed
 }
 
-// entry is a buffer's account: its size, where the buffer lives and the
-// cleanup that settles the account when the buffer is collected.
+// entry is a buffer's account: its size, the buffer, and the cleanup that
+// settles the account when the buffer is collected.
 type entry struct {
 	bytes int64
-	addr  uintptr
+	ref   weak.Pointer[byte] // the buffer, which a weak pointer does not keep alive
 	stop  runtime.Cleanup
 }
 
@@ -76,7 +80,7 @@ var pools = map[backend.Backend]*pool{}
 func poolOf(be backend.Backend) *pool {
 	p := pools[be]
 	if p == nil {
-		p = &pool{be: be, free: map[poolKey][]pooled{}, owned: map[uintptr]*entry{}}
+		p = &pool{be: be, free: map[poolKey][]pooled{}, owned: map[weak.Pointer[byte]]*entry{}}
 		pools[be] = p
 	}
 	return p
@@ -151,11 +155,11 @@ func (p *pool) track(buf backend.Buffer) {
 	if ptr == nil {
 		return
 	}
-	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), addr: uintptr(ptr)}
+	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), ref: weak.Make((*byte)(ptr))}
 	p.acct.Lock()
 	defer p.acct.Unlock()
 	p.allocated += e.bytes
-	p.owned[e.addr] = e
+	p.owned[e.ref] = e
 	e.stop = runtime.AddCleanup((*byte)(ptr), p.settle, e)
 }
 
@@ -167,27 +171,32 @@ func (p *pool) untrack(buf backend.Buffer) {
 	if ptr == nil {
 		return
 	}
+	ref := weak.Make((*byte)(ptr))
 	p.acct.Lock()
 	defer p.acct.Unlock()
-	e := p.owned[uintptr(ptr)]
+	e := p.owned[ref]
 	if e == nil {
 		return
 	}
 	e.stop.Stop()
-	delete(p.owned, e.addr)
-	p.allocated -= e.bytes
+	p.drop(e)
 }
 
 // settle is the cleanup of a buffer the pool obtained: the buffer has
-// been collected, so its bytes are no longer held. Its address may hold a
-// newer buffer by now, whose entry is left alone.
+// been collected, so its bytes are no longer held, unless its account is
+// settled already.
 func (p *pool) settle(e *entry) {
 	p.acct.Lock()
 	defer p.acct.Unlock()
-	if p.owned[e.addr] == e {
-		delete(p.owned, e.addr)
+	p.drop(e)
+}
+
+// drop takes e off the account, if it is on it. The caller holds acct.
+func (p *pool) drop(e *entry) {
+	if p.owned[e.ref] == e {
+		delete(p.owned, e.ref)
+		p.allocated -= e.bytes
 	}
-	p.allocated -= e.bytes
 }
 
 // held returns the bytes obtained from the backend whose buffers are

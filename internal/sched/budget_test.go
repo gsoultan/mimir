@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/backend/cpu"
@@ -365,5 +366,81 @@ func TestCollectedResultsLeaveTheAccount(t *testing.T) {
 	}
 	if m := MemoryOf(be); m.Obtained != n*4 || m.Predicted != n*4 {
 		t.Errorf("memory %+v, want %d obtained and predicted", m, n*4)
+	}
+}
+
+// collectedEntry obtains a buffer of n elements of be through its pool,
+// drops it and returns its address and its account entry, whose cleanup
+// it stops: the entry then outlives the buffer, as the entry of a
+// collected buffer does until its cleanup runs, and the test settles it.
+func collectedEntry(t *testing.T, be backend.Backend, n int) (uintptr, *entry) {
+	t.Helper()
+	p := poolOf(be)
+	buf, err := p.alloc(backend.Float32, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := uintptr(addressOf(buf))
+	p.acct.Lock()
+	e := p.owned[weak.Make((*byte)(addressOf(buf)))]
+	p.acct.Unlock()
+	if e == nil {
+		t.Fatal("a buffer the pool obtained is not on its account")
+	}
+	e.stop.Stop()
+	return addr, e
+}
+
+func TestStaleAccountEntriesAreSettledOnce(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	p := poolOf(be)
+	const n = 100
+	addr, e := collectedEntry(t, be, n)
+	// Another buffer, allocated outside the pool, takes the collected
+	// buffer's address.
+	var buf backend.Buffer
+	var keep []backend.Buffer
+	for round := 0; buf == nil && round < 64; round++ {
+		runtime.GC()
+		for range 4096 {
+			b, err := be.Alloc(backend.Float32, n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if uintptr(addressOf(b)) == addr {
+				buf = b
+				break
+			}
+			keep = append(keep, b)
+		}
+	}
+	if buf == nil {
+		t.Skip("the allocator did not reuse the collected buffer's address")
+	}
+	runtime.KeepAlive(keep)
+	// It reaches the pool, as a released gradient does, and is freed. The
+	// collected buffer's entry is not its account, and its bytes come off
+	// once, when its cleanup settles it.
+	node, err := graph.Load(be, buf, []int{n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	Release(node, nil)
+	if held := p.held(); held < 0 {
+		t.Fatalf("%d bytes held with a buffer given to the pool", held)
+	}
+	p.evict(poolKey{backend.Float32, n}, 1)
+	if held := p.held(); held != n*4 {
+		t.Errorf("%d bytes held after the pool freed the buffer, want the collected buffer's %d, not settled yet", held, n*4)
+	}
+	p.settle(e)
+	if held := p.held(); held != 0 {
+		t.Errorf("%d bytes held after the collected buffer's account settled, want 0", held)
+	}
+	p.acct.Lock()
+	left := len(p.owned)
+	p.acct.Unlock()
+	if left != 0 {
+		t.Errorf("%d buffers on the account after both were freed", left)
 	}
 }
