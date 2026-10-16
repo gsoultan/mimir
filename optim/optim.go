@@ -122,9 +122,11 @@ func (o *Optimizer) ZeroGrad() {
 
 // Step updates every trainable parameter that has a gradient, divided by
 // the gradient scale (see SetGradScale), writing the new values and
-// states over the old ones (see tensor.RealizeInto). If it fails before
-// it starts writing, nothing changes; cancelling ctx after that does not
-// stop it.
+// states over the old ones (see tensor.RealizeInto). The rule's value is
+// cast to the parameter's dtype, so a BFloat16 or Float16 parameter takes
+// an update computed in float32 rounded to its dtype (see MasterWeights).
+// If Step fails before it starts writing, nothing changes; cancelling ctx
+// after that does not stop it.
 func (o *Optimizer) Step(ctx context.Context) error {
 	if o.err != nil {
 		return o.err
@@ -158,6 +160,9 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		}
 		if !slices.Equal(v.Shape(), cur.Shape()) {
 			return fmt.Errorf("optim: parameter %d: rule returned %v for %v: %w", i, v.Shape(), cur.Shape(), tensor.ErrShape)
+		}
+		if v.DType() != cur.DType() {
+			v = v.Cast(cur.DType())
 		}
 		for name, t := range s {
 			if t == g {
@@ -234,7 +239,7 @@ type Option func(*config)
 type config struct {
 	lr, momentum, dampening, weightDecay float64
 	beta1, beta2, eps, alpha             float64
-	nesterov                             bool
+	nesterov, master                     bool
 }
 
 // LR sets the learning rate.
@@ -262,6 +267,36 @@ func Eps(eps float64) Option { return func(c *config) { c.eps = eps } }
 
 // Alpha sets RMSprop's smoothing constant.
 func Alpha(a float64) Option { return func(c *config) { c.alpha = a } }
+
+// MasterWeights keeps a float32 master copy of every BFloat16 and Float16
+// parameter in its state, named "master", and updates that: the rule runs
+// on the master copy with the gradient cast to float32, and the parameter
+// takes the result rounded to its dtype. Without it a half parameter is
+// updated in its own precision, where an update smaller than half the
+// spacing of its values is lost: in BFloat16 a step of less than 1/512 of
+// a weight leaves it unchanged. Float32 parameters are updated as usual.
+// The master copy is saved and restored with the rest of the state.
+func MasterWeights() Option { return func(c *config) { c.master = true } }
+
+// master returns rule applied to the float32 master copy of each half
+// parameter, kept in the parameter's state as "master".
+func master(rule Rule) Rule {
+	return func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+		if p.DType() == tensor.Float32 {
+			return rule(lr, step, p, g, s)
+		}
+		m, ok := s["master"]
+		if !ok {
+			m = p.Cast(tensor.Float32)
+		}
+		v, next := rule(lr, step, m, g.Cast(tensor.Float32), s)
+		if next == nil {
+			next = State{}
+		}
+		next["master"] = v
+		return v.Cast(p.DType()), next
+	}
+}
 
 func configure(opts []Option, c config) (config, error) {
 	for _, o := range opts {
@@ -291,7 +326,11 @@ func configure(opts []Option, c config) (config, error) {
 
 // build returns an optimizer for rule, or one whose Step reports err.
 func build(params []*tensor.Param, c config, err error, rule func(c config) Rule) *Optimizer {
-	o := New(params, c.lr, rule(c))
+	r := rule(c)
+	if c.master {
+		r = master(r)
+	}
+	o := New(params, c.lr, r)
 	if err != nil {
 		o.err = err
 	}
