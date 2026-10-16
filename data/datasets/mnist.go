@@ -1,4 +1,5 @@
-// Package datasets loads standard datasets as data.Datasets.
+// Package datasets loads standard datasets as data.Datasets, and streams
+// CSV shards too large for memory as a data.Source.
 package datasets
 
 import (

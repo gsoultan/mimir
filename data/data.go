@@ -9,6 +9,16 @@
 //		pred := model.Forward(batch.X)
 //		...
 //	}
+//
+// A training set larger than memory streams from a Source of shards, such
+// as the CSV files of datasets.CSVShards, through a Stream, which reads a
+// few shards ahead of the batches it yields and shuffles the shard order
+// and a buffer of examples every epoch, so resident memory stays flat
+// however many rows there are. Statistics reads the source once for the
+// per-feature mean and deviation that Normalize applies on the way:
+//
+//	stats, err := data.Statistics(ctx, src)
+//	trainSet, err := data.NewStream(src, data.BatchSize(4096), data.Shuffle(42), data.Normalize(stats))
 package data
 
 import (
@@ -42,6 +52,12 @@ type config struct {
 	shuffle  bool
 	seed     uint64
 	dropLast bool
+	// Stream and Statistics options; Tensors ignores them.
+	prefetch   int
+	shuffleBuf int
+	classes    bool
+	normalize  bool
+	stats      *Stats
 }
 
 // BatchSize sets the number of examples per batch. The default is 1.
