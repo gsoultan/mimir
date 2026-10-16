@@ -346,6 +346,9 @@ read.
 | Joining and windows | `Cat`, `Stack`, `Flatten`, `Unfold`, `SliceScatter` |
 | Scans | `CumSum`, `CumMax`, `LogCumSumExp`, `Scan` |
 | Attention | `ScaledDotProductAttention` (causal, masks, grouped-query) |
+| Sorting | `Sort`, `Argsort`, `TopK` (stable; NaN sorts last) |
+| Fourier | `FFT`, `IFFT`, `RFFT`, `IRFFT` (any length; complex numbers as a trailing axis of 2) |
+| Linear algebra | `Cholesky`, `TriangularSolve`, `Solve`, `Inv`, `Det`, `SlogDet`, `QR`, `SVD`, `Eigh` (batched, with gradients; on the CPU, so GPU tensors make a round trip) |
 | Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
 | Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
 | Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `FromBytes` over mapped files |
@@ -458,7 +461,7 @@ NVRTC on every change, which needs no GPU.
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
 | M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
-| M7 Full coverage | distributions and generative models, linear algebra, differentiable gradients, forward mode and vmap, ONNX import, ROCm |
+| M7 Full coverage | distributions and generative models, linear algebra, differentiable gradients, forward mode and vmap, ONNX import, ROCm (in progress: sorting, FFT and linear algebra done) |
 | M8 Multiple devices | data parallelism over NCCL, then tensor sharding modeled on `jax.sharding` |
 
 ## License
