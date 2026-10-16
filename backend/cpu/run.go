@@ -82,6 +82,9 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		return runFFT(ctx, b, k, out, ins[0])
 	case k.Op >= backend.OpCholesky && k.Op <= backend.OpEigh:
 		return runLinalg(ctx, b, k, out, ins)
+
+	case k.Op == backend.OpRandGamma || k.Op == backend.OpRandPoisson || k.Op == backend.OpGammaGrad:
+		return runSample(ctx, b, k, out, ins)
 	}
 	switch k.DType {
 	case backend.Float32:

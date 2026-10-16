@@ -248,6 +248,9 @@ func unaryRule(op backend.Op) (rule, bool) {
 			jvp: func(t, _ []*Tensor, y *Tensor) *Tensor { return byRecip(t[0], y) },
 		}, true
 	}
+	if op.IsSpecial() {
+		return specialRule(op), true
+	}
 	return rule{}, false
 }
 

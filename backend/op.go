@@ -163,6 +163,29 @@ const (
 	OpSVD             // A = U·diag(S)·Vh with k = min(m, n) singular values in descending order: U [B..., m, k], S [B..., k], Vh [B..., k, n]
 	OpEigh            // A = V·diag(W)·Vᵀ for a symmetric [B..., n, n], read from its lower triangle: W [B..., n] in ascending order, V [B..., n, n]
 
+	// Special functions, unary and elementwise like OpExp2, on float types
+	// only. Each is a pole or a limit where its mathematical function has
+	// one, as in torch.special.
+	OpLog1p    // log(1 + x)
+	OpExpm1    // e^x - 1
+	OpErf      // the error function
+	OpErfinv   // the inverse of the error function on [-1, 1]: ±Inf at ±1, NaN outside
+	OpLgamma   // log|Γ(x)|: +Inf at the non-positive integers
+	OpDigamma  // ψ(x), the derivative of log Γ(x): -Inf at +0, +Inf at -0, NaN at the negative integers
+	OpTrigamma // ψ'(x), the derivative of ψ: +Inf at the non-positive integers
+
+	// Samplers whose elements each draw as many Philox4x32-10 blocks as
+	// their rejection loop needs, keyed by Attrs.Seed: element i draws
+	// blocks (i, j, 0, word) for j = 0, 1 and so on, where word tells the
+	// ops apart. They map a Float32 parameter In[0] to Float32 samples of
+	// its shape.
+	OpRandGamma   // Gamma(In[0], 1) by Marsaglia and Tsang's method, with Gamma(α+1)·U^(1/α) for α < 1; at least the smallest normal float32
+	OpRandPoisson // Poisson(In[0]) by multiplication of uniforms below 10 and Hörmann's PTRS above
+	// OpGammaGrad is the derivative of a sample In[1] of Gamma(In[0], 1)
+	// with respect to In[0] that keeps its CDF fixed, the implicit
+	// reparameterization gradient: -(∂P(α, x)/∂α) / p(x; α).
+	OpGammaGrad
+
 	numOps
 )
 
@@ -256,6 +279,17 @@ var opNames = [numOps]string{
 	OpQR:              "qr",
 	OpSVD:             "svd",
 	OpEigh:            "eigh",
+
+	OpLog1p:       "log1p",
+	OpExpm1:       "expm1",
+	OpErf:         "erf",
+	OpErfinv:      "erfinv",
+	OpLgamma:      "lgamma",
+	OpDigamma:     "digamma",
+	OpTrigamma:    "trigamma",
+	OpRandGamma:   "rand_gamma",
+	OpRandPoisson: "rand_poisson",
+	OpGammaGrad:   "gamma_grad",
 }
 
 func (o Op) String() string {
@@ -266,7 +300,11 @@ func (o Op) String() string {
 }
 
 // IsUnary reports whether o takes one input and applies elementwise.
-func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast }
+func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast || o.IsSpecial() }
+
+// IsSpecial reports whether o is one of the special functions, unary ops
+// defined on float types only, from OpLog1p to OpTrigamma.
+func (o Op) IsSpecial() bool { return o >= OpLog1p && o <= OpTrigamma }
 
 // IsBinary reports whether o takes two same-shaped inputs elementwise.
 func (o Op) IsBinary() bool { return o >= OpAdd && o <= OpMod }
