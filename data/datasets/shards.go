@@ -210,7 +210,8 @@ func (r *csvRows) checkHeader(header []string) error {
 	return nil
 }
 
-// Read fills x and y with up to len(y) examples.
+// Read fills x and y with up to min(len(x)/features, len(y)) examples,
+// the lesser of the room in x and in y, as data.Rows says.
 func (r *csvRows) Read(x, y []float32) (int, error) {
 	f := r.src.Features()
 	room := min(len(x)/f, len(y))
