@@ -963,6 +963,15 @@ def torch_causal(T, q, k, offset=0):
     return T.ones(q.shape[-2], k.shape[-2], dtype=T.bool).tril(diagonal=offset)
 
 
+def torch_sdpa_math(T, q, k, v, attn_mask=None):
+    """F.scaled_dot_product_attention written out in differentiable ops, for
+    torch.func transforms: its fused CPU kernel has no forward-mode AD."""
+    s = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+    if attn_mask is not None:
+        s = s.masked_fill(~attn_mask, float("-inf"))
+    return T.softmax(s, dim=-1) @ v
+
+
 def np_rope(x, dim, base, offset, interleaved=False, scaling=None):
     half = dim // 2
     inv = base ** (-np.arange(half) * 2.0 / dim)
@@ -1349,8 +1358,8 @@ def transform_cases(rng):
          lambda T, x, w, y: F(T).cross_entropy(x @ w, y.long()))
     case("hvp_attention_causal", "hvp", [u(1, 2, 3, 4), u(1, 2, 5, 4), u(1, 2, 5, 3), u(1, 2, 3, 3)], [0, 1, 2],
          lambda q, k, v, w: (np_sdpa(q, k, v, causal=True, offset=2) * w).sum(),
-         lambda T, q, k, v, w: (F(T).scaled_dot_product_attention(
-             q, k, v, attn_mask=torch_causal(T, q, k, 2)) * w).sum())
+         lambda T, q, k, v, w: (torch_sdpa_math(
+             T, q, k, v, attn_mask=torch_causal(T, q, k, 2)) * w).sum())
     case("hvp_conv_pool", "hvp", [u(1, 2, 6, 6), u(3, 2, 3, 3), u(3), u(1, 3, 3, 3)], [0, 1, 2],
          lambda x, w, b, g: ((np_max_pool2d(np_conv2d(x, w, b, padding=1), 2) ** 2) * g).sum(),
          lambda T, x, w, b, g: ((F(T).max_pool2d(F(T).conv2d(x, w, b, padding=1), 2) ** 2) * g).sum())
@@ -1362,8 +1371,8 @@ def transform_cases(rng):
          lambda x, w, b: np.tanh(x @ w + b), lambda T, x, w, b: T.tanh(x @ w + b))
     case("jvp_attention_gqa", "jvp", [u(1, 4, 3, 4), u(1, 2, 5, 4), u(1, 2, 5, 4)], [0, 1, 2],
          lambda q, k, v: np_sdpa(q, k, v),
-         lambda T, q, k, v: F(T).scaled_dot_product_attention(
-             q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1)))
+         lambda T, q, k, v: torch_sdpa_math(
+             T, q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1)))
     case("jvp_softmax_cumsum", "jvp", [u(3, 4, lo=-2, hi=2)], [0],
          lambda x: np.cumsum(np_softmax(x, -1), axis=0), lambda T, x: T.cumsum(T.softmax(x, -1), dim=0))
     case("jvp_conv_avg_pool", "jvp", [u(1, 2, 5, 5), u(2, 2, 3, 3)], [0, 1],
