@@ -168,7 +168,9 @@ func SetDefaultDevice(d Device) Device {
 // allocates or computes anything, instead of running out of memory
 // midway. The budget counts the memory of computed tensors on d, held by
 // them or kept by the device for reuse, until they are garbage collected;
-// tensors uploaded with FromSlice are not counted. train.MemoryBudget
+// tensors uploaded with FromSlice are not counted, unless they reuse
+// memory the device kept, as the next batch after a donated one does (see
+// Donate). train.MemoryBudget
 // trains within a budget by splitting batches that do not fit.
 func SetMemoryBudget(d Device, bytes int64) { sched.SetBudget(d.backend(), bytes) }
 
@@ -214,7 +216,7 @@ func (t *Tensor) To(d Device) *Tensor {
 	ctx := context.Background()
 	size, _ := t.node.DType.Bytes(t.node.Size())
 	data := make([]byte, size)
-	if err := sched.Download(ctx, from, t.node, data); err != nil {
+	if err := sched.Download(ctx, from, t.node, data, lazy.values); err != nil {
 		return fail(err)
 	}
 	return record(upload(to, t.node.DType, data, t.node.Shape), toRule, t)
@@ -225,14 +227,5 @@ func upload(be backend.Backend, dt DType, data []byte, shape []int) *Tensor {
 	if defaultErr != nil {
 		return fail(defaultErr)
 	}
-	n, _ := backend.NumElements(shape)
-	buf, err := be.Alloc(dt, n)
-	if err != nil {
-		return fail(err)
-	}
-	if err := be.Upload(context.Background(), buf, data); err != nil {
-		be.Free(buf)
-		return fail(err)
-	}
-	return wrap(graph.Load(be, buf, shape))
+	return wrap(sched.Upload(context.Background(), be, dt, data, shape))
 }

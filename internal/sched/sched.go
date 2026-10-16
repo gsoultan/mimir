@@ -30,16 +30,17 @@ var mu sync.Mutex
 func Realize(ctx context.Context, be backend.Backend, targets ...*graph.Node) error {
 	mu.Lock()
 	defer mu.Unlock()
-	return realize(ctx, be, targets, nil)
+	return realize(ctx, be, targets, nil, nil)
 }
 
 // RealizeInto computes every target on be like Realize, but writes
 // targets[i] over the memory of dsts[i] where it can instead of into a new
-// buffer. A nil dsts[i] is ignored. A target goes into its destination's
-// memory when the destination is realized, with the target's dtype and
-// shape, into a buffer of its own, and when no kernel reads that memory
-// after the one that writes the target, which may itself read it
-// elementwise, as an optimizer's update reads the old value it replaces.
+// buffer. A nil dsts[i], or nil dsts, is ignored. A target goes into its
+// destination's memory when the destination is realized, with the
+// target's dtype and shape, into a buffer of its own, and when no kernel
+// reads that memory after the one that writes the target, which may
+// itself read it elementwise, as an optimizer's update reads the old
+// value it replaces.
 //
 // Either way each destination, and every node realized into the same
 // memory, is stale afterwards, unless its target shares that memory. Once
@@ -55,9 +56,11 @@ func Realize(ctx context.Context, be backend.Backend, targets ...*graph.Node) er
 // computed, is computed first, in a schedule of its own, so that the
 // targets are written over their destinations as if it had been computed
 // before. A node that fails to compute stays uncomputed, and is stale
-// once the destinations it reads are written over.
+// once the destinations it reads are written over. Nor does the schedule
+// take the memory of a donated node that a node keep lists reads (see
+// donate.go).
 func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
-	if len(dsts) != len(targets) {
+	if dsts != nil && len(dsts) != len(targets) {
 		return fmt.Errorf("sched: %d destinations for %d targets: %w", len(dsts), len(targets), backend.ErrInternal)
 	}
 	mu.Lock()
@@ -65,9 +68,11 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 	if keep != nil {
 		if k := endangered(keep(), targets, dsts); len(k) > 0 {
 			// The errors are their readers' to see, when they read them.
-			if realize(ctx, be, k, nil) != nil {
+			// They take no donated memory that the targets read.
+			read := func() []*graph.Node { return targets }
+			if realize(ctx, be, k, nil, read) != nil {
 				for _, n := range k {
-					_ = realize(ctx, be, []*graph.Node{n}, nil)
+					_ = realize(ctx, be, []*graph.Node{n}, nil, read)
 				}
 			}
 			// Those computed join the targets, which costs no kernels: one
@@ -81,7 +86,7 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 			}
 		}
 	}
-	return realize(ctx, be, targets, dsts)
+	return realize(ctx, be, targets, dsts, keep)
 }
 
 // A node's state says what it is computed from.
@@ -267,11 +272,12 @@ func Device(n *graph.Node) backend.Backend {
 
 // Download realizes n on be, unless it is realized, and copies its
 // elements into dst as row-major bytes. len(dst) must equal the tensor's
-// size in bytes.
-func Download(ctx context.Context, be backend.Backend, n *graph.Node, dst []byte) error {
+// size in bytes. keep, if not nil, lists nodes whose memory the schedule
+// must not take, as for RealizeInto.
+func Download(ctx context.Context, be backend.Backend, n *graph.Node, dst []byte, keep func() []*graph.Node) error {
 	mu.Lock()
 	defer mu.Unlock()
-	if err := realize(ctx, be, []*graph.Node{n}, nil); err != nil {
+	if err := realize(ctx, be, []*graph.Node{n}, nil, keep); err != nil {
 		return err
 	}
 	return download(ctx, n, dst)
@@ -304,13 +310,14 @@ type result struct {
 	mem  *graph.Storage
 }
 
-func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node) (err error) {
+func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) (err error) {
 	generation++
 	w := &walker0
 	defer w.forget()
 	if err := w.run(be, targets, dsts); err != nil {
 		return err
 	}
+	w.withhold(keep, targets)
 	if len(w.order) == 0 {
 		consume(targets, dsts)
 		return nil

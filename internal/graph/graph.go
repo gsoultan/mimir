@@ -17,6 +17,11 @@ import (
 // optimizer step.
 var ErrOverwritten = errors.New("tensor memory was overwritten")
 
+// ErrDonated reports a read of a realized node whose memory a schedule
+// took for its own after the node was donated to it. Errors that wrap it
+// wrap ErrOverwritten too.
+var ErrDonated = errors.New("tensor memory was donated")
+
 // Node is one primitive operation. Op, DType, Shape and Attrs never change
 // after construction. Mem, Ver, View and Inputs are owned by the scheduler:
 // once a node is realized it holds its result and drops its inputs, so a
@@ -40,6 +45,10 @@ type Node struct {
 	Mem  *Storage     // set once realized
 	Ver  int          // the version of Mem that holds the result
 	View backend.View // how Shape is read from Mem.Buf
+	// Donated marks a realized node whose memory its owner hands over:
+	// the next schedule that reads it may take that memory for its own
+	// results and temporaries.
+	Donated bool
 
 	// Mark is the scheduler's scratch space, which it uses under its lock
 	// while it walks a graph.
@@ -62,6 +71,13 @@ type Storage struct {
 	Dev     backend.Backend // the backend that owns Buf
 	Version int
 	Refs    int // the nodes realized into the storage since Version changed
+	// Pooled marks a buffer that the scheduler or an upload obtained
+	// from the backend, which a schedule may take over when it is
+	// donated, unlike memory a caller lent, such as a mapped file.
+	Pooled bool
+	// Donated is set once a schedule took Buf over, so that a read of a
+	// node realized into it reports ErrDonated.
+	Donated bool
 
 	Mark Mark // the scheduler's scratch space, like Node.Mark
 }
