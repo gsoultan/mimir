@@ -510,6 +510,7 @@ func Attention(t *testing.T) []Case {
 		{name: "bfloat16", batch: []int{1}, h: 2, hk: 2, q: 6, k: 6, d: 8, dv: 8, causal: true, dt: backend.BFloat16},
 		{name: "float16 masked", batch: []int{1}, h: 2, hk: 1, q: 6, k: 6, d: 8, dv: 8, mask: true, dt: backend.Float16},
 		{name: "head size 128", batch: []int{1}, h: 2, hk: 1, q: 20, k: 40, d: 128, dv: 128, causal: true, offset: 20},
+		{name: "odd head sizes", batch: []int{1}, h: 2, hk: 2, q: 33, k: 40, d: 24, dv: 12, causal: true},
 	} {
 		dt := c.dt
 		if dt == 0 {
