@@ -4,14 +4,17 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestone 5.** mimir trains neural networks on the CPU with
+> **Status: milestone 6.** mimir trains neural networks on the CPU with
 > SIMD matrix kernels, fused elementwise kernels and in-place updates, and
 > runs the same code on Apple GPUs through Metal and on NVIDIA GPUs through
 > CUDA: autograd, layers, losses, optimizers, data loading and a training
 > loop, each checked against PyTorch. It streams training sets larger than
 > memory from Parquet and CSV shards in flat memory, plans every
-> computation against a memory budget, and stores tensors in bfloat16 and
-> float16. The API may change between 0.x releases.
+> computation against a memory budget, stores tensors in bfloat16 and
+> float16, and replays repeated training steps from a cached schedule. It
+> has recurrent and transformer layers with fused attention, and runs
+> quantized Llama models from GGUF files. The API may change between 0.x
+> releases.
 
 ## Example
 
@@ -170,6 +173,19 @@ GPU to finish. The CI job `gpu` prints these numbers for every change, and
 the job `cuda` prints the same numbers for an NVIDIA T4 when the repository
 has Modal credentials (see Testing).
 
+A training step builds the same graph every time, so mimir compiles it once.
+The scheduler keys each schedule on the graph's structure (operations,
+shapes, dtypes, devices and which tensors are realized) and, when a step
+repeats, replays the planned kernels into the same buffers, passing changed
+constants and random seeds as kernel arguments, without building, sorting
+or planning anything or allocating. On CUDA the replayed kernels and cuBLAS
+calls run as one CUDA graph from the second step, updated in place when an
+argument changes (`MIMIR_CUDA_GRAPHS=0` launches them one by one instead),
+and on Metal they are encoded into one command buffer. On the GPUs,
+convolutions run as tiled implicit-GEMM kernels that read their windows
+from the image where they lie, for the forward pass and both gradients;
+the CPU multiplies unfolded windows with its GEMM microkernels.
+
 On an M5 Pro under macOS 26, the GPU's neural accelerators run float32
 products through Metal 4 tensor operations at 5,790 GFLOP/s for 2048 × 2048
 and 6,050 for 4096 × 4096, 3 to 11% faster than Metal Performance Shaders
@@ -226,6 +242,56 @@ copy of each half parameter for the optimizer to update, and
 `train.LossScale` or `train.DynamicLossScale` scale the loss so small
 gradients survive float16.
 
+## Sequences, transformers and LLMs
+
+`tensor.Scan` runs a step function over an axis, like `jax.lax.scan`, taking
+a view per step and stacking the outputs once, in either direction and
+optionally recomputing each step in `Backward`. `CumSum`, `CumMax` and
+`LogCumSumExp` are single kernels on every device. `nn.RNN`, `nn.LSTM` and
+`nn.GRU` follow PyTorch's layouts and options (layers, bidirectional,
+`BatchFirst`, dropout between layers) and match it to float32 precision;
+an LSTM step is one matrix product with the gate math fused into it.
+
+`tensor.ScaledDotProductAttention` computes attention in one fused kernel
+that never materializes the scores, forward and backward, as tiled
+FlashAttention on the CPU and generated kernels on Metal and CUDA, with
+causal, additive and boolean masks and grouped-query attention. On four CPU
+cores it trains at the speed of PyTorch's attention at sequence length 1024
+and 5 to 15 times faster than composing it from products and a softmax.
+`nn` builds transformers from it: `MultiheadAttention`, `SelfAttention`
+with fused QKV and rotary embeddings (`RotaryEmbedding`, with Llama 3
+scaling), `RMSNorm`, `MLP`, `GatedMLP`, `KVCache` for decoding, the
+`DecoderBlock`s of `NewGPT2Block` and `NewLlamaBlock`, and
+`TransformerEncoderLayer`.
+
+`gguf.Open` maps a GGUF file and `File.Load` returns its tensors, including
+the block-quantized `tensor.Q8_0`, `Q4_K` and `Q6_K`. A quantized weight
+stays quantized: `MatMulT`, and so `nn.Linear` and `nn.Embedding`, multiply
+by it as llama.cpp does, rounding activations to int8 and summing in
+integers with AVX2 or NEON dot-product kernels, and GPUs dequantize it in
+the kernel. Quantized weights are for inference and have no gradient. A
+one-row product by a Q4_K weight takes 0.7 to 0.9 times llama.cpp's time on
+the same CPU.
+
+`examples/gpt2` trains a byte-level GPT-2 from scratch on a text file, with
+warmup and cosine decay, gradient clipping and bfloat16 on a GPU, and
+samples from it with the KV cache:
+
+```sh
+curl -o input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+go run ./examples/gpt2 -data input.txt -model small -steps 2000 -checkpoint gpt2.safetensors
+go run ./examples/gpt2 -generate -checkpoint gpt2.safetensors -prompt "ROMEO:" -temperature 0.8 -topk 40
+```
+
+`examples/llama` runs Llama-architecture GGUF models (Llama 2 and 3,
+TinyLlama, SmolLM) in their own quantization, with the file's SentencePiece
+or BPE tokenizer, a batched prompt pass and greedy, temperature, top-k or
+top-p decoding:
+
+```sh
+go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.gguf -prompt "The capital of France is" -n 64 -temperature 0
+```
+
 ## Requirements
 
 Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
@@ -250,7 +316,9 @@ read.
   random numbers are reproducible across devices (counter-based Philox).
 - **Small core.** About 30 primitive operations. Everything else, including
   softmax, GELU and variance, is composed from them, so a new backend only has
-  to implement the primitives.
+  to implement the primitives. A few fused operations, such as attention,
+  scans and quantized products, have their own kernels because composing
+  them would be much slower.
 
 ## Non-goals
 
@@ -270,19 +338,24 @@ read.
 | Activations | `ReLU`, `Sigmoid`, `Tanh`, `GELU` (tanh approximation), `SiLU`, `Softmax`, `LogSoftmax` |
 | Reductions | `Sum`, `Max`, `Min`, `Mean`, `Var` |
 | Shape | `Reshape`, `Permute`, `Transpose`, `Expand`, `Pad`, `Shrink`, `Flip`, `Unsqueeze`, `Squeeze` |
-| Linear algebra | `MatMul` with NumPy semantics and batch broadcasting |
+| Linear algebra | `MatMul` with NumPy semantics and batch broadcasting, `MatMulT` (also by quantized weights) |
 | Indexing | `Gather`, `ScatterAdd`, `Argmax` |
-| Joining and windows | `Cat`, `Stack`, `Flatten`, `Unfold` |
+| Joining and windows | `Cat`, `Stack`, `Flatten`, `Unfold`, `SliceScatter` |
+| Scans | `CumSum`, `CumMax`, `LogCumSumExp`, `Scan` |
+| Attention | `ScaledDotProductAttention` (causal, masks, grouped-query) |
 | Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
 | Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
 | Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `FromBytes` over mapped files |
-| Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `Flatten`, `Cast` |
+| Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `Flatten`, `Cast` |
+| Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
 | Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `MSE`, `L1`, `Huber` |
 | Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
+| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`; `Accuracy` |
 
-Element types are `float32`, `int32`, `bfloat16` and `float16`. Broadcasting follows NumPy.
+Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
+block-quantized `Q8_0`, `Q4_K` and `Q6_K` for weights. Broadcasting follows NumPy.
 Modules are plain structs: `nn.Parameters` finds every `*tensor.Param` a model
 holds, in exported or unexported fields, so custom layers need no
 registration.
@@ -305,16 +378,23 @@ backend/cuda/        CUDA backend: driver API, NVRTC and cuBLAS, through purego
 backend/internal/gen/        generates the kernels, in Metal Shading Language or CUDA C++
 backend/internal/kerneltest/ kernel cases for every device, and a CPU emulator for both dialects
 internal/graph/      lazy IR with shape and dtype checks
-internal/sched/      runs graphs: views, buffer reuse, freeing
+internal/sched/      runs graphs: views, buffer reuse, freeing, the schedule cache
+internal/filemap/    read-only file mappings
 internal/goldentest/ golden-file loading and comparison
+internal/quanttest/  reference quantization for tests
 io/safetensors/      safetensors reader, writer and file mapping
 io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
+io/gguf/             GGUF reader and writer
 examples/mnist/      trains an MLP or CNN on MNIST
+examples/gpt2/       trains a GPT-2 on a text file and samples from it
+examples/llama/      runs Llama-architecture GGUF models
 testdata/golden/     expected results from PyTorch or NumPy
+tools/asmgen/        generates the CPU assembly kernels with avo
 tools/devices/       lists the devices mimir can use
 tools/bench/         PyTorch and NumPy counterparts of the benchmarks
 tools/golden/        golden-file generator (Python, development only)
 tools/parquet/       Parquet test-file generator (Python, development only)
+tools/gguf/          GGUF test-file generators (Python, development only)
 ```
 
 ## Testing
@@ -326,6 +406,7 @@ MIMIR_DEVICE=gpu go test ./...   # on a Mac or an NVIDIA machine: every test on 
 MIMIR_EMULATE=1 go test -timeout=60m -run Kernels ./backend/...   # the GPU kernels on the CPU, with clang++
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
+go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/gguf
 MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train   # the billion-row run
 ```
 
@@ -336,7 +417,8 @@ tools/parquet/gen.py` writes them again.
 
 `testdata/golden/` holds inputs and expected results: every operation's
 output, the gradients of operations and layers, every layer and loss, and
-optimizer steps and learning-rate schedules. The committed files were computed
+optimizer steps and learning-rate schedules, scans, recurrent and
+transformer layers, and quantized weights. The committed files were computed
 with NumPy in float64, with gradients by central differences. CI regenerates
 them with PyTorch, using autograd in float64 for gradients, and runs the same
 tests against them:
@@ -369,10 +451,12 @@ NVRTC on every change, which needs no GPU.
 | M2 Train MNIST | autograd, `nn` layers, losses, optimizers, data loading, `Fit`; first release v0.1.0 (done) |
 | M3 Fast on CPU | SIMD GEMM microkernels with fused epilogues, fused elementwise kernels, convolution as GEMM, in-place optimizer updates with no allocations per step (done) |
 | M4 Same code on GPU | Metal backend without cgo, unified memory, MPS matrix products, fused kernels, automatic device choice with CPU fallback and Metal 4 tensor operations on M5 GPUs (done) |
-| M4b CUDA | CUDA driver, NVRTC and cuBLAS through purego, stream-ordered memory pool, on-disk kernel cache, conformance tests on a Modal T4 (done; convolution runs through unfold and GEMM, not cuDNN) |
+| M4b CUDA | CUDA driver, NVRTC and cuBLAS through purego, stream-ordered memory pool, on-disk kernel cache, conformance tests on a Modal T4 (done) |
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
-| M6 Transformers and LLMs | attention and KV cache, RNN, LSTM and GRU, GGUF quantized matmul |
-| M7 Full coverage | distributions, linear algebra, function transforms, ONNX import |
+| M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
+| M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
+| M7 Full coverage | distributions and generative models, linear algebra, differentiable gradients, forward mode and vmap, ONNX import, ROCm |
+| M8 Multiple devices | data parallelism over NCCL, then tensor sharding modeled on `jax.sharding` |
 
 ## License
 
