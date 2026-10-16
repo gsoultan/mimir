@@ -27,7 +27,9 @@ import (
 // A transpose of a product that nothing else reads is computed as the
 // product of the transposed operands, (AB)ᵀ = BᵀAᵀ, so it is written in
 // the order it is read. Linear layers multiply by transposed weights, and
-// the weight gradients come out transposed back.
+// the weight gradients come out transposed back. So does a transpose of
+// a product summed over batch axes, through reshapes that drop the
+// summed axes: the gradient of a weight that a batch of inputs shares.
 //
 // A sum over batch axes of a product that nothing else reads runs as one
 // matmul kernel that adds the products of each output as it computes
@@ -62,7 +64,7 @@ type work struct {
 	prog   []backend.Instr // a fused program, or gemm's epilogue
 	gemm   *graph.Node     // a product its kernel computes, which prog, if any, reads as input 0
 	stores []store         // the targets prog also writes
-	swap   bool            // a transposed product, computed from deps transposed
+	swap   bool            // a transposed product, computed from deps transposed; of gemm if set, a summed product
 	src    []*graph.Node   // the node each instruction of prog computes
 	conv   *conv           // a convolution kernel that computes the product or fold
 }
@@ -99,6 +101,22 @@ func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, bac
 	}
 	if w.swap {
 		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
+		if w.gemm != nil {
+			// Summed over the batch axes of the product, whose last two
+			// axes the transpose swaps.
+			r := len(w.gemm.Shape)
+			axes := make([]int, r)
+			for i := range axes {
+				axes[i] = i
+			}
+			axes[r-2], axes[r-1] = r-1, r-2
+			shape := slices.Clone(w.gemm.Shape)
+			shape[r-2], shape[r-1] = shape[r-1], shape[r-2]
+			k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: shape, In: []backend.View{
+				views[0].Permute(axes), views[1].Permute(axes),
+			}, Attrs: backend.Attrs{Axes: w.gemm.Attrs.Axes}}
+			return k, backend.View{}, nil
+		}
 		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
 			views[0].Permute(n.Attrs.Axes), views[1].Permute(n.Attrs.Axes),
 		}}
@@ -246,6 +264,10 @@ func newPlan(be backend.Backend, order []*graph.Node, isTarget map[*graph.Node]b
 		case transposes(n) && n.Inputs[0].Op == backend.OpMatMul && private(n.Inputs[0]):
 			mm := n.Inputs[0]
 			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true}
+		case transposedSum(n, private) != nil:
+			sum := transposedSum(n, private)
+			mm := sum.Inputs[0]
+			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true, gemm: sum}
 		case n.Op.IsElementwise():
 			prog, nodes, ins := fuse(n, member)
 			w := &work{deps: ins, prog: prog, src: nodes}
@@ -382,6 +404,32 @@ func transposes(n *graph.Node) bool {
 		}
 	}
 	return true
+}
+
+// transposedSum returns the summed product whose transpose n is, if n
+// swaps the last two axes of a private summed product, directly or
+// through private reshapes that only add or drop leading axes of one
+// element, and nil otherwise.
+func transposedSum(n *graph.Node, private func(*graph.Node) bool) *graph.Node {
+	if !transposes(n) {
+		return nil
+	}
+	x := n.Inputs[0]
+	for x.Op == backend.OpReshape && private(x) && slices.Equal(trimOnes(x.Shape), trimOnes(x.Inputs[0].Shape)) {
+		x = x.Inputs[0]
+	}
+	if !summedProduct(x, private) || !private(x) {
+		return nil
+	}
+	return x
+}
+
+// trimOnes returns shape without its leading axes of one element.
+func trimOnes(shape []int) []int {
+	for len(shape) > 0 && shape[0] == 1 {
+		shape = shape[1:]
+	}
+	return shape
 }
 
 // summedProduct reports whether n sums a private matmul over batch axes

@@ -492,6 +492,38 @@ func TestTransposedProductsAreComputedTransposed(t *testing.T) {
 	}
 }
 
+func TestTransposedSummedProductsAreComputedTransposed(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	// The gradient of a weight shared by a batch: Σ xᵀ·dy over the batch,
+	// reshaped to the weight's rank and transposed to its layout.
+	x := realized(t, be, []int{3, 5, 6}, 1)
+	dy := realized(t, be, []int{3, 5, 4}, 2)
+	sum := func() *graph.Node {
+		return must(graph.Reduce(backend.OpReduceSum, must(graph.MatMul(must(graph.Permute(x, []int{0, 2, 1})), dy)), []int{0}))
+	}
+	untransposed := floats(t, be, sum())
+	want := make([]float32, 24)
+	for i := range 6 {
+		for j := range 4 {
+			want[j*6+i] = untransposed[i*4+j]
+		}
+	}
+	g := must(graph.Permute(must(graph.Reshape(sum(), []int{6, 4})), []int{1, 0}))
+	be.ops = nil
+	if err := Realize(t.Context(), be, g); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpMatMul}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	if v := g.View; !v.IsContiguous() || v.Offset != 0 {
+		t.Errorf("result view %+v, want contiguous", v)
+	}
+	if got := floats(t, be, g); !slices.Equal(got, want) {
+		t.Errorf("transposed sum %v, want %v", got, want)
+	}
+}
+
 // floats downloads n's elements.
 func floats(t *testing.T, be backend.Backend, n *graph.Node) []float32 {
 	t.Helper()
