@@ -326,7 +326,7 @@ func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer,
 		if err != nil {
 			return Epoch{}, err
 		}
-		v, skipped, err := l.step(ctx, model, opt, b.X.To(l.dev), b.Y.To(l.dev))
+		v, skipped, err := l.step(ctx, model, opt, l.batch(b.X), l.batch(b.Y))
 		if err != nil {
 			return Epoch{}, err
 		}
@@ -348,6 +348,20 @@ func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer,
 		Steps:    opt.Steps(),
 		Duration: time.Since(began),
 	}, nil
+}
+
+// batch returns t on the device the model is on. A copy that To makes
+// is the loop's own, read by the one schedule of a whole batch's step,
+// so it is donated to that schedule (see tensor.Tensor.Donate), which
+// may compute into its memory, and the next batch's copy reuses it. A
+// batch split into chunks is read by a schedule per chunk, and one that
+// is already on the device is the dataset's, so neither is donated.
+func (l *loop) batch(t *tensor.Tensor) *tensor.Tensor {
+	moved := t.To(l.dev)
+	if moved == t || l.chunk != 0 || l.c.budget != 0 {
+		return moved
+	}
+	return moved.Donate()
 }
 
 // step trains on one batch: the loss and gradients of each chunk, then

@@ -158,8 +158,10 @@ func (t *Trainer) Step(ctx context.Context) (lossv, norm float64, skipped bool, 
 		}
 	}()
 	t.Opt.SetLR(t.Cfg.LRAt(t.Opt.Steps()))
+	// The batch is read by Backward alone, so its memory is donated to
+	// it: the next batch is uploaded into the same buffers.
 	x, y := t.batch(t.train, t.rng)
-	l := t.lossOf(x, y)
+	l := t.lossOf(x.Donate(), y.Donate())
 	if t.scale != 0 {
 		l = l.Mul(tensor.Scalar(float32(t.scale)))
 	}
