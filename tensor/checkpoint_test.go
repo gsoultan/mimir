@@ -371,6 +371,54 @@ func TestCheckpointBackwardsOnManyGoroutinesTakeTurns(t *testing.T) {
 	}
 }
 
+func TestCheckpointFailsOnAParameterChangedBeforeBackward(t *testing.T) {
+	ctx := t.Context()
+	f := func(w *tensor.Param) func(in ...*tensor.Tensor) *tensor.Tensor {
+		return func(in ...*tensor.Tensor) *tensor.Tensor { return in[0].Mul(w.Value()) }
+	}
+	for _, tc := range []struct {
+		name string
+		loss func(w *tensor.Param, x *tensor.Tensor) *tensor.Tensor
+	}{
+		{"plain", func(w *tensor.Param, x *tensor.Tensor) *tensor.Tensor { return f(w)(x).Sum() }},
+		{"checkpointed", func(w *tensor.Param, x *tensor.Tensor) *tensor.Tensor {
+			return tensor.Checkpoint(f(w), x).Sum()
+		}},
+		{"nested", func(w *tensor.Param, x *tensor.Tensor) *tensor.Tensor {
+			// The outer recompute calls the inner Checkpoint again, after
+			// the change: the outer checkpoint holds what the inner one
+			// read in the forward pass.
+			return tensor.Checkpoint(func(in ...*tensor.Tensor) *tensor.Tensor {
+				return tensor.Checkpoint(f(w), in[0])
+			}, x).Sum()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tensor.NewParam(tensor.FromSlice([]float32{1, 2, 3}))
+			x := tensor.FromSlice([]float32{4, 5, 6}).RequiresGrad()
+			l := tc.loss(w, x)
+			if _, err := l.Item[float32](ctx); err != nil {
+				t.Fatal(err)
+			}
+			// An optimizer step: the new value written over the old one.
+			cur := w.Value().Detach()
+			next := cur.Mul(tensor.Scalar[float32](0.5))
+			if err := tensor.RealizeInto(ctx, []*tensor.Tensor{cur}, []*tensor.Tensor{next}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Set(next); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Backward(ctx); !errors.Is(err, tensor.ErrOverwritten) {
+				t.Errorf("Backward after the step: %v, want ErrOverwritten", err)
+			}
+			if w.Grad() != nil || x.Grad() != nil {
+				t.Error("a failed Backward changed a gradient")
+			}
+		})
+	}
+}
+
 // peakMeter is a backend that records the most memory its buffers held
 // at once. Buffers go back to the scheduler's pool, not to the backend,
 // so what the backend has allocated and not freed is the most the pool

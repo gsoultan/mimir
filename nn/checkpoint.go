@@ -22,11 +22,13 @@ import (
 //		nn.NewLayerNorm(512),
 //	)
 //
-// The recompute runs m's forward pass a second time, so a layer whose
-// forward pass changes state it reads first gets that state back: the
-// buffers of m, such as running statistics, take the values they had
-// before the forward pass, and Dropout layers draw the mask they drew.
-// The running statistics are then updated once, as without Checkpoint.
+// The recompute runs m's forward pass a second time, and a layer's
+// forward pass changes state it reads first: the buffers of m, such as
+// running statistics, and the masks its Dropout layers are up to. Each
+// forward pass changes that state once, in the order the passes ran, as
+// without Checkpoint, however many passes run before Backward: the
+// recompute of a pass runs from the state the pass started from, so it
+// draws the masks the pass drew, and then puts back the state it found.
 func Checkpoint(m Module) Module {
 	c := &checkpointed{Inner: m}
 	c.training.Store(true)
@@ -44,49 +46,83 @@ type checkpointed struct {
 func (c *checkpointed) SetTraining(on bool) { c.training.Store(on) }
 
 // Forward applies Inner to x.
+//
+// The function given to tensor.Checkpoint is called first for the forward
+// pass, whose changes to the state of Inner stand and whose effects the
+// result carries. Every later call is a recompute, which must leave the
+// state of Inner exactly as it found it: it runs from the state the
+// forward pass started from, then restores the state it found, so its own
+// changes, like its effects, are dropped.
 func (c *checkpointed) Forward(x *tensor.Tensor) *tensor.Tensor {
 	if !c.training.Load() {
 		return c.Inner.Forward(x)
 	}
-	restore := snapshot(c.Inner)
+	var before *moduleState // the state the forward pass started from
 	return tensor.Checkpoint(func(in ...*tensor.Tensor) *tensor.Tensor {
-		if err := restore(); err != nil {
-			return tensor.Failed(err)
+		if before == nil {
+			before = stateOf(c.Inner)
+			return c.Inner.Forward(in[0])
 		}
-		return c.Inner.Forward(in[0])
+		return replay(c.Inner, before, in[0])
 	}, x)
 }
 
-// snapshot records the state that a forward pass of m changes and reads:
-// the values of its buffers and the masks its dropout layers are up to.
-// The returned function puts that state back, so that a forward pass run
-// after it does what one run now would.
-func snapshot(m Module) (restore func() error) {
-	var buffers []*tensor.Param
-	var values []*tensor.Tensor
-	var dropouts []*Dropout
-	var calls []uint64
+// replay runs m's forward pass on x from the state from and returns its
+// result, leaving m in the state it found it in.
+func replay(m Module, from *moduleState, x *tensor.Tensor) *tensor.Tensor {
+	found := stateOf(m)
+	err := from.restore()
+	var y *tensor.Tensor
+	if err == nil {
+		y = m.Forward(x)
+	}
+	if rerr := found.restore(); err == nil {
+		err = rerr
+	}
+	if err != nil {
+		return tensor.Failed(err)
+	}
+	return y
+}
+
+// moduleState is the state that a forward pass of a module reads and
+// changes: the values of its buffers and the masks its dropout layers are
+// up to.
+type moduleState struct {
+	buffers  []*tensor.Param
+	values   []*tensor.Tensor
+	dropouts []*Dropout
+	calls    []uint64
+}
+
+// stateOf records the state of m now.
+func stateOf(m Module) *moduleState {
+	s := &moduleState{}
 	w := walker{seen: map[unsafe.Pointer]bool{}}
 	w.visit(reflect.ValueOf(m), "", func(_ string, v reflect.Value) bool {
 		switch x := v.Interface().(type) {
 		case *tensor.Param:
 			if !x.Trainable() {
-				buffers, values = append(buffers, x), append(values, x.Value())
+				s.buffers, s.values = append(s.buffers, x), append(s.values, x.Value())
 			}
 		case *Dropout:
-			dropouts, calls = append(dropouts, x), append(calls, x.calls.Load())
+			s.dropouts, s.calls = append(s.dropouts, x), append(s.calls, x.calls.Load())
 		}
 		return true
 	})
-	return func() error {
-		for i, p := range buffers {
-			if err := p.Set(values[i]); err != nil {
-				return err
-			}
+	return s
+}
+
+// restore puts the state s recorded back, so that a forward pass run after
+// it does what one run when s was recorded would.
+func (s *moduleState) restore() error {
+	for i, p := range s.buffers {
+		if err := p.Set(s.values[i]); err != nil {
+			return err
 		}
-		for i, d := range dropouts {
-			d.calls.Store(calls[i])
-		}
-		return nil
 	}
+	for i, d := range s.dropouts {
+		d.calls.Store(s.calls[i])
+	}
+	return nil
 }

@@ -135,3 +135,64 @@ func TestCheckpointFollowsTrainEvalAndTo(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckpointKeepsTheStateOfEveryForwardPassBeforeBackward(t *testing.T) {
+	ctx := t.Context()
+	x1 := tensor.FromSlice([]float32{1, 10, 3, 30}, 2, 2) // channel means 2 and 20
+	x2 := tensor.FromSlice([]float32{5, 50, 7, 70}, 2, 2) // channel means 6 and 60
+	plain := nn.NewBatchNorm1d(2)
+	bn := nn.NewBatchNorm1d(2)
+	model := nn.Checkpoint(bn)
+	// Two forward passes, then one Backward, which recomputes the second
+	// pass first and the first one last.
+	for _, m := range []nn.Module{plain, model} {
+		if err := m.Forward(x1).Sum().Add(m.Forward(x2).Sum()).Backward(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Momentum 0.1: 0.9 * (0.1 * [2 20]) + 0.1 * [6 60].
+	want := data(t, plain.RunningMean.Value())
+	if abs(want[0]-0.78) > 1e-6 || abs(want[1]-7.8) > 1e-5 {
+		t.Fatalf("plain running mean = %v, want [0.78 7.8]", want)
+	}
+	if got := data(t, bn.RunningMean.Value()); !slices.Equal(got, want) {
+		t.Errorf("running mean = %v, want %v", got, want)
+	}
+	if got, want := data(t, bn.RunningVar.Value()), data(t, plain.RunningVar.Value()); !slices.Equal(got, want) {
+		t.Errorf("running variance = %v, want %v", got, want)
+	}
+}
+
+func TestCheckpointDrawsTheMasksOfThePlainModuleAcrossSteps(t *testing.T) {
+	ctx := t.Context()
+	newDropBlock := func() nn.Module {
+		nn.ManualSeed(11)
+		return nn.NewSequential(nn.NewLinear(8, 8), nn.NewDropout(0.5))
+	}
+	plain, inner := newDropBlock(), newDropBlock()
+	model := nn.Checkpoint(inner)
+	x := tensor.Randn(5, 4, 8)
+	// The block runs twice in one graph, so each step draws two masks,
+	// and the next step must draw the two after them.
+	for step := range 2 {
+		wantOut, gotOut := plain.Forward(plain.Forward(x)), model.Forward(model.Forward(x))
+		if err := wantOut.Sum().Backward(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := gotOut.Sum().Backward(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := data(t, gotOut), data(t, wantOut); !slices.Equal(got, want) {
+			t.Errorf("step %d: output %v\nwant %v", step, got, want)
+		}
+		_, want := namedParams(plain)
+		names, got := namedParams(inner)
+		for i, p := range want {
+			if gv, wv := data(t, got[i].Grad()), data(t, p.Grad()); !slices.Equal(gv, wv) {
+				t.Errorf("step %d: %s gradient %v\nwant %v", step, names[i], gv, wv)
+			}
+			p.ZeroGrad()
+			got[i].ZeroGrad()
+		}
+	}
+}
