@@ -202,9 +202,24 @@ func TestCSV(t *testing.T) {
 		"no target":   "a,b\n1,2\n",
 		"not numeric": "a,y\nx,1\n",
 		"no rows":     "a,y\n",
+		"NaN":         "a,y\n1,2\nnan,1\n",
+		"Inf":         "a,y\n1,2\n3,4\n-Infinity,1\n",
+		"Inf target":  "a,y\n1,2\n3,inf\n",
+		"too large":   "a,y\n1e39,1\n",
 	} {
 		if _, err := CSV(strings.NewReader(bad), "y"); !errors.Is(err, ErrFormat) {
 			t.Errorf("%s: %v, want ErrFormat", name, err)
 		}
+	}
+	// The line and column of a value that is not finite.
+	if _, err := CSV(strings.NewReader("a,y\n1,2\n3,4\n-Infinity,1\n"), "y"); err == nil || !strings.Contains(err.Error(), `line 4 column "a"`) || !strings.Contains(err.Error(), "finite") {
+		t.Errorf("Inf feature: %v", err)
+	}
+	if _, err := CSV(strings.NewReader("a,y\n1,2\n3,NaN\n"), "y"); err == nil || !strings.Contains(err.Error(), `line 3 column "y"`) {
+		t.Errorf("NaN target: %v", err)
+	}
+	// As class labels, such strings are labels like any other.
+	if tab, err := CSV(strings.NewReader("a,y\n1,nan\n2,inf\n"), "y", Classes()); err != nil || !slices.Equal(tab.Classes, []string{"inf", "nan"}) {
+		t.Errorf("labels nan and inf: %v", err)
 	}
 }

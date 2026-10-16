@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"strconv"
 
@@ -63,7 +64,8 @@ func classIndex(names []string) (map[string]int32, error) {
 
 // CSV reads a CSV table with a header row. The column named target becomes
 // Y and every other column, which must be numeric, becomes a Float32
-// feature in X [N, F].
+// feature in X [N, F]. A value that is not finite, such as "NaN" or
+// "Inf", is an error, as a numeric target's is.
 func CSV(r io.Reader, target string, opts ...CSVOption) (*Table, error) {
 	var cfg csvConfig
 	for _, o := range opts {
@@ -100,6 +102,9 @@ func CSV(r io.Reader, target string, opts ...CSVOption) (*Table, error) {
 			if err != nil {
 				return nil, fmt.Errorf("datasets: csv line %d column %q: %q is not a number: %w", line, header[i], field, ErrFormat)
 			}
+			if !finite(v) {
+				return nil, fmt.Errorf("datasets: csv line %d column %q: %q is not a finite number: %w", line, header[i], field, ErrFormat)
+			}
 			x = append(x, float32(v))
 		}
 	}
@@ -109,7 +114,13 @@ func CSV(r io.Reader, target string, opts ...CSVOption) (*Table, error) {
 	}
 	t := &Table{Features: features}
 	var y *tensor.Tensor
-	if nums, ok := parseFloats(labels); ok && !cfg.classes {
+	nums, ok := parseFloats(labels)
+	if ok && !cfg.classes {
+		for i, v := range nums {
+			if !finite(float64(v)) {
+				return nil, fmt.Errorf("datasets: csv line %d column %q: %q is not a finite number (Classes reads the column as class labels): %w", i+2, target, labels[i], ErrFormat)
+			}
+		}
 		y = tensor.FromSlice(nums)
 	} else if cfg.names != nil {
 		index, err := classIndex(cfg.names)
@@ -140,6 +151,9 @@ func CSV(r io.Reader, target string, opts ...CSVOption) (*Table, error) {
 	}
 	return t, nil
 }
+
+// finite reports whether v is a number other than an infinity.
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 func parseFloats(s []string) ([]float32, bool) {
 	out := make([]float32, len(s))
