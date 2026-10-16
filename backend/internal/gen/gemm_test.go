@@ -2,6 +2,7 @@ package gen_test
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"testing"
 
@@ -44,7 +45,7 @@ func TestGEMMReadsTheOperandsElements(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"contiguous/contiguous", "transposed/transposed", "padded/contiguous", "contiguous/broadcast"} {
+	for _, want := range []string{"contiguous/contiguous", "transposed/transposed", "padded/contiguous", "contiguous/broadcast", "broadcast/contiguous"} {
 		if !planned[want] {
 			t.Errorf("no product of %s operands planned", want)
 		}
@@ -66,7 +67,11 @@ func checkGEMM(t *testing.T, name string, g gen.GEMM, batch []int, vx, vy backen
 		gen.Matrix
 		len int
 	}{{g.A, nx}, {g.B, ny}} {
-		if hi := mat.Offset + g.Batch*mat.Stride; hi > mat.len || mat.Cols > mat.LD {
+		hi := mat.Offset + g.Batch*mat.Stride
+		if mat.Stride == 0 {
+			hi = mat.Offset + mat.Rows*mat.LD
+		}
+		if hi > mat.len || mat.Cols > mat.LD {
 			t.Fatalf("%s: matrix %+v outside a buffer of %d", name, mat.Matrix, mat.len)
 		}
 	}
@@ -112,12 +117,61 @@ func TestGEMMLeavesOtherProductsToTheKernel(t *testing.T) {
 			In: []backend.View{backend.Contiguous([]int{4, 2, 3}), backend.Contiguous([]int{4, 3, 2})}},
 		"empty": {Op: backend.OpMatMul, DType: f, Shape: []int{2, 2},
 			In: []backend.View{backend.Contiguous([]int{2, 0}), backend.Contiguous([]int{0, 2})}},
-		"broadcast left": {Op: backend.OpMatMul, DType: f, Shape: []int{4, 2, 2},
-			In: []backend.View{backend.Contiguous([]int{1, 2, 3}).Expand([]int{4, 2, 3}), backend.Contiguous([]int{4, 3, 2})}},
+		"both broadcast": {Op: backend.OpMatMul, DType: f, Shape: []int{4, 2, 2},
+			In: []backend.View{backend.Contiguous([]int{1, 2, 3}).Expand([]int{4, 2, 3}), backend.Contiguous([]int{1, 3, 2}).Expand([]int{4, 3, 2})}},
 	} {
 		lens := []int{1 << 10, 1 << 10}
 		if _, ok := gen.PlanGEMM(k, lens); ok {
 			t.Errorf("%s: planned", name)
+		}
+	}
+}
+
+// TestGEMMFoldsSumsIntoTheInnerDimension checks that a product summed over
+// batch axes laid out outside the inner dimension, as a layer's weight
+// gradient over a batch of sequences reads its operands, is planned as
+// one product with a longer inner dimension that computes the sum.
+func TestGEMMFoldsSumsIntoTheInnerDimension(t *testing.T) {
+	f := backend.Float32
+	rng := rand.New(rand.NewPCG(5, 6))
+	for _, c := range []struct {
+		name    string
+		x, y    backend.View
+		shape   []int
+		axes    []int
+		k, rows int // the folded inner dimension, and the rows of one product
+	}{
+		// [B, T, F]ᵀ · [B, T, O] summed over B.
+		{"weight gradient", backend.Contiguous([]int{3, 5, 4}).Permute([]int{0, 2, 1}), backend.Contiguous([]int{3, 5, 2}),
+			[]int{1, 4, 2}, []int{0}, 15, 4},
+		// Two summed axes, and a batch axis kept.
+		{"two sums", backend.Contiguous([]int{2, 3, 5, 4}).Permute([]int{0, 1, 3, 2}), backend.Contiguous([]int{2, 3, 5, 2}),
+			[]int{1, 1, 4, 2}, []int{0, 1}, 30, 4},
+		{"kept batch", backend.Contiguous([]int{2, 3, 5, 4}).Permute([]int{0, 1, 3, 2}), backend.Contiguous([]int{2, 3, 5, 2}),
+			[]int{2, 1, 4, 2}, []int{1}, 15, 4},
+	} {
+		k := &backend.Kernel{Op: backend.OpMatMul, DType: f, Shape: c.shape, In: []backend.View{c.x, c.y}, Attrs: backend.Attrs{Axes: c.axes}}
+		nx, _ := backend.NumElements(c.x.Shape)
+		ny, _ := backend.NumElements(c.y.Shape)
+		g, ok := gen.PlanGEMM(k, []int{nx, ny})
+		if !ok {
+			t.Errorf("%s: not planned", c.name)
+			continue
+		}
+		if g.K != c.k || g.M != c.rows {
+			t.Errorf("%s: planned %d × [%d, %d, %d], want an inner dimension of %d", c.name, g.Batch, g.M, g.K, g.N, c.k)
+		}
+		x, y := kerneltest.HostBuffer(t, rng, f, nx, -5, 5), kerneltest.HostBuffer(t, rng, f, ny, -5, 5)
+		n, _ := backend.NumElements(c.shape)
+		want := kerneltest.HostBuffer(t, nil, f, n, 0, 0)
+		if err := kerneltest.Host.Run(t.Context(), k, []backend.Buffer{want}, []backend.Buffer{x, y}); err != nil {
+			t.Fatal(err)
+		}
+		got := kerneltest.GEMM(g, kerneltest.Floats(t, x), kerneltest.Floats(t, y))
+		for i, w := range kerneltest.Floats(t, want) {
+			if d := got[i] - w; d > 1e-3 || d < -1e-3 {
+				t.Fatalf("%s: element %d is %v, want %v", c.name, i, got[i], w)
+			}
 		}
 	}
 }
