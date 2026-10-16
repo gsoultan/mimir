@@ -97,6 +97,15 @@ func planGEMM(k *backend.Kernel, lens []int) (gemm, bool) {
 	return g, true
 }
 
+// packed reports whether each operand's matrices lie one after another,
+// rows × ld elements apart, or there is one matrix. Metal Performance
+// Shaders on an M5 under macOS 26 reads batched matrices that far apart
+// whatever the descriptor's matrix stride says, so a product of batches
+// spaced further apart runs elsewhere.
+func (g gemm) packed() bool {
+	return g.batch == 1 || g.a.stride == g.a.rows*g.a.ld && g.b.stride == g.b.rows*g.b.ld
+}
+
 // layout returns how MPS reads a rows × cols matrix with the given strides
 // and offset: row-major with equally spaced rows, or the transpose of one.
 func layout(rows, cols, sr, sc, offset int) (matrix, bool) {
