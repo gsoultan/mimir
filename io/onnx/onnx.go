@@ -200,7 +200,11 @@ func (m *Model) load(b []byte, dir string) error {
 		}
 	}
 	m.nodes = nodes
-	return m.foldConstants()
+	if err := m.foldConstants(); err != nil {
+		return err
+	}
+	m.fuseAttention()
+	return nil
 }
 
 // sort returns the nodes in an order in which each follows the nodes
