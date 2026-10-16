@@ -178,11 +178,25 @@ func dot64(a, b []float32) float64 {
 	return s
 }
 
+// axpyVector adds a times each of the n elements at x, a multiple of
+// axpyLanes, to those at y, or is nil where there is no vector routine.
+// The architecture-specific files set it at init.
+var (
+	axpyVector func(a float32, x, y *float32, n int)
+	axpyLanes  int
+)
+
 // axpy adds a·x to y.
 func axpy(a float32, x, y []float32) {
 	y = y[:len(x)]
-	for i, v := range x {
-		y[i] += a * v
+	n := 0
+	if axpyVector != nil {
+		if n = len(x) &^ (axpyLanes - 1); n > 0 {
+			axpyVector(a, &x[0], &y[0], n)
+		}
+	}
+	for i := n; i < len(x); i++ {
+		y[i] += a * x[i]
 	}
 }
 

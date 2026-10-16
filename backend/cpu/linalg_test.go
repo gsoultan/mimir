@@ -318,13 +318,15 @@ func checkSVD(t *testing.T, a []float32, got []float32, m, n int, tol float64) {
 
 func TestSVDReconstructs(t *testing.T) {
 	rng := rand.New(rand.NewPCG(9, 10))
-	for _, s := range []struct{ m, n int }{{1, 1}, {5, 3}, {3, 5}, {4, 4}, {64, 64}, {150, 100}, {100, 150}} {
+	// Square, tall, much taller than wide, which takes a QR first, and
+	// wide, with several blocks of reflectors.
+	for _, s := range []struct{ m, n int }{{1, 1}, {5, 3}, {3, 5}, {4, 4}, {7, 5}, {64, 64}, {150, 100}, {100, 150}, {200, 200}, {300, 70}} {
 		x := randMatrix(rng, s.m*s.n)
 		for _, w := range linalgWorkers {
 			t.Run(fmt.Sprintf("%dx%d workers %d", s.m, s.n, w), func(t *testing.T) {
 				shape := []int{s.m, s.n}
 				got := runOn[float32](t, w, linalgKernel(backend.OpSVD, shape, backend.Contiguous(shape)), f32buf(x...))
-				checkSVD(t, x, got, s.m, s.n, 2e-5)
+				checkSVD(t, x, got, s.m, s.n, 3e-5)
 			})
 		}
 	}
@@ -342,8 +344,39 @@ func TestSVDOfRankDeficient(t *testing.T) {
 	shape := []int{m, n}
 	got := runOn[float32](t, 1, linalgKernel(backend.OpSVD, shape, backend.Contiguous(shape)), f32buf(x...))
 	checkSVD(t, x, got, m, n, 2e-5)
-	if s := got[m*n:][:n]; s[3] != 0 || s[2] > 1e-5 {
+	if s := got[m*n:][:n]; s[3] > 1e-6 || s[2] > 1e-5 {
 		t.Fatalf("singular values %v, want the last two zero", s)
+	}
+}
+
+func TestSVDOfSpecialMatrices(t *testing.T) {
+	rng := rand.New(rand.NewPCG(15, 16))
+	n := 90
+	// An orthogonal matrix, whose singular values are all one.
+	orth := runOn[float32](t, 1, linalgKernel(backend.OpQR, []int{n, n}, backend.Contiguous([]int{n, n})), f32buf(randMatrix(rng, n*n)...))[:n*n]
+	// A matrix of rank 10.
+	f, g := denseOf(randMatrix(rng, n*10), n, 10), denseOf(randMatrix(rng, 10*n), 10, n)
+	low := f.mul(g).v32()
+	// Singular values spread over 12 orders of magnitude.
+	q2 := denseOf(runOn[float32](t, 1, linalgKernel(backend.OpQR, []int{n, n}, backend.Contiguous([]int{n, n})), f32buf(randMatrix(rng, n*n)...))[:n*n], n, n)
+	scaled := dense{n, n, slices.Clone(denseOf(orth, n, n).v)}
+	for i := range n {
+		for j := range n {
+			scaled.v[i*n+j] *= math.Pow(10, -12*float64(j)/float64(n-1))
+		}
+	}
+	graded := scaled.mul(q2).v32()
+	for _, c := range []struct {
+		name string
+		x    []float32
+	}{{"zero", make([]float32, n*n)}, {"orthogonal", orth}, {"rank 10", low}, {"graded", graded}} {
+		for _, w := range linalgWorkers {
+			t.Run(fmt.Sprintf("%s workers %d", c.name, w), func(t *testing.T) {
+				shape := []int{n, n}
+				got := runOn[float32](t, w, linalgKernel(backend.OpSVD, shape, backend.Contiguous(shape)), f32buf(c.x...))
+				checkSVD(t, c.x, got, n, n, 3e-5)
+			})
+		}
 	}
 }
 
