@@ -17,22 +17,27 @@ import (
 // line is read into complex128 values, transformed in float64 and rounded
 // once as it is stored, like the pocketfft that NumPy and PyTorch use.
 //
-// A line whose length is a power of two is transformed by iterative
-// radix-2 Cooley-Tukey; a short line of another length by the definition;
-// and a long one by Bluestein's algorithm, which writes the transform as
-// a convolution with a chirp and computes that with transforms of a
-// power of two at least twice as long. The inverse direction conjugates
-// before and after the forward transform.
+// A line whose length has no prime factor above fftLargestRadix is
+// transformed by mixed-radix Cooley-Tukey, as KissFFT does: the length
+// is factored into radices, fours first, the transform recurses into the
+// p subsequences of every p-th element for the first radix p, and
+// butterflies combine their transforms, specialized for radices 2, 3 and
+// 4. Any other length uses Bluestein's algorithm, which writes the
+// transform as a convolution with a chirp and computes that with
+// transforms of a power of two at least twice as long. The inverse
+// direction conjugates before and after the forward transform.
 
-// fftDirect is the longest line of a length other than a power of two
-// that is transformed by the definition.
-const fftDirect = 16
+// fftLargestRadix is the largest prime factor of a length that the
+// mixed-radix transform takes, with a butterfly whose cost grows with it.
+const fftLargestRadix = 31
 
-// fftPlan holds what transforms of length n need: the twiddle factors
-// e^(-2πik/n), and for Bluestein's algorithm the chirp e^(-πij²/n), the
-// transform of its filter, divided by m, and the plan of length m.
+// fftPlan holds what transforms of length n need: its radices and the
+// twiddle factors e^(-2πik/n), or for Bluestein's algorithm the chirp
+// e^(-πij²/n), the transform of its filter, divided by m, and the plan of
+// length m.
 type fftPlan struct {
 	n       int
+	radices []int
 	twiddle []complex128
 	chirp   []complex128
 	filter  []complex128
@@ -61,48 +66,56 @@ func planFFT(n int) *fftPlan {
 	return p
 }
 
-func newFFTPlan(n int) *fftPlan {
-	p := &fftPlan{n: n}
-	pow2 := n&(n-1) == 0
-	switch {
-	case pow2 || n <= fftDirect:
-		size := n
-		if pow2 {
-			size = n / 2
+// radices returns the factors of n, fours first, then twos and odd
+// primes in increasing order, or nil if one exceeds fftLargestRadix.
+func radices(n int) []int {
+	var out []int
+	for n%4 == 0 {
+		out, n = append(out, 4), n/4
+	}
+	for p := 2; n > 1; p++ {
+		if p > fftLargestRadix {
+			return nil
 		}
-		p.twiddle = make([]complex128, size)
-		for k := range p.twiddle {
-			p.twiddle[k] = rootOfUnity(k, n)
-		}
-	default:
-		m := 1 << bits.Len(uint(2*n-2))
-		p.inner = newFFTPlan(m)
-		p.chirp = make([]complex128, n)
-		for j := range p.chirp {
-			// j² mod 2n, exactly, gives the angle πj²/n.
-			sq := uint64(j) * uint64(j) % uint64(2*n)
-			s, c := math.Sincos(math.Pi * float64(sq) / float64(n))
-			p.chirp[j] = complex(c, -s)
-		}
-		p.filter = make([]complex128, m)
-		p.filter[0] = cmplx.Conj(p.chirp[0])
-		for j := 1; j < n; j++ {
-			p.filter[j] = cmplx.Conj(p.chirp[j])
-			p.filter[m-j] = p.filter[j]
-		}
-		p.inner.transform(p.filter, nil)
-		scale := complex(1/float64(m), 0)
-		for i := range p.filter {
-			p.filter[i] *= scale
+		for n%p == 0 {
+			out, n = append(out, p), n/p
 		}
 	}
-	return p
+	return out
 }
 
-// rootOfUnity returns e^(-2πik/n).
-func rootOfUnity(k, n int) complex128 {
-	s, c := math.Sincos(2 * math.Pi * float64(k%n) / float64(n))
-	return complex(c, -s)
+func newFFTPlan(n int) *fftPlan {
+	p := &fftPlan{n: n, radices: radices(n)}
+	if n <= 1 || p.radices != nil {
+		p.twiddle = make([]complex128, n)
+		for k := range p.twiddle {
+			s, c := math.Sincos(2 * math.Pi * float64(k) / float64(n))
+			p.twiddle[k] = complex(c, -s)
+		}
+		return p
+	}
+	m := 1 << bits.Len(uint(2*n-2))
+	p.inner = newFFTPlan(m)
+	p.chirp = make([]complex128, n)
+	for j := range p.chirp {
+		// j² mod 2n, exactly, gives the angle πj²/n.
+		sq := uint64(j) * uint64(j) % uint64(2*n)
+		s, c := math.Sincos(math.Pi * float64(sq) / float64(n))
+		p.chirp[j] = complex(c, -s)
+	}
+	p.filter = make([]complex128, m)
+	p.filter[0] = cmplx.Conj(p.chirp[0])
+	for j := 1; j < n; j++ {
+		p.filter[j] = cmplx.Conj(p.chirp[j])
+		p.filter[m-j] = p.filter[j]
+	}
+	work := make([]complex128, m)
+	p.inner.transform(p.filter, work)
+	scale := complex(1/float64(m), 0)
+	for i := range p.filter {
+		p.filter[i] *= scale
+	}
+	return p
 }
 
 // transform replaces x, of the plan's length, with its forward transform,
@@ -111,55 +124,162 @@ func (p *fftPlan) transform(x, work []complex128) []complex128 {
 	n := p.n
 	switch {
 	case n <= 1:
-	case n&(n-1) == 0:
-		p.radix2(x)
-	case p.chirp == nil:
+	case p.radices != nil:
 		work = grow(work, n)
-		for k := range n {
-			var s complex128
-			for j, v := range x {
-				s += v * p.twiddle[j*k%n]
-			}
-			work[k] = s
-		}
-		copy(x, work)
+		p.mixed(work[:n], x, 1, p.radices, n)
+		copy(x, work[:n])
 	default:
 		m := p.inner.n
-		work = grow(work, m)
+		work = grow(work, 2*m)
+		a, scratch := work[:m], work[m:2*m]
 		for j, v := range x {
-			work[j] = v * p.chirp[j]
+			a[j] = v * p.chirp[j]
 		}
-		clear(work[n:])
-		p.inner.radix2(work)
+		clear(a[n:])
+		p.inner.mixed(scratch, a, 1, p.inner.radices, m)
 		for i, f := range p.filter {
-			work[i] = cmplx.Conj(work[i] * f)
+			a[i] = cmplx.Conj(scratch[i] * f)
 		}
-		p.inner.radix2(work) // the inverse, conjugated
+		p.inner.mixed(scratch, a, 1, p.inner.radices, m) // the inverse, conjugated
 		for k := range x {
-			x[k] = cmplx.Conj(work[k]) * p.chirp[k]
+			x[k] = cmplx.Conj(scratch[k]) * p.chirp[k]
 		}
 	}
 	return work
 }
 
-// radix2 transforms x, whose length is the plan's power of two, in place.
-func (p *fftPlan) radix2(x []complex128) {
-	n := len(x)
-	shift := 64 - bits.Len(uint(n-1))
-	for i := range x {
-		if j := int(bits.Reverse64(uint64(i)) >> shift); i < j {
-			x[i], x[j] = x[j], x[i]
+// transformParallel is transform with the workers sharing the
+// transforms of the first radix's subsequences and their butterflies.
+func (p *fftPlan) transformParallel(ctx context.Context, b *Backend, x, work []complex128) ([]complex128, error) {
+	n := p.n
+	switch {
+	case n <= 1:
+	case p.radices != nil:
+		work = grow(work, n)
+		if err := p.mixedParallel(ctx, b, work[:n], x); err != nil {
+			return work, err
+		}
+		copy(x, work[:n])
+	default:
+		m := p.inner.n
+		work = grow(work, 2*m)
+		a, scratch := work[:m], work[m:2*m]
+		for j, v := range x {
+			a[j] = v * p.chirp[j]
+		}
+		clear(a[n:])
+		if err := p.inner.mixedParallel(ctx, b, scratch, a); err != nil {
+			return work, err
+		}
+		for i, f := range p.filter {
+			a[i] = cmplx.Conj(scratch[i] * f)
+		}
+		if err := p.inner.mixedParallel(ctx, b, scratch, a); err != nil {
+			return work, err
+		}
+		for k := range x {
+			x[k] = cmplx.Conj(scratch[k]) * p.chirp[k]
 		}
 	}
-	for half := 1; half < n; half *= 2 {
-		step := n / (2 * half)
-		for start := 0; start < n; start += 2 * half {
-			lo := x[start : start+half]
-			hi := x[start+half : start+2*half]
-			for j := range lo {
-				t := hi[j] * p.twiddle[j*step]
-				hi[j] = lo[j] - t
-				lo[j] += t
+	return work, nil
+}
+
+// mixed sets out, of length n, to the transform of the n elements of in
+// stride apart, whose length factors into rs.
+func (p *fftPlan) mixed(out, in []complex128, stride int, rs []int, n int) {
+	r := rs[0]
+	m := n / r
+	if m == 1 {
+		for q := range r {
+			out[q] = in[q*stride]
+		}
+	} else {
+		for q := range r {
+			p.mixed(out[q*m:(q+1)*m], in[q*stride:], stride*r, rs[1:], m)
+		}
+	}
+	p.butterflies(out, r, m, p.n/n, 0, m)
+}
+
+// mixedParallel is mixed of the plan's whole length with the workers
+// sharing the transforms of the subsequences of the first radix and the
+// butterflies that combine them.
+func (p *fftPlan) mixedParallel(ctx context.Context, b *Backend, out, in []complex128) error {
+	r := p.radices[0]
+	m := p.n / r
+	if m == 1 {
+		p.mixed(out, in, 1, p.radices, p.n)
+		return nil
+	}
+	err := b.parallelFor(ctx, r, 1, func(lo, hi int) error {
+		for q := lo; q < hi; q++ {
+			p.mixed(out[q*m:(q+1)*m], in[q:], r, p.radices[1:], m)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return b.parallelFor(ctx, m, 1<<12, func(lo, hi int) error {
+		p.butterflies(out, r, m, 1, lo, hi)
+		return nil
+	})
+}
+
+// butterflies combines the transforms of the r subsequences of a
+// transform of length r·m, out[q*m+k] for subsequence q, into
+// out[k+o*m], for k in [k0, k1). The transform's twiddles are those of
+// the plan step apart.
+func (p *fftPlan) butterflies(out []complex128, r, m, step, k0, k1 int) {
+	tw := p.twiddle
+	switch r {
+	case 2:
+		lo, hi := out[:m], out[m:2*m]
+		for k := k0; k < k1; k++ {
+			t := hi[k] * tw[k*step]
+			hi[k] = lo[k] - t
+			lo[k] += t
+		}
+	case 3:
+		const s3 = 0.86602540378443864676 // sin(2π/3)
+		a, b, c := out[:m], out[m:2*m], out[2*m:3*m]
+		for k := k0; k < k1; k++ {
+			s1, s2 := b[k]*tw[k*step], c[k]*tw[2*k*step]
+			sum, diff := s1+s2, s1-s2
+			mid := a[k] - sum*0.5
+			rot := complex(imag(diff)*s3, -real(diff)*s3) // -i·sin(2π/3)·diff
+			a[k] += sum
+			b[k] = mid + rot
+			c[k] = mid - rot
+		}
+	case 4:
+		a, b, c, d := out[:m], out[m:2*m], out[2*m:3*m], out[3*m:4*m]
+		for k := k0; k < k1; k++ {
+			s0, s1, s2 := b[k]*tw[k*step], c[k]*tw[2*k*step], d[k]*tw[3*k*step]
+			e, f := a[k]+s1, a[k]-s1
+			g, h := s0+s2, s0-s2
+			ih := complex(imag(h), -real(h)) // -i·h
+			a[k], c[k] = e+g, e-g
+			b[k], d[k] = f+ih, f-ih
+		}
+	default:
+		var buf [fftLargestRadix]complex128
+		t := buf[:r]
+		pstep := p.n / r
+		for k := k0; k < k1; k++ {
+			t[0] = out[k]
+			for q := 1; q < r; q++ {
+				t[q] = out[q*m+k] * tw[q*k*step]
+			}
+			for o := range r {
+				s := t[0]
+				for q, e := 1, o; q < r; q++ {
+					s += t[q] * tw[e*pstep]
+					if e += o; e >= r {
+						e -= r
+					}
+				}
+				out[o*m+k] = s
 			}
 		}
 	}
@@ -193,32 +313,55 @@ func runFFT(ctx context.Context, b *Backend, k *backend.Kernel, outBuf, inBuf ba
 	lines, _ := backend.NumElements(rest)
 	inStep, inImag, outStep := v.Strides[axis], v.Strides[r-1], outStrides[axis]
 	conj := k.Attrs.Inverse
+	load := func(line []complex128, off int) {
+		for j := range line {
+			re, im := float64(in[off]), float64(in[off+inImag])
+			if conj {
+				im = -im
+			}
+			line[j] = complex(re, im)
+			off += inStep
+		}
+	}
+	store := func(line []complex128, off int) {
+		for _, z := range line {
+			im := imag(z)
+			if conj {
+				im = -im
+			}
+			out[off], out[off+1] = float32(real(z)), float32(im)
+			off += outStep
+		}
+	}
+	if lines < b.workers && n >= fftSplit {
+		// Too few lines to share: the workers share each.
+		c := newCursor(rest, views, 0)
+		line := make([]complex128, n)
+		var work []complex128
+		for range lines {
+			load(line, c.offs[0])
+			if work, err = plan.transformParallel(ctx, b, line, work); err != nil {
+				return err
+			}
+			store(line, c.offs[1])
+			c.next()
+		}
+		return nil
+	}
 	return b.parallelFor(ctx, lines, max(1, elementGrain/(8*n)), func(lo, hi int) error {
 		c := newCursor(rest, views, lo)
 		line := make([]complex128, n)
 		var work []complex128
 		for range hi - lo {
-			off := c.offs[0]
-			for j := range line {
-				re, im := float64(in[off]), float64(in[off+inImag])
-				if conj {
-					im = -im
-				}
-				line[j] = complex(re, im)
-				off += inStep
-			}
+			load(line, c.offs[0])
 			work = plan.transform(line, work)
-			off = c.offs[1]
-			for _, z := range line {
-				im := imag(z)
-				if conj {
-					im = -im
-				}
-				out[off], out[off+1] = float32(real(z)), float32(im)
-				off += outStep
-			}
+			store(line, c.offs[1])
 			c.next()
 		}
 		return nil
 	})
 }
+
+// fftSplit is the shortest line whose transform the workers share when
+// there are too few lines to go round.
+const fftSplit = 1 << 15
