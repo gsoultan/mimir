@@ -213,6 +213,11 @@ func gradCases() []gradCase {
 		top, _ := x[0].TopK(2, 1, true)
 		return tensor.Cat(1, v.Mul(v), top.Exp())
 	}, distinct(3, 4))
+	add("split", func(x []*tensor.Tensor) *tensor.Tensor {
+		// The middle part gets no gradient.
+		p := x[0].Split(1, 2, 1, 3)
+		return tensor.Cat(1, p[2].Exp(), p[0].Mul(p[0]))
+	}, u(-1, 1, 3, 6))
 	return cases
 }
 
