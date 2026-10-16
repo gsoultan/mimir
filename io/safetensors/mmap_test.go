@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -136,5 +137,69 @@ func TestOpenReportsMissingAndCorruptFiles(t *testing.T) {
 		if mapped, known := mapsPath(t, path); known && mapped {
 			t.Errorf("%s: the file stayed mapped after Open failed", name)
 		}
+	}
+}
+
+// TestHoldKeepsTheMappingPastClose checks that the mapping lasts while a
+// reader that Hold added keeps it, and goes with the last of them.
+func TestHoldKeepsTheMappingPastClose(t *testing.T) {
+	path := writeTestFile(t, map[string]Tensor{"w": Float32Tensor([]int{2}, []float32{1.5, -2})})
+	f, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.Mapped() {
+		f.Hold()() // does nothing
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		t.Skip("files are not mapped on " + runtime.GOOS)
+	}
+	w, _ := f.Tensor("w")
+	first, second := f.Hold(), f.Hold()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+	if _, ok := f.Tensor("w"); ok {
+		t.Error("a closed file still has tensors")
+	}
+	f.Hold()() // a closed file adds no hold, and letting go of it does nothing
+	first()
+	first() // lets go once
+	if got, _ := w.Float32s(); !slices.Equal(got, []float32{1.5, -2}) {
+		t.Errorf("held tensor reads %v after Close", got)
+	}
+	if mapped, known := mapsPath(t, path); known && !mapped {
+		t.Error("the file was unmapped while a hold remained")
+	}
+	second()
+	if mapped, known := mapsPath(t, path); known && mapped {
+		t.Error("the file is still mapped after the last hold went")
+	}
+}
+
+// TestDroppedFileIsUnmapped checks that a File that is never closed lets
+// go of its mapping once it is garbage.
+func TestDroppedFileIsUnmapped(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the mappings of the process are read on Linux")
+	}
+	path := writeTestFile(t, map[string]Tensor{"w": Float32Tensor([]int{1}, []float32{3})})
+	if _, err := Open(path); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		runtime.GC()
+		if mapped, _ := mapsPath(t, path); !mapped {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a dropped File kept its mapping")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

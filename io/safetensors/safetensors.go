@@ -16,6 +16,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"runtime"
 	"slices"
 )
 
@@ -43,7 +44,9 @@ type Tensor struct {
 type File struct {
 	Metadata map[string]string
 	tensors  map[string]Tensor
-	mapping  *mapping // the mapping the tensors alias, when Open made one
+	mapping  *mapping        // the mapping the tensors alias, when Open made one
+	cleanup  runtime.Cleanup // lets go of the mapping if the File is garbage
+	closed   bool            // Close ran; guarded by mapping.mu
 }
 
 type entry struct {

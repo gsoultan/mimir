@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/io/safetensors"
 	"github.com/gsoultan/mimir/nn"
@@ -83,5 +84,80 @@ func TestLoadFromMappedFileReadsItInPlace(t *testing.T) {
 	}
 	if now, err := os.ReadFile(path); err != nil || !bytes.Equal(now, saved) {
 		t.Errorf("the file changed after a training step (%v)", err)
+	}
+}
+
+// mapsFile reports whether the process maps the file at path, and whether
+// that can be seen at all.
+func mapsFile(t *testing.T, path string) (mapped, known bool) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return false, false
+	}
+	maps, err := os.ReadFile("/proc/self/maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.Contains(maps, []byte(path)), true
+}
+
+// TestLoadedModelOutlivesTheFile checks that the parameters of a model
+// loaded from a mapped file hold the mapping: the file may be closed once
+// Load returns, and is unmapped once the model is garbage.
+func TestLoadedModelOutlivesTheFile(t *testing.T) {
+	ctx := t.Context()
+	nn.ManualSeed(5)
+	a := nn.NewLinear(64, 32)
+	path := filepath.Join(t.TempDir(), "model.safetensors")
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nn.Save(ctx, out, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	x := tensor.Randn(6, 8, 64)
+	want := data(t, a.Forward(x))
+
+	load := func() *nn.Linear {
+		f, err := safetensors.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := nn.NewLinear(64, 32)
+		if err := nn.Load(f, b); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	b := load()
+	runtime.GC()
+	runtime.GC()
+	if got := data(t, b.Forward(x)); !slices.Equal(got, want) {
+		t.Errorf("model loaded from a closed file computes %v, want %v", got, want)
+	}
+	inPlace := tensor.DefaultDevice().Equal(tensor.CPU())
+	if mapped, known := mapsFile(t, path); known && inPlace && !mapped {
+		t.Error("the file was unmapped while the model reads it")
+	}
+	runtime.KeepAlive(b)
+	b = nil
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		runtime.GC()
+		mapped, known := mapsFile(t, path)
+		if !known || !mapped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the file is still mapped after the model is garbage")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"math"
 	"runtime"
 	"runtime/debug"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -211,5 +212,75 @@ func TestKernelsKeepTheirBuffersAlive(t *testing.T) {
 		if err := b.Download(t.Context(), asBytes(x), out); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestWrapFuncReleasesOnce checks that a buffer of WrapFunc runs its
+// release once: when Free frees it, or once it is garbage.
+func TestWrapFuncReleasesOnce(t *testing.T) {
+	b := New()
+	raw := aligned(64)
+	var freed, collected atomic.Int32
+	buf, err := WrapFunc(backend.Float32, raw, func() { freed.Add(1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Free(buf)
+	b.Free(buf)
+	if n := freed.Load(); n != 1 || buf.Len() != 0 {
+		t.Errorf("released %d times by Free, %d elements left", n, buf.Len())
+	}
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	if n := freed.Load(); n != 1 {
+		t.Errorf("released %d times after Free and a collection", n)
+	}
+
+	func() {
+		if _, err := WrapFunc(backend.Int32, raw, func() { collected.Add(1) }); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for collected.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the release of a garbage buffer never ran")
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := WrapFunc(backend.Float32, raw[1:5], func() { t.Error("a failed WrapFunc ran release") }); !errors.Is(err, ErrUnaligned) {
+		t.Errorf("unaligned WrapFunc: %v", err)
+	}
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	if n := collected.Load(); n != 1 {
+		t.Errorf("released %d times once garbage", n)
+	}
+}
+
+// TestAllocPacesTheCollector drops mapped buffers without freeing them,
+// with the heap's own pacing off, as a training loop whose tensors hold
+// little heap memory leaves it: Alloc's collections must keep the mapped
+// bytes bounded rather than let them grow with every buffer.
+func TestAllocPacesTheCollector(t *testing.T) {
+	if !offHeap {
+		t.Skip("no off-heap buffers on " + runtime.GOOS)
+	}
+	settle(t)
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	b := New()
+	const size = 16 << 20
+	base := OffHeapBytes()
+	var peak int64
+	for range 256 { // 4 GiB in all, never touched, so never resident
+		if _, err := b.Alloc(backend.Float32, size/4); err != nil {
+			t.Fatal(err)
+		}
+		peak = max(peak, OffHeapBytes()-base)
+	}
+	t.Logf("peak of %d MiB mapped", peak>>20)
+	if peak > 1<<30 {
+		t.Errorf("%d MiB mapped at once by buffers dropped as soon as made", peak>>20)
 	}
 }

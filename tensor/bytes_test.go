@@ -4,8 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"runtime"
 	"slices"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/optim"
@@ -103,5 +106,42 @@ func TestOptimizerStepsWriteTheBytesOfAParam(t *testing.T) {
 	// of its own, so the bytes keep the old value there.
 	if !tensor.Eager() && !slices.Equal(v, []float32{0, 0}) {
 		t.Errorf("bytes after the step = %v, want [0 0]", v)
+	}
+}
+
+// TestFromBytesFuncReleases checks when FromBytesFunc lets go of its
+// bytes: at once when it copies them or fails, and only once the tensor's
+// memory is garbage when it reads them in place.
+func TestFromBytesFuncReleases(t *testing.T) {
+	backing := f32bytes(make([]float32, 6))
+	released := 0
+	release := func() { released++ }
+	if x := tensor.FromBytesFunc(tensor.Float32, backing[1:21], release, 5); x.Err() != nil || released != 1 {
+		t.Errorf("unaligned bytes: %v, released %d times, want once at once", x.Err(), released)
+	}
+	if x := tensor.FromBytesFunc(tensor.Float32, backing[:6], release); !errors.Is(x.Err(), tensor.ErrShape) || released != 2 {
+		t.Errorf("partial element: %v, released %d times in all, want 2", x.Err(), released)
+	}
+
+	var inPlace atomic.Int32
+	func() {
+		x := tensor.FromBytesFunc(tensor.Float32, backing, func() { inPlace.Add(1) }, 6)
+		y := x.Reshape(2, 3).Add(tensor.Scalar(float32(1)))
+		if _, err := y.Data[float32](t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		if n := inPlace.Load(); n != 0 {
+			t.Errorf("released %d times while the tensor is in use", n)
+		}
+		runtime.KeepAlive(x)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for inPlace.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("bytes read in place were never released")
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
 	}
 }

@@ -26,18 +26,35 @@ var hostIsLittleEndian = binary.NativeEndian.Uint32([]byte{1, 2, 3, 4}) == binar
 // address that is a multiple of the element size and the host is
 // little-endian; otherwise it holds a copy, as FromSlice does. In place,
 // the caller keeps data valid for as long as the tensor, or any view of
-// it, is in use: data may be a mapped file, such as one safetensors.Open
-// maps. An operation that writes over the tensor's memory, as an optimizer
-// step does over a parameter set from it (see Param.Set), writes the
-// bytes.
+// it, is in use; FromBytesFunc tells the caller when that is. An
+// operation that writes over the tensor's memory, as an optimizer step
+// does over a parameter set from it (see Param.Set), writes the bytes.
 //
 // The tensor lives on the CPU whatever the default device; To moves it.
 func FromBytes(dt DType, data []byte, shape ...int) *Tensor {
+	return FromBytesFunc(dt, data, nil, shape...)
+}
+
+// FromBytesFunc is FromBytes for bytes that the tensor holds until it no
+// longer reads them, such as a mapped file whose owner counts its
+// readers, as safetensors.File.Hold does: release runs once, after the
+// tensor's memory, which every view and every tensor that took it over
+// share, becomes garbage or is freed. When the tensor holds a copy, or
+// FromBytesFunc fails, release runs before it returns. A nil release
+// makes it FromBytes.
+func FromBytesFunc(dt DType, data []byte, release func(), shape ...int) *Tensor {
+	done := func() {
+		if release != nil {
+			release()
+		}
+	}
 	if defaultErr != nil {
+		done()
 		return fail(defaultErr)
 	}
 	size := dt.Size()
 	if size == 0 {
+		done()
 		return fail(fmt.Errorf("tensor: FromBytes of %s: %w", dt, ErrDType))
 	}
 	if len(shape) == 0 {
@@ -45,15 +62,18 @@ func FromBytes(dt DType, data []byte, shape ...int) *Tensor {
 	}
 	n, ok := backend.NumElements(shape)
 	if !ok || n > math.MaxInt/size || n*size != len(data) {
+		done()
 		return fail(fmt.Errorf("tensor: %d bytes of %s for shape %v: %w", len(data), dt, shape, ErrShape))
 	}
 	if hostIsLittleEndian && aligned(data, size) {
-		buf, err := cpu.Wrap(dt, data)
+		buf, err := cpu.WrapFunc(dt, data, release)
 		if err != nil {
+			done()
 			return fail(err)
 		}
 		return wrap(graph.Load(cpuBackend, buf, shape))
 	}
+	defer done() // upload copies data
 	return upload(cpuBackend, dt, hostOrder(size, data), shape)
 }
 

@@ -2,7 +2,6 @@ package datasets
 
 import (
 	"fmt"
-	"runtime"
 
 	"github.com/gsoultan/mimir/data"
 	"github.com/gsoultan/mimir/io/safetensors"
@@ -17,10 +16,12 @@ import (
 // of the mapping, or gathers from it when shuffling, so a dataset larger
 // than memory streams from disk through the page cache.
 //
-// The mapping lives as long as the dataset: it is released once the
-// dataset is garbage, never before, and batches, which read it, are valid
-// only while the dataset is. On a default device other than the CPU the
-// examples are copied to the device instead, and the file is closed.
+// The mapping lives as long as anything reads it: the dataset, and every
+// batch, since a batch is a view of it or a gather from it. It is
+// released once they are all garbage. On a default device other than the
+// CPU the examples are copied to the device instead. The tensors must
+// start at a multiple of 4 bytes, as safetensors.Write lays them out, to
+// be read in place; others are copied.
 //
 // Such a file is written with safetensors.Write from Float32Tensor and
 // Int32Tensor:
@@ -34,19 +35,10 @@ func Mapped(path, x, y string, opts ...data.Option) (*data.Tensors, error) {
 	if err != nil {
 		return nil, fmt.Errorf("datasets: %w", err)
 	}
-	ds, err := fromFile(f, path, x, y, opts)
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if !f.Mapped() || !tensor.DefaultDevice().Equal(tensor.CPU()) {
-		_ = f.Close() // the tensors hold copies
-		return ds, nil
-	}
-	// The tensors read the mapping, so it stays until the dataset is
-	// garbage. The cleanup holds f, which holds nothing of the dataset.
-	runtime.AddCleanup(ds, func(f *safetensors.File) { _ = f.Close() }, f)
-	return ds, nil
+	// The tensors that read the mapping hold it, so the file's own hold
+	// goes once they are made.
+	defer f.Close()
+	return fromFile(f, path, x, y, opts)
 }
 
 // fromFile builds the dataset of the tensors x and y of f on the default
@@ -79,7 +71,7 @@ func mappedTensor(f *safetensors.File, path, name string) (*tensor.Tensor, error
 	default:
 		return nil, fmt.Errorf("datasets: %s: tensor %q has dtype %s, want F32 or I32: %w", path, name, st.DType, tensor.ErrDType)
 	}
-	t := tensor.FromBytes(dt, st.Data, st.Shape...).To(tensor.DefaultDevice())
+	t := tensor.FromBytesFunc(dt, st.Data, f.Hold(), st.Shape...).To(tensor.DefaultDevice())
 	if err := t.Err(); err != nil {
 		return nil, fmt.Errorf("datasets: %s: tensor %q: %w", path, name, err)
 	}
