@@ -239,10 +239,12 @@ func (p *Pattern) Max(x *Tensor) *Tensor {
 
 // maxHits returns, for the maximum out of x by p, whether each entry
 // holds its row's maximum, as 1 or 0 in an [entries, D...] tensor, and
-// how many entries of each row do, [rows, D...].
+// how many entries of each row do, at least 1, [rows, D...].
 func (p *Pattern) maxHits(x, out *Tensor) (hit, n *Tensor) {
 	hit = p.atCols(x.stopGradient()).Equal(p.atRows(out.stopGradient()))
-	return hit, p.rowSum(hit)
+	// A row without entries has no hits; counting it as one keeps its
+	// derivatives zero rather than 0/0.
+	return hit, p.rowSum(hit).Maximum(Scalar[float32](1))
 }
 
 // The maps below take a tensor with a row per column or row of p to one
