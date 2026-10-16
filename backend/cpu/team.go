@@ -54,8 +54,11 @@ const yieldBusy = 20 * time.Microsecond
 
 // defaultTeam returns the process-wide team, with a helper for every
 // processor beyond the caller's, or nil if there is a single processor.
-var defaultTeam = sync.OnceValue(func() *team {
-	helpers := runtime.GOMAXPROCS(0) - 1
+var defaultTeam = sync.OnceValue(func() *team { return newTeam(runtime.GOMAXPROCS(0) - 1) })
+
+// newTeam returns a team of helpers goroutines, or nil if helpers is
+// less than 1.
+func newTeam(helpers int) *team {
 	if helpers < 1 {
 		return nil
 	}
@@ -64,7 +67,7 @@ var defaultTeam = sync.OnceValue(func() *team {
 		go t.help()
 	}
 	return t
-})
+}
 
 // run calls fn over [0, n) in chunks of size elements, using the calling
 // goroutine and any helpers that are free, and returns the error of the

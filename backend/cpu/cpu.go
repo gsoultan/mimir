@@ -38,6 +38,9 @@ import (
 // Backend runs kernels on the host CPU. It is safe for concurrent use.
 type Backend struct {
 	workers int
+	// team runs the chunks of parallel loops, or is nil for the
+	// process-wide team (see team.go). A Stream has a team of its own.
+	team *team
 }
 
 // New returns a CPU backend that uses up to GOMAXPROCS goroutines per kernel.
