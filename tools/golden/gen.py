@@ -1636,8 +1636,11 @@ def distribution_cases(rng):
     case("mvn_variance", [mloc, mtril], [1], lambda m, s: (np.tril(s) ** 2).sum(-1),
          lambda T, m, s: D(T).MultivariateNormal(m, scale_tril=s).variance)
     case("mvn_kl", [u(2, 3), tril(2, 3, 3), u(3), tril(3, 3)], [0, 1, 2, 3], np_mvn_kl,
+         # Only the lower triangles are parameters: torch's KL reads the
+         # upper triangle of the first scale too, so mask both.
          lambda T, m1, s1, m2, s2: D(T).kl_divergence(
-             D(T).MultivariateNormal(m1, scale_tril=s1), D(T).MultivariateNormal(m2.expand(2, 3), scale_tril=s2.expand(2, 3, 3))))
+             D(T).MultivariateNormal(m1, scale_tril=T.tril(s1)),
+             D(T).MultivariateNormal(m2.expand(2, 3), scale_tril=T.tril(s2).expand(2, 3, 3))))
 
     # Bernoulli and categorical.
     coin = rng.integers(0, 2, size=(3, 5)).astype(F32)
