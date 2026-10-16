@@ -77,6 +77,7 @@ type config struct {
 	dynamic   bool    // the loss scale adjusts itself
 	onEpoch   []func(Epoch) error
 	onBatch   []func(Batch) error
+	parallel  []tensor.Device // the devices of DataParallel, or nil
 	configErr error
 }
 
@@ -235,8 +236,23 @@ func Fit(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dat
 		return fmt.Errorf("%w: no Loss", ErrConfig)
 	case c.epochs < 0:
 		return fmt.Errorf("%w: %d epochs", ErrConfig, c.epochs)
+	case c.parallel != nil && (c.micro != 0 || c.budget != 0):
+		return fmt.Errorf("%w: DataParallel with MicroBatch or MemoryBudget", ErrConfig)
 	}
 	l := &loop{c: &c, dev: deviceOf(model), chunk: c.micro, scale: c.scale}
+	if c.parallel != nil {
+		if !l.dev.Equal(c.parallel[0]) {
+			if err := nn.To(model, c.parallel[0]); err != nil {
+				return err
+			}
+		}
+		dp, err := NewParallel(model, c.parallel...)
+		if err != nil {
+			return err
+		}
+		defer dp.Close()
+		l.dp, l.dev = dp, c.parallel[0]
+	}
 	if c.budget > 0 {
 		for _, p := range nn.NamedParams(model) {
 			l.params = append(l.params, p)
@@ -308,6 +324,7 @@ type loop struct {
 	chunk  int             // examples per chunk, or 0 for whole batches
 	scale  float64         // the loss scale, or 0 for none
 	finite int             // steps in a row whose gradients were finite
+	dp     *Parallel       // the replicas of DataParallel, or nil
 }
 
 func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dataset, epoch int) (Epoch, error) {
@@ -357,6 +374,9 @@ func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer,
 // batch split into chunks is read by a schedule per chunk, and one that
 // is already on the device is the dataset's, so neither is donated.
 func (l *loop) batch(t *tensor.Tensor) *tensor.Tensor {
+	if l.dp != nil {
+		return t // Parallel copies each device's share
+	}
 	moved := t.To(l.dev)
 	if moved == t || l.chunk != 0 || l.c.budget != 0 {
 		return moved
@@ -460,6 +480,19 @@ func (l *loop) restore(values []*tensor.Tensor) error {
 // the chunk's share of the batch and scaled by the loss scale, and its
 // gradients, accumulating them. It returns the batch's loss, unscaled.
 func (l *loop) backward(ctx context.Context, model nn.Module, x, y *tensor.Tensor) (float64, error) {
+	if l.dp != nil {
+		lossFn := l.c.loss
+		if l.scale != 0 {
+			lossFn = func(pred, target *tensor.Tensor) *tensor.Tensor {
+				return l.c.loss(pred, target).Mul(tensor.Scalar(float32(l.scale)))
+			}
+		}
+		v, err := l.dp.Backward(ctx, lossFn, x, y)
+		if l.scale != 0 {
+			v /= l.scale
+		}
+		return v, err
+	}
 	rows, chunk := l.chunks(x)
 	if chunk < rows {
 		if y.Rank() == 0 || y.Shape()[0] != rows {
