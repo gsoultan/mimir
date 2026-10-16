@@ -135,7 +135,7 @@ func Rand(shape []int, seed uint64, normal bool) (*Node, error) {
 }
 
 // Unary applies an elementwise op. Exp2, Log2, Sin, Sqrt and Recip accept
-// only Float32.
+// only float types.
 func Unary(op backend.Op, x *Node) (*Node, error) {
 	if !op.IsUnary() || op == backend.OpCast {
 		return nil, errorf(op, backend.ErrInternal, "not a unary op")
@@ -146,7 +146,8 @@ func Unary(op backend.Op, x *Node) (*Node, error) {
 	return newNode(&Node{Op: op, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}})
 }
 
-// Cast converts x to dt. Float to integer truncates toward zero.
+// Cast converts x to dt. Float to integer truncates toward zero; float to
+// a narrower float rounds to nearest even.
 func Cast(x *Node, dt backend.DType) (*Node, error) {
 	if err := checkDType(backend.OpCast, dt); err != nil {
 		return nil, err
@@ -182,6 +183,7 @@ func Where(cond, x, y *Node) (*Node, error) {
 
 // Reduce reduces x over axes, keeping them with size 1. Axes must be valid,
 // distinct and sorted. ReduceMax rejects empty axes, which have no maximum.
+// A half input is reduced in float32, into a Float32 result.
 func Reduce(op backend.Op, x *Node, axes []int) (*Node, error) {
 	if !op.IsReduce() {
 		return nil, errorf(op, backend.ErrInternal, "not a reduction")
@@ -196,7 +198,11 @@ func Reduce(op backend.Op, x *Node, axes []int) (*Node, error) {
 		}
 		shape[a] = 1
 	}
-	return newNode(&Node{Op: op, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}})
+	dt := x.DType
+	if dt.Size() == 2 {
+		dt = backend.Float32
+	}
+	return newNode(&Node{Op: op, DType: dt, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axes: slices.Clone(axes)}})
 }
 
 // Reshape gives x a new shape with the same number of elements.
@@ -290,12 +296,14 @@ func Flip(x *Node, axes []int) (*Node, error) {
 }
 
 // MatMul multiplies [..., M, K] by [..., K, N] with equal batch dimensions.
+// Products are Float32 or Int32: the tensor package multiplies half types
+// in Float32.
 func MatMul(x, y *Node) (*Node, error) {
 	r := len(x.Shape)
 	if r < 2 || len(y.Shape) != r || !slices.Equal(x.Shape[:r-2], y.Shape[:r-2]) || x.Shape[r-1] != y.Shape[r-2] {
 		return nil, errorf(backend.OpMatMul, backend.ErrShape, "%v and %v", x.Shape, y.Shape)
 	}
-	if x.DType != y.DType {
+	if x.DType != y.DType || x.DType.Size() == 2 {
 		return nil, errorf(backend.OpMatMul, backend.ErrDType, "%s and %s", x.DType, y.DType)
 	}
 	shape := slices.Concat(x.Shape[:r-1], y.Shape[r-1:])

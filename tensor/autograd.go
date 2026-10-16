@@ -106,7 +106,9 @@ func (t *Tensor) Detach() *Tensor {
 }
 
 // RequiresGrad returns a tensor with t's values whose gradient Backward
-// computes and accumulates in Grad. Only Float32 tensors have gradients.
+// computes and accumulates in Grad. Only float tensors have gradients; a
+// half tensor's gradient has the dtype the chain rule gives it, its own
+// or Float32.
 func (t *Tensor) RequiresGrad() *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
@@ -205,7 +207,7 @@ func (t *Tensor) Backward(ctx context.Context) error {
 		var dst *Tensor
 		if l.grad != nil {
 			sums[i] = l.grad.Add(sums[i])
-			if l.own {
+			if l.own && sums[i].node.DType == l.grad.node.DType {
 				dst = l.grad
 			}
 		}
@@ -471,11 +473,13 @@ func (p *Param) Grad() *Tensor { return p.Value().Grad() }
 // ZeroGrad discards the accumulated gradient.
 func (p *Param) ZeroGrad() { p.Value().ZeroGrad() }
 
-// Set replaces the value with v, which must have the same shape and dtype.
-// The accumulated gradient is kept. Optimizers compute v first, so the
-// parameter never holds a growing recipe; a lazy v is allowed for buffers
-// updated with WithEffects. The parameter takes over v's memory, which
-// optimizer steps write over, so pass v.Clone() to keep using v.
+// Set replaces the value with v, which must have the same shape. A
+// trainable parameter keeps a float dtype, which v may change, as a cast
+// of a model to BFloat16 does; a buffer takes any dtype. The accumulated
+// gradient is kept. Optimizers compute v first, so the parameter never
+// holds a growing recipe; a lazy v is allowed for buffers updated with
+// WithEffects. The parameter takes over v's memory, which optimizer steps
+// write over, so pass v.Clone() to keep using v.
 //
 // A lazy v stays computable: a RealizeInto that would write over memory
 // it reads, such as an optimizer step over the weights that running
@@ -500,8 +504,11 @@ func (p *Param) set(v *Tensor) error {
 	if err := p.value.err; err != nil {
 		return err
 	}
-	if !slices.Equal(v.node.Shape, p.value.node.Shape) || v.node.DType != p.value.node.DType {
+	if !slices.Equal(v.node.Shape, p.value.node.Shape) {
 		return fmt.Errorf("tensor: set %s%v parameter to %s%v: %w", p.value.node.DType, p.value.node.Shape, v.node.DType, v.node.Shape, ErrShape)
+	}
+	if p.trainable && !v.node.DType.IsFloat() {
+		return fmt.Errorf("tensor: set trainable %s parameter to %s: %w", p.value.node.DType, v.node.DType, ErrDType)
 	}
 	p.value = &Tensor{node: v.node, tape: p.value.tape}
 	return nil

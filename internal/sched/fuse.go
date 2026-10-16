@@ -242,7 +242,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			}
 			if w.stores == nil && !slices.ContainsFunc(ins, overwritable) {
 				for i, x := range ins {
-					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType {
+					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType && n.DType == backend.Float32 {
 						w = epilogue(prog, ins, i, gemm)
 						break
 					}

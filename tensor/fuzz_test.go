@@ -24,9 +24,10 @@ func FuzzOps(f *testing.F) {
 			}
 			return 0
 		}
+		dtypes := []tensor.DType{tensor.Float32, tensor.Int32, tensor.BFloat16, tensor.Float16}
 		for i, op := range ops {
 			a, b := arg(i+1), arg(i+2)
-			switch op % 14 {
+			switch op % 17 {
 			case 0:
 				x = x.Reshape(a, -1)
 			case 1:
@@ -63,12 +64,18 @@ func FuzzOps(f *testing.F) {
 				x = x.Gather(0, tensor.Zeros(tensor.Int32, x.Shape()...))
 			case 13:
 				x = x.Max(a).Log()
+			case 14:
+				x = x.Cast(dtypes[(a+6)%4])
+			case 15:
+				x = x.Mul(tensor.Ones(tensor.BFloat16, a, b)).Sigmoid()
+			case 16:
+				x = x.MatMul(tensor.Ones(tensor.Float16, max(a, 0), max(b, 0)))
 			}
 			if x.Size() > 1<<16 {
 				return
 			}
 		}
-		v, err := x.Data[float32](t.Context())
+		v, err := x.Cast(tensor.Float32).Data[float32](t.Context())
 		if err == nil && len(v) != x.Size() {
 			t.Fatalf("%d elements for shape %v", len(v), x.Shape())
 		}
