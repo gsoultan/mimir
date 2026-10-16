@@ -1,6 +1,6 @@
 //go:build windows
 
-package safetensors
+package filemap
 
 import (
 	"os"
