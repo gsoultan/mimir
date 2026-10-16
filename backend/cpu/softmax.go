@@ -17,6 +17,7 @@ type rowRoutines struct {
 	expShift    func(x *float32, n int, shift float32) float32
 	scale       func(x *float32, n int, a float32)
 	softmaxGrad func(p, dp *float32, n int, d float32)
+	dot         func(x, y *float32, n int) float32
 }
 
 // vectorPart returns how many leading elements of a row of n the vector
