@@ -326,11 +326,29 @@ func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backe
 		return err
 	}
 	total, _ := backend.NumElements(k.Shape)
-	return b.parallelFor(ctx, total, elementGrain, func(lo, hi int) error {
+	return b.parallelFor(ctx, total, programGrain(prog), func(lo, hi int) error {
 		s := scratchPool.Get().(*scratch)
 		defer scratchPool.Put(s)
 		return e.run(s, lo, hi)
 	})
+}
+
+// programGrain returns the fewest elements of prog worth a goroutine:
+// elementGrain for a single binary op, and proportionally fewer for
+// programs that cost more per element, counting a transcendental op as
+// many simple ones. A recurrent step's gate math, tens of operations over
+// a few thousand elements, is then spread over the workers too.
+func programGrain(prog []backend.Instr) int {
+	cost := 0
+	for _, in := range prog {
+		switch in.Op {
+		case backend.OpExp2, backend.OpLog2, backend.OpSin:
+			cost += 16
+		default:
+			cost++
+		}
+	}
+	return max(tileLen, elementGrain*3/max(cost, 1))
 }
 
 // evaluator computes an elementwise program over ranges of its output.
@@ -792,7 +810,7 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 		}
 	case backend.OpExp2:
 		for i, x := range a {
-			dst[i] = T(math.Exp2(float64(x)))
+			dst[i] = T(exp2f(float32(x)))
 		}
 	case backend.OpLog2:
 		for i, x := range a {
