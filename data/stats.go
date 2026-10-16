@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -19,32 +20,34 @@ type Stats struct {
 	Mean, Std, Min, Max []float32 // per feature; Std is the population standard deviation
 }
 
-// affine returns the per-feature scale and shift that standardize an
-// example of features values: x*scale+shift.
-func (s *Stats) affine(features int) (scale, shift []float32, err error) {
+// standardizer returns the per-feature mean and scale that standardize
+// an example of features values: (x-mean)*scale. The mean is subtracted
+// before scaling, which is exact when x is near it, rather than folded
+// into a shift, which would round x*scale at the magnitude of mean/std.
+func (s *Stats) standardizer(features int) (mean, scale []float32, err error) {
 	if s == nil {
 		return nil, nil, fmt.Errorf("data: Normalize with nil statistics: %w", ErrOption)
 	}
 	if len(s.Mean) != features || len(s.Std) != features {
 		return nil, nil, fmt.Errorf("data: statistics of %d means and %d deviations for %d features: %w", len(s.Mean), len(s.Std), features, tensor.ErrShape)
 	}
-	scale, shift = make([]float32, features), make([]float32, features)
+	mean, scale = slices.Clone(s.Mean), make([]float32, features)
 	for j := range features {
 		scale[j] = 1
 		if s.Std[j] > 0 {
 			scale[j] = 1 / s.Std[j]
 		}
-		shift[j] = -s.Mean[j] * scale[j]
 	}
-	return scale, shift, nil
+	return mean, scale, nil
 }
 
 // Statistics reads every shard of src once, Prefetch shards at a time,
 // through a chunk of about 4 MiB per shard being read, and returns the
-// per-feature statistics of its examples, accumulated in float64. A
-// cancelled ctx returns its error; a shard that fails returns its error,
-// which names the shard, the lowest when several fail; a source without
-// examples is ErrSource.
+// per-feature statistics of its examples, accumulated in float64. It
+// holds the moments of at most Prefetch shards at a time, however many
+// shards there are. A cancelled ctx returns its error; a shard that fails
+// returns its error, which names the shard, the lowest when several fail;
+// a source without examples is ErrSource.
 func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error) {
 	if src == nil {
 		return nil, fmt.Errorf("data: nil source: %w", ErrSource)
@@ -66,29 +69,68 @@ func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error)
 	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	accs := make([]moments, shards)
+	// The readers' shards are merged in shard order, so the result does
+	// not depend on timing, and only a bounded number wait to be merged:
+	// a reader takes a slot before claiming a shard, and the merge of the
+	// shard returns the slot. The moments of shard i wait in the ring at
+	// i mod workers, whose earlier occupant, shard i-workers, was merged
+	// before the slot that claimed i came free, so the send never blocks.
+	// A reader takes the moments to accumulate into from free, which
+	// holds one per slot, so that never blocks either.
+	workers := min(cfg.prefetch, shards)
+	slots := make(chan struct{}, workers)
+	free := make(chan *moments, workers)
+	ring := make([]chan *moments, workers)
+	for i := range workers {
+		slots <- struct{}{}
+		free <- newMoments(features)
+		ring[i] = make(chan *moments, 1)
+	}
 	errs := make([]error, shards) // each set by the reader of its shard, before Wait returns
 	var (
 		next    atomic.Int64
 		readers sync.WaitGroup
 	)
 	rows := chunkRows(features)
-	for range min(cfg.prefetch, shards) {
+	for range workers {
 		readers.Go(func() {
 			x := make([]float32, rows*features)
 			y := make([]float32, rows)
+			sums := newChunkSums(features)
 			for ctx.Err() == nil {
+				select {
+				case <-slots:
+				case <-ctx.Done():
+					return
+				}
 				i := int(next.Add(1) - 1)
 				if i >= shards {
 					return
 				}
-				if err := accumulate(ctx, src, i, &accs[i], x, y); err != nil {
+				acc := <-free
+				if err := accumulate(ctx, src, i, acc, sums, x, y); err != nil {
 					errs[i] = fmt.Errorf("data: shard %d: %w", i, err)
 					cancel()
 					return
 				}
+				ring[i%workers] <- acc
 			}
 		})
+	}
+	total := newMoments(features)
+	for i := range shards {
+		var acc *moments
+		select {
+		case acc = <-ring[i%workers]:
+		case <-ctx.Done():
+		}
+		if acc == nil {
+			break
+		}
+		total.merge(acc)
+		acc.reset()
+		free <- acc
+		slots <- struct{}{}
 	}
 	readers.Wait()
 	if err := parent.Err(); err != nil {
@@ -96,11 +138,6 @@ func Statistics(ctx context.Context, src Source, opts ...Option) (*Stats, error)
 	}
 	if err := firstFailure(errs); err != nil {
 		return nil, err
-	}
-	// Merging in shard order makes the result independent of timing.
-	total := newMoments(features)
-	for i := range accs {
-		total.merge(&accs[i])
 	}
 	if total.n == 0 {
 		return nil, fmt.Errorf("data: source has no examples: %w", ErrSource)
@@ -140,8 +177,9 @@ func cancelled(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// accumulate reads shard i of src into acc, through the buffers x and y.
-func accumulate(ctx context.Context, src Source, i int, acc *moments, x, y []float32) (err error) {
+// accumulate reads shard i of src into acc, through the buffers x and y
+// and the chunk sums.
+func accumulate(ctx context.Context, src Source, i int, acc *moments, sums *chunkSums, x, y []float32) (err error) {
 	rows, err := src.Open(ctx, i)
 	if err != nil {
 		return err
@@ -159,7 +197,7 @@ func accumulate(ctx context.Context, src Source, i int, acc *moments, x, y []flo
 			return fmt.Errorf("read %d examples into room for %d: %w", n, len(y), ErrSource)
 		}
 		if n > 0 {
-			acc.add(x[:n*features], n)
+			acc.add(x[:n*features], n, sums)
 			idle = 0
 		} else if rerr == nil {
 			if idle++; idle >= noProgressLimit {
@@ -183,7 +221,6 @@ func accumulate(ctx context.Context, src Source, i int, acc *moments, x, y []flo
 type moments struct {
 	n                int64
 	mean, m2, lo, hi []float64
-	cmean, cm2       []float64 // the chunk being added
 }
 
 func newMoments(features int) *moments {
@@ -193,22 +230,32 @@ func newMoments(features int) *moments {
 		lo:   make([]float64, features),
 		hi:   make([]float64, features),
 	}
-	for j := range features {
-		m.lo[j], m.hi[j] = math.Inf(1), math.Inf(-1)
-	}
+	m.reset()
 	return m
 }
 
-// add merges the n examples of x, row-major, into m.
-func (m *moments) add(x []float32, n int) {
-	f := len(x) / n
-	if m.mean == nil {
-		*m = *newMoments(f)
+// reset empties m, to accumulate another shard.
+func (m *moments) reset() {
+	m.n = 0
+	for j := range m.lo {
+		m.lo[j], m.hi[j] = math.Inf(1), math.Inf(-1)
 	}
-	if m.cmean == nil {
-		m.cmean, m.cm2 = make([]float64, f), make([]float64, f)
-	}
-	cmean, cm2, lo, hi := m.cmean[:f], m.cm2[:f], m.lo[:f], m.hi[:f]
+}
+
+// chunkSums is a reader's scratch for the mean and squared deviations of
+// the chunk being added.
+type chunkSums struct {
+	mean, m2 []float64
+}
+
+func newChunkSums(features int) *chunkSums {
+	return &chunkSums{mean: make([]float64, features), m2: make([]float64, features)}
+}
+
+// add merges the n examples of x, row-major, into m, through sums.
+func (m *moments) add(x []float32, n int, sums *chunkSums) {
+	f := len(m.mean)
+	cmean, cm2, lo, hi := sums.mean[:f], sums.m2[:f], m.lo[:f], m.hi[:f]
 	clear(cmean)
 	clear(cm2)
 	for i := range n {
@@ -237,9 +284,6 @@ func (m *moments) add(x []float32, n int) {
 func (m *moments) merge(o *moments) {
 	if o.n == 0 {
 		return
-	}
-	if m.mean == nil {
-		*m = *newMoments(len(o.mean))
 	}
 	for j := range m.lo {
 		m.lo[j] = min(m.lo[j], o.lo[j])
