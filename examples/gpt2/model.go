@@ -125,12 +125,6 @@ func (g *GPT) Decode(ctx context.Context, idx *tensor.Tensor, caches []*nn.KVCac
 	}
 	x := g.embed(idx, caches[0].Len())
 	for i, b := range g.Blocks {
-		// A block's Decode computes the keys and values it caches alone.
-		// Computing its input first keeps every later block from running
-		// the products of the blocks before it once more.
-		if err := x.Realize(ctx); err != nil {
-			return nil, err
-		}
 		var err error
 		if x, err = b.Decode(ctx, x, caches[i]); err != nil {
 			return nil, err
