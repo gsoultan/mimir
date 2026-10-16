@@ -220,13 +220,17 @@ func BenchmarkMatMul(b *testing.B) {
 						c.be.Free(buf)
 					}
 				}()
-				for b.Loop() {
+				product := func() {
 					if err := c.be.Run(b.Context(), k, bufs[:1], bufs[1:]); err != nil {
 						b.Fatal(err)
 					}
 					if err := c.be.Sync(b.Context()); err != nil {
 						b.Fatal(err)
 					}
+				}
+				product() // compiles the kernel, or lets cuBLAS load its own
+				for b.Loop() {
+					product()
 				}
 				b.ReportMetric(2*float64(n)*float64(n)*float64(n)*float64(b.N)/b.Elapsed().Seconds()/1e9, "GFLOP/s")
 			})
@@ -246,15 +250,21 @@ func TestDeviceReportsItself(t *testing.T) {
 	}
 }
 
-// TestBatchesMatchTheirKernelsOnTheGPU runs a batch again and again, as a
-// CUDA graph from its second run on, with a new constant or buffers
-// between runs, and checks each run's results against the host's.
+// TestBatchesMatchTheirKernelsOnTheGPU runs a batch again and again, with
+// graphs on, as a CUDA graph from its second run on, with a new constant
+// or buffers between runs, and checks each run's results against the
+// host's and that the runs it should launch as a graph did.
 func TestBatchesMatchTheirKernelsOnTheGPU(t *testing.T) {
 	if newGPU(t, 0) == nil {
 		t.Skip("no CUDA device")
 	}
+	if err := graphsReady(); err != nil {
+		t.Skipf("no CUDA graphs: %v", err)
+	}
 	gpuMu.Lock()
 	defer gpuMu.Unlock()
+	defer func(on bool) { graphsOn = on }(graphsOn)
+	graphsOn = true
 	b := gpu
 	b.mu.Lock()
 	defer func(blasMin int) {
@@ -313,12 +323,13 @@ func TestBatchesMatchTheirKernelsOnTheGPU(t *testing.T) {
 			st.graph.destroy()
 		}
 	}()
-	for run, c := range []float64{2, 2, 3, 3, 5, 5} {
+	launches := graphCounts.launches.Load()
+	for run, c := range []float64{2, 2, 3, 3, 5, 5, 7, 7} {
 		fused.Attrs.Program[1].Value = c
 		switch run {
 		case 3: // a new output for the generated kernel
 			bt.Outs[0][0] = upload(make([]float32, 8))
-		case 5: // a new operand for cuBLAS
+		case 5: // a new operand for cuBLAS: one by one until runs repeat twice
 			bt.Ins[1][0] = upload(as)
 		}
 		if err := b.RunBatch(t.Context(), bt); err != nil {
@@ -345,7 +356,11 @@ func TestBatchesMatchTheirKernelsOnTheGPU(t *testing.T) {
 			}
 		}
 	}
-	if st := bt.State.(*batchState); !graphsOff && (st.noGraph || st.graph == nil || st.graph.exec == 0) {
+	if st := bt.State.(*batchState); st.noGraph || !st.graph.live() {
 		t.Error("the batch did not run as a CUDA graph")
+	}
+	// Runs 1 to 4 and 7.
+	if n := graphCounts.launches.Load() - launches; n != 5 {
+		t.Errorf("%d runs launched as a graph, want 5", n)
 	}
 }
