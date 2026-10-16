@@ -38,6 +38,9 @@ type Dialect struct {
 	shared, sync string
 	// signature writes the kernel's declaration and opening brace.
 	signature func(s *strings.Builder, outs, ins []backend.DType, params int)
+	// decl declares a helper function, and global qualifies the type a
+	// pointer to a buffer's elements points to.
+	decl, global string
 }
 
 // Metal is Metal Shading Language. A kernel takes its outputs, inputs,
@@ -47,6 +50,8 @@ var Metal = &Dialect{
 	param:  "p[%d]",
 	shared: "threadgroup",
 	sync:   "threadgroup_barrier(mem_flags::mem_threadgroup)",
+	decl:   "static inline",
+	global: "device ",
 	prelude: `#include <metal_stdlib>
 using namespace metal;
 
@@ -101,8 +106,10 @@ var CUDA = &Dialect{
 	param:  "p.v[%d]",
 	shared: "__shared__",
 	sync:   "__syncthreads()",
+	decl:   "static __device__ inline",
 	prelude: `typedef unsigned int uint;
 typedef unsigned short ushort;
+typedef unsigned char uchar;
 
 static __device__ inline float fbits(int b) { return __int_as_float(b); }
 static __device__ inline float fbits(uint b) { return __uint_as_float(b); }

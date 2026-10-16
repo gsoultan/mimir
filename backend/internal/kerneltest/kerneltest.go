@@ -137,7 +137,10 @@ func Values(t *testing.T, dt backend.DType, raw []byte) []float64 {
 }
 
 // byteSize returns the size of b in bytes.
-func byteSize(b backend.Buffer) int { return b.Len() * b.DType().Size() }
+func byteSize(b backend.Buffer) int {
+	n, _ := b.DType().Bytes(b.Len())
+	return n
+}
 
 // Contents returns the bytes of the Host buffer b.
 func Contents(t *testing.T, b backend.Buffer) []byte {
