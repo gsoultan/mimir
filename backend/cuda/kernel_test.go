@@ -63,3 +63,6 @@ func TestAttentionKernels(t *testing.T) {
 func TestConvKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Conv(t), targets(t, false)) }
 func TestSortKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Sort(t), targets(t, false)) }
 func TestFFTKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.FFT(t), targets(t, false)) }
+func TestSegmentKernels(t *testing.T) {
+	kerneltest.Run(t, kerneltest.Segment(t), targets(t, false))
+}

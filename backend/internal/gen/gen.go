@@ -530,6 +530,9 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return planArgsort(d, k, outs, ins, n)
 	case op == backend.OpFFT:
 		return planFFT(d, k, outs, ins, n)
+
+	case op == backend.OpSegment:
+		return g.segment(n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }

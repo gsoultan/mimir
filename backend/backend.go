@@ -185,7 +185,8 @@ type Attrs struct {
 	// and are computed, not loaded: a copy of an input is OpContiguous.
 	Stores []int
 
-	// Scan: how the elements along Axis combine.
+	// Scan: how the elements along Axis combine. Segment: how the rows
+	// of a segment combine.
 	Combine Combine
 
 	// Attention, AttentionGrad: the factor applied to the scores q·k, and

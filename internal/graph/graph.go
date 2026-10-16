@@ -757,3 +757,25 @@ func GammaGrad(alpha, x *Node) (*Node, error) {
 	}
 	return newNode(&Node{Op: backend.OpGammaGrad, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{alpha, x}})
 }
+
+// Segment combines rows of x, [R, D...], in the segments that offsets,
+// Int32 [S+1], cuts the Int32 row list rows into, by combine, CombineSum
+// or CombineMax, into [S, D...]; see backend.OpSegment. Offsets and rows
+// are checked when the graph runs.
+func Segment(x, offsets, rows *Node, combine backend.Combine) (*Node, error) {
+	if offsets.DType != backend.Int32 || rows.DType != backend.Int32 {
+		return nil, errorf(backend.OpSegment, backend.ErrDType, "%s offsets and %s rows", offsets.DType, rows.DType)
+	}
+	if err := checkDType(backend.OpSegment, x.DType); err != nil {
+		return nil, err
+	}
+	if len(x.Shape) == 0 || len(offsets.Shape) != 1 || offsets.Shape[0] == 0 || len(rows.Shape) != 1 {
+		return nil, errorf(backend.OpSegment, backend.ErrShape, "rows of %v in segments %v of %v", x.Shape, offsets.Shape, rows.Shape)
+	}
+	if combine != backend.CombineSum && combine != backend.CombineMax {
+		return nil, errorf(backend.OpSegment, backend.ErrShape, "segments combined by %s", combine)
+	}
+	shape := slices.Clone(x.Shape)
+	shape[0] = offsets.Shape[0] - 1
+	return newNode(&Node{Op: backend.OpSegment, DType: x.DType, Shape: shape, Inputs: []*Node{x, offsets, rows}, Attrs: backend.Attrs{Combine: combine}})
+}
