@@ -29,6 +29,7 @@ import (
 	"math"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
@@ -113,14 +114,32 @@ var (
 // which their few heap bytes may not bring for a long time, and mapped
 // memory would grow without bound. One goroutine runs it while the
 // others go on.
+//
+// The cleanups that give the mappings back run after the collection, on
+// goroutines of their own, and where they fall behind, the bytes off the
+// heap grow, which puts the next collection off further. So the
+// goroutine that ran the collection waits, up to cleanupWait, for the
+// cleanup of an object the collection found, which runs among theirs.
 func paceGC(size int) {
 	if mappedSinceGC.Add(int64(size)) < max(gcPaceMin, offHeapBytes.Load()/2) || !collecting.CompareAndSwap(false, true) {
 		return
 	}
 	defer collecting.Store(false)
 	mappedSinceGC.Store(0)
+	done := make(chan struct{})
+	runtime.AddCleanup(new(sentinel), func(done chan struct{}) { close(done) }, done)
 	runtime.GC()
+	wait := time.NewTimer(cleanupWait)
+	defer wait.Stop()
+	select {
+	case <-done:
+	case <-wait.C:
+	}
 }
+
+// cleanupWait is the longest a collection that Alloc runs waits for the
+// cleanups the collection queued.
+const cleanupWait = time.Second
 
 // Alloc returns a zeroed buffer of n elements. A buffer of offHeapMin bytes
 // or more comes from an anonymous mapping on platforms that have them,
