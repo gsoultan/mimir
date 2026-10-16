@@ -3,13 +3,16 @@ package datasets
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gsoultan/mimir/data"
@@ -151,6 +154,9 @@ func TestParquetShardsErrors(t *testing.T) {
 		"numeric classes":   {[]string{reg0}, "y", []CSVOption{Classes("a")}, data.ErrOption, []string{`"y"`, "DOUBLE", "Classes"}},
 		"type mismatch":     {[]string{reg0, parquetFixture("mismatch")}, "y", nil, ErrFormat, []string{"mismatch.parquet", "column 2", `"x2" INT64`, `"x2" INT32`, "reg_0.parquet"}},
 		"column mismatch":   {[]string{reg1, parquetFixture("single")}, "y", nil, ErrFormat, []string{"single.parquet", "1 columns, want 5", "reg_1.parquet"}},
+		"nested":            {[]string{parquetFixture("nested")}, "y", nil, ErrFormat, []string{"nested.parquet", `"vals.list.element"`, "nested"}},
+		"nested elsewhere":  {[]string{reg0, parquetFixture("nested")}, "y", nil, ErrFormat, []string{"nested.parquet", "6 columns, want 5"}},
+		"no row groups":     {[]string{parquetFixture("no_rows")}, "y", nil, data.ErrSource, []string{"no_rows.parquet", "no row groups"}},
 	} {
 		_, _, err := ParquetShards(tc.paths, tc.target, tc.opts...)
 		if !errors.Is(err, tc.is) {
@@ -171,7 +177,10 @@ func TestParquetShardsErrors(t *testing.T) {
 		opts   []CSVOption
 		want   []string
 	}{
-		"null":          {[]string{parquetFixture("nulls")}, "y", nil, []string{"nulls.parquet", "row 3", `column "x2"`, "null"}},
+		"null": {[]string{parquetFixture("nulls")}, "y", nil, []string{"nulls.parquet", "row 3", `column "x2"`, "null"}},
+		// The first file declares x1 required, the second does not and
+		// holds a null in it, which is not read as NaN.
+		"null in a column required in the first file": {[]string{parquetFixture("required"), parquetFixture("x1_null")}, "y", nil, []string{"x1_null.parquet", "row 4", `column "x1"`, "null"}},
 		"unknown class": {[]string{cls0}, "label", []CSVOption{Classes("a", "b")}, []string{"cls_0.parquet", "row 2", `column "label"`, `"c"`}},
 	} {
 		src, _, err := ParquetShards(tc.paths, tc.target, tc.opts...)
@@ -230,6 +239,202 @@ func TestParquetShardsErrors(t *testing.T) {
 	}
 }
 
+func TestParquetShardsLogicalTypes(t *testing.T) {
+	src, features, err := ParquetShards([]string{parquetFixture("logical")}, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"d64", "d32", "day"}; !slices.Equal(features, want) {
+		t.Errorf("features %v, want %v", features, want)
+	}
+	ys, xs := readAll(t, src)
+	// DECIMALs are their value, DATEs their days since the epoch.
+	want := [][]float32{{12.34, -1.234, 10}, {0.01, 0.5, 10957}}
+	if !slices.Equal(ys, []float32{1, 2}) || len(xs) != 2 {
+		t.Fatalf("targets %v, rows %v", ys, xs)
+	}
+	for i := range want {
+		for j, w := range want[i] {
+			if got := xs[i][j]; math.Abs(float64(got-w)) > 1e-6*math.Abs(float64(w)) {
+				t.Errorf("row %d %s = %v, want %v", i, features[j], got, w)
+			}
+		}
+	}
+}
+
+func TestParquetShardsReadsAnySizes(t *testing.T) {
+	src, _, err := ParquetShards([]string{parquetFixture("reg_0")}, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Blocks of 3 rows, so that most Reads span several.
+	src.(*parquetSource).block = 3
+	for _, sizes := range [][][2]int{
+		{{40, 10}, {8, 1}},          // a smaller y after a larger one
+		{{4, 7}, {40, 2}, {13, 13}}, // x and y the limit in turn, x not a whole number of rows
+		{{4 * 50, 50}},
+		{{4 * 64, 64}},
+	} {
+		rows, err := src.Open(t.Context(), 1) // rows 50 to 99
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := 50
+		for k := 0; ; k++ {
+			size := sizes[k%len(sizes)]
+			x, y := make([]float32, size[0]), make([]float32, size[1])
+			n, err := rows.Read(x, y)
+			if want := min(size[0]/4, size[1], 100-row); n != want && !(want == 0 && n == 0) {
+				t.Fatalf("%v: read %d at row %d, want %d", sizes, n, row, want)
+			}
+			for i := range n {
+				wx, wy := regressionRow(row + i)
+				if !slices.Equal(x[4*i:4*i+4], wx) || y[i] != wy {
+					t.Fatalf("%v: row %d: %v -> %v, want %v -> %v", sizes, row+i, x[4*i:4*i+4], y[i], wx, wy)
+				}
+			}
+			row += n
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if row != 100 {
+			t.Errorf("%v: read to row %d, want 100", sizes, row)
+		}
+		rows.Close()
+	}
+}
+
+func TestParquetShardsShareOpenFiles(t *testing.T) {
+	// The shards of a file read one after another, by Stream and
+	// Statistics, parse its footer once.
+	src, _, err := ParquetShards([]string{parquetFixture("reg_0")}, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := src.(*parquetSource)
+	for range 2 {
+		if ys, _ := readAll(t, src); len(ys) != 100 {
+			t.Fatalf("%d rows", len(ys))
+		}
+	}
+	if _, err := data.Statistics(t.Context(), src); err != nil {
+		t.Fatal(err)
+	}
+	if n := ps.opened.Load(); n != 1 {
+		t.Errorf("reading the 2 shards of a file 3 times opened it %d times", n)
+	}
+
+	// Of six files read in turn, four stay open, the last read.
+	dir := t.TempDir()
+	var paths []string
+	for i := range 6 {
+		paths = append(paths, filepath.Join(dir, fmt.Sprintf("reg_%d.parquet", i)))
+		copyFile(t, parquetFixture("reg_1"), paths[i])
+	}
+	src, _, err = ParquetShards(paths, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps = src.(*parquetSource)
+	if ys, _ := readAll(t, src, data.Prefetch(1)); len(ys) != 180 {
+		t.Fatalf("%d rows", len(ys))
+	}
+	checkIdle(t, ps, paths[2:])
+	// Reading them again in order finds the first two closed and the
+	// rest evicted by the time it gets to them.
+	readAll(t, src, data.Prefetch(1))
+	if n := ps.opened.Load(); n != 12 {
+		t.Errorf("reading 6 files twice opened them %d times", n)
+	}
+	// Read in the order the cache keeps them, none is opened again.
+	for _, shard := range []int{2, 3, 4, 5} {
+		rows, err := src.Open(t.Context(), shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil { // a second Close does nothing
+			t.Fatal(err)
+		}
+	}
+	if n := ps.opened.Load(); n != 12 {
+		t.Errorf("reading the open files opened %d", n-12)
+	}
+	checkIdle(t, ps, paths[2:])
+
+	// Shards opened, read and closed at random from several goroutines
+	// share files and leave at most 4 open.
+	paths = append(paths, parquetFixture("reg_0"), parquetFixture("reg_0")) // a path twice
+	src, _, err = ParquetShards(paths, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps = src.(*parquetSource)
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			rng := rand.New(rand.NewPCG(uint64(g), 0))
+			x, y := make([]float32, 4*16), make([]float32, 16)
+			for range 50 {
+				shard := rng.IntN(src.Shards())
+				rows, err := src.Open(t.Context(), shard)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				n := 0
+				for {
+					m, err := rows.Read(x, y)
+					n += m
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					if err != nil {
+						t.Error(err)
+						return
+					}
+				}
+				if want := []int{30, 30, 30, 30, 30, 30, 50, 50, 50, 50}[shard]; n != want {
+					t.Errorf("shard %d: %d rows, want %d", shard, n, want)
+				}
+				if err := rows.Close(); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	checkIdle(t, ps, nil)
+}
+
+// checkIdle checks that every file ps keeps open is idle, at most 4 of
+// them, and, if want is not nil, that they are those of want in order of
+// last use.
+func checkIdle(t *testing.T, ps *parquetSource, want []string) {
+	t.Helper()
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	var idle []string
+	for _, sf := range ps.idle {
+		idle = append(idle, sf.path)
+		if sf.refs != 0 || ps.open[sf.path] != sf {
+			t.Errorf("idle file %s has %d references", sf.path, sf.refs)
+		}
+	}
+	if len(ps.open) != len(ps.idle) || len(ps.idle) > maxIdleFiles {
+		t.Errorf("%d files open, %d of them idle", len(ps.open), len(ps.idle))
+	}
+	if want != nil && !slices.Equal(idle, want) {
+		t.Errorf("idle files %v, want %v", idle, want)
+	}
+}
+
 func copyFile(t *testing.T, from, to string) {
 	t.Helper()
 	b, err := os.ReadFile(from)
@@ -239,4 +444,87 @@ func copyFile(t *testing.T, from, to string) {
 	if err := os.WriteFile(to, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// BenchmarkParquetShards reads the file named by MIMIR_PARQUET_BENCH, such
+// as one of many row groups and columns, through the shard reader with the
+// last column as the target: "open" times Open and Close of the first
+// shard, "read" the Reads of every shard in order with the timer stopped
+// around Open and Close, and "epoch" all of it, as an in-order epoch does.
+// MB/s is the file's bytes.
+func BenchmarkParquetShards(b *testing.B) {
+	path := os.Getenv("MIMIR_PARQUET_BENCH")
+	if path == "" {
+		b.Skip("MIMIR_PARQUET_BENCH names no file")
+	}
+	f, err := parquet.OpenFile(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cols := f.Columns()
+	f.Close()
+	src, features, err := ParquetShards([]string{path}, cols[len(cols)-1].Name)
+	if err != nil {
+		b.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	const chunk = 4096
+	x, y := make([]float32, chunk*len(features)), make([]float32, chunk)
+	b.Run("open", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			rows, err := src.Open(b.Context(), 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := rows.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	epoch := func(b *testing.B, pause bool) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		var n int
+		for b.Loop() {
+			n = 0
+			for shard := range src.Shards() {
+				if pause {
+					b.StopTimer()
+				}
+				rows, err := src.Open(b.Context(), shard)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if pause {
+					b.StartTimer()
+				}
+				for {
+					m, err := rows.Read(x, y)
+					n += m
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				if pause {
+					b.StopTimer()
+				}
+				if err := rows.Close(); err != nil {
+					b.Fatal(err)
+				}
+				if pause {
+					b.StartTimer()
+				}
+			}
+		}
+		b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "rows/s")
+	}
+	b.Run("read", func(b *testing.B) { epoch(b, true) })
+	b.Run("epoch", func(b *testing.B) { epoch(b, false) })
 }

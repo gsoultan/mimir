@@ -58,11 +58,24 @@ and of a classification table, whose row i is
     nulls        rows 0 to 9 of the regression table with x2 null at row 3
     mismatch     rows 0 to 9 of the regression table with x2 as int64
     single       rows 0 to 9 of y alone
+    required     rows 0 to 9 of the regression table with x1 required
+                 (nullable=False), the other columns optional
+    x1_null      rows 10 to 19, every column optional, x1 null at row 14
+    nested       rows 0 to 9 of the regression table with a column vals of
+                 list<int32>, [i, i + 1] in row i
+    logical      two rows of logical types stored as integers, and y 1, 2:
+                 d64 decimal(10, 2) 12.34, 0.01 as INT64
+                 d32 decimal(5, 3) -1.234, 0.5 as INT32
+                 day date32 1970-01-11, 2000-01-01 (days 10, 10957)
+    no_rows      x1 and y with no row groups at all, as a writer closed
+                 without writing leaves a file
 """
 
 import argparse
+import datetime
 import math
 import os
+from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -108,11 +121,11 @@ FILES = {
 }
 
 
-def regression(start: int, n: int, x2: pa.DataType = pa.int32(), x2_null: int = -1) -> pa.Table:
+def regression(start: int, n: int, x2: pa.DataType = pa.int32(), x2_null: int = -1, x1_null: int = -1) -> pa.Table:
     rows = range(start, start + n)
     return pa.table(
         {
-            "x1": pa.array([i / 4 for i in rows], pa.float32()),
+            "x1": pa.array([None if i == x1_null else i / 4 for i in rows], pa.float32()),
             "x2": pa.array([None if i == x2_null else i % 7 - 3 for i in rows], x2),
             "x3": pa.array([i % 2 == 0 for i in rows], pa.bool_()),
             "x4": pa.array([i * 1_000_000_007 for i in rows], pa.int64()),
@@ -132,6 +145,22 @@ def classification(start: int, n: int) -> pa.Table:
     )
 
 
+def required_x1(t: pa.Table) -> pa.Table:
+    fields = [f.with_nullable(False) if f.name == "x1" else f for f in t.schema]
+    return t.cast(pa.schema(fields))
+
+
+def logical() -> pa.Table:
+    return pa.table(
+        {
+            "d64": pa.array([Decimal("12.34"), Decimal("0.01")], pa.decimal128(10, 2)),
+            "d32": pa.array([Decimal("-1.234"), Decimal("0.5")], pa.decimal128(5, 3)),
+            "day": pa.array([datetime.date(1970, 1, 11), datetime.date(2000, 1, 1)], pa.date32()),
+            "y": pa.array([1.0, 2.0], pa.float64()),
+        }
+    )
+
+
 SHARDS = {
     "reg_0": (regression(0, 100), dict(row_group_size=50, use_dictionary=False)),
     "reg_1": (regression(100, 30), dict(use_dictionary=False)),
@@ -140,6 +169,19 @@ SHARDS = {
     "nulls": (regression(0, 10, x2_null=3), dict(use_dictionary=False)),
     "mismatch": (regression(0, 10, x2=pa.int64()), dict(use_dictionary=False)),
     "single": (regression(0, 10).select(["y"]), dict(use_dictionary=False)),
+    "required": (required_x1(regression(0, 10)), dict(use_dictionary=False)),
+    "x1_null": (regression(10, 10, x1_null=14), dict(use_dictionary=False)),
+    "nested": (
+        regression(0, 10).append_column("vals", pa.array([[i, i + 1] for i in range(10)], pa.list_(pa.int32()))),
+        dict(use_dictionary=False),
+    ),
+    "logical": (logical(), dict(use_dictionary=False, store_decimal_as_integer=True)),
+}
+
+# Files written by a ParquetWriter closed without a table, which holds no
+# row group.
+EMPTY_SHARDS = {
+    "no_rows": pa.schema([pa.field("x1", pa.float32()), pa.field("y", pa.float64())]),
 }
 
 
@@ -167,6 +209,11 @@ def main() -> None:
     os.makedirs(args.shards, exist_ok=True)
     for name, (t, opts) in SHARDS.items():
         write(os.path.join(args.shards, name + ".parquet"), t, opts)
+    for name, schema in EMPTY_SHARDS.items():
+        path = os.path.join(args.shards, name + ".parquet")
+        pq.ParquetWriter(path, schema, write_statistics=False).close()
+        meta = pq.read_metadata(path)
+        print(f"{name}: {meta.num_rows} rows, {meta.num_row_groups} row groups, {os.path.getsize(path)} bytes")
 
 
 if __name__ == "__main__":
