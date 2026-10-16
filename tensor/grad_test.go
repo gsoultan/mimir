@@ -203,6 +203,16 @@ func gradCases() []gradCase {
 			return ys[0].Sum(0).Add(carry[0])
 		}, u(-1, 1, 5, 2, 3), u(-1, 1, 2, 3), u(-1, 1, 3, 3))
 	}
+
+	add("fft", func(x []*tensor.Tensor) *tensor.Tensor {
+		y := x[0].FFT(1)
+		return y.Mul(y).IFFT(0)
+	}, u(-1, 1, 3, 4, 2))
+	add("sort_topk", func(x []*tensor.Tensor) *tensor.Tensor {
+		v, _ := x[0].Sort(1, false)
+		top, _ := x[0].TopK(2, 1, true)
+		return tensor.Cat(1, v.Mul(v), top.Exp())
+	}, distinct(3, 4))
 	return cases
 }
 

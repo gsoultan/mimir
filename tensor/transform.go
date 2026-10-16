@@ -386,7 +386,12 @@ func transposed(r rule, ts, in []*Tensor, out *Tensor, create bool) (*Tensor, er
 	if err := s.Err(); err != nil {
 		return nil, err
 	}
-	if s.tape == nil {
+	switch {
+	case s.tape == nil && r.firstOrder:
+		// A first-order rule may compute its gradients with operations
+		// that record nothing, which leaves nothing to transpose.
+		return nil, fmt.Errorf("tensor: JVP through a gradient rule that cannot be transposed: %w", ErrNotDifferentiable)
+	case s.tape == nil:
 		return nil, nil // the tangents do not reach the result
 	}
 	var stops []*tape
@@ -456,10 +461,10 @@ func Jacobian(f func(x *Tensor) *Tensor, x *Tensor) *Tensor {
 		cols := VMap(func(t ...*Tensor) []*Tensor {
 			_, ty := jvpCall(fs, []*Tensor{x}, t, nil)
 			return ty
-		})(eye(n, x.node.DType).reshape(slices.Concat([]int{n}, xs)))[0]
+		})(eye(n).Cast(x.node.DType).reshape(slices.Concat([]int{n}, xs)))[0]
 		return cols.Reshape(n, m).Transpose(0, 1).Reshape(slices.Concat(ys, xs)...)
 	}
-	rows := VMap(func(g ...*Tensor) []*Tensor { return pull(g...) })(eye(m, y[0].node.DType).reshape(slices.Concat([]int{m}, ys)))[0]
+	rows := VMap(func(g ...*Tensor) []*Tensor { return pull(g...) })(eye(m).Cast(y[0].node.DType).reshape(slices.Concat([]int{m}, ys)))[0]
 	return rows.Reshape(slices.Concat(ys, xs)...)
 }
 
@@ -473,12 +478,4 @@ func Jacobian(f func(x *Tensor) *Tensor, x *Tensor) *Tensor {
 func Hessian(f func(x *Tensor) *Tensor, x *Tensor) *Tensor {
 	grad := Grad(func(x ...*Tensor) *Tensor { return f(x[0]) })
 	return Jacobian(func(x *Tensor) *Tensor { return grad(x)[0] }, x)
-}
-
-// eye returns the n×n identity matrix of dtype dt, made of constants, so
-// that it runs on any device.
-func eye(n int, dt DType) *Tensor {
-	i := Ones(Float32, n, 1).cumsum(0)
-	j := Ones(Float32, 1, n).cumsum(1)
-	return i.Equal(j).Cast(dt)
 }

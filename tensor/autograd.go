@@ -171,15 +171,21 @@ func record(out *Tensor, r rule, ins ...*Tensor) *Tensor {
 // captured. The gradients it computes cannot be differentiated in turn:
 // that fails with ErrNotDifferentiable. JVP derives the forward
 // derivative from it by transposition. record with a rule that reads its
-// inputs and result gives derivatives of every order.
-//
-//lint:ignore U1000 the rule of an operation whose gradient needs values it captures
+// inputs and result gives derivatives of every order. vjp computes
+// with captured tensors outside VMap's batching, so a batched g fails
+// with ErrNotBatchable.
 func track(out *Tensor, vjp func(g *Tensor) []*Tensor, ins ...*Tensor) *Tensor {
 	if out.err != nil || !tracked(ins...) {
 		return out
 	}
 	return record(out, rule{
-		vjp:        func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return vjp(g) },
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor {
+			if batchLevel(g) != 0 {
+				err := fail(fmt.Errorf("tensor: batched gradient of a first-order rule: %w", ErrNotBatchable))
+				return slices.Repeat([]*Tensor{err}, len(ins))
+			}
+			return vjp(g)
+		},
 		firstOrder: true,
 	}, ins...)
 }

@@ -131,8 +131,18 @@ func (t *Tensor) dft(axis int, inverse bool) *Tensor {
 	if n := t.node.Shape[axis]; n > gpuDirectDFT && n&(n-1) != 0 && t.Device().backend() != cpuBackend {
 		return t.bluestein(axis, inverse)
 	}
-	out := wrap(graph.FFT(t.node, axis, inverse))
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.Cast(Float32).dft(axis, !inverse)) }, t)
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchFFT(l, t, axis, inverse)
+	} else {
+		out = wrap(graph.FFT(t.node, axis, inverse))
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.Cast(Float32).dft(axis, !inverse)) },
+		// The transform is linear: the tangent's transform is the
+		// result's tangent.
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].Cast(Float32).dft(axis, inverse) },
+	}, t)
 }
 
 // gpuDirectDFT is the longest transform of a length that is not a power

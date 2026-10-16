@@ -29,8 +29,8 @@ type Node struct {
 	// tensor.VMap stands for one example of a batch.
 	Placeholder bool
 	Shape       []int
-	Attrs  backend.Attrs
-	Inputs []*Node
+	Attrs       backend.Attrs
+	Inputs      []*Node
 
 	// Dev is the device that holds the node's inputs, and so computes
 	// it, or nil if it is computed from constants alone and runs on any

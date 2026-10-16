@@ -210,6 +210,9 @@ func (t *Tensor) matrices(what string, square bool) (*Tensor, error) {
 	if err := firstErr(t); err != nil {
 		return nil, err
 	}
+	if batchLevel(t) != 0 {
+		return nil, fmt.Errorf("tensor: %s: %w", what, ErrNotBatchable)
+	}
 	s := t.node.Shape
 	r := len(s)
 	if r < 2 || square && s[r-2] != s[r-1] {

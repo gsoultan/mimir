@@ -56,5 +56,8 @@ func (t *Tensor) argsort(axis, k int, descending bool) *Tensor {
 	if n := t.node.Shape[axis]; k < n && k > backend.MaxTopK {
 		return t.argsort(axis, n, descending).shrink(axisRange(t.node.Shape, axis, 0, k))
 	}
+	if l := batchLevel(t); l != 0 {
+		return batchArgsort(l, t, axis, k, descending)
+	}
 	return wrap(graph.Argsort(t.node, axis, k, descending))
 }
