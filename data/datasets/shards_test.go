@@ -241,6 +241,8 @@ func TestCSVShardsErrors(t *testing.T) {
 		[2]string{"number.csv", "x1,label,x2\n1,cat,2\n3,cat,four\n"},
 		[2]string{"fields.csv", "x1,label,x2\n1,cat\n"},
 		[2]string{"target.csv", "x1,label,x2\n1,2.5,2\n"},
+		[2]string{"nan.csv", "x1,label,x2\n1,cat,2\n3,cat,NaN\n"},
+		[2]string{"inf.csv", "x1,label,x2\n1,cat,2\n3,cat,4\n-Infinity,cat,4\n"},
 	)
 	notGz := filepath.Join(t.TempDir(), "plain.csv.gz")
 	if err := os.WriteFile(notGz, []byte(good), 0o644); err != nil {
@@ -256,6 +258,8 @@ func TestCSVShardsErrors(t *testing.T) {
 		"unknown class":     {paths[3], []string{filepath.Base(paths[3]), "line 3", `column "label"`, `"dog"`}},
 		"non-numeric":       {paths[4], []string{filepath.Base(paths[4]), "line 3", `column "x2"`, `"four"`}},
 		"short line":        {paths[5], []string{filepath.Base(paths[5]), "line 2", "2 fields, want 3"}},
+		"NaN":               {paths[7], []string{filepath.Base(paths[7]), "line 3", `column "x2"`, `"NaN"`, "not a finite number"}},
+		"-Infinity":         {paths[8], []string{filepath.Base(paths[8]), "line 4", `column "x1"`, `"-Infinity"`, "not a finite number"}},
 	} {
 		src, _, err := CSVShards([]string{good0, tc.path}, "label", Classes("cat"))
 		if err != nil {
@@ -327,6 +331,36 @@ func TestCSVShardsErrors(t *testing.T) {
 	}
 	if _, _, err := CSVShards([]string{good0}, "label", With(data.BatchSize(2))); !errors.Is(err, data.ErrOption) {
 		t.Errorf("With: %v", err)
+	}
+}
+
+func TestCSVShardsRejectsValuesNotFinite(t *testing.T) {
+	// One such value would make the mean of its feature NaN, and every
+	// example that Normalize standardizes with it.
+	for name, tc := range map[string]struct {
+		body string
+		want []string
+	}{
+		"nan feature":  {"x,y\n1,2\nnan,3\n", []string{"line 3", `column "x"`, `"nan"`}},
+		"inf feature":  {"x,y\n1,2\n3,4\ninf,3\n", []string{"line 4", `column "x"`, `"inf"`}},
+		"inf target":   {"x,y\n1,+Inf\n", []string{"line 2", `column "y"`, `"+Inf"`}},
+		"beyond float": {"x,y\n1e39,2\n", []string{"line 2", `column "x"`, `"1e39"`}},
+	} {
+		paths := writeShards(t, [2]string{"a.csv", "x,y\n0,1\n"}, [2]string{name + ".csv", tc.body})
+		src, _, err := CSVShards(paths, "y")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		_, err = data.Statistics(t.Context(), src)
+		if !errors.Is(err, ErrFormat) || !strings.Contains(err.Error(), "data: shard 1:") {
+			t.Errorf("%s: Statistics: %v", name, err)
+			continue
+		}
+		for _, w := range append(tc.want, filepath.Base(paths[1])) {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("%s: %v does not mention %q", name, err, w)
+			}
+		}
 	}
 }
 

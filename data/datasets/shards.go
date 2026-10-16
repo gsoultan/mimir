@@ -40,7 +40,9 @@ var utf8BOM = []byte("\xEF\xBB\xBF")
 // the indices as Float32, and data.ClassTargets on data.NewStream makes
 // them Int32. A label not among them, a feature that is not a number and
 // a header unlike the first file's fail the shard with the file, line and
-// column. A field may be quoted, with "" for a quote inside, but a quoted
+// column, and so do "NaN", "Inf" and the other spellings strconv accepts
+// for a value that is not finite, which would make every mean, and every
+// example Normalize standardizes, NaN. A field may be quoted, with "" for a quote inside, but a quoted
 // field may not contain a line break. Every path must exist when
 // CSVShards is called. With is for CSV only: the data options of a
 // stream go to data.NewStream.
@@ -365,12 +367,18 @@ func (r *csvRows) parseLine(line []byte, xrow []float32, y *float32) error {
 			if err != nil {
 				return fmt.Errorf("datasets: %s line %d column %q: %q is not a number (Classes names the labels of a class target): %w", r.path, r.line, header[col], field, ErrFormat)
 			}
+			if !finite(v) {
+				return fmt.Errorf("datasets: %s line %d column %q: %q is not a finite number: %w", r.path, r.line, header[col], field, ErrFormat)
+			}
 			*y = float32(v)
 			continue
 		}
 		v, err := strconv.ParseFloat(string(field), 32)
 		if err != nil {
 			return fmt.Errorf("datasets: %s line %d column %q: %q is not a number: %w", r.path, r.line, header[col], field, ErrFormat)
+		}
+		if !finite(v) {
+			return fmt.Errorf("datasets: %s line %d column %q: %q is not a finite number: %w", r.path, r.line, header[col], field, ErrFormat)
 		}
 		xrow[xi] = float32(v)
 		xi++
