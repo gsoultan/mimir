@@ -173,8 +173,8 @@ func TestTransfersFromOtherDevicesArePredicted(t *testing.T) {
 		t.Errorf("schedule reading the same input again obtained %d bytes, want only its result's", got)
 	}
 
-	// A view of a moved input shares the copy, which is released once its
-	// last reader has run, and once only.
+	// A view of a moved input shares the copy, which is released at the end
+	// of the schedule, and once only.
 	c, d := &counting{Backend: cpu.New()}, &counting{Backend: cpu.New()}
 	z := realized(t, c, []int{1000}, 2)
 	v := must(graph.Reshape(z, []int{10, 100}))
@@ -187,6 +187,47 @@ func TestTransfersFromOtherDevicesArePredicted(t *testing.T) {
 	}
 	if pooled := poolOf(d).pooledElements(); pooled != 1000 {
 		t.Errorf("%d elements pooled after the schedule, want the copy's 1000 once", pooled)
+	}
+}
+
+func TestMovedInputsOutliveTheViewsOfTheirCopies(t *testing.T) {
+	a, b := &counting{Backend: cpu.New()}, &counting{Backend: cpu.New()}
+	sum := func(n *graph.Node) *graph.Node { return must(graph.Reduce(backend.OpReduceSum, n, []int{0})) }
+	flat := func(n *graph.Node) *graph.Node { return must(graph.Reshape(n, []int{16})) }
+	x := realized(t, a, []int{4, 4}, 1)
+	xs := floats(t, a, x)
+	// The sum is the last reader of a view of x's copy; the product reads
+	// the copy itself after it, and must not find it handed out as its own
+	// output: the copy, the sum and the product each take a buffer.
+	p := must(graph.MatMul(x, x))
+	if got := exact(t, b, sum(flat(x)), p); got != (16+1+16)*4 {
+		t.Errorf("schedule obtained %d bytes, want %d", got, (16+1+16)*4)
+	}
+	for i, v := range floats(t, b, p) {
+		var want float32
+		for k := range 4 {
+			want += xs[i/4*4+k] * xs[k*4+i%4]
+		}
+		if d := v - want; d > 1e-5 || d < -1e-5 {
+			t.Fatalf("product element %d = %v, want %v", i, v, want)
+		}
+	}
+	if pooled := poolOf(b).pooledElements(); pooled != 16 {
+		t.Errorf("%d elements pooled after the schedule, want the copy's 16 once", pooled)
+	}
+
+	// Nor may an elementwise kernel, which may run in place, write its
+	// result over the copy while a later kernel still reads it.
+	y := realized(t, a, []int{4, 4}, 2)
+	ys := floats(t, a, y)
+	neg := must(graph.Unary(backend.OpNeg, must(graph.Permute(y, []int{1, 0}))))
+	if err := Realize(t.Context(), b, sum(flat(y)), must(graph.Unary(backend.OpExp2, y)), neg); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range floats(t, b, neg) {
+		if want := -ys[i%4*4+i/4]; v != want {
+			t.Fatalf("negated transpose element %d = %v, want %v", i, v, want)
+		}
 	}
 }
 

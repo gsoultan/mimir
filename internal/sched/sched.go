@@ -363,7 +363,10 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 	// a buffer shared by views is freed only after its last reader.
 	refs := make(map[backend.Buffer]int)
 	// A realized input on another device, such as a constant computed
-	// there, is copied to be first.
+	// there, is copied to be first. Kernels read the copy until the end of
+	// the schedule, directly or through views, so the schedule holds a
+	// reference to it as well as the results that view it, and gives it
+	// back after the last kernel.
 	moved := make(map[*graph.Node]result)
 	for _, n := range p.order {
 		for _, in := range p.work[n].deps {
@@ -377,7 +380,7 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 				}
 				return err
 			}
-			refs[buf] = 0
+			refs[buf] = 1
 			moved[in] = result{buf: buf, view: backend.Contiguous(in.Shape)}
 		}
 	}
@@ -457,8 +460,8 @@ func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Nod
 		return err
 	}
 	for _, r := range moved {
-		// A view of a moved input may have released its buffer already.
-		if n, ok := refs[r.buf]; ok && n == 0 {
+		// A target that views the copy keeps it.
+		if refs[r.buf]--; refs[r.buf] == 0 {
 			delete(refs, r.buf)
 			m.release(r.buf)
 		}
