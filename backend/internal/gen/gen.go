@@ -12,6 +12,14 @@
 // where a group of GroupSize threads computes one. Threads visit the
 // inputs an element sums in the same order as the CPU backend, so sums
 // that one thread computes match it bit for bit.
+//
+// Half elements, BFloat16 and Float16, are ushort in a buffer. Kernels
+// convert them to float as they load them, compute in float and round to
+// the nearest element as they store, with the prelude's bf2f, f2bf, h2f
+// and f2h, written in the integer arithmetic of the CPU backend's
+// conversions so that every device rounds alike. A half-typed value of a
+// program is rounded after every instruction, as the CPU backend rounds
+// it.
 package gen
 
 import (
@@ -111,18 +119,62 @@ func (g *gen) finish(groups int, barriers bool) (*Launch, error) {
 	return &Launch{Src: s.String(), Groups: groups, Threads: GroupSize, Params: g.params, Barriers: barriers}, nil
 }
 
+// typeName returns the type kernels compute values of dt in: float for
+// every float type.
 func typeName(dt backend.DType) string {
-	if dt == backend.Float32 {
+	if dt.IsFloat() {
 		return "float"
 	}
 	return "int"
 }
 
+// elemName returns the type of the elements of a buffer of dt.
+func elemName(dt backend.DType) string {
+	if dt.Size() == 2 {
+		return "ushort"
+	}
+	return typeName(dt)
+}
+
+// load returns the expression that reads the element x of a buffer of
+// dt as a value.
+func load(dt backend.DType, x string) string {
+	switch dt {
+	case backend.BFloat16:
+		return fmt.Sprintf("bf2f(%s)", x)
+	case backend.Float16:
+		return fmt.Sprintf("h2f(%s)", x)
+	}
+	return x
+}
+
+// store returns the expression that converts the value x to an element
+// of a buffer of dt, rounding to the nearest half element.
+func store(dt backend.DType, x string) string {
+	switch dt {
+	case backend.BFloat16:
+		return fmt.Sprintf("f2bf(%s)", x)
+	case backend.Float16:
+		return fmt.Sprintf("f2h(%s)", x)
+	}
+	return x
+}
+
+// round returns the expression of the value x rounded to dt, which
+// leaves a value of a 32-bit type as it is.
+func round(dt backend.DType, x string) string {
+	if dt.Size() == 2 {
+		return load(dt, store(dt, x))
+	}
+	return x
+}
+
 // constant returns an expression of the value v of type dt, read from the
 // parameters, so that kernels that differ only in their constants, such as
-// an optimizer's update at each step, share one compiled pipeline.
+// an optimizer's update at each step, share one compiled pipeline. The
+// value of a half type is a float, to round when stored.
 func (g *gen) constant(v float64, dt backend.DType) string {
-	if dt == backend.Float32 {
+	if dt.IsFloat() {
 		return fmt.Sprintf("fbits(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
 	}
 	return g.param(int(int32(v)))
@@ -131,7 +183,7 @@ func (g *gen) constant(v float64, dt backend.DType) string {
 // literal returns an exact expression for v converted to dt, as the CPU
 // backend converts it.
 func literal(v float64, dt backend.DType) string {
-	if dt == backend.Float32 {
+	if dt.IsFloat() {
 		return fmt.Sprintf("fbits(0x%08xu)", math.Float32bits(float32(v)))
 	}
 	if i := int32(v); i != math.MinInt32 {
@@ -200,8 +252,9 @@ func (g *gen) index(lin string, shape []int) []string {
 }
 
 // program emits the instructions of an elementwise program and returns the
-// variable holding each value. load returns the expression of input a.
-func (g *gen) program(prog []backend.Instr, load func(a int) string) []string {
+// variable holding each value. input returns the expression of the
+// element of input a, which a load converts to a value.
+func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 	vals := make([]string, len(prog))
 	for j, in := range prog {
 		t := typeName(in.DType)
@@ -209,7 +262,7 @@ func (g *gen) program(prog []backend.Instr, load func(a int) string) []string {
 		var e string
 		switch op := in.Op; op {
 		case backend.OpLoad:
-			e = load(in.Args[0])
+			e = load(in.DType, input(in.Args[0]))
 		case backend.OpConst:
 			e = g.constant(in.Value, in.DType)
 		case backend.OpNeg:
@@ -244,6 +297,9 @@ func (g *gen) program(prog []backend.Instr, load func(a int) string) []string {
 			g.err = fmt.Errorf("instruction %d: %s is not elementwise: %w", j, op, backend.ErrInternal)
 			e = "0"
 		}
+		if in.Op != backend.OpLoad {
+			e = round(in.DType, e)
+		}
 		vals[j] = g.v("v")
 		g.line("%s %s = %s;", t, vals[j], e)
 	}
@@ -265,7 +321,7 @@ func checkProgram(prog []backend.Instr, stores []int, out backend.DType, ins []b
 		bad := func(what string) error {
 			return fmt.Errorf("instruction %d (%s): %s: %w", j, in.Op, what, backend.ErrInternal)
 		}
-		if in.DType != backend.Float32 && in.DType != backend.Int32 {
+		if in.DType.Size() == 0 {
 			return backend.ErrDType
 		}
 		want := 0
@@ -302,7 +358,7 @@ func checkProgram(prog []backend.Instr, stores []int, out backend.DType, ins []b
 		}
 		switch in.Op {
 		case backend.OpExp2, backend.OpLog2, backend.OpSin, backend.OpSqrt, backend.OpRecip:
-			if in.DType != backend.Float32 {
+			if !in.DType.IsFloat() {
 				return backend.ErrDType
 			}
 		}
@@ -352,7 +408,7 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		}
 		return g.elementwise(n, prog, nil)
 	case op == backend.OpConst:
-		g.line("o0[i] = %s;", g.constant(k.Attrs.Value, k.DType))
+		g.line("o0[i] = %s;", store(k.DType, g.constant(k.Attrs.Value, k.DType)))
 		return g.perElement(n)
 	case op == backend.OpRandUniform || op == backend.OpRandNormal:
 		return g.random(n)
@@ -388,9 +444,9 @@ func (g *gen) elementwise(n int, prog []backend.Instr, stores []int) (*Launch, e
 	shape, views := backend.Coalesce(g.k.Shape, g.k.In)
 	offs := g.offsets("i", shape, views)
 	vals := g.program(prog, func(a int) string { return fmt.Sprintf("i%d[%s]", a, offs[a]) })
-	g.line("o0[i] = %s;", vals[len(vals)-1])
+	g.line("o0[i] = %s;", store(g.k.DType, vals[len(vals)-1]))
 	for s, at := range stores {
-		g.line("o%d[i] = %s;", s+1, vals[at])
+		g.line("o%d[i] = %s;", s+1, store(g.k.DType, vals[at]))
 	}
 	return g.perElement(n)
 }
@@ -451,10 +507,12 @@ func reduceStep(op backend.Op, acc, x string) string {
 // combines its reduced positions in row-major order, one thread per
 // element, unless there are few elements that each reduce many positions:
 // then a group computes each, and sums are no longer in the CPU's order.
+// A half input is reduced in float, into a Float32 output.
 func planReduce(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int) (*Launch, error) {
 	v := k.In[0]
-	if len(v.Shape) != len(k.Shape) || ins[0].DType() != k.DType {
-		return nil, fmt.Errorf("reduction of %v to %v: %w", v.Shape, k.Shape, backend.ErrInternal)
+	in := ins[0].DType()
+	if len(v.Shape) != len(k.Shape) || in != k.DType && !(in.Size() == 2 && k.DType == backend.Float32) {
+		return nil, fmt.Errorf("reduction of %s%v to %s%v: %w", in, v.Shape, k.DType, k.Shape, backend.ErrInternal)
 	}
 	kept := backend.View{Shape: k.Shape, Strides: slices.Clone(v.Strides), Offset: v.Offset}
 	var red backend.View
@@ -482,7 +540,7 @@ func planReduce(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int
 		g.line("%s acc = %s;", t, init)
 		g.line("for (int j = int(tid); j < %s; j += %d) {", g.param(positions), GroupSize)
 		off := g.offsets("j", rshape, []backend.View{red})[0]
-		g.line("\tacc = %s;", reduceStep(k.Op, "acc", fmt.Sprintf("i0[%s + %s]", base, off)))
+		g.line("\tacc = %s;", reduceStep(k.Op, "acc", load(in, fmt.Sprintf("i0[%s + %s]", base, off))))
 		g.line("}")
 		g.line("%s %s part[%d];", d.shared, t, GroupSize)
 		g.line("part[tid] = acc;")
@@ -506,7 +564,7 @@ func planReduce(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int
 		g.line("int %s = %s + %s * %s;", next, off, a, g.param(red.Strides[d]))
 		off = next
 	}
-	g.line("acc = %s;", reduceStep(k.Op, "acc", fmt.Sprintf("i0[%s]", off)))
+	g.line("acc = %s;", reduceStep(k.Op, "acc", load(in, fmt.Sprintf("i0[%s]", off))))
 	for range rshape {
 		g.line("}")
 	}
@@ -529,7 +587,7 @@ func (g *gen) pad(n int) (*Launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", s, s, g.param(v.Shape[d]))
 		g.line("off += %s * %s;", s, g.param(v.Strides[d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", g.constant(g.k.Attrs.Value, g.k.DType))
+	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.constant(g.k.Attrs.Value, g.k.DType)))
 	return g.perElement(n)
 }
 
@@ -580,8 +638,8 @@ func (g *gen) scatterAdd(n int) (*Launch, error) {
 		g.line("idx += %s * %s;", c, g.param(vi.Strides[d]))
 		g.line("upd += %s * %s;", c, g.param(vu.Strides[d]))
 	}
-	t := typeName(g.k.DType)
-	g.line("%s acc = i0[dst];", t)
+	t, dt := typeName(g.k.DType), g.k.DType
+	g.line("%s acc = %s;", t, load(dt, "i0[dst]"))
 	g.line("if (covered) {")
 	g.line("\tint at = %s;", coords[axis])
 	g.line("\tint limit = %s;", g.param(g.k.Shape[axis]))
@@ -589,10 +647,10 @@ func (g *gen) scatterAdd(n int) (*Launch, error) {
 	g.line("\tfor (int j = 0; j < %s; j++) {", g.param(vi.Shape[axis]))
 	g.line("\t\tint to = i1[idx + j * si];")
 	g.line("\t\tif (at == 0 && (to < 0 || to >= limit)) report(err, %du);", ErrIndex)
-	g.line("\t\tif (to == at) acc = acc + i2[upd + j * su];")
+	g.line("\t\tif (to == at) acc = acc + %s;", load(dt, "i2[upd + j * su]"))
 	g.line("\t}")
 	g.line("}")
-	g.line("o0[i] = acc;")
+	g.line("o0[i] = %s;", store(dt, "acc"))
 	return g.perElement(n)
 }
 
@@ -633,7 +691,7 @@ func (g *gen) unfold(n int) (*Launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", x, x, g.param(v.Shape[lead+d]))
 		g.line("off += %s * %s;", x, g.param(v.Strides[lead+d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", g.constant(a.Value, g.k.DType))
+	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.constant(a.Value, g.k.DType)))
 	return g.perElement(n)
 }
 
@@ -671,11 +729,11 @@ func (g *gen) fold(n int) (*Launch, error) {
 		g.line("int %s = %s + %s * %s + %s * %s;", next, off, k, g.param(v.Strides[lead+d]), o, g.param(v.Strides[r+d]))
 		off = next
 	}
-	g.line("acc = acc + i0[%s];", off)
+	g.line("acc = acc + %s;", load(g.k.DType, fmt.Sprintf("i0[%s]", off)))
 	for range s {
 		g.line("}")
 	}
-	g.line("o0[i] = acc;")
+	g.line("o0[i] = %s;", store(g.k.DType, "acc"))
 	return g.perElement(n)
 }
 
@@ -684,6 +742,9 @@ func (g *gen) fold(n int) (*Launch, error) {
 // element, and applies the epilogue program, if any, to the result.
 func (g *gen) matmul(n int) (*Launch, error) {
 	k := g.k
+	if k.DType.Size() == 2 {
+		return nil, fmt.Errorf("%s product: %w", k.DType, backend.ErrDType)
+	}
 	vx, vy := k.In[0], k.In[1]
 	r := len(k.Shape)
 	if r < 2 || len(vx.Shape) != r || len(vy.Shape) != r || g.ins[0] != k.DType || g.ins[1] != k.DType {
