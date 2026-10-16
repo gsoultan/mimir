@@ -170,8 +170,8 @@ DECL float h2f(ushort h) {
 }
 DECL uint rne(uint h, uint m, uint shift) {
 	uint rest = m & ((1u << shift) - 1u);
-	uint half = 1u << (shift - 1u);
-	if (rest > half || (rest == half && (h & 1u) == 1u)) h++;
+	uint mid = 1u << (shift - 1u);
+	if (rest > mid || (rest == mid && (h & 1u) == 1u)) h++;
 	return h;
 }
 DECL ushort f2h(float f) {
