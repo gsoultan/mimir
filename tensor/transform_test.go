@@ -97,42 +97,48 @@ func TestJVPMatchesFiniteDifferences(t *testing.T) {
 // each case's loss with a direction v is the derivative of its gradient
 // along v.
 func TestHessianVectorProductsMatchFiniteDifferences(t *testing.T) {
-	const h = 1e-2
 	for _, c := range gradCases() {
-		t.Run(c.name, func(t *testing.T) {
-			x, v := c.inputs(0), c.tangents()
-			grad := tensor.Grad(c.loss)
-			_, hvp := tensor.JVP(grad, x, v)
-			if slices.Contains(notDifferentiableTwice, c.name) {
-				if err := hvp[0].Err(); !errors.Is(err, tensor.ErrNotDifferentiable) {
-					t.Fatalf("HVP through a first-order rule: %v, want ErrNotDifferentiable", err)
-				}
-				return
-			}
-			// Reverse over reverse: the gradient of the gradient's
-			// product with v.
-			xs := make([]*tensor.Tensor, len(x))
-			for i := range x {
-				xs[i] = x[i].Clone().RequiresGrad()
-			}
-			g := grad(xs...)
-			var dot *tensor.Tensor
-			for i := range g {
-				d := g[i].Mul(v[i]).Sum()
-				if dot == nil {
-					dot = d
-				} else {
-					dot = dot.Add(d)
-				}
-			}
-			rr := tensor.Gradients(dot, xs...)
-			gp, gm := grad(along(x, v, h)...), grad(along(x, v, -h)...)
-			for i := range x {
-				want := gp[i].Sub(gm[i]).Div(tensor.Scalar[float32](2 * h))
-				near(t, "forward over reverse", hvp[i], want, 1e-2, 2e-2)
-				near(t, "reverse over reverse", rr[i], hvp[i], 1e-4, 1e-3)
-			}
-		})
+		t.Run(c.name, func(t *testing.T) { checkHessianVectorProducts(t, c) })
+	}
+}
+
+// checkHessianVectorProducts checks c's Hessian-vector products, forward
+// over reverse against central differences of the gradient, and reverse
+// over reverse against forward over reverse.
+func checkHessianVectorProducts(t *testing.T, c gradCase) {
+	t.Helper()
+	const h = 1e-2
+	x, v := c.inputs(0), c.tangents()
+	grad := tensor.Grad(c.loss)
+	_, hvp := tensor.JVP(grad, x, v)
+	if slices.Contains(notDifferentiableTwice, c.name) {
+		if err := hvp[0].Err(); !errors.Is(err, tensor.ErrNotDifferentiable) {
+			t.Fatalf("HVP through a first-order rule: %v, want ErrNotDifferentiable", err)
+		}
+		return
+	}
+	// Reverse over reverse: the gradient of the gradient's product
+	// with v.
+	xs := make([]*tensor.Tensor, len(x))
+	for i := range x {
+		xs[i] = x[i].Clone().RequiresGrad()
+	}
+	g := grad(xs...)
+	var dot *tensor.Tensor
+	for i := range g {
+		d := g[i].Mul(v[i]).Sum()
+		if dot == nil {
+			dot = d
+		} else {
+			dot = dot.Add(d)
+		}
+	}
+	rr := tensor.Gradients(dot, xs...)
+	gp, gm := grad(along(x, v, h)...), grad(along(x, v, -h)...)
+	for i := range x {
+		want := gp[i].Sub(gm[i]).Div(tensor.Scalar[float32](2 * h))
+		near(t, "forward over reverse", hvp[i], want, 1e-2, 2e-2)
+		near(t, "reverse over reverse", rr[i], hvp[i], 1e-4, 1e-3)
 	}
 }
 
