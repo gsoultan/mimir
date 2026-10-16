@@ -28,7 +28,7 @@ image = (
     .add_local_dir(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "/mimir",
-        ignore=[".git", "data", "ckpt"],
+        ignore=[".git", "data", "ckpt", "*.txt", "*.log"],  # a log written here as the run goes
     )
 )
 app = modal.App("mimir-cuda", image=image)
