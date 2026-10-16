@@ -1,8 +1,10 @@
 package sched
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
+	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
@@ -15,9 +17,10 @@ import (
 // by mirroring its own allocations on a copy of the pool's free lists (see
 // forecast), and it is refused with ErrMemoryBudget when that, with the
 // memory the pool holds already, exceeds the budget. Pooled buffers the
-// schedule would not take are freed first when that makes it fit: a
-// schedule of new shapes, such as a smaller batch after a refusal, cannot
-// reuse them.
+// schedule would not take are freed first when that makes it fit, the
+// oldest first and only as many as it needs: a schedule of new shapes,
+// such as a smaller batch after a refusal, cannot reuse them, but the
+// next one of the old shapes can reuse those left.
 
 // SetBudget limits the memory that schedules on be may hold to bytes, or
 // removes the limit when bytes is 0 or less.
@@ -89,23 +92,56 @@ func (s *sim) give(key poolKey) { s.freed[key]++ }
 
 // reserve admits an operation that s predicts, recording the prediction,
 // or refuses it with ErrMemoryBudget when the bytes it obtains from the
-// backend and those held already exceed the budget. The pooled buffers it
-// would not take are freed first when that makes it fit.
+// backend and those held already exceed the budget. When freeing pooled
+// buffers that it would not take makes it fit, the oldest of them are
+// freed until it does.
 func (p *pool) reserve(s *sim) error {
-	if p.budget > 0 && p.held()+s.extra > p.budget {
-		var spare int64
-		for key, n := range s.pooled {
-			spare += key.bytes() * int64(n)
+	if over := p.held() + s.extra - p.budget; p.budget > 0 && over > 0 {
+		spares := p.spares(s)
+		n, freed := 0, int64(0)
+		for ; n < len(spares) && freed < over; n++ {
+			freed += spares[n].bytes
 		}
-		if p.held()-spare+s.extra > p.budget {
+		if freed < over {
 			return fmt.Errorf("sched: schedule needs %s with %s in use, budget %s: %w", mib(s.extra), mib(p.held()), mib(p.budget), backend.ErrMemoryBudget)
 		}
-		for key, n := range s.pooled {
+		evict := map[poolKey]int{}
+		for _, sp := range spares[:n] {
+			evict[sp.key]++
+		}
+		for key, n := range evict {
 			p.evict(key, n)
 		}
 	}
 	p.predicted += s.extra
 	return nil
+}
+
+// spare is a pooled buffer that an operation would not take.
+type spare struct {
+	key   poolKey
+	clock int   // when the buffer was freed
+	bytes int64 // on the account, which freeing the buffer takes off
+}
+
+// spares returns the pooled buffers that the operation s predicts would
+// not take, oldest first: of each key, the oldest, since the pool serves
+// the most recently freed first.
+func (p *pool) spares(s *sim) []spare {
+	var out []spare
+	p.acct.Lock()
+	defer p.acct.Unlock()
+	for key, bufs := range p.free {
+		for _, b := range bufs[:s.pooled[key]] {
+			out = append(out, spare{key, b.clock, p.accounted(b.buf)})
+		}
+	}
+	// Each list is oldest first, and a stable sort keeps the buffers of a
+	// key in that order, so that freeing the first n of a key frees those.
+	slices.SortStableFunc(out, func(a, b spare) int {
+		return cmp.Or(cmp.Compare(a.clock, b.clock), cmp.Compare(a.key.n, b.key.n), cmp.Compare(a.key.dt, b.key.dt))
+	})
+	return out
 }
 
 // mib formats bytes as mebibytes.

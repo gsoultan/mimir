@@ -444,3 +444,78 @@ func TestStaleAccountEntriesAreSettledOnce(t *testing.T) {
 		t.Errorf("%d buffers on the account after both were freed", left)
 	}
 }
+
+func TestBudgetFreesTheOldestPooledBuffersItNeedsOnly(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	// A pooled buffer of 300 elements, then eight of 1000 freed later.
+	small := realized(t, be, []int{300}, 1)
+	large := make([]*graph.Node, 8)
+	for i := range large {
+		large[i] = realized(t, be, []int{1000}, uint64(i+2))
+	}
+	Release(small, nil)
+	kept := realized(t, be, []int{1}, 10)
+	defer runtime.KeepAlive(kept)
+	for _, n := range large {
+		Release(n, nil)
+	}
+	held := MemoryOf(be).Allocated
+	if want := int64(300*4 + 8*1000*4 + 4); held != want {
+		t.Fatalf("%d bytes held, want %d", held, want)
+	}
+	// A schedule needing 2000 bytes is 1996 over the budget: the oldest
+	// pooled buffer, of 300, is not enough, and with one of 1000 it fits.
+	SetBudget(be, held+4)
+	if got := exact(t, be, must(graph.Rand([]int{500}, 11, false))); got != 500*4 {
+		t.Errorf("schedule obtained %d bytes, want %d", got, 500*4)
+	}
+	if pooled := poolOf(be).pooledElements(); pooled != 7*1000 {
+		t.Errorf("%d elements pooled after the schedule, want %d: the buffer of 300 and one of 1000 freed", pooled, 7*1000)
+	}
+	if got, want := MemoryOf(be).Allocated, held-300*4-1000*4+500*4; got != want {
+		t.Errorf("%d bytes held after the schedule, want %d", got, want)
+	}
+}
+
+func TestBudgetCountsMemoryGivenToThePool(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	held := realized(t, be, []int{1000}, 1)
+	defer runtime.KeepAlive(held)
+	// An uploaded buffer, as a gradient moved with its parameter is, is not
+	// counted until its memory is given to the pool, which may serve or
+	// free it from then on like any other.
+	buf, err := be.Alloc(backend.Float32, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	given, err := graph.Load(be, buf, []int{1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := MemoryOf(be); m.Allocated != 1000*4 {
+		t.Fatalf("%d bytes held with an uploaded buffer, want %d", m.Allocated, 1000*4)
+	}
+	Release(given, nil)
+	if m := MemoryOf(be); m.Allocated != 2*1000*4 {
+		t.Fatalf("%d bytes held once the uploaded buffer is pooled, want %d", m.Allocated, 2*1000*4)
+	}
+	// Freeing the pooled buffer would not make 2000 more bytes fit beside
+	// the 4000 held in a budget of 5000, so the schedule is refused and
+	// the pool left alone.
+	y := must(graph.Rand([]int{500}, 2, false))
+	SetBudget(be, 5000)
+	if err := Realize(t.Context(), be, y); !errors.Is(err, backend.ErrMemoryBudget) {
+		t.Fatalf("got %v, want ErrMemoryBudget", err)
+	}
+	if pooled := poolOf(be).pooledElements(); pooled != 1000 {
+		t.Errorf("a refused schedule left %d elements pooled, want 1000", pooled)
+	}
+	// With room for it once the pooled buffer is freed, it runs.
+	SetBudget(be, 6000)
+	if got := exact(t, be, y); got != 500*4 {
+		t.Errorf("schedule obtained %d bytes, want %d", got, 500*4)
+	}
+	if m := MemoryOf(be); m.Allocated != 6000 || poolOf(be).pooledElements() != 0 {
+		t.Errorf("after the schedule %d bytes are held and %d elements pooled, want 6000 and the given buffer freed", m.Allocated, poolOf(be).pooledElements())
+	}
+}

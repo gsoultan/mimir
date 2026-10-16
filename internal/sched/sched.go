@@ -226,7 +226,9 @@ func keptMemory(keep []*graph.Node) map[*graph.Storage]bool {
 // Release gives the memory of the realized node n to its device's pool for
 // later schedules and makes n stale, if n is the only node realized into that
 // memory and no node that keep lists, when it is not nil, reads it (see
-// RealizeInto). The caller must be done with n.
+// RealizeInto). The caller must be done with n. Memory that the pool did
+// not obtain, such as an upload's, counts against the device's budget
+// from then on.
 func Release(n *graph.Node, keep func() []*graph.Node) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -238,7 +240,9 @@ func Release(n *graph.Node, keep func() []*graph.Node) {
 	}
 	n.Mem.Version++
 	n.Mem.Refs = 0
-	poolOf(n.Mem.Dev).release(n.Buf())
+	p := poolOf(n.Mem.Dev)
+	p.track(n.Buf())
+	p.release(n.Buf())
 }
 
 // Realized reports whether n holds its result. Unlike n.Realized, it is
