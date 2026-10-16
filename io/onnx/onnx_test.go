@@ -3,6 +3,7 @@ package onnx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -413,10 +414,14 @@ func TestExternalData(t *testing.T) {
 		tp.msg(13, (&pb{}).str(1, "length").str(2, "24"))
 		return tp.varint(14, 1)
 	}
+	// Each model gets a file of its own: Windows refuses to rewrite a
+	// file that an open model maps.
+	written := 0
 	write := func(t *pb) string {
 		g := newGraph().input("x", Float, 2, 3).node("Add", []string{"x", "w", "->", "y"}).output("y")
 		g.inits = append(g.inits, t)
-		path := filepath.Join(dir, "model.onnx")
+		written++
+		path := filepath.Join(dir, fmt.Sprintf("model%d.onnx", written))
 		if err := os.WriteFile(path, g.model(), 0o600); err != nil {
 			panic(err)
 		}
