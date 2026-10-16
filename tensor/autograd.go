@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"weak"
 
 	"github.com/gsoultan/mimir/internal/graph"
@@ -26,7 +27,8 @@ var gradMu sync.Mutex
 // chain rule. A leaf's tape has no rule and instead holds the gradient
 // accumulated for it.
 type tape struct {
-	shape []int // of the tensor; gradients must match it
+	seq   uint64 // the count of tapes when this one was made
+	shape []int  // of the tensor; gradients must match it
 
 	// parents has one entry per input: the input's tape, or nil when the
 	// input does not require gradients.
@@ -41,6 +43,22 @@ type tape struct {
 	grad     *Tensor // accumulated gradient of a leaf
 	own      bool    // grad's memory is the tape's to reuse
 	released bool    // Backward has run through this node
+}
+
+// tapes counts the tapes made. A tape's seq tells whether it was made
+// before or after a point in time: Checkpoint tells the tapes of a
+// recomputed function from those of tensors it captured by it.
+var tapes atomic.Uint64
+
+// newTape returns the tape of a tensor of shape computed from the tensors
+// of parents by the gradient rule vjp.
+func newTape(shape []int, parents []*tape, vjp func(g *Tensor) []*Tensor) *tape {
+	return &tape{seq: tapes.Add(1), shape: shape, parents: parents, vjp: vjp}
+}
+
+// newLeaf returns the tape of a leaf of shape.
+func newLeaf(shape []int) *tape {
+	return &tape{seq: tapes.Add(1), shape: shape, leaf: true}
 }
 
 // tracked reports whether any of ts requires gradients.
@@ -63,7 +81,7 @@ func track(out *Tensor, vjp func(g *Tensor) []*Tensor, ins ...*Tensor) *Tensor {
 	for i, in := range ins {
 		parents[i] = in.tape
 	}
-	return &Tensor{node: out.node, tape: &tape{shape: out.node.Shape, parents: parents, vjp: vjp}}
+	return &Tensor{node: out.node, tape: newTape(out.node.Shape, parents, vjp)}
 }
 
 // grads is shorthand for a gradient rule's result.
@@ -96,7 +114,7 @@ func (t *Tensor) RequiresGrad() *Tensor {
 	if !t.node.DType.IsFloat() {
 		return fail(fmt.Errorf("tensor: gradient of %s tensor: %w", t.node.DType, ErrDType))
 	}
-	return &Tensor{node: t.node, tape: &tape{shape: t.node.Shape, leaf: true}}
+	return &Tensor{node: t.node, tape: newLeaf(t.node.Shape)}
 }
 
 // Tracked reports whether t requires gradients: it comes from
@@ -137,10 +155,12 @@ func (t *Tensor) ZeroGrad() {
 //
 // Backward computes t itself in the same schedule, so work shared by the
 // forward and backward passes runs once: call Backward before reading t.
-// On success the graph between t and its leaves is released, and a later
-// Backward through it returns ErrNoGrad. A gradient that Backward adds to
-// is updated in place, so a gradient read from Grad before it is stale
-// after it (see RealizeInto). If Backward fails before it starts updating
+// Functions computed with Checkpoint are recomputed in that schedule
+// instead of keeping their activations from the forward pass. On success
+// the graph between t and its leaves is released, and a later Backward
+// through it returns ErrNoGrad. A gradient that Backward adds to is
+// updated in place, so a gradient read from Grad before it is stale after
+// it (see RealizeInto). If Backward fails before it starts updating
 // gradients no gradient changes; cancelling ctx after that does not stop
 // it.
 func (t *Tensor) Backward(ctx context.Context) error {
@@ -158,43 +178,17 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	}
 	gradMu.Lock()
 	defer gradMu.Unlock()
+	bwd = backwardState{acc: map[*tape]*Tensor{}}
+	defer func() { bwd = backwardState{} }()
 
-	order, err := tapeOrder(t.tape)
+	order, effects, err := propagate(t.tape, Ones(t.node.DType, t.node.Shape...))
 	if err != nil {
 		return err
 	}
-	acc := map[*tape]*Tensor{t.tape: Ones(t.node.DType, t.node.Shape...)}
-	var leaves []*tape
-	var effects []*Tensor
-	for _, n := range slices.Backward(order) {
-		effects = append(effects, n.effects...)
-		g, ok := acc[n]
-		if !ok {
-			continue
-		}
-		if n.leaf {
-			leaves = append(leaves, n)
-			continue
-		}
-		delete(acc, n) // its inputs' gradients are all that is needed now
-		gs := n.vjp(g)
-		for i, p := range n.parents {
-			if p == nil || i >= len(gs) || gs[i] == nil {
-				continue
-			}
-			gi := gs[i].detached()
-			if err := gi.Err(); err != nil {
-				return fmt.Errorf("tensor: backward: %w", err)
-			}
-			if !slices.Equal(gi.node.Shape, p.shape) {
-				return fmt.Errorf("tensor: backward: gradient of shape %v for input of shape %v: %w", gi.node.Shape, p.shape, ErrShape)
-			}
-			if prev, ok := acc[p]; ok {
-				gi = prev.Add(gi)
-			}
-			acc[p] = gi
-		}
-	}
+	effects = append(effects, bwd.effects...)
+	// A leaf read only by a checkpointed function is not among order: its
+	// gradient came from the function's recompute.
+	leaves := bwd.leaves()
 
 	// The sums go over the memory of the gradients they add to, where
 	// that memory is the tapes' own. A sum that Backward computes, rather
@@ -207,7 +201,7 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	dsts := make([]*Tensor, 1, cap(targets))
 	computed := map[*graph.Node]bool{t.node: true}
 	for i, l := range leaves {
-		sums[i] = acc[l]
+		sums[i] = bwd.acc[l]
 		var dst *Tensor
 		if l.grad != nil {
 			sums[i] = l.grad.Add(sums[i])
@@ -238,6 +232,110 @@ func (t *Tensor) Backward(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// bwd is the state of the Backward that is running: the gradient
+// accumulated for each leaf reached, the order the leaves were reached in,
+// the effects of checkpointed functions recomputed on the way and the
+// first error one of them met. Gradient rules run while Backward holds
+// gradMu, which guards it; the rule of a checkpoint (see Checkpoint)
+// propagates gradients through the function it recomputes into it, since
+// the parameters the function reads are leaves of this Backward, not
+// inputs of the checkpoint.
+var bwd backwardState
+
+type backwardState struct {
+	acc     map[*tape]*Tensor
+	order   []*tape
+	effects []*Tensor
+	err     error
+}
+
+// add adds g to the gradient accumulated for the leaf l.
+func (s *backwardState) add(l *tape, g *Tensor) {
+	if prev, ok := s.acc[l]; ok {
+		g = prev.Add(g)
+	} else {
+		s.order = append(s.order, l)
+	}
+	s.acc[l] = g
+}
+
+// take removes and returns the gradient accumulated for the leaf l, or nil
+// if it received none.
+func (s *backwardState) take(l *tape) *Tensor {
+	g := s.acc[l]
+	delete(s.acc, l)
+	return g
+}
+
+// leaves returns the leaves holding a gradient, each once, in the order
+// they were reached.
+func (s *backwardState) leaves() []*tape {
+	var ls []*tape
+	seen := make(map[*tape]bool, len(s.acc))
+	for _, l := range s.order {
+		if _, ok := s.acc[l]; ok && !seen[l] {
+			seen[l] = true
+			ls = append(ls, l)
+		}
+	}
+	return ls
+}
+
+// fail records err as the error of the running Backward, unless one is
+// recorded already.
+func (s *backwardState) fail(err error) {
+	if s.err == nil {
+		s.err = err
+	}
+}
+
+// propagate applies the chain rule from root, whose gradient is g, through
+// the tapes reachable from it: each gradient rule runs once, on the sum of
+// the gradients its result received, and the gradient of each leaf
+// reached is added to bwd. It returns the tapes it walked, each after its
+// parents, and the effects they carry. Backward uses it for the loss, and
+// Checkpoint for the function it recomputes.
+func propagate(root *tape, g *Tensor) (order []*tape, effects []*Tensor, err error) {
+	order, err = tapeOrder(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	acc := map[*tape]*Tensor{root: g}
+	for _, n := range slices.Backward(order) {
+		effects = append(effects, n.effects...)
+		g, ok := acc[n]
+		if !ok {
+			continue
+		}
+		delete(acc, n) // its inputs' gradients are all that is needed now
+		if n.leaf {
+			bwd.add(n, g)
+			continue
+		}
+		gs := n.vjp(g)
+		if bwd.err != nil {
+			return nil, nil, bwd.err
+		}
+		for i, p := range n.parents {
+			if p == nil || i >= len(gs) || gs[i] == nil {
+				continue
+			}
+			gi := gs[i].detached()
+			if err := gi.Err(); err != nil {
+				return nil, nil, fmt.Errorf("tensor: backward: %w", err)
+			}
+			if !slices.Equal(gi.node.Shape, p.shape) {
+				return nil, nil, fmt.Errorf("tensor: backward: gradient of shape %v for input of shape %v: %w", gi.node.Shape, p.shape, ErrShape)
+			}
+			if prev, ok := acc[p]; ok {
+				gi = prev.Add(gi)
+			}
+			acc[p] = gi
+		}
+	}
+	return order, effects, nil
 }
 
 // tapeOrder returns the tapes reachable from root, each after its parents.
@@ -290,7 +388,9 @@ func (t *Tensor) WithEffects(effects ...*Tensor) *Tensor {
 		det[i] = e.detached()
 	}
 	identity := func(g *Tensor) []*Tensor { return grads(g) }
-	return &Tensor{node: t.node, tape: &tape{shape: t.node.Shape, parents: []*tape{t.tape}, vjp: identity, effects: det}}
+	tp := newTape(t.node.Shape, []*tape{t.tape}, identity)
+	tp.effects = det
+	return &Tensor{node: t.node, tape: tp}
 }
 
 // Func is an operation with a hand-written gradient, like
@@ -427,16 +527,20 @@ func (p *Param) To(d Device) error {
 			return grad.err
 		}
 	}
+	if grad != nil {
+		// Backward holds gradMu while the functions it recomputes read
+		// parameters, which takes p.mu: the same order here.
+		gradMu.Lock()
+		defer gradMu.Unlock()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.value != v {
 		return fmt.Errorf("tensor: parameter set while moving to %v: %w", d, ErrInternal)
 	}
 	p.value = &Tensor{node: moved.node, tape: v.tape}
-	if v.tape != nil && grad != nil {
-		gradMu.Lock()
+	if grad != nil {
 		v.tape.grad, v.tape.own = grad, true
-		gradMu.Unlock()
 	}
 	return nil
 }
