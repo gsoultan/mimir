@@ -53,6 +53,41 @@ type Launch struct {
 	Threads  int
 	Params   []int32
 	Barriers bool // threads of a group synchronize
+
+	args []argParam // the parameters that hold the kernel's arguments
+}
+
+// argParam is parameter param, which holds argument arg of the kernel
+// (see backend.Kernel.AppendArgs): a constant of dtype dt, or, for the
+// seed, its low or high word.
+type argParam struct {
+	param, arg int
+	dt         backend.DType
+	high       bool
+}
+
+// SetArgs writes the arguments args of a kernel (see
+// backend.Kernel.AppendArgs) into the parameters of l, which Plan or
+// PlanEpilogue returned for a kernel that differs from it in its
+// arguments at most. Kernels that differ only in their arguments share
+// their source, so l then runs the other kernel: a backend that keeps a
+// planned launch need not plan it again, which costs far more, when an
+// optimizer's constants change from one step to the next.
+func (l *Launch) SetArgs(args []uint64) {
+	for _, a := range l.args {
+		var v int32
+		switch {
+		case a.arg >= len(args):
+			continue
+		case a.dt == backend.Invalid && a.high:
+			v = int32(uint32(args[a.arg] >> 32))
+		case a.dt == backend.Invalid:
+			v = int32(uint32(args[a.arg]))
+		default:
+			v = constantParam(math.Float64frombits(args[a.arg]), a.dt)
+		}
+		l.Params[a.param] = v
+	}
 }
 
 // MaxElems bounds the elements of a buffer and the offsets kernels
@@ -68,6 +103,7 @@ type gen struct {
 	body    strings.Builder
 	helpers string // functions the body calls, beyond the prelude's
 	params  []int32
+	args    []argParam
 	vars    int
 	err     error
 }
@@ -121,7 +157,7 @@ func (g *gen) finish(groups int, barriers bool) (*Launch, error) {
 	g.d.signature(&s, g.outs, g.ins, len(g.params))
 	s.WriteString(g.body.String())
 	s.WriteString("}\n")
-	return &Launch{Src: s.String(), Groups: groups, Threads: GroupSize, Params: g.params, Barriers: barriers}, nil
+	return &Launch{Src: s.String(), Groups: groups, Threads: GroupSize, Params: g.params, Barriers: barriers, args: g.args}, nil
 }
 
 // typeName returns the type kernels compute values of dt in: float for
@@ -182,10 +218,29 @@ func round(dt backend.DType, x string) string {
 // an optimizer's update at each step, share one compiled pipeline. The
 // value of a half type is a float, to round when stored.
 func (g *gen) constant(v float64, dt backend.DType) string {
+	p := g.param(int(constantParam(v, dt)))
 	if dt.IsFloat() {
-		return fmt.Sprintf("fbits(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
+		return fmt.Sprintf("fbits(%s)", p)
 	}
-	return g.param(int(int32(v)))
+	return p
+}
+
+// constantParam returns the parameter that holds the constant v of type
+// dt: its float32 bits, or the integer.
+func constantParam(v float64, dt backend.DType) int32 {
+	if dt.IsFloat() {
+		return int32(math.Float32bits(float32(v)))
+	}
+	return int32(v)
+}
+
+// arg returns the expression of the constant v of type dt, argument a of
+// the kernel (see backend.Kernel.AppendArgs), as constant does, and
+// records its parameter for Launch.SetArgs.
+func (g *gen) arg(a int, v float64, dt backend.DType) string {
+	e := g.constant(v, dt)
+	g.args = append(g.args, argParam{param: len(g.params) - 1, arg: a, dt: dt})
+	return e
 }
 
 // literal returns an exact expression for v converted to dt, as the CPU
@@ -262,8 +317,12 @@ func (g *gen) index(lin string, shape []int) []string {
 // program emits the instructions of an elementwise program and returns the
 // variable holding each value. input returns the expression of the
 // element of input a, which a load converts to a value.
+//
+// The constants of prog, which is the kernel's program when it has any,
+// are its arguments from the third on, in order.
 func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 	vals := make([]string, len(prog))
+	consts := 0
 	for j, in := range prog {
 		t := typeName(in.DType)
 		arg := func(i int) string { return vals[in.Args[i]] }
@@ -272,7 +331,8 @@ func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 		case backend.OpLoad:
 			e = load(in.DType, input(in.Args[0]))
 		case backend.OpConst:
-			e = g.constant(in.Value, in.DType)
+			e = g.arg(2+consts, in.Value, in.DType)
+			consts++
 		case backend.OpNeg:
 			e = "-" + arg(0)
 		case backend.OpExp2:
@@ -425,7 +485,7 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		}
 		return g.elementwise(n, prog, nil)
 	case op == backend.OpConst:
-		g.line("o0[i] = %s;", store(k.DType, g.constant(k.Attrs.Value, k.DType)))
+		g.line("o0[i] = %s;", store(k.DType, g.arg(0, k.Attrs.Value, k.DType)))
 		return g.perElement(n)
 	case op == backend.OpRandUniform || op == backend.OpRandNormal:
 		return g.random(n)
@@ -498,7 +558,10 @@ func (g *gen) random(n int) (*Launch, error) {
 	}
 	seed := g.k.Attrs.Seed
 	g.line("uint w0 = uint(i / 4), w1 = 0u, w2 = 0u, w3 = 0u;")
-	g.line("uint key0 = uint(%s), key1 = uint(%s);", g.param(int(int32(uint32(seed)))), g.param(int(int32(uint32(seed>>32)))))
+	key0 := g.param(int(int32(uint32(seed))))
+	key1 := g.param(int(int32(uint32(seed >> 32))))
+	g.args = append(g.args, argParam{param: len(g.params) - 2, arg: 1}, argParam{param: len(g.params) - 1, arg: 1, high: true})
+	g.line("uint key0 = uint(%s), key1 = uint(%s);", key0, key1)
 	g.line("for (int round = 0; round < 10; round++) {")
 	g.line("\tif (round > 0) { key0 += 0x9E3779B9u; key1 += 0xBB67AE85u; }")
 	g.line("\tuint hi0 = mulhi(0xD2511F53u, w0), lo0 = 0xD2511F53u * w0;")
@@ -626,7 +689,7 @@ func (g *gen) pad(n int) (*Launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", s, s, g.param(v.Shape[d]))
 		g.line("off += %s * %s;", s, g.param(v.Strides[d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.constant(g.k.Attrs.Value, g.k.DType)))
+	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.arg(0, g.k.Attrs.Value, g.k.DType)))
 	return g.perElement(n)
 }
 
@@ -744,7 +807,7 @@ func (g *gen) unfold(n int) (*Launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", x, x, g.param(v.Shape[lead+d]))
 		g.line("off += %s * %s;", x, g.param(v.Strides[lead+d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.constant(a.Value, g.k.DType)))
+	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.arg(0, a.Value, g.k.DType)))
 	return g.perElement(n)
 }
 
