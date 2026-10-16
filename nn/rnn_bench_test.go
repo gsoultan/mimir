@@ -26,15 +26,21 @@ func BenchmarkLSTM(b *testing.B) {
 	}
 	b.Run("forward", func(b *testing.B) {
 		m, x, _ := setup(b)
-		for b.Loop() {
+		step := func() {
 			if err := m.Forward(x).Realize(b.Context()); err != nil {
 				b.Fatal(err)
 			}
 		}
+		for range warmup {
+			step()
+		}
+		for b.Loop() {
+			step()
+		}
 	})
 	backward := func(b *testing.B, opts ...nn.Option) {
 		m, x, y := setup(b, opts...)
-		for b.Loop() {
+		step := func() {
 			if err := loss.MSE(m.Forward(x), y).Backward(b.Context()); err != nil {
 				b.Fatal(err)
 			}
@@ -42,13 +48,19 @@ func BenchmarkLSTM(b *testing.B) {
 				p.ZeroGrad()
 			}
 		}
+		for range warmup {
+			step()
+		}
+		for b.Loop() {
+			step()
+		}
 	}
 	b.Run("backward", func(b *testing.B) { backward(b) })
 	b.Run("backward/checkpoint16", func(b *testing.B) { backward(b, nn.StepCheckpoint(16)) })
 	b.Run("train", func(b *testing.B) {
 		m, x, y := setup(b)
 		opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-3))
-		for b.Loop() {
+		step := func() {
 			if err := loss.MSE(m.Forward(x), y).Backward(b.Context()); err != nil {
 				b.Fatal(err)
 			}
@@ -56,6 +68,12 @@ func BenchmarkLSTM(b *testing.B) {
 				b.Fatal(err)
 			}
 			opt.ZeroGrad()
+		}
+		for range warmup {
+			step()
+		}
+		for b.Loop() {
+			step()
 		}
 	})
 }

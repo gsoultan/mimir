@@ -44,7 +44,7 @@ func BenchmarkTrainStep(b *testing.B) {
 			if err := tensor.Realize(b.Context(), x, y); err != nil {
 				b.Fatal(err)
 			}
-			for b.Loop() {
+			step := func() {
 				l := loss.CrossEntropy(m.Forward(x), y)
 				if err := l.Backward(b.Context()); err != nil {
 					b.Fatal(err)
@@ -53,6 +53,15 @@ func BenchmarkTrainStep(b *testing.B) {
 					b.Fatal(err)
 				}
 				opt.ZeroGrad()
+			}
+			// The first steps compile the GPU kernels, plan the schedules,
+			// create the optimizer's state and, on CUDA, capture the step's
+			// graph: work a training run does once, which is not timed.
+			for range 3 {
+				step()
+			}
+			for b.Loop() {
+				step()
 			}
 		})
 	}

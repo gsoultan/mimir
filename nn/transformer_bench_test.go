@@ -9,6 +9,13 @@ import (
 	"github.com/gsoultan/mimir/tensor"
 )
 
+// warmup is the number of steps a benchmark runs before it starts timing:
+// the first steps compile the GPU kernels, plan and cache the schedules,
+// create the optimizer's state and, on CUDA, capture the step's graph,
+// work a program does once, which timing would report as seconds per
+// step when b.N is small.
+const warmup = 3
+
 // BenchmarkDecoderBlockStep times one training step of a GPT-2 small
 // block (768 features in 12 heads) over 8 sequences: the forward pass, a
 // loss, the backward pass and an AdamW update.
@@ -24,7 +31,7 @@ func BenchmarkDecoderBlockStep(b *testing.B) {
 			if err := tensor.Realize(ctx, x, w); err != nil {
 				b.Fatal(err)
 			}
-			for b.Loop() {
+			step := func() {
 				if err := block.Forward(x).Mul(w).Mean().Backward(ctx); err != nil {
 					b.Fatal(err)
 				}
@@ -32,6 +39,12 @@ func BenchmarkDecoderBlockStep(b *testing.B) {
 					b.Fatal(err)
 				}
 				opt.ZeroGrad()
+			}
+			for range warmup {
+				step()
+			}
+			for b.Loop() {
+				step()
 			}
 		})
 	}
@@ -60,7 +73,7 @@ func BenchmarkDecode(b *testing.B) {
 		if err := tensor.Realize(ctx, q, k, v); err != nil {
 			b.Fatal(err)
 		}
-		for b.Loop() {
+		step := func() {
 			cache.Truncate(past)
 			keys, values, err := cache.Append(ctx, k, v)
 			if err != nil {
@@ -69,6 +82,12 @@ func BenchmarkDecode(b *testing.B) {
 			if err := tensor.ScaledDotProductAttention(q, keys, values, tensor.CausalOffset(past)).Realize(ctx); err != nil {
 				b.Fatal(err)
 			}
+		}
+		for range warmup {
+			step()
+		}
+		for b.Loop() {
+			step()
 		}
 	})
 	b.Run("block", func(b *testing.B) {
@@ -84,7 +103,7 @@ func BenchmarkDecode(b *testing.B) {
 		if err := x.Realize(ctx); err != nil {
 			b.Fatal(err)
 		}
-		for b.Loop() {
+		step := func() {
 			cache.Truncate(past)
 			y, err := block.Decode(ctx, x, cache)
 			if err != nil {
@@ -93,6 +112,12 @@ func BenchmarkDecode(b *testing.B) {
 			if err := y.Realize(ctx); err != nil {
 				b.Fatal(err)
 			}
+		}
+		for range warmup {
+			step()
+		}
+		for b.Loop() {
+			step()
 		}
 	})
 }
