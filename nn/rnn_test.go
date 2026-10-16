@@ -337,3 +337,53 @@ func TestRecurrentLayerDropout(t *testing.T) {
 	// A single layer has no layer after it whose input to drop.
 	near(t, "one layer", run(1, true, nn.LayerDropout(0.5)), run(1, true), 0)
 }
+
+// TestRecurrentTransforms checks the forward derivatives of the layers
+// against finite differences, and that their second derivatives fail
+// with ErrNotDifferentiable rather than come out wrong: the steps read
+// W_hh detached, and a hook gives it the gradient, which holds for first
+// derivatives only.
+func TestRecurrentTransforms(t *testing.T) {
+	layers := map[string]func() nn.Module{
+		"rnn":  func() nn.Module { return nn.NewRNN(3, 4) },
+		"lstm": func() nn.Module { return nn.NewLSTM(3, 4, nn.NumLayers(2)) },
+		"gru":  func() nn.Module { return nn.NewGRU(3, 4, nn.Bidirectional()) },
+	}
+	for _, name := range slices.Sorted(maps.Keys(layers)) {
+		t.Run(name, func(t *testing.T) {
+			nn.ManualSeed(4)
+			m := layers[name]()
+			x, v := tensor.Randn(5, 6, 2, 3), tensor.Randn(6, 6, 2, 3)
+			f := func(x ...*tensor.Tensor) []*tensor.Tensor { return []*tensor.Tensor{m.Forward(x[0])} }
+			_, ty := tensor.JVP(f, []*tensor.Tensor{x}, []*tensor.Tensor{v})
+			const h = 1e-2
+			step := v.Mul(tensor.Scalar[float32](h))
+			want := m.Forward(x.Add(step)).Sub(m.Forward(x.Sub(step))).Div(tensor.Scalar[float32](2 * h))
+			near(t, "JVP", data(t, ty[0]), data(t, want), 2e-3)
+
+			loss := func(x ...*tensor.Tensor) *tensor.Tensor { y := m.Forward(x[0]); return y.Mul(y).Sum() }
+			grad := tensor.Grad(loss)
+			_, hvp := tensor.JVP(grad, []*tensor.Tensor{x}, []*tensor.Tensor{v})
+			if err := hvp[0].Err(); !errors.Is(err, tensor.ErrNotDifferentiable) {
+				t.Errorf("Hessian-vector product: %v, want ErrNotDifferentiable", err)
+			}
+			var values []*tensor.Tensor
+			for _, p := range nn.Parameters(m) {
+				values = append(values, p.Value())
+			}
+			for i, g := range tensor.Gradients(grad(x)[0].Sum(), values...) {
+				if err := g.Err(); !errors.Is(err, tensor.ErrNotDifferentiable) {
+					t.Errorf("second derivative in weight %d: %v, want ErrNotDifferentiable", i, err)
+				}
+			}
+			// Reverse over forward too.
+			jvp := func(x ...*tensor.Tensor) *tensor.Tensor {
+				_, ty := tensor.JVP(f, x, []*tensor.Tensor{v})
+				return ty[0].Sum()
+			}
+			if err := tensor.Gradients(jvp(x), values...)[0].Err(); !errors.Is(err, tensor.ErrNotDifferentiable) {
+				t.Errorf("gradient of a JVP: %v, want ErrNotDifferentiable", err)
+			}
+		})
+	}
+}
