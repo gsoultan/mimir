@@ -148,8 +148,15 @@ func (p *pool) pooledElements() int {
 
 // track adds buf, just obtained from the backend, to the account, with a
 // cleanup that settles it when nothing references buf any more, as
-// happens to a result whose tensor is dropped. A buffer that is not a
-// pointer cannot carry a cleanup and is left out of the account.
+// happens to a result whose tensor is dropped. A buffer on the account
+// already is left alone, and one that is not a pointer cannot carry a
+// cleanup and is left out of the account.
+//
+// Release tracks the buffers it gives to the pool too: one the pool did
+// not obtain, such as an uploaded gradient that ZeroGrad releases, is the
+// pool's from then on, to hand out or to free like its own, so the
+// account covers every buffer the pool holds and freeing a pooled buffer
+// takes its bytes off.
 func (p *pool) track(buf backend.Buffer) {
 	ptr := addressOf(buf)
 	if ptr == nil {
@@ -158,14 +165,15 @@ func (p *pool) track(buf backend.Buffer) {
 	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), ref: weak.Make((*byte)(ptr))}
 	p.acct.Lock()
 	defer p.acct.Unlock()
+	if p.owned[e.ref] != nil {
+		return
+	}
 	p.allocated += e.bytes
 	p.owned[e.ref] = e
 	e.stop = runtime.AddCleanup((*byte)(ptr), p.settle, e)
 }
 
-// untrack settles the account of buf as the pool frees it, if the pool
-// obtained it: a buffer that reached the pool from elsewhere, such as an
-// uploaded gradient that ZeroGrad released, was never counted.
+// untrack settles the account of buf as the pool frees it.
 func (p *pool) untrack(buf backend.Buffer) {
 	ptr := addressOf(buf)
 	if ptr == nil {
@@ -189,6 +197,19 @@ func (p *pool) settle(e *entry) {
 	p.acct.Lock()
 	defer p.acct.Unlock()
 	p.drop(e)
+}
+
+// accounted returns the bytes on the account for buf, or 0 if buf is not
+// on it. The caller holds acct.
+func (p *pool) accounted(buf backend.Buffer) int64 {
+	ptr := addressOf(buf)
+	if ptr == nil {
+		return 0
+	}
+	if e := p.owned[weak.Make((*byte)(ptr))]; e != nil {
+		return e.bytes
+	}
+	return 0
 }
 
 // drop takes e off the account, if it is on it. The caller holds acct.
