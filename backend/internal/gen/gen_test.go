@@ -2,6 +2,7 @@ package gen_test
 
 import (
 	"errors"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"testing"
@@ -42,6 +43,44 @@ func TestWindowKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.Window(
 func TestMatMulKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.MatMul(t), emulators(t)) }
 func TestScanKernels(t *testing.T)        { kerneltest.Run(t, kerneltest.Scan(t), emulators(t)) }
 func TestQuantKernels(t *testing.T)       { kerneltest.Run(t, kerneltest.Quant(t), emulators(t)) }
+func TestAttentionKernels(t *testing.T)   { kerneltest.Run(t, kerneltest.Attention(t), emulators(t)) }
+
+// TestSliceScatterInPlaceWritesTheBlock checks that a slice scatter
+// written over its input writes the block and nothing else.
+func TestSliceScatterInPlaceWritesTheBlock(t *testing.T) {
+	f := backend.Float32
+	rng := rand.New(rand.NewPCG(3, 4))
+	shape := []int{4, 6}
+	k := &backend.Kernel{Op: backend.OpSliceScatter, DType: f, Shape: shape,
+		In:    []backend.View{backend.Contiguous(shape), backend.Contiguous([]int{3, 2}).Permute([]int{1, 0})},
+		Attrs: backend.Attrs{Ranges: [][2]int{{1, 3}, {2, 5}}}}
+	x, src := kerneltest.HostBuffer(t, rng, f, 24, 0, 0), kerneltest.HostBuffer(t, rng, f, 6, 0, 0)
+	want := kerneltest.HostBuffer(t, nil, f, 24, 0, 0)
+	if err := kerneltest.Host.Run(t.Context(), k, []backend.Buffer{want}, []backend.Buffer{x, src}); err != nil {
+		t.Fatal(err)
+	}
+	wv, xv := kerneltest.Floats(t, want), kerneltest.Floats(t, x)
+	for _, d := range dialects {
+		l, err := gen.Plan(d, k, []backend.Buffer{x}, []backend.Buffer{x, src})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := kerneltest.NewEmulator(t, d)
+		if e == nil {
+			continue
+		}
+		// The launch writes into a buffer of NaNs: outside the block they
+		// must stay, as x does when the output is x.
+		got, _ := e.Exec(t, l, []backend.Buffer{kerneltest.HostBuffer(t, nil, f, 24, 0, 0)}, []backend.Buffer{x, src})
+		for i, v := range kerneltest.FromBytes(got[0]) {
+			row, col := i/6, i%6
+			inside := row >= 1 && row < 3 && col >= 2 && col < 5
+			if inside && v != wv[i] || !inside && v == v {
+				t.Fatalf("%s: element %d = %v, want %v (x has %v)", d.Name, i, v, wv[i], xv[i])
+			}
+		}
+	}
+}
 
 // TestConstantsAreParameters checks that kernels differing only in their
 // constants, as an optimizer's update does from one step to the next,
