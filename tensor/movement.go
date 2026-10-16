@@ -193,7 +193,7 @@ func (t *Tensor) MatMul(u *Tensor) *Tensor {
 	y = y.broadcastTo(slices.Concat(batch, y.node.Shape[ry-2:]))
 	out := product(x, y)
 	if out.err != nil {
-		return fail(fmt.Errorf("tensor: matmul %v and %v: %w", t.node.Shape, u.node.Shape, ErrShape))
+		return fail(fmt.Errorf("tensor: matmul %v and %v: %w", t.node.Shape, u.node.Shape, out.err))
 	}
 	if !vecX && !vecY {
 		return out

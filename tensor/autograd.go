@@ -486,16 +486,26 @@ type Param struct {
 
 // NewParam returns a trainable parameter holding a copy of init's values.
 // It computes them now, so the parameter holds memory of its own rather
-// than a recipe. If that fails, Value carries the error.
+// than a recipe. If that fails, Value carries the error, as it does for a
+// block-quantized init, which cannot be trained.
 func NewParam(init *Tensor) *Param { return newParam(init, true) }
 
 // NewBuffer returns a parameter that is saved and restored with a model
 // but not trained: Backward computes no gradient for it. Batch
-// normalization keeps its running statistics in buffers.
+// normalization keeps its running statistics in buffers. A
+// block-quantized init, such as weights read from a GGUF file, is held
+// as it is rather than copied, since nothing writes over it.
 func NewBuffer(init *Tensor) *Param { return newParam(init, false) }
 
 func newParam(init *Tensor, trainable bool) *Param {
-	v := init.Detach().Clone()
+	v := init.Detach()
+	switch {
+	case v.err != nil:
+	case !v.node.DType.IsQuantized():
+		v = v.Clone()
+	case trainable:
+		v = fail(fmt.Errorf("tensor: trainable parameter of %s: %w", v.node.DType, ErrDType))
+	}
 	if v.err == nil {
 		if err := v.Realize(context.Background()); err != nil {
 			v = fail(err)

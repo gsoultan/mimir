@@ -204,7 +204,8 @@ func (t *Tensor) To(d Device) *Tensor {
 		return t
 	}
 	ctx := context.Background()
-	data := make([]byte, t.node.Size()*t.node.DType.Size())
+	size, _ := t.node.DType.Bytes(t.node.Size())
+	data := make([]byte, size)
 	if err := sched.Download(ctx, from, t.node, data); err != nil {
 		return fail(err)
 	}

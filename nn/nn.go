@@ -289,7 +289,10 @@ func Encode(ctx context.Context, t *tensor.Tensor) (safetensors.Tensor, error) {
 	case tensor.BFloat16, tensor.Float16:
 		return encodeHalf(ctx, t)
 	}
-	return safetensors.Tensor{}, t.Err()
+	if err := t.Err(); err != nil {
+		return safetensors.Tensor{}, err
+	}
+	return safetensors.Tensor{}, fmt.Errorf("nn: encode %s tensor: %w", t.DType(), tensor.ErrDType)
 }
 
 // Decode returns a safetensors tensor of dtype F32, I32, BF16 or F16 as a

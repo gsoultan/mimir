@@ -45,6 +45,13 @@ var (
 // a fused program computes what the operations compute one by one.
 // Reductions of half inputs accumulate in float32 and write Float32
 // outputs; matrix products and random numbers are Float32 only.
+//
+// Q8_0, Q4_K and Q6_K are block-quantized storage types, read-only and
+// laid out as ggml stores them (see BlockSize): a buffer of one holds the
+// bytes of whole blocks, and its Len counts their elements. Kernels read
+// them only to dequantize them to Float32: OpCast, OpGather from them and
+// OpQMatMul. They have no Size; Bytes gives the size of a buffer of any
+// dtype.
 type DType uint8
 
 // Supported element types.
@@ -54,9 +61,19 @@ const (
 	Int32
 	BFloat16 // IEEE 754 binary32 truncated to its top 16 bits: 8 exponent and 7 fraction bits
 	Float16  // IEEE 754 binary16: 5 exponent and 10 fraction bits
+
+	// Block-quantized types, in the layouts of ggml (ggml-common.h). A
+	// block's values are its quants times scales that the block stores
+	// as binary16, each element of a block computed as ggml's
+	// dequantize_row functions compute it, rounding after every
+	// operation.
+	Q8_0 // blocks of 32: a binary16 scale d, then 32 int8 quants q; d·q
+	Q4_K // super-blocks of 256: binary16 d and dmin, 12 bytes of eight 6-bit scales and mins, 128 bytes of 4-bit quants
+	Q6_K // super-blocks of 256: 128 bytes of the low 4 bits of the quants, 64 of the high 2 bits, sixteen int8 scales, binary16 d
 )
 
-// Size returns the size of one element in bytes.
+// Size returns the size of one element in bytes, or 0 for a
+// block-quantized type, whose elements share the bytes of their block.
 func (d DType) Size() int {
 	switch d {
 	case Float32, Int32:
@@ -81,6 +98,12 @@ func (d DType) String() string {
 		return "bfloat16"
 	case Float16:
 		return "float16"
+	case Q8_0:
+		return "q8_0"
+	case Q4_K:
+		return "q4_K"
+	case Q6_K:
+		return "q6_K"
 	default:
 		return fmt.Sprintf("DType(%d)", uint8(d))
 	}

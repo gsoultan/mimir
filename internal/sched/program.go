@@ -448,7 +448,8 @@ func (p *program) unbind() {
 // copyFrom copies the realized node n, which lives on another device,
 // into dst, a buffer of be.
 func copyFrom(ctx context.Context, n *graph.Node, be backend.Backend, dst backend.Buffer) error {
-	data := make([]byte, n.Size()*n.DType.Size())
+	size, _ := n.DType.Bytes(n.Size())
+	data := make([]byte, size)
 	if err := download(ctx, n, data); err != nil {
 		return err
 	}

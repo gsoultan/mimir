@@ -135,6 +135,8 @@ func (*Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 		return nil, fmt.Errorf("cpu: alloc %d x %s: %w", n, dt, backend.ErrOutOfMemory)
 	}
 	switch dt {
+	case backend.Q8_0, backend.Q4_K, backend.Q6_K:
+		return allocBlocks(dt, n)
 	case backend.Float32:
 		return alloc[float32](n)
 	case backend.Int32:
@@ -221,7 +223,8 @@ var ErrUnaligned = errors.New("cpu: unaligned bytes")
 // of dt in the host's byte order. data must hold a whole number of
 // elements, or Wrap fails with backend.ErrShape, and must start at an
 // address that is a multiple of the element size, or it fails with
-// ErrUnaligned. The caller keeps data valid for as long as the buffer is
+// ErrUnaligned. A buffer of a block-quantized dtype holds whole blocks in
+// ggml's little-endian layout at any address. The caller keeps data valid for as long as the buffer is
 // in use. data may be a mapped file: a kernel that writes the buffer, as
 // an in-place update does, then writes the mapping. Free does nothing to
 // a wrapped buffer.
@@ -235,6 +238,9 @@ func Wrap(dt backend.DType, data []byte) (backend.Buffer, error) {
 // it unreachable, whichever comes first. A nil release makes it Wrap.
 // When WrapFunc fails, it does not run release.
 func WrapFunc(dt backend.DType, data []byte, release func()) (backend.Buffer, error) {
+	if dt.IsQuantized() {
+		return wrapBlocks(dt, data, release)
+	}
 	size := dt.Size()
 	if size == 0 {
 		return nil, fmt.Errorf("cpu: wrap %s: %w", dt, backend.ErrDType)
@@ -333,6 +339,8 @@ func bytesOf(b backend.Buffer) ([]byte, error) {
 		return asBytes(b.data), nil
 	case *buffer[f16]:
 		return asBytes(b.data), nil
+	case *blocks:
+		return b.data, nil
 	default:
 		return nil, fmt.Errorf("cpu: foreign buffer %T: %w", b, backend.ErrDType)
 	}

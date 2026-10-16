@@ -56,7 +56,18 @@
 // Rand and Randn are Float32.
 //
 // FromSlice, Data and Item exchange float32 and int32 values: a half
-// tensor is read by casting it to Float32 first. Gradients have the type
+// tensor is read by casting it to Float32 first.
+//
+// # Quantized weights
+//
+// Q8_0, Q4_K and Q6_K hold weights quantized in blocks, as ggml and GGUF
+// files store them (see backend.DType): FromBytes reads their blocks in
+// place, as io/gguf maps them. They are read-only and have no gradient.
+// Cast dequantizes one to a float type, Gather dequantizes the elements
+// it reads, so a quantized table serves an embedding, and MatMulT
+// multiplies by the transpose of a quantized matrix without
+// dequantizing it, as a linear layer does. Every other operation on one
+// fails with ErrDType. Gradients have the type
 // the chain rule gives them, so a half leaf may accumulate a Float32
 // gradient; an optimizer casts each update to its parameter's type, and
 // optim.MasterWeights keeps Float32 copies of half parameters to update.
@@ -81,12 +92,16 @@ import (
 type DType = backend.DType
 
 // Element types. BFloat16 and Float16 are storage types computed in
-// float32; see the package documentation.
+// float32, and Q8_0, Q4_K and Q6_K block-quantized weights; see the
+// package documentation.
 const (
 	Float32  = backend.Float32
 	Int32    = backend.Int32
 	BFloat16 = backend.BFloat16
 	Float16  = backend.Float16
+	Q8_0     = backend.Q8_0
+	Q4_K     = backend.Q4_K
+	Q6_K     = backend.Q6_K
 )
 
 // Elem is the set of Go types that FromSlice, Data and Item exchange with
@@ -394,7 +409,7 @@ func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 		return nil, err
 	}
 	if want := dtypeOf[T](); t.node.DType != want {
-		if t.node.DType.Size() == 2 {
+		if t.node.DType.Size() == 2 || t.node.DType.IsQuantized() {
 			return nil, fmt.Errorf("tensor: Data[%s] of %s tensor: cast it to float32 first: %w", want, t.node.DType, ErrDType)
 		}
 		return nil, fmt.Errorf("tensor: Data[%s] of %s tensor: %w", want, t.node.DType, ErrDType)

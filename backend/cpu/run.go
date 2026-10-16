@@ -37,6 +37,12 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buffer, ins []backend.Buffer) error {
 	out := outs[0]
 	switch {
+	case k.Op == backend.OpCast && ins[0].DType().IsQuantized():
+		return dequantize(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpGather && ins[0].DType().IsQuantized():
+		return gatherQuant(ctx, b, k, out, ins)
+	case k.Op == backend.OpQMatMul:
+		return runQMatMul(ctx, b, k, out, ins)
 	case k.Op == backend.OpFused:
 		return runProgram(ctx, b, k, k.Attrs.Program, k.Attrs.Stores, outs, ins)
 	case k.Op.RunsElementwise():
