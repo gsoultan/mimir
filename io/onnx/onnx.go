@@ -200,7 +200,11 @@ func (m *Model) load(b []byte, dir string) error {
 		}
 	}
 	m.nodes = nodes
-	if err := m.foldConstants(); err != nil {
+	limit := len(b)
+	for _, data := range m.external {
+		limit += len(data)
+	}
+	if err := m.foldConstants(limit); err != nil {
 		return err
 	}
 	m.fuseAttention()
@@ -213,6 +217,9 @@ func (m *Model) load(b []byte, dir string) error {
 func (m *Model) sort(nodes []*nodeProto, defined map[string]bool) ([]*node, error) {
 	producer := map[string]int{}
 	for i, n := range nodes {
+		if len(n.outputs) == 0 {
+			return nil, fmt.Errorf("%w: node %q has no outputs", ErrFormat, n.name)
+		}
 		for _, out := range n.outputs {
 			if out == "" {
 				continue
@@ -294,8 +301,10 @@ func lookup(n *nodeProto, opset int64) (opFunc, error) {
 
 // foldConstants computes, once, the nodes whose inputs are all constants,
 // and keeps their outputs as constants: tensors realized on the CPU, or
-// host values.
-func (m *Model) foldConstants() error {
+// host values. A tensor of more elements than the model's files have
+// bytes, which no transposition or cast of weights makes, stays a node
+// to compute in each run, within the memory budget of its device.
+func (m *Model) foldConstants(limit int) error {
 	r := &run{ctx: context.Background(), m: m, dev: tensor.CPU(), env: map[string]*value{}, fold: true}
 	kept := m.nodes[:0]
 	for _, n := range m.nodes {
@@ -306,6 +315,10 @@ func (m *Model) foldConstants() error {
 		outs, err := r.eval(n)
 		if err != nil {
 			return err
+		}
+		if slices.ContainsFunc(outs, func(v *value) bool { return !v.host && v.size() > limit }) {
+			kept = append(kept, n)
+			continue
 		}
 		var realize []*tensor.Tensor
 		for i, o := range n.outputs {
@@ -358,6 +371,10 @@ func (r *run) eval(n *node) ([]*value, error) {
 	}
 	if err == nil {
 		for _, v := range outs {
+			if v == nil {
+				err = fmt.Errorf("onnx: an output is missing: %w", tensor.ErrInternal)
+				break
+			}
 			if v.t != nil && !v.host {
 				if err = v.t.Err(); err != nil {
 					break
@@ -366,11 +383,8 @@ func (r *run) eval(n *node) ([]*value, error) {
 		}
 	}
 	if err != nil {
-		if errors.Is(err, ErrUnsupported) {
-			var u *UnsupportedError
-			if errors.As(err, &u) {
-				return nil, err
-			}
+		if u := (*UnsupportedError)(nil); errors.As(err, &u) {
+			return nil, err
 		}
 		return nil, fmt.Errorf("onnx: node %q (%s): %w", n.name, n.op, err)
 	}
@@ -553,6 +567,14 @@ func (m *Model) constant(t *tensorProto, dir string, weights bool) (*value, erro
 	if hasRaw && weights && n > hostLimit && typ.IsFloat() && typ != Double {
 		dt, _ := typ.DType()
 		x := tensor.FromBytesFunc(dt, raw, m.hold(), shape...)
+		return &value{typ: typ, shape: shape, t: x, constant: true}, x.Err()
+	}
+	if !hasRaw && weights && n > hostLimit && typ == Float && len(t.floats) == n {
+		b := make([]byte, 4*n)
+		for i, f := range t.floats {
+			binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(f))
+		}
+		x := tensor.FromBytes(tensor.Float32, b, shape...)
 		return &value{typ: typ, shape: shape, t: x, constant: true}, x.Err()
 	}
 	var count int

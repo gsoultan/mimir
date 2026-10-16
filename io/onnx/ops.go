@@ -286,7 +286,7 @@ func one1(v *value) []*value { return []*value{v} }
 // normAxis returns axis, which may count from the end, of a rank-rank
 // shape.
 func normAxis(axis int64, rank int) (int, error) {
-	if axis < -int64(rank) || axis >= int64(max(rank, 1)) {
+	if axis < -int64(rank) || axis >= int64(rank) {
 		return 0, fmt.Errorf("onnx: axis %d of rank %d: %w", axis, rank, tensor.ErrShape)
 	}
 	if axis < 0 {

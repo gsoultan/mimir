@@ -130,6 +130,9 @@ func (w window) square() (p int, ok bool) {
 
 // padSpatial pads the spatial axes of t by pads, filled with fill.
 func padSpatial(t *tensor.Tensor, pads [][2]int, fill float64) *tensor.Tensor {
+	if t.Err() != nil || t.Rank() < len(pads) {
+		return t
+	}
 	if !slices.ContainsFunc(pads, func(p [2]int) bool { return p != [2]int{} }) {
 		return t
 	}
@@ -144,7 +147,7 @@ func slide(t *tensor.Tensor, w window) *tensor.Tensor {
 		t = t.Unfold(2+i, w.effective(i), w.stride[i])
 	}
 	for i, d := range w.dilation {
-		if d == 1 {
+		if d == 1 || t.Err() != nil {
 			continue
 		}
 		// Keep every d-th element of the window's span: padded to k·d
@@ -224,6 +227,9 @@ func (c *call) kernelShape(def []int) ([]int, error) {
 
 // addChannelBias adds bias, [C], to y, [N, C, spatial...].
 func addChannelBias(y, bias *tensor.Tensor) *tensor.Tensor {
+	if y.Rank() < 2 {
+		return y.Add(bias)
+	}
 	shape := slices.Repeat([]int{1}, y.Rank()-1)
 	shape[0] = -1
 	return y.Add(bias.Reshape(shape...))
@@ -292,10 +298,11 @@ func convTranspose(c *call) ([]*value, error) {
 	}
 	outShape, given := c.ints("output_shape")
 	if given && len(outShape) != ns {
-		outShape = outShape[len(outShape)-ns:]
-		if len(outShape) != ns {
+		// output_shape may list the batch and channels too.
+		if len(outShape) < ns {
 			return nil, fmt.Errorf("onnx: output_shape %v: %w", outShape, tensor.ErrShape)
 		}
+		outShape = outShape[len(outShape)-ns:]
 	}
 	for i := range ns {
 		full := wn.stride[i]*(xs[2+i]-1) + outPad[i] + wn.effective(i)
@@ -327,7 +334,7 @@ func convTranspose(c *call) ([]*value, error) {
 	t := x
 	for i := range ns {
 		s := wn.stride[i]
-		if s == 1 {
+		if s == 1 || t.Err() != nil {
 			continue
 		}
 		a := 2 + i
@@ -342,6 +349,9 @@ func convTranspose(c *call) ([]*value, error) {
 		t = t.Shrink(r)
 	}
 	for i := range ns {
+		if err := t.Err(); err != nil {
+			return nil, err
+		}
 		e := wn.effective(i) - 1
 		lo, hi := e-wn.pads[i][0], e-wn.pads[i][1]+outPad[i]
 		shape := t.Shape()
@@ -450,6 +460,9 @@ func pool(isMax bool) opFunc {
 			return one1(out(c.in[0].typ, win.Max(axes...))), nil
 		}
 		y := win.Sum(axes...)
+		if err := y.Err(); err != nil {
+			return nil, err
+		}
 		// Divide each window's sum by the number of elements it covers:
 		// per axis, those within the input, or within its padding too.
 		outShape := y.Shape()[2:]
@@ -798,6 +811,9 @@ func repeatOrTake(c *call, x *value, axis int, idx []int) (*value, error) {
 		return take(c, x, axis, idx)
 	}
 	t := c.tensorOf(x)
+	if err := t.Err(); err != nil {
+		return nil, err
+	}
 	shape := t.Shape()
 	split := slices.Concat(shape[:axis+1], []int{1}, shape[axis+1:])
 	wide := slices.Concat(shape[:axis+1], []int{f}, shape[axis+1:])
