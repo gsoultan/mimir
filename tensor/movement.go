@@ -166,7 +166,9 @@ func (t *Tensor) Squeeze(axes ...int) *Tensor {
 
 // MatMul returns the matrix product with NumPy semantics: 1-D operands are
 // promoted to matrices and the added dimension removed afterwards, and
-// batch dimensions broadcast.
+// batch dimensions broadcast. Half operands are multiplied in Float32 and
+// the product returned in their dtype, or in Float32 when their dtypes
+// differ.
 func (t *Tensor) MatMul(u *Tensor) *Tensor {
 	if err := firstErr(t, u); err != nil {
 		return fail(err)
@@ -189,7 +191,7 @@ func (t *Tensor) MatMul(u *Tensor) *Tensor {
 	}
 	x = x.broadcastTo(slices.Concat(batch, x.node.Shape[rx-2:]))
 	y = y.broadcastTo(slices.Concat(batch, y.node.Shape[ry-2:]))
-	out := matmulPrim(x, y)
+	out := product(x, y)
 	if out.err != nil {
 		return fail(fmt.Errorf("tensor: matmul %v and %v: %w", t.node.Shape, u.node.Shape, ErrShape))
 	}
@@ -207,6 +209,23 @@ func (t *Tensor) MatMul(u *Tensor) *Tensor {
 		shape = shape[:r-1]
 	}
 	return out.reshape(shape)
+}
+
+// product multiplies matrices with equal batch dimensions, half operands
+// in Float32, and returns the product in the operands' common dtype.
+func product(x, y *Tensor) *Tensor {
+	if err := firstErr(x, y); err != nil {
+		return fail(err)
+	}
+	dx, dy := x.node.DType, y.node.DType
+	if dx.Size() != 2 && dy.Size() != 2 || !dx.IsFloat() || !dy.IsFloat() {
+		return matmulPrim(x, y)
+	}
+	out := matmulPrim(x.Cast(Float32), y.Cast(Float32))
+	if dx != dy {
+		return out
+	}
+	return out.Cast(dx)
 }
 
 // matmulPrim multiplies matrices with equal batch dimensions.
@@ -241,7 +260,8 @@ func (t *Tensor) Gather(axis int, idx *Tensor) *Tensor {
 
 // ScatterAdd returns a copy of t with src added at the Int32 positions in
 // idx along axis, like torch.Tensor.scatter_add. idx and src share a shape.
-// Repeated positions accumulate.
+// Repeated positions accumulate. t and src of different float dtypes are
+// promoted to Float32.
 func (t *Tensor) ScatterAdd(axis int, idx, src *Tensor) *Tensor {
 	if err := firstErr(t, idx, src); err != nil {
 		return fail(err)
@@ -250,9 +270,10 @@ func (t *Tensor) ScatterAdd(axis int, idx, src *Tensor) *Tensor {
 	if err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.ScatterAdd(t.node, idx.node, src.node, a))
+	x, s := promote(t, src)
+	out := wrap(graph.ScatterAdd(x.node, idx.node, s.node, a))
 	i := idx.detached()
-	return track(out, func(g *Tensor) []*Tensor { return grads(g, nil, g.Gather(a, i)) }, t, idx, src)
+	return track(out, func(g *Tensor) []*Tensor { return grads(g, nil, g.Gather(a, i)) }, x, idx, s)
 }
 
 // The movement primitives below take validated arguments and record their

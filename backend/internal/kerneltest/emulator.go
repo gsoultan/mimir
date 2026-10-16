@@ -36,6 +36,7 @@ const metalShim = `#pragma once
 #define threadgroup static
 namespace metal {
 using uint = unsigned int;
+using ushort = unsigned short;
 using atomic_uint = std::atomic<unsigned int>;
 enum memory_order { memory_order_relaxed };
 inline unsigned atomic_fetch_or_explicit(atomic_uint* a, unsigned v, memory_order) { return a->fetch_or(v); }
@@ -232,8 +233,11 @@ func (e *Emulator) binary(t *testing.T, l *gen.Launch, types []backend.DType) st
 	var args []string
 	for i, dt := range types {
 		name := "int"
-		if dt == backend.Float32 {
+		switch {
+		case dt == backend.Float32:
 			name = "float"
+		case dt.Size() == 2:
+			name = "unsigned short"
 		}
 		args = append(args, fmt.Sprintf("(%s*)bufs[%d].data()", name, i))
 	}
@@ -280,18 +284,21 @@ func (e *Emulator) Exec(t *testing.T, l *gen.Launch, outs, ins []backend.Buffer)
 	if l == nil {
 		res := make([][]byte, len(outs))
 		for i := range outs {
-			res[i] = make([]byte, 4*outs[i].Len())
+			res[i] = make([]byte, byteSize(outs[i]))
 		}
 		return res, false
 	}
+	// The driver holds buffers as words of four bytes.
+	words := func(b backend.Buffer) int { return (byteSize(b) + 3) / 4 }
 	var types []backend.DType
 	var in bytes.Buffer
 	put := func(v any) { binary.Write(&in, binary.LittleEndian, v) }
 	put(int32(len(all)))
 	for _, b := range all {
 		types = append(types, b.DType())
-		put(int32(b.Len()))
+		put(int32(words(b)))
 		in.Write(Contents(t, b))
+		in.Write(make([]byte, 4*words(b)-byteSize(b)))
 	}
 	put(int32(len(l.Params)))
 	put(l.Params)
@@ -316,8 +323,8 @@ func (e *Emulator) Exec(t *testing.T, l *gen.Launch, outs, ins []backend.Buffer)
 	}
 	var got [][]byte
 	for _, b := range all {
-		got = append(got, res[:4*b.Len()])
-		res = res[4*b.Len():]
+		got = append(got, res[:byteSize(b)])
+		res = res[4*words(b):]
 	}
 	return got[:len(outs)], binary.LittleEndian.Uint32(res) != 0
 }

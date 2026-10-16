@@ -232,3 +232,36 @@ func TestParamsTakeValuesThatOtherGoroutinesRealize(t *testing.T) {
 		t.Errorf("value = %v, %v; want -1s", got, err)
 	}
 }
+
+func TestParamToKeepsWhatAConcurrentBackwardAdds(t *testing.T) {
+	// To copies the gradient and replaces it with the copy. A Backward
+	// adding to the gradient in between would add to the gradient the
+	// copy then replaces, and its contribution would be lost.
+	ctx := t.Context()
+	w := tensor.NewParam(tensor.Zeros(tensor.Float32, 64))
+	const rounds = 300
+	for range rounds {
+		l := w.Value().Sum()
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			if err := l.Backward(ctx); err != nil {
+				t.Error(err)
+			}
+		})
+		wg.Go(func() {
+			if err := w.To(tensor.CPU()); err != nil {
+				t.Error(err)
+			}
+		})
+		wg.Wait()
+	}
+	got, err := w.Grad().Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range got {
+		if v != rounds {
+			t.Fatalf("gradient[%d] = %v, want %d: a Backward's contribution was lost", i, v, rounds)
+		}
+	}
+}

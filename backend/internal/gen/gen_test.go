@@ -1,7 +1,9 @@
 package gen_test
 
 import (
+	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gsoultan/mimir/backend"
@@ -76,6 +78,52 @@ func TestConstantsAreParameters(t *testing.T) {
 			}
 			if srcs[0] != srcs[1] {
 				t.Errorf("%s %s: sources differ with the constant:\n%s\n%s", d.Name, a[i].Op, srcs[0], srcs[1])
+			}
+		}
+	}
+}
+
+// TestHalfProductsAreRejected checks that no dialect generates a product
+// of half elements, which the tensor package computes in float32.
+func TestHalfProductsAreRejected(t *testing.T) {
+	square := backend.Contiguous([]int{2, 2})
+	for _, dt := range []backend.DType{backend.BFloat16, backend.Float16} {
+		k := &backend.Kernel{Op: backend.OpMatMul, DType: dt, Shape: []int{2, 2}, In: []backend.View{square, square}}
+		out := kerneltest.HostBuffer(t, nil, dt, 4, 0, 0)
+		x := kerneltest.HostBuffer(t, nil, dt, 4, 0, 0)
+		for _, d := range dialects {
+			if _, err := gen.Plan(d, k, []backend.Buffer{out}, []backend.Buffer{x, x}); !errors.Is(err, backend.ErrDType) {
+				t.Errorf("%s %s product: %v, want ErrDType", d.Name, dt, err)
+			}
+		}
+		if _, ok := gen.PlanGEMM(k, []int{4, 4}); ok {
+			t.Errorf("%s product planned as a GEMM", dt)
+		}
+	}
+}
+
+// TestHalfKernelsConvertOnLoadAndStore checks the shape of the generated
+// code for half elements: ushort buffers, float values and the prelude's
+// conversions around loads and stores.
+func TestHalfKernelsConvertOnLoadAndStore(t *testing.T) {
+	shape := []int{4, 5}
+	in := backend.Contiguous(shape)
+	k := &backend.Kernel{Op: backend.OpFused, DType: backend.BFloat16, Shape: shape, In: []backend.View{in, in}, Attrs: backend.Attrs{Program: []backend.Instr{
+		{Op: backend.OpLoad, DType: backend.BFloat16, Args: []int{0}},
+		{Op: backend.OpLoad, DType: backend.Float16, Args: []int{1}},
+		{Op: backend.OpCast, DType: backend.BFloat16, Args: []int{1}},
+		{Op: backend.OpAdd, DType: backend.BFloat16, Args: []int{0, 2}},
+	}}}
+	out := kerneltest.HostBuffer(t, nil, backend.BFloat16, 20, 0, 0)
+	ins := []backend.Buffer{kerneltest.HostBuffer(t, nil, backend.BFloat16, 20, 0, 0), kerneltest.HostBuffer(t, nil, backend.Float16, 20, 0, 0)}
+	for _, d := range dialects {
+		l, err := gen.Plan(d, k, []backend.Buffer{out}, ins)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"ushort* o0", "ushort* i0", "ushort* i1", "float v3 = bf2f(i0[", "float v4 = h2f(i1[", "float v5 = bf2f(f2bf(float(v4)));", "float v6 = bf2f(f2bf(v3 + v5));", "o0[i] = f2bf(v6);"} {
+			if !strings.Contains(l.Src, want) {
+				t.Errorf("%s: no %q in\n%s", d.Name, want, l.Src)
 			}
 		}
 	}

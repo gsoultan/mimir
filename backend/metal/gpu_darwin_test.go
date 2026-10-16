@@ -93,7 +93,7 @@ func (g gpuTarget) Run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buff
 	}
 	res := make([][]byte, len(mo))
 	for i, b := range mo {
-		res[i] = make([]byte, 4*b.Len())
+		res[i] = make([]byte, b.Len()*b.DType().Size())
 		if err := g.b.Download(t.Context(), res[i], b); err != nil {
 			t.Fatal(err)
 		}

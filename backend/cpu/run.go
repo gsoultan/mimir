@@ -3,6 +3,7 @@ package cpu
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/gsoultan/mimir/backend"
 )
@@ -11,6 +12,11 @@ import (
 // written contiguously. Any panic inside a kernel is reported as
 // backend.ErrInternal instead of crashing the program.
 func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buffer, ins []backend.Buffer) (err error) {
+	// A kernel works on the buffers' memory, not the buffers: one that the
+	// caller drops must stay reachable until the kernel is done, or the
+	// cleanup of an off-heap buffer unmaps it under the kernel.
+	defer runtime.KeepAlive(outs)
+	defer runtime.KeepAlive(ins)
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("cpu: panic in %s: %v: %w", k.Op, r, backend.ErrInternal)
@@ -45,13 +51,21 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 			return runMatMul[float32](ctx, b, k, out, ins, epi)
 		case backend.Int32:
 			return runMatMul[int32](ctx, b, k, out, ins, epi)
+		default:
+			return fmt.Errorf("%s product: %w", k.DType, backend.ErrDType)
 		}
+	case k.Op.IsReduce():
+		return runReduce(ctx, b, k, out, ins[0])
 	}
 	switch k.DType {
 	case backend.Float32:
 		return runTyped[float32](ctx, b, k, out, ins)
 	case backend.Int32:
 		return runTyped[int32](ctx, b, k, out, ins)
+	case backend.BFloat16:
+		return runTyped[bf16](ctx, b, k, out, ins)
+	case backend.Float16:
+		return runTyped[f16](ctx, b, k, out, ins)
 	default:
 		return backend.ErrDType
 	}
@@ -76,7 +90,7 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 
 	switch op := k.Op; {
 	case op == backend.OpConst:
-		v := T(k.Attrs.Value)
+		v := valueOf[T](k.Attrs.Value)
 		for i := range out {
 			out[i] = v
 		}
@@ -87,10 +101,6 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 			return backend.ErrDType
 		}
 		return b.fillRand(ctx, f32, k.Attrs.Seed, op == backend.OpRandNormal)
-	case op == backend.OpReduceSum:
-		return reduceSum(ctx, b, k, out, in[0])
-	case op == backend.OpReduceMax:
-		return reduceMax(ctx, b, k, out, in[0])
 	case op == backend.OpPad:
 		return pad(ctx, b, k, out, in[0])
 	case op == backend.OpGather:

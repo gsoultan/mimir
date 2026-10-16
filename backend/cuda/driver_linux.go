@@ -22,10 +22,13 @@ const (
 	cudaOutOfMemory result = 2
 	cudaNoDevice    result = 100
 
-	attrMaxThreadsPerBlock = 1
-	attrComputeMajor       = 75
-	attrComputeMinor       = 76
-	attrMemoryPools        = 115
+	// CUdevice_attribute values.
+	attrComputeMajor = 75
+	attrComputeMinor = 76
+	attrMemoryPools  = 115
+
+	// CUfunction_attribute values, numbered apart from the device's.
+	funcAttrMaxThreadsPerBlock = 0
 
 	hostAllocDeviceMap = 0x2
 

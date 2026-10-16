@@ -35,9 +35,28 @@ func gather[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, src
 // scatterAdd copies dst into out, then adds each update into
 // out[m with m[axis] = idx[m]]. Index and updates share a shape that fits
 // dst outside axis. It runs sequentially so that colliding indices add in a
-// fixed order and results are reproducible.
+// fixed order and results are reproducible. Half elements are summed in
+// float32 and rounded once.
 func scatterAdd[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, dst []T, idx []int32, upd []T) error {
-	if err := mapStrided(ctx, b, k.Shape, k.In[0], len(out), func(i, off int) { out[i] = dst[off] }); err != nil {
+	switch out := any(out).(type) {
+	case []float32:
+		return scatterAddInto(ctx, b, k, out, dst, idx, upd)
+	case []int32:
+		return scatterAddInto(ctx, b, k, out, dst, idx, upd)
+	}
+	sums := make([]float32, len(out))
+	if err := scatterAddInto(ctx, b, k, sums, dst, idx, upd); err != nil {
+		return err
+	}
+	for i, v := range sums {
+		out[i] = ofF32[T](v)
+	}
+	return nil
+}
+
+// scatterAddInto computes a scatterAdd into out, as A.
+func scatterAddInto[A number, S elem](ctx context.Context, b *Backend, k *backend.Kernel, out []A, dst []S, idx []int32, upd []S) error {
+	if err := mapStrided(ctx, b, k.Shape, k.In[0], len(out), func(i, off int) { out[i] = conv[A](dst[off]) }); err != nil {
 		return err
 	}
 	axis := k.Attrs.Axis
@@ -59,7 +78,7 @@ func scatterAdd[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out,
 		if j < 0 || j >= limit {
 			return fmt.Errorf("index %d for axis %d of size %d: %w", j, axis, limit, backend.ErrIndex)
 		}
-		out[c.offs[2]+j*step] += upd[c.offs[1]]
+		out[c.offs[2]+j*step] += conv[A](upd[c.offs[1]])
 		c.next()
 	}
 	return nil

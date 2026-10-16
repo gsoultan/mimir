@@ -443,7 +443,7 @@ func (b *Backend) function(src string, threads int) (uintptr, error) {
 		return 0, check(r, "kernel function")
 	}
 	var maxThreads int32
-	if r := cuFuncGetAttribute(&maxThreads, attrMaxThreadsPerBlock, fn); r != cudaSuccess {
+	if r := cuFuncGetAttribute(&maxThreads, funcAttrMaxThreadsPerBlock, fn); r != cudaSuccess {
 		return 0, check(r, "kernel attribute")
 	}
 	if int(maxThreads) < threads {

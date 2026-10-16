@@ -177,7 +177,7 @@ func TestRealizeWaitsForErrorsReportedAtSync(t *testing.T) {
 func TestElementwiseChainsFuse(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	x := must(graph.Rand([]int{1000}, 1, false))
-	e := must(graph.Unary(backend.OpExp2, x)) // read twice, so it gets a buffer
+	e := must(graph.Unary(backend.OpExp2, x)) // read twice, by one kernel, so computed inside it once
 	two := must(graph.Expand(must(graph.Const(backend.Float32, []int{1}, 2)), []int{1000}))
 	sq := must(graph.Binary(backend.OpMul, e, e))
 	y := must(graph.Binary(backend.OpAdd, must(graph.Binary(backend.OpMul, sq, two)), e))
@@ -193,7 +193,7 @@ func TestElementwiseChainsFuse(t *testing.T) {
 	if err := Download(t.Context(), be, y, out); err != nil {
 		t.Fatal(err)
 	}
-	if want := []backend.Op{backend.OpExp2, backend.OpFused}; !slices.Equal(be.ops, want) {
+	if want := []backend.Op{backend.OpFused}; !slices.Equal(be.ops, want) {
 		t.Errorf("kernels %v, want %v", be.ops, want)
 	}
 	for i := range 1000 {
@@ -206,6 +206,47 @@ func TestElementwiseChainsFuse(t *testing.T) {
 		if got := float32frombytes(out[4*i:]); got != want {
 			t.Fatalf("element %d = %v, want %v", i, got, want)
 		}
+	}
+}
+
+func TestValuesReadSeveralTimesByOneKernelAreComputedInsideIt(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	x := realized(t, be, []int{1000}, 1)
+	xs := floats(t, be, x)
+	c := func(v float64) *graph.Node { return must(graph.Const(backend.Float32, []int{1000}, v)) }
+	bin := func(op backend.Op, a, b *graph.Node) *graph.Node { return must(graph.Binary(op, a, b)) }
+	// A Huber-like loss reads |x| three times, by three different ops.
+	d := bin(backend.OpMax, x, must(graph.Unary(backend.OpNeg, x)))
+	small := bin(backend.OpMul, bin(backend.OpMul, c(0.5), d), d)
+	large := bin(backend.OpAdd, d, c(-0.5))
+	y := must(graph.Where(bin(backend.OpCmpLT, d, c(1)), small, large))
+	be.ops = nil
+	got := floats(t, be, y)
+	if want := []backend.Op{backend.OpFused}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
+	}
+	for i, v := range got {
+		a := float32(math.Abs(float64(xs[i])))
+		want := a + -0.5
+		if a < 1 {
+			want = float32(0.5*a) * a
+		}
+		if v != want {
+			t.Fatalf("element %d = %v, want %v", i, v, want)
+		}
+	}
+
+	// A value that a reduction reads too is computed by a kernel of its
+	// own, into a buffer that the elementwise reader loads.
+	d = bin(backend.OpMax, x, must(graph.Unary(backend.OpNeg, x)))
+	sum := must(graph.Reduce(backend.OpReduceSum, d, []int{0}))
+	z := bin(backend.OpAdd, d, must(graph.Expand(sum, []int{1000})))
+	be.ops = nil
+	if err := Realize(t.Context(), be, z); err != nil {
+		t.Fatal(err)
+	}
+	if want := []backend.Op{backend.OpFused, backend.OpReduceSum, backend.OpAdd}; !slices.Equal(be.ops, want) {
+		t.Errorf("kernels %v, want %v", be.ops, want)
 	}
 }
 

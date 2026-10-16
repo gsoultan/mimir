@@ -9,6 +9,20 @@
 //		pred := model.Forward(batch.X)
 //		...
 //	}
+//
+// A training set larger than memory streams from a Source of shards, such
+// as the CSV files of datasets.CSVShards or the row groups of the Parquet
+// files of datasets.ParquetShards, through a Stream, which reads a
+// few shards ahead of the batches it yields and shuffles the shard order
+// and a buffer of examples every epoch, so resident memory stays flat
+// however many rows there are: a Stream holds up to 2×Prefetch+1 chunks
+// of at most 4 MiB each, the shuffle buffer of ShuffleBuffer×Features×4 bytes
+// and one batch, and keeps them from one epoch to the next. Statistics
+// reads the source once for the per-feature mean and deviation that
+// Normalize applies on the way:
+//
+//	stats, err := data.Statistics(ctx, src)
+//	trainSet, err := data.NewStream(src, data.BatchSize(4096), data.Shuffle(42), data.Normalize(stats))
 package data
 
 import (
@@ -42,6 +56,30 @@ type config struct {
 	shuffle  bool
 	seed     uint64
 	dropLast bool
+	// Stream and Statistics options, which FromTensors rejects.
+	prefetch   int
+	shuffleBuf int
+	classes    bool
+	normalize  bool
+	stats      *Stats
+}
+
+// streamOnly names the first option set that only a Stream takes, or
+// returns "" when none is: the zero values are unset, since Prefetch
+// must be at least 1 for a Stream and ShuffleBuffer(0) means nothing to
+// tensors.
+func (c *config) streamOnly() string {
+	switch {
+	case c.prefetch != 0:
+		return "Prefetch"
+	case c.shuffleBuf != 0:
+		return "ShuffleBuffer"
+	case c.classes:
+		return "ClassTargets"
+	case c.normalize:
+		return "Normalize"
+	}
+	return ""
 }
 
 // BatchSize sets the number of examples per batch. The default is 1.
@@ -68,7 +106,9 @@ type Tensors struct {
 
 // FromTensors returns a dataset of the examples along the first dimension
 // of x and y, which must have the same length. Batches are views of x and
-// y, or gathers when shuffling, so x and y should already be computed.
+// y, or gathers when shuffling, so x and y should already be computed. It
+// takes BatchSize, Shuffle, InOrder and DropLast; the options of a Stream
+// are ErrOption.
 func FromTensors(x, y *tensor.Tensor, opts ...Option) (*Tensors, error) {
 	if err := x.Err(); err != nil {
 		return nil, err
@@ -79,6 +119,9 @@ func FromTensors(x, y *tensor.Tensor, opts ...Option) (*Tensors, error) {
 	cfg := config{batch: 1}
 	for _, o := range opts {
 		o(&cfg)
+	}
+	if name := cfg.streamOnly(); name != "" {
+		return nil, fmt.Errorf("data: %s is an option of NewStream, not of FromTensors: %w", name, ErrOption)
 	}
 	if cfg.batch < 1 {
 		return nil, fmt.Errorf("data: batch size %d: %w", cfg.batch, tensor.ErrShape)
