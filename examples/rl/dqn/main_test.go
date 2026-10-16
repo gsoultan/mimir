@@ -10,7 +10,7 @@ import (
 
 func TestDQNImprovesOnASmallBudget(t *testing.T) {
 	cfg := defaults
-	cfg.Episodes, cfg.Start, cfg.EpsilonSteps, cfg.SyncEvery, cfg.Seed = 120, 500, 2000, 200, 2
+	cfg.Episodes, cfg.Hidden, cfg.Batch, cfg.Start, cfg.EpsilonSteps, cfg.SyncEvery, cfg.Seed = 80, 64, 32, 300, 1500, 200, 2
 	res, err := run(t.Context(), cfg, nil)
 	if err != nil {
 		t.Fatal(err)
