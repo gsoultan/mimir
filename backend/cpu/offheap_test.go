@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"runtime"
+	"runtime/debug"
 	"testing"
 	"time"
 	"unsafe"
@@ -81,7 +82,7 @@ func TestKernelsRunOnOffHeapBuffers(t *testing.T) {
 		t.Skipf("no anonymous mappings on %s", runtime.GOOS)
 	}
 	b := New()
-	const n = 2 * offHeapMin / 4
+	const n = 8 * offHeapMin / 4
 	in, err := b.Alloc(backend.Float32, n)
 	if err != nil {
 		t.Fatal(err)
@@ -164,5 +165,51 @@ func TestWrapReadsAndWritesBytesInPlace(t *testing.T) {
 	empty, err := Wrap(backend.Int32, nil)
 	if err != nil || empty.Len() != 0 {
 		t.Errorf("wrapping no bytes: %v, %v", empty, err)
+	}
+}
+
+// TestKernelsKeepTheirBuffersAlive runs kernels over off-heap buffers
+// that nothing but the call refers to, with the garbage collector running
+// as often as it can: a buffer collected during a kernel would be
+// unmapped under it.
+func TestKernelsKeepTheirBuffersAlive(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(1))
+	b := New()
+	const n = 2 * offHeapMin / 4
+	k := &backend.Kernel{
+		Op: backend.OpNeg, DType: backend.Float32, Shape: []int{n},
+		In: []backend.View{backend.Contiguous([]int{n})},
+	}
+	x := make([]float32, n)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				runtime.GC()
+			}
+		}
+	}()
+	for i := range 200 {
+		in, err := b.Alloc(backend.Float32, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Upload(t.Context(), in, asBytes(x)); err != nil {
+			t.Fatal(err)
+		}
+		out, err := b.Alloc(backend.Float32, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Run(t.Context(), k, []backend.Buffer{out}, []backend.Buffer{in}); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if err := b.Download(t.Context(), asBytes(x), out); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
