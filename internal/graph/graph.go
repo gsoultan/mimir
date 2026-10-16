@@ -433,3 +433,22 @@ func Fold(x *Node, spatial []int, w Window) (*Node, error) {
 	}
 	return newNode(&Node{Op: backend.OpFold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)})
 }
+
+// Scan is the inclusive scan of x along axis by combine; see
+// backend.OpScan. The result has x's shape and dtype. CombineLogSumExp
+// accepts only float types.
+func Scan(x *Node, axis int, combine backend.Combine) (*Node, error) {
+	if axis < 0 || axis >= len(x.Shape) {
+		return nil, errorf(backend.OpScan, backend.ErrShape, "axis %d for shape %v", axis, x.Shape)
+	}
+	switch combine {
+	case backend.CombineSum, backend.CombineMax:
+	case backend.CombineLogSumExp:
+		if !x.DType.IsFloat() {
+			return nil, errorf(backend.OpScan, backend.ErrDType, "%s of %s", combine, x.DType)
+		}
+	default:
+		return nil, errorf(backend.OpScan, backend.ErrInternal, "no combine %s", combine)
+	}
+	return newNode(&Node{Op: backend.OpScan, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Combine: combine}})
+}

@@ -56,6 +56,8 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		}
 	case k.Op.IsReduce():
 		return runReduce(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpScan:
+		return runScan(ctx, b, k, out, ins[0])
 	}
 	switch k.DType {
 	case backend.Float32:

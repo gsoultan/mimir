@@ -123,6 +123,13 @@ func TestSchedulesPredictTheirAllocationsExactly(t *testing.T) {
 			u := must(graph.Unfold(p, w, 0))
 			return []*graph.Node{u}, (2*7*7 + 2*3*3*5*5) * f
 		}},
+		{"scan of a view, scanned again", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			// The scan reads the transposed input in place; the second
+			// scan reads the first, which is freed after it.
+			x := realized(t, be, []int{4, 6}, 1)
+			s := must(graph.Scan(must(graph.Permute(x, []int{1, 0})), 0, backend.CombineSum))
+			return []*graph.Node{must(graph.Scan(s, 1, backend.CombineMax))}, 2 * 6 * 4 * f
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
