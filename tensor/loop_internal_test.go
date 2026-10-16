@@ -30,6 +30,9 @@ func TestSplitJoinsGradientsOnce(t *testing.T) {
 }
 
 func TestCatJoinsInATreeOfKernels(t *testing.T) {
+	// Eager mode would compute the join before the test sees its node.
+	defer func(old bool) { eager = old }(eager)
+	eager = false
 	n := 3*backend.MaxCatInputs + 1
 	ts := make([]*Tensor, n)
 	want := make([]float32, n)
