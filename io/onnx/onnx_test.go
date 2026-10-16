@@ -111,7 +111,7 @@ func expect(t testing.TB, got []float32, gotShape []int, want *arr, tol float64)
 		if math.IsNaN(w) && math.IsNaN(g) || g == w {
 			continue
 		}
-		if math.Abs(g-w) > tol*max(1, math.Abs(w)) {
+		if !(math.Abs(g-w) <= tol*max(1, math.Abs(w))) {
 			t.Fatalf("element %d is %v, want %v (of %v, want %v)", i, g, w, got[:min(len(got), 12)], want.data[:min(len(want.data), 12)])
 		}
 	}
