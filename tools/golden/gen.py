@@ -24,6 +24,9 @@ Files:
                         gradients (package nn)
     linalg.safetensors  sorts, top-k, Fourier transforms and linear algebra with
                         their gradients (package tensor)
+    transforms.safetensors  Hessian-vector and Jacobian-vector products,
+                        Jacobians, Hessians and per-example gradients
+                        (package tensor)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -1306,6 +1309,182 @@ def linalg_cases(rng):
     return c
 
 
+# ---------------------------------------------------------------------------
+# Function transformations (transforms.safetensors, package tensor). Each
+# case is a function of its inputs and a kind of derivative with respect
+# to the inputs listed in diff:
+#
+#   hvp    a scalar function; vec<i> are directions and hvp<i> the parts of
+#          the product of the Hessian with them, as
+#          torch.autograd.functional.hvp computes
+#   jvp    tan<i> are tangents and jvp the derivative along them, as
+#          torch.func.jvp computes
+#   jac    jac is the Jacobian with respect to input 0, shaped like out
+#          followed by the input
+#   hess   hess is the Hessian of a scalar function with respect to input 0
+#   perex  inputs 0 and 1 are a batch of examples and their labels, the
+#          others parameters; out holds each example's loss and pergrad<i>
+#          the gradients of each with respect to parameter i, as
+#          torch.func.vmap of torch.func.grad computes
+#
+# The NumPy oracle takes central differences in float64: of the function
+# for first derivatives, and of the function along two directions at once
+# for second derivatives.
+
+def transform_cases(rng):
+    c = {}
+
+    def case(name, kind, inputs, diff, np_fn, torch_fn):
+        c[name] = (kind, inputs, diff, np_fn, torch_fn)
+
+    def u(*shape, lo=-1.0, hi=1.0):
+        return uniform(rng, shape, lo, hi)
+
+    F = lambda T: T.nn.functional  # noqa: E731
+    case("hvp_mlp", "hvp", [u(4, 3), u(3, 5), u(5), u(5, 2)], [0, 1, 2, 3],
+         lambda x, w1, b1, w2: 0.25 * ((np.tanh(x @ w1 + b1) @ w2) ** 2).sum(),
+         lambda T, x, w1, b1, w2: 0.25 * ((T.tanh(x @ w1 + b1) @ w2) ** 2).sum())
+    case("hvp_cross_entropy", "hvp", [u(3, 4), u(4, 5), ints(rng, (3,), 0, 5)], [0, 1],
+         lambda x, w, y: np_cross_entropy(x @ w, y),
+         lambda T, x, w, y: F(T).cross_entropy(x @ w, y.long()))
+    case("hvp_attention_causal", "hvp", [u(1, 2, 3, 4), u(1, 2, 5, 4), u(1, 2, 5, 3), u(1, 2, 3, 3)], [0, 1, 2],
+         lambda q, k, v, w: (np_sdpa(q, k, v, causal=True, offset=2) * w).sum(),
+         lambda T, q, k, v, w: (F(T).scaled_dot_product_attention(
+             q, k, v, attn_mask=torch_causal(T, q, k, 2)) * w).sum())
+    case("hvp_conv_pool", "hvp", [u(1, 2, 6, 6), u(3, 2, 3, 3), u(3), u(1, 3, 3, 3)], [0, 1, 2],
+         lambda x, w, b, g: ((np_max_pool2d(np_conv2d(x, w, b, padding=1), 2) ** 2) * g).sum(),
+         lambda T, x, w, b, g: ((F(T).max_pool2d(F(T).conv2d(x, w, b, padding=1), 2) ** 2) * g).sum())
+    case("hvp_logcumsumexp", "hvp", [u(3, 5, lo=-3, hi=3), u(3, 5)], [0],
+         lambda x, g: (np.logaddexp.accumulate(x, axis=-1) * g).sum(),
+         lambda T, x, g: (T.logcumsumexp(x, dim=-1) * g).sum())
+
+    case("jvp_mlp", "jvp", [u(4, 3), u(3, 5), u(5)], [0, 1, 2],
+         lambda x, w, b: np.tanh(x @ w + b), lambda T, x, w, b: T.tanh(x @ w + b))
+    case("jvp_attention_gqa", "jvp", [u(1, 4, 3, 4), u(1, 2, 5, 4), u(1, 2, 5, 4)], [0, 1, 2],
+         lambda q, k, v: np_sdpa(q, k, v),
+         lambda T, q, k, v: F(T).scaled_dot_product_attention(
+             q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1)))
+    case("jvp_softmax_cumsum", "jvp", [u(3, 4, lo=-2, hi=2)], [0],
+         lambda x: np.cumsum(np_softmax(x, -1), axis=0), lambda T, x: T.cumsum(T.softmax(x, -1), dim=0))
+    case("jvp_conv_avg_pool", "jvp", [u(1, 2, 5, 5), u(2, 2, 3, 3)], [0, 1],
+         lambda x, w: np_avg_pool2d(np_conv2d(x, w, padding=1), 2),
+         lambda T, x, w: F(T).avg_pool2d(F(T).conv2d(x, w, padding=1), 2))
+
+    case("jacobian_softmax", "jac", [u(2, 3), u(3, 4)], [0],
+         lambda x, w: np_softmax(x @ w, -1), lambda T, x, w: T.softmax(x @ w, -1))
+    case("jacobian_rows", "jac", [u(3, 4), u(4, 2)], [0],
+         lambda x, w: np.tanh(x @ w).sum(axis=0), lambda T, x, w: T.tanh(x @ w).sum(0))
+    case("hessian_logsumexp", "hess", [u(2, 3), u(3, 4)], [0],
+         lambda x, w: np.log(np.exp(np.sin(x) @ w).sum()), lambda T, x, w: T.log(T.exp(T.sin(x) @ w).sum()))
+
+    case("per_example_mlp", "perex", [u(6, 5), ints(rng, (6,), 0, 3), u(5, 8), u(8), u(8, 3)], [2, 3, 4],
+         lambda x, y, w1, b1, w2: np_cross_entropy((np.maximum(x @ w1 + b1, 0) @ w2)[None], y[None]),
+         lambda T, x, y, w1, b1, w2: F(T).cross_entropy((T.relu(x @ w1 + b1) @ w2)[None], y[None].long()))
+    return c
+
+
+def np_second(f, xs, i, idx, v, h=1e-4):
+    """The derivative of f along the directions v, one per input or None,
+    and along element idx of input i, by central differences."""
+    def at(a, b):
+        ys = [x if d is None else x + a * d for x, d in zip(xs, v)]
+        ys[i] = ys[i].copy()
+        ys[i][idx] += b
+        return float(f(*ys))
+    return (at(h, h) - at(h, -h) - at(-h, h) + at(-h, -h)) / (4 * h * h)
+
+
+def np_along(f, xs, v, h=1e-6):
+    """The derivative of f along the directions v, one per input or None,
+    by central differences."""
+    up = [x if d is None else x + h * d for x, d in zip(xs, v)]
+    down = [x if d is None else x - h * d for x, d in zip(xs, v)]
+    return (np.asarray(f(*up)) - np.asarray(f(*down))) / (2 * h)
+
+
+def unit(xs, idx):
+    """The direction of element idx of input 0."""
+    e = [None] * len(xs)
+    e[0] = np.zeros_like(xs[0])
+    e[0][idx] = 1
+    return e
+
+
+def evaluate_transform(oracle, kind, inputs, diff, np_fn, torch_fn, vec_rng):
+    wide = widen(inputs)
+    out = None if kind == "perex" else np.asarray(np_fn(*wide))
+    result = {}
+    vecs = [None] * len(inputs)
+    if kind in ("hvp", "jvp"):
+        for i in diff:
+            vecs[i] = vec_rng.uniform(-1, 1, size=inputs[i].shape).astype(F32)
+            result[f"{'vec' if kind == 'hvp' else 'tan'}{i}"] = vecs[i]
+    wvecs = [None if d is None else d.astype(np.float64) for d in vecs]
+    if oracle == "torch":
+        import torch
+
+        xs = [torch.from_numpy(a) for a in wide]
+
+        def partial(*d):
+            ys = list(xs)
+            for i, a in zip(diff, d):
+                ys[i] = a
+            return torch_fn(torch, *ys)
+
+        primals = tuple(xs[i] for i in diff)
+        dirs = tuple(torch.from_numpy(wvecs[i]) for i in diff) if kind in ("hvp", "jvp") else None
+        if kind == "hvp":
+            out, hv = torch.autograd.functional.hvp(partial, primals, dirs)
+            result.update({f"hvp{i}": h.numpy() for i, h in zip(diff, hv)})
+        elif kind == "jvp":
+            out, tv = torch.func.jvp(partial, primals, dirs)
+            result["jvp"] = tv.numpy()
+        elif kind == "jac":
+            out = partial(*primals)
+            result["jac"] = torch.autograd.functional.jacobian(partial, primals[0]).numpy()
+        elif kind == "hess":
+            out = partial(*primals)
+            result["hess"] = torch.autograd.functional.hessian(partial, primals[0]).numpy()
+        else:
+            def loss(*a):
+                return torch_fn(torch, *a)
+            dims = (0, 0) + (None,) * (len(xs) - 2)
+            out = torch.func.vmap(loss, in_dims=dims)(*xs)
+            gs = torch.func.vmap(torch.func.grad(loss, argnums=tuple(diff)), in_dims=dims)(*xs)
+            result.update({f"pergrad{i}": g.numpy() for i, g in zip(diff, gs)})
+        out = out.detach().numpy()
+    elif kind == "hvp":
+        for i in diff:
+            h = np.zeros_like(wide[i])
+            for idx in np.ndindex(*wide[i].shape):
+                h[idx] = np_second(np_fn, wide, i, idx, wvecs)
+            result[f"hvp{i}"] = h
+    elif kind == "jvp":
+        result["jvp"] = np_along(np_fn, wide, wvecs)
+    elif kind == "jac":
+        jac = np.zeros(out.shape + wide[0].shape)
+        for idx in np.ndindex(*wide[0].shape):
+            jac[(...,) + idx] = np_along(np_fn, wide, unit(wide, idx))
+        result["jac"] = jac
+    elif kind == "hess":
+        hess = np.zeros(wide[0].shape * 2)
+        for jdx in np.ndindex(*wide[0].shape):
+            for idx in np.ndindex(*wide[0].shape):
+                hess[idx + jdx] = np_second(np_fn, wide, 0, idx, unit(wide, jdx))
+        result["hess"] = hess
+    else:
+        losses, grads = [], {i: [] for i in diff}
+        for k in range(wide[0].shape[0]):
+            ex = [wide[0][k], wide[1][k]] + wide[2:]
+            losses.append(np_fn(*ex))
+            for i, g in zip(diff, numeric_grads(np_fn, ex, 1.0, diff)):
+                grads[i].append(g)
+        out = np.asarray(losses)
+        result.update({f"pergrad{i}": np.stack(grads[i]) for i in diff})
+    result["out"] = np.asarray(out)
+    return {k: v.astype(F32) if v.dtype == np.float64 else v for k, v in result.items()}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--oracle", choices=["torch", "numpy"], default="torch")
@@ -1406,6 +1585,16 @@ def main():
         for part, a in parts.items():
             tensors[f"{name}/{part}"] = a
     files["linalg"] = tensors
+
+    # Function transformations, from their own streams at seed offset 9.
+    rng, vec_rng = np.random.default_rng(args.seed + 9), np.random.default_rng(args.seed + 109)
+    tensors = {}
+    for name, (kind, inputs, diff, np_fn, torch_fn) in transform_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        for part, a in evaluate_transform(args.oracle, kind, inputs, diff, np_fn, torch_fn, vec_rng).items():
+            tensors[f"{name}/{part}"] = a
+    files["transforms"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
