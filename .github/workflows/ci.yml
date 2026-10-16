@@ -173,12 +173,16 @@ jobs:
         with:
           python-version: '3.12'
       - run: |
-          pip install numpy
+          pip install numpy onnx onnxscript
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python tools/golden/gen.py --oracle torch --out "$RUNNER_TEMP/golden"
       - run: go test -count=1 -run TestGolden -v ./...
         env:
           MIMIR_GOLDEN_DIR: ${{ runner.temp }}/golden
+      - run: python tools/onnx/gen.py --oracle torch --out "$RUNNER_TEMP/onnx"
+      - run: go test -count=1 -run TestGolden -v ./io/onnx
+        env:
+          MIMIR_ONNX_DIR: ${{ runner.temp }}/onnx
 
   bench:
     if: github.event_name == 'pull_request'
