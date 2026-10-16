@@ -6,10 +6,11 @@ import (
 	"slices"
 )
 
-// ErrCheckpoint reports a checkpointed function that reads a tracked
-// tensor it captured from its surroundings instead of receiving it as an
-// input (see Checkpoint).
-var ErrCheckpoint = errors.New("tensor: checkpointed function reads a tracked tensor that is not an input or a leaf")
+// ErrCheckpoint reports a checkpointed function that breaks a rule of
+// Checkpoint: it reads a tracked tensor it captured from its surroundings
+// instead of receiving it as an input, or it calls Backward while Backward
+// recomputes it.
+var ErrCheckpoint = errors.New("tensor: checkpointed function breaks a rule of Checkpoint")
 
 // Checkpoint computes f(in...) like calling f, but trades compute for
 // memory: Backward recomputes f to get the gradients instead of keeping
@@ -19,7 +20,9 @@ var ErrCheckpoint = errors.New("tensor: checkpointed function reads a tracked te
 // from RequiresGrad or Param.Value); a tracked tensor it captures any
 // other way fails with ErrCheckpoint, at the call or in Backward. Random
 // tensors inside f are deterministic in mimir (counter-based), so a
-// dropout mask drawn from a seed is recomputed the same.
+// dropout mask drawn from a seed is recomputed the same. f may read
+// gradients, but calling Backward from the recompute fails with
+// ErrCheckpoint.
 //
 // In the lazy graph the result is a recipe that reads f's inputs, like
 // any other, and Backward computes it in the schedule of the gradients.
@@ -59,7 +62,7 @@ func Checkpoint(f func(in ...*Tensor) *Tensor, in ...*Tensor) *Tensor {
 		return fail(err)
 	}
 	if readsOutside(out.tape, since) {
-		return fail(ErrCheckpoint)
+		return fail(fmt.Errorf("tensor: checkpointed function reads a tracked tensor that is not an input or a leaf: %w", ErrCheckpoint))
 	}
 	if !tracked(in...) && out.tape == nil {
 		return out
@@ -96,7 +99,7 @@ func recompute(f func(in ...*Tensor) *Tensor, det []*Tensor, parents []*tape, g 
 		return nil
 	}
 	if readsOutside(out.tape, since) {
-		bwd.fail(fmt.Errorf("tensor: backward: %w", ErrCheckpoint))
+		bwd.fail(fmt.Errorf("tensor: backward: recompute reads a tracked tensor that is not an input or a leaf: %w", ErrCheckpoint))
 		return nil
 	}
 	if out.tape != nil {
