@@ -1,6 +1,8 @@
 // Command softmax generates the amd64 assembly of the row operations of
 // backend/cpu's attention kernels: the maximum of a row, exponentials
-// shifted by it and their sum, scaling a row, and the softmax gradient.
+// shifted by it and their sum, scaling a row, and the softmax gradient;
+// and of its elementwise kernels and products of few rows: sums,
+// products, reciprocals and powers of 2 of vectors, and dot products.
 //
 //	go run ./softmax -out ../../backend/cpu/softmax_amd64.s -stubs ../../backend/cpu/softmax_stub_amd64.go -pkg cpu
 //
@@ -59,8 +61,13 @@ func main() {
 		expShift(v)
 		scaleRow(v)
 		softmaxGrad(v)
-		dot(v)
+		dot4(v)
 		exp2(v)
+		for _, op := range []string{"add", "mul"} {
+			binaryVV(v, op)
+			binaryVS(v, op)
+		}
+		recip(v)
 	}
 	Generate()
 }
@@ -108,50 +115,159 @@ func exp2(v isa) {
 	RET()
 }
 
-func dot(v isa) {
-	name := "dot" + v.name
-	TEXT(name, NOSPLIT, "func(x *float32, y *float32, n int) float32")
-	Pragma("noescape")
-	Doc(fmt.Sprintf("%s returns the sum of the products of the n elements at x and y, a multiple of %d.", name, v.lanes))
-	px := Load(Param("x"), GP64())
-	py := Load(Param("y"), GP64())
-	n := Load(Param("n"), GP64())
-	// Four accumulators hide the latency of the fused multiply-adds.
-	var acc [4]VecVirtual
-	for i := range acc {
-		acc[i] = v.vec()
-		VXORPS(acc[i], acc[i], acc[i])
+// arith emits the instruction of a binary operation: dst = x op y, with y
+// a register or memory.
+func arith(op string, y, x Op, dst VecVirtual) {
+	switch op {
+	case "add":
+		VADDPS(y, x, dst)
+	case "mul":
+		VMULPS(y, x, dst)
 	}
-	step := 4 * v.lanes
+}
+
+// unroll is how many vectors the elementwise loops handle at a time.
+const unroll = 4
+
+// elementLoop emits a loop over the n elements at the pointers in ptrs, a
+// whole number of vectors, calling body with the displacement of each
+// vector from the pointers, unroll vectors at a time while there are as
+// many.
+func elementLoop(v isa, name string, ptrs []Register, n Register, body func(disp int)) {
+	step := unroll * v.lanes
+	CMPQ(n, U32(step))
+	JL(LabelRef(name + "_one"))
+	Label(name + "_wide")
+	for u := range unroll {
+		body(4 * v.lanes * u)
+	}
+	for _, p := range ptrs {
+		ADDQ(U32(4*step), p)
+	}
+	SUBQ(U32(step), n)
+	CMPQ(n, U32(step))
+	JGE(LabelRef(name + "_wide"))
+	Label(name + "_one")
+	TESTQ(n, n)
+	JZ(LabelRef(name + "_done"))
+	body(0)
+	for _, p := range ptrs {
+		ADDQ(U32(4*v.lanes), p)
+	}
+	SUBQ(U32(v.lanes), n)
+	JMP(LabelRef(name + "_one"))
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
+}
+
+func binaryVV(v isa, op string) {
+	name := op + "VV" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, b *float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the %s of those at a and b.", name, v.lanes, map[string]string{"add": "sums", "mul": "products"}[op]))
+	pd := Load(Param("dst"), GP64())
+	pa := Load(Param("a"), GP64())
+	pb := Load(Param("b"), GP64())
+	n := Load(Param("n"), GP64())
+	elementLoop(v, name, []Register{pd, pa, pb}, n, func(disp int) {
+		x := v.vec()
+		VMOVUPS(Mem{Base: pa, Disp: disp}, x)
+		arith(op, Mem{Base: pb, Disp: disp}, x, x)
+		VMOVUPS(x, Mem{Base: pd, Disp: disp})
+	})
+}
+
+func binaryVS(v isa, op string) {
+	name := op + "VS" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, s float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the %s of those at a and s.", name, v.lanes, map[string]string{"add": "sums", "mul": "products"}[op]))
+	pd := Load(Param("dst"), GP64())
+	pa := Load(Param("a"), GP64())
+	sv := broadcast(v, "s")
+	n := Load(Param("n"), GP64())
+	elementLoop(v, name, []Register{pd, pa}, n, func(disp int) {
+		x := v.vec()
+		arith(op, Mem{Base: pa, Disp: disp}, sv, x)
+		VMOVUPS(x, Mem{Base: pd, Disp: disp})
+	})
+}
+
+func recip(v isa) {
+	name := "recip" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the reciprocals of those at a, correctly rounded.", name, v.lanes))
+	pd := Load(Param("dst"), GP64())
+	pa := Load(Param("a"), GP64())
+	n := Load(Param("n"), GP64())
+	one := v.vec()
+	VMOVUPS(consts["one"], one)
+	elementLoop(v, name, []Register{pd, pa}, n, func(disp int) {
+		x := v.vec()
+		VDIVPS(Mem{Base: pa, Disp: disp}, one, x)
+		VMOVUPS(x, Mem{Base: pd, Disp: disp})
+	})
+}
+
+// dot4 computes the dot products of a vector with four rows at once, so
+// that a product of few rows streams four rows of its other operand
+// together. Each row's sum takes the same order whatever the other rows
+// are, so a row repeated with stride 0 gets the sum it gets among others.
+func dot4(v isa) {
+	name := "dot4" + v.name
+	TEXT(name, NOSPLIT, "func(x *float32, y *float32, stride int, n int, out *float32)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets out[r], for r < 4, to the sum of the products of the n elements at x, a multiple of %d, and those of row r of y, which starts stride elements after row r-1.", name, v.lanes))
+	px := Load(Param("x"), GP64())
+	stride := Load(Param("stride"), GP64())
+	n := Load(Param("n"), GP64())
+	SHLQ(U8(2), stride)
+	var rows [4]Register
+	rows[0] = Load(Param("y"), GP64())
+	for r := 1; r < 4; r++ {
+		rows[r] = GP64()
+		LEAQ(Mem{Base: rows[r-1], Index: stride, Scale: 1}, rows[r])
+	}
+	// Two accumulators a row, over alternate vectors.
+	var acc [4][2]VecVirtual
+	for r := range acc {
+		for i := range acc[r] {
+			acc[r][i] = v.vec()
+			VXORPS(acc[r][i], acc[r][i], acc[r][i])
+		}
+	}
+	step := 2 * v.lanes
 	CMPQ(n, U32(step))
 	JL(LabelRef(name + "_tail"))
 	Label(name + "_wide")
-	for i := range acc {
-		t := v.vec()
-		VMOVUPS(Mem{Base: px, Disp: 4 * v.lanes * i}, t)
-		VFMADD231PS(Mem{Base: py, Disp: 4 * v.lanes * i}, t, acc[i])
+	x0, x1 := v.vec(), v.vec()
+	VMOVUPS(Mem{Base: px}, x0)
+	VMOVUPS(Mem{Base: px, Disp: 4 * v.lanes}, x1)
+	for r := range rows {
+		VFMADD231PS(Mem{Base: rows[r]}, x0, acc[r][0])
+		VFMADD231PS(Mem{Base: rows[r], Disp: 4 * v.lanes}, x1, acc[r][1])
+		ADDQ(U32(4*step), rows[r])
 	}
 	ADDQ(U32(4*step), px)
-	ADDQ(U32(4*step), py)
 	SUBQ(U32(step), n)
 	CMPQ(n, U32(step))
 	JGE(LabelRef(name + "_wide"))
 	Label(name + "_tail")
 	TESTQ(n, n)
 	JZ(LabelRef(name + "_done"))
-	Label(name + "_loop")
-	t := v.vec()
-	VMOVUPS(Mem{Base: px}, t)
-	VFMADD231PS(Mem{Base: py}, t, acc[0])
-	ADDQ(U32(4*v.lanes), px)
-	ADDQ(U32(4*v.lanes), py)
-	SUBQ(U32(v.lanes), n)
-	JNZ(LabelRef(name + "_loop"))
+	x := v.vec()
+	VMOVUPS(Mem{Base: px}, x)
+	for r := range rows {
+		VFMADD231PS(Mem{Base: rows[r]}, x, acc[r][0])
+	}
 	Label(name + "_done")
-	VADDPS(acc[1], acc[0], acc[0])
-	VADDPS(acc[3], acc[2], acc[2])
-	VADDPS(acc[2], acc[0], acc[0])
-	Store(horizontal(v, acc[0], VADDPS), ReturnIndex(0))
+	out := Load(Param("out"), GP64())
+	for r := range acc {
+		VADDPS(acc[r][1], acc[r][0], acc[r][0])
+		MOVSS(horizontal(v, acc[r][0], VADDPS), Mem{Base: out, Disp: 4 * r})
+	}
 	VZEROUPPER()
 	RET()
 }
