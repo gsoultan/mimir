@@ -1740,6 +1740,159 @@ def distribution_cases(rng):
     return c
 
 
+# ---------------------------------------------------------------------------
+# Graph neural networks (gnn.safetensors, package nn): aggregation of edge
+# features into nodes, the edge softmax, and the GCN, GraphSAGE and GAT
+# layers of PyTorch Geometric, written out from their definitions. Edges
+# run from edge_index[0] to edge_index[1].
+
+GNN_NODES = 7
+
+
+def gnn_edges(rng):
+    """A random edge index [2, E] over GNN_NODES nodes with a repeated
+    edge and a self loop, and no edge into the last node."""
+    n = GNN_NODES
+    src = rng.integers(0, n, size=14)
+    dst = rng.integers(0, n - 1, size=14)
+    src = np.concatenate([src, [src[0], 3]])
+    dst = np.concatenate([dst, [dst[0], 3]])
+    return np.stack([src, dst]).astype(I32)
+
+
+def np_scatter_sum(m, dst, n):
+    out = np.zeros((n,) + m.shape[1:])
+    np.add.at(out, dst, m)
+    return out
+
+
+def np_scatter_mean(m, dst, n):
+    count = np.bincount(dst, minlength=n).reshape((n,) + (1,) * (m.ndim - 1))
+    return np_scatter_sum(m, dst, n) / np.maximum(count, 1)
+
+
+def np_scatter_max(m, dst, n):
+    out = np.full((n,) + m.shape[1:], -np.inf)
+    np.maximum.at(out, dst, m)
+    return np.where(np.isinf(out), 0.0, out)
+
+
+def np_edge_softmax(s, dst, n):
+    e = np.exp(s - np_scatter_max(s, dst, n)[dst])
+    return e / np_scatter_sum(e, dst, n)[dst]
+
+
+def np_self_loops(ei, n):
+    src, dst = ei[0].astype(np.int64), ei[1].astype(np.int64)
+    keep = src != dst
+    return np.concatenate([src[keep], np.arange(n)]), np.concatenate([dst[keep], np.arange(n)])
+
+
+def np_gcn(x, ei, w, b):
+    n = x.shape[0]
+    src, dst = np_self_loops(ei, n)
+    dinv = np.bincount(dst, minlength=n) ** -0.5
+    h = x @ w.T
+    return np_scatter_sum(h[src] * (dinv[src] * dinv[dst])[:, None], dst, n) + b
+
+
+def np_sage(x, ei, wl, bl, wr):
+    src, dst = ei[0].astype(np.int64), ei[1].astype(np.int64)
+    return np_scatter_mean(x[src], dst, x.shape[0]) @ wl.T + bl + x @ wr.T
+
+
+def np_gat(concat):
+    def f(x, ei, w, att_src, att_dst, b):
+        n, (heads, c) = x.shape[0], att_src.shape
+        h = (x @ w.T).reshape(n, heads, c)
+        a_src, a_dst = (h * att_src).sum(-1), (h * att_dst).sum(-1)
+        src, dst = np_self_loops(ei, n)
+        e = a_src[src] + a_dst[dst]
+        alpha = np_edge_softmax(np.where(e > 0, e, 0.2 * e), dst, n)
+        out = np_scatter_sum(h[src] * alpha[:, :, None], dst, n)
+        return (out.reshape(n, heads * c) if concat else out.mean(1)) + b
+    return f
+
+
+def torch_scatter(T, m, dst, n, reduce):
+    dst = dst.long()
+    shape = (n,) + tuple(m.shape[1:])
+    if reduce == "sum":
+        return T.zeros(shape, dtype=m.dtype).index_add(0, dst, m)
+    idx = dst.reshape((-1,) + (1,) * (m.dim() - 1)).expand_as(m)
+    return T.zeros(shape, dtype=m.dtype).scatter_reduce(0, idx, m, reduce=reduce, include_self=False)
+
+
+def torch_edge_softmax(T, s, dst, n):
+    e = T.exp(s - torch_scatter(T, s.detach(), dst, n, "amax")[dst.long()])
+    return e / torch_scatter(T, e, dst, n, "sum")[dst.long()]
+
+
+def torch_self_loops(T, ei, n):
+    src, dst = ei[0].long(), ei[1].long()
+    keep = src != dst
+    loop = T.arange(n)
+    return T.cat([src[keep], loop]), T.cat([dst[keep], loop])
+
+
+def torch_gcn(T, x, ei, w, b):
+    n = x.shape[0]
+    src, dst = torch_self_loops(T, ei, n)
+    dinv = T.bincount(dst, minlength=n).to(x.dtype) ** -0.5
+    h = x @ w.T
+    return torch_scatter(T, h[src] * (dinv[src] * dinv[dst])[:, None], dst, n, "sum") + b
+
+
+def torch_sage(T, x, ei, wl, bl, wr):
+    src, dst = ei[0].long(), ei[1].long()
+    return torch_scatter(T, x[src], dst, x.shape[0], "mean") @ wl.T + bl + x @ wr.T
+
+
+def torch_gat(concat):
+    def f(T, x, ei, w, att_src, att_dst, b):
+        n, (heads, c) = x.shape[0], att_src.shape
+        h = (x @ w.T).reshape(n, heads, c)
+        a_src, a_dst = (h * att_src).sum(-1), (h * att_dst).sum(-1)
+        src, dst = torch_self_loops(T, ei, n)
+        alpha = torch_edge_softmax(T, T.nn.functional.leaky_relu(a_src[src] + a_dst[dst], 0.2), dst, n)
+        out = torch_scatter(T, h[src] * alpha[:, :, None], dst, n, "sum")
+        return (out.reshape(n, heads * c) if concat else out.mean(1)) + b
+    return f
+
+
+def gnn_cases(rng):
+    c = {}
+    n = GNN_NODES
+    for reduce in ["sum", "mean", "max"]:
+        ei = gnn_edges(rng)
+        np_fn = {"sum": np_scatter_sum, "mean": np_scatter_mean, "max": np_scatter_max}[reduce]
+        torch_reduce = {"sum": "sum", "mean": "mean", "max": "amax"}[reduce]
+        c[f"aggregate_{reduce}"] = (
+            [uniform(rng, (ei.shape[1], 2, 3), -1, 1), ei], [0],
+            lambda m, ei, f=np_fn: f(m, ei[1].astype(np.int64), n),
+            lambda T, m, ei, r=torch_reduce: torch_scatter(T, m, ei[1], n, r))
+    ei = gnn_edges(rng)
+    c["edge_softmax"] = (
+        [uniform(rng, (ei.shape[1], 2), -2, 2), ei], [0],
+        lambda s, ei: np_edge_softmax(s, ei[1].astype(np.int64), n),
+        lambda T, s, ei: torch_edge_softmax(T, s, ei[1], n))
+    ei = gnn_edges(rng)
+    c["gcn"] = ([uniform(rng, (n, 5), -1, 1), ei, uniform(rng, (4, 5), -1, 1), uniform(rng, (4,), -1, 1)],
+                [0, 2, 3], np_gcn, torch_gcn)
+    ei = gnn_edges(rng)
+    c["sage"] = ([uniform(rng, (n, 5), -1, 1), ei, uniform(rng, (4, 5), -1, 1), uniform(rng, (4,), -1, 1),
+                  uniform(rng, (4, 5), -1, 1)], [0, 2, 3, 4], np_sage, torch_sage)
+    for concat in [True, False]:
+        ei = gnn_edges(rng)
+        heads, out = 2, 3
+        c["gat_concat" if concat else "gat_mean"] = (
+            [uniform(rng, (n, 5), -1, 1), ei, uniform(rng, (heads * out, 5), -1, 1),
+             uniform(rng, (heads, out), -1, 1), uniform(rng, (heads, out), -1, 1),
+             uniform(rng, (heads * out if concat else out,), -1, 1)],
+            [0, 2, 3, 4, 5], np_gat(concat), torch_gat(concat))
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--oracle", choices=["torch", "numpy"], default="torch")
@@ -1861,6 +2014,16 @@ def main():
         for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
             tensors[f"{name}/{part}"] = a
     files["distributions"] = tensors
+
+    # Graph neural networks, from their own streams at seed offset 11.
+    rng, gout_rng = np.random.default_rng(args.seed + 11), np.random.default_rng(args.seed + 111)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in gnn_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
+            tensors[f"{name}/{part}"] = a
+    files["gnn"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
