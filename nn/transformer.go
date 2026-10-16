@@ -416,6 +416,12 @@ func (a *SelfAttention) Decode(ctx context.Context, x *tensor.Tensor, cache *KVC
 	if err != nil {
 		return nil, err
 	}
+	// The queries, keys and values share one projection: realized
+	// together, it runs once, where appending the keys and values alone
+	// would leave the queries to compute it again.
+	if err := tensor.Realize(ctx, q, k, v); err != nil {
+		return nil, err
+	}
 	keys, values, err := cache.Append(ctx, k, v)
 	if err != nil {
 		return nil, err
