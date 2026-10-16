@@ -4,7 +4,7 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestone 6.** mimir trains neural networks on the CPU with
+> **Status: milestone 7.** mimir trains neural networks on the CPU with
 > SIMD matrix kernels, fused elementwise kernels and in-place updates, and
 > runs the same code on Apple GPUs through Metal and on NVIDIA GPUs through
 > CUDA: autograd, layers, losses, optimizers, data loading and a training
@@ -13,8 +13,9 @@ codebase with no cgo and no Python.
 > computation against a memory budget, stores tensors in bfloat16 and
 > float16, and replays repeated training steps from a cached schedule. It
 > has recurrent and transformer layers with fused attention, and runs
-> quantized Llama models from GGUF files. The API may change between 0.x
-> releases.
+> quantized Llama models from GGUF files. Function transforms, probability
+> distributions, graph network layers and an ONNX interpreter build on the
+> same graph. The API may change between 0.x releases.
 
 ## Example
 
@@ -199,13 +200,19 @@ The scheduler keys each schedule on the graph's structure (operations,
 shapes, dtypes, devices and which tensors are realized) and, when a step
 repeats, replays the planned kernels into the same buffers, passing changed
 constants and random seeds as kernel arguments, without building, sorting
-or planning anything or allocating. On CUDA the replayed kernels and cuBLAS
-calls run as one CUDA graph from the second step, updated in place when an
-argument changes (`MIMIR_CUDA_GRAPHS=0` launches them one by one instead),
-and on Metal they are encoded into one command buffer. On the GPUs,
-convolutions run as tiled implicit-GEMM kernels that read their windows
-from the image where they lie, for the forward pass and both gradients;
-the CPU multiplies unfolded windows with its GEMM microkernels.
+or planning anything or allocating, and gives each kernel the buffers it
+had in the last run. On Metal the replayed kernels are encoded into one
+command buffer. On CUDA they launch one by one by default;
+`MIMIR_CUDA_GRAPHS=1` runs a step's kernels and cuBLAS calls as one CUDA
+graph, captured once a run has repeated the last one's products and
+updated in place when only arguments change. On the GPUs, convolutions run
+as tiled implicit-GEMM kernels that read their windows from the image
+where they lie, for the forward pass and both gradients; the CPU
+multiplies unfolded windows with its GEMM microkernels. On CUDA, a
+convolution too deep for its image to fill the device with tiles, such as
+a 512-channel layer over a small image, runs as unfold, cuBLAS product and
+fold instead, and products summed over batch axes or whose operand every
+batch shares run on cuBLAS too.
 
 On an M5 Pro under macOS 26, the GPU's neural accelerators run float32
 products through Metal 4 tensor operations at 5,790 GFLOP/s for 2048 × 2048
@@ -250,11 +257,34 @@ and `train.MicroBatch` does the same with a fixed chunk size.
 during the forward pass and recompute the rest in `Backward`, trading
 compute for activation memory.
 
+A batch can be donated to the step that reads it, as `jax.jit`'s
+`donate_argnums` does. `Donate` marks a realized tensor as done with: the
+next schedule that reads it gives its buffer back to the pool after its
+last reader, and `FromSlice` takes a free buffer of its size before it
+allocates, so a loop that uploads and donates its batches runs over the
+same memory every step. Reading the tensor afterwards returns
+`tensor.ErrDonated`, which wraps `ErrOverwritten`. `train.Fit` donates the
+copy of each batch it moves to the model's device, and `examples/gpt2`
+donates its batches:
+
+```go
+x := tensor.FromSlice(pixels, 128, 784).To(dev).Donate()
+```
+
 CPU buffers of a megabyte or more live in anonymous memory mappings
-outside the Go heap, returned to the operating system as soon as they are
-freed. `safetensors.Open` maps a file instead of reading it, so
-`nn.Load` and `datasets.Mapped` read weights and examples in place, and the
-file's pages stream in from disk as they are used.
+outside the Go heap. A freed buffer leaves its mapping in a bounded cache
+that the next allocation of a similar size takes, clearing only the bytes
+it needs, so an uploaded batch lands in pages already resident rather
+than faulting in new ones; mappings that no allocation takes within two
+garbage collections go back to the operating system, and
+`cpu.CachedMapBytes` reports what the cache holds. Mapped buffers barely
+grow the Go heap, so the CPU backend runs a collection itself once enough
+has been mapped since the last, paced as `GOGC=50` would, and waits for
+the cleanups that give dropped buffers' mappings back.
+
+`safetensors.Open` maps a file instead of reading it, so `nn.Load` and
+`datasets.Mapped` read weights and examples in place, and the file's pages
+stream in from disk as they are used.
 
 Tensors can be stored as `tensor.BFloat16` or `tensor.Float16`, which
 halves their memory; operations compute in float32 and round on the way
@@ -283,7 +313,9 @@ and 5 to 15 times faster than composing it from products and a softmax.
 with fused QKV and rotary embeddings (`RotaryEmbedding`, with Llama 3
 scaling), `RMSNorm`, `MLP`, `GatedMLP`, `KVCache` for decoding, the
 `DecoderBlock`s of `NewGPT2Block` and `NewLlamaBlock`, and
-`TransformerEncoderLayer`.
+`TransformerEncoderLayer`. Self-attention and rotary embeddings cut their
+features apart with `Split`, which takes parts of given sizes along an
+axis like `torch.split` and joins their gradients with one copy.
 
 `gguf.Open` maps a GGUF file and `File.Load` returns its tensors, including
 the block-quantized `tensor.Q8_0`, `Q4_K` and `Q6_K`. A quantized weight
@@ -314,6 +346,117 @@ top-p decoding:
 
 ```sh
 go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.gguf -prompt "The capital of France is" -n 64 -temperature 0
+```
+
+## Distributions and generative models
+
+Package `distributions` follows `torch.distributions`: `Normal`,
+`MultivariateNormal` (from a lower-triangular scale or a covariance),
+`Bernoulli` and `Categorical` (from probabilities or logits), `Uniform`,
+`Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet` and `Poisson`. Each
+samples with a caller's seed, the same on every device, and reports its
+log density or mass, entropy, mean and variance. The continuous families
+also draw reparameterized samples with `RSample`, whose gradients flow to
+the parameters; `Gamma`, `Beta` and `Dirichlet` get theirs from the
+implicit gradients of their gamma samples. `KL` returns the divergence in
+closed form between two distributions of a family, and
+`distributions.ErrNoKL` for other pairs:
+
+```go
+q := distributions.NewNormal(mu, logVar.Mul(tensor.Scalar[float32](0.5)).Exp())
+z := q.RSample(seed) // gradients flow to mu and logVar
+kl := distributions.KL(q, prior).Sum()
+```
+
+They rest on new elementwise operations with gradients, `Log1p`, `Expm1`,
+`Erf`, `Erfinv`, `Lgamma` and `Digamma`, and on the samplers
+`tensor.RandGamma`, whose gradient is the implicit reparameterization
+gradient, and `tensor.RandPoisson`. The samplers run on the CPU, so GPU
+tensors make a round trip.
+
+Three examples train generative models on MNIST and write PNG grids of
+their samples: `examples/vae` a variational autoencoder that prints its
+ELBO, `examples/gan` a GAN of two perceptrons, and `examples/diffusion` a
+DDPM with ancestral and DDIM samplers, which also trains on a toy cloud of
+two moons:
+
+```sh
+go run ./examples/vae -epochs 10 -out vae
+go run ./examples/diffusion -dataset moons -out moons
+```
+
+## Graph networks
+
+`tensor.Pattern` is a sparse matrix of ones, such as a graph's adjacency,
+built once on the host from coordinate lists. Its `MatMul`, `Mean` and
+`Max` combine rows of a tensor over each row's entries with one segment
+kernel on every device, without a tensor per edge, and their gradients
+are products by the transpose, so they differentiate again and batch
+under `VMap`. `nn.Graph` holds the edges of a directed graph, as PyTorch
+Geometric's `edge_index` does, and passes messages over them: `Source` and
+`Target` read node features onto edges, `Sum`, `Mean` and `Max` aggregate
+them into nodes, and `Softmax` normalizes edge scores over each node's
+incoming edges. `GCNConv`, `SAGEConv` and `GATConv` are built on it:
+
+```go
+g, err := nn.NewGraph(nodes, src, dst) // an edge from src[e] to dst[e]
+if err != nil {
+	return err
+}
+conv1, conv2 := nn.NewGCNConv(1433, 16), nn.NewGCNConv(16, 7)
+logits := conv2.Convolve(g, conv1.Convolve(g, x).ReLU())
+```
+
+`examples/gnn` trains this network to classify the papers of a citation
+graph with Cora's sizes, generated in code so nothing is downloaded.
+
+## Reinforcement learning
+
+`examples/rl/cartpole` simulates Gymnasium's CartPole-v1 in pure Go, and
+two examples learn it until the greedy policy's mean return over 100
+episodes reaches 195: `examples/rl/dqn` with a double deep Q-network and a
+replay buffer, and `examples/rl/ppo` with proximal policy optimization
+over eight environments side by side and generalized advantage
+estimation.
+
+```sh
+go run ./examples/rl/ppo
+```
+
+## ONNX
+
+`onnx.Open` maps an ONNX model, and `onnx.Parse` reads one from bytes.
+`Inputs` and `Outputs` describe what it takes and computes, and `Run`
+turns the whole graph into lazy mimir operations and realizes the outputs
+together, so a model is one schedule that the cache replays from the
+second run, on any device:
+
+```go
+m, err := onnx.Open("model.onnx")
+if err != nil {
+	return err
+}
+defer m.Close()
+out, err := m.Run(ctx, map[string]*tensor.Tensor{"input": x})
+logits := out["output"]
+```
+
+It reads opsets `onnx.MinOpset` to `onnx.MaxOpset` (11 to 22) and runs
+about ninety operators: the elementwise and comparison operators, `MatMul`
+and `Gemm`, reductions, the shape, joining and indexing operators, `Conv`
+and `ConvTranspose` of any number of spatial axes, the poolings and
+normalizations, `Softmax`, `Gelu`, `Resize`, `Trilu`, `Range` and `CumSum`.
+Shapes and indices that a graph computes, such as a `Reshape`'s target, are
+computed on the host, and nodes of initializers alone are folded when the
+model opens. Attention that an exporter writes as products, a scale, a
+mask and a softmax becomes one `ScaledDotProductAttention` kernel.
+Anything else, such as `Loop`, `If`, `Scan` or a cubic `Resize`, is an
+`*onnx.UnsupportedError` that names it. The reader bounds every length by
+the size of the file, so a corrupt model is an error, never a panic.
+`examples/onnx` runs a model on random inputs and times it:
+
+```sh
+go run ./examples/onnx -model io/onnx/testdata/transformer.onnx -dim batch=4 -dim seq=16 -intmax 50
 ```
 
 ## Requirements
@@ -357,14 +500,16 @@ read.
 
 | Area | Operations |
 | --- | --- |
-| Create | `FromSlice`, `Full`, `Zeros`, `Ones`, `Scalar`, `Arange`, `Rand`, `Randn` |
+| Create | `FromSlice`, `Full`, `Zeros`, `Ones`, `Scalar`, `Arange`, `Rand`, `Randn`, `RandGamma`, `RandPoisson` |
 | Elementwise | `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Exp`, `Exp2`, `Log`, `Log2`, `Sin`, `Cos`, `Sqrt`, `Recip`, `Abs`, `Maximum`, `Minimum`, `Less`, `Greater`, `Equal`, `Fmod`, `Where`, `Cast` |
+| Special functions | `Log1p`, `Expm1`, `Erf`, `Erfinv`, `Lgamma`, `Digamma` |
 | Activations | `ReLU`, `Sigmoid`, `Tanh`, `GELU` (tanh approximation), `SiLU`, `Softmax`, `LogSoftmax` |
 | Reductions | `Sum`, `Max`, `Min`, `Mean`, `Var` |
 | Shape | `Reshape`, `Permute`, `Transpose`, `Expand`, `Pad`, `Shrink`, `Flip`, `Unsqueeze`, `Squeeze` |
 | Linear algebra | `MatMul` with NumPy semantics and batch broadcasting, `MatMulT` (also by quantized weights) |
 | Indexing | `Gather`, `ScatterAdd`, `Argmax` |
-| Joining and windows | `Cat`, `Stack`, `Flatten`, `Unfold`, `SliceScatter` |
+| Joining and windows | `Cat`, `Stack`, `Split`, `Flatten`, `Unfold`, `SliceScatter` |
+| Sparse | `Pattern` with `MatMul`, `Mean` and `Max` over its entries, as one segment kernel |
 | Scans | `CumSum`, `CumMax`, `LogCumSumExp`, `Scan` |
 | Attention | `ScaledDotProductAttention` (causal, masks, grouped-query) |
 | Sorting | `Sort`, `Argsort`, `TopK` (stable; NaN sorts last) |
@@ -372,13 +517,15 @@ read.
 | Linear algebra | `Cholesky`, `TriangularSolve`, `Solve`, `Inv`, `Det`, `SlogDet`, `QR`, `SVD`, `Eigh` (batched, with gradients; on the CPU, so GPU tensors make a round trip) |
 | Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
 | Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
-| Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `FromBytes` over mapped files |
+| Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `Donate`, `ErrDonated`, `FromBytes` over mapped files |
 | Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `Flatten`, `Cast` |
 | Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
+| Graph layers (`nn`) | `Graph` (`Source`, `Target`, `Sum`, `Mean`, `Max`, `Softmax`, `Adjacency`), `GCNConv`, `SAGEConv`, `GATConv` |
 | Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `MSE`, `L1`, `Huber` |
 | Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
+| Distributions (`distributions`) | `Normal`, `MultivariateNormal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet`, `Poisson`; `Sample`, `RSample`, `LogProb`, `Entropy`, `Mean`, `Variance`, `KL` |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
-| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write |
+| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22) |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`; `Accuracy` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -394,6 +541,7 @@ tensor/              public Tensor API and autograd
 nn/                  layers, parameter discovery, save and load
 nn/loss/             loss functions
 optim/               optimizers and learning-rate schedules
+distributions/       probability distributions, sampling, log densities and KL divergences
 data/                datasets, batching, streams of shards and their statistics
 data/datasets/       MNIST, CSV, CSV and Parquet shards, mapped safetensors, synthetic rows
 train/               Fit, evaluation, checkpoints
@@ -412,9 +560,19 @@ internal/quanttest/  reference quantization for tests
 io/safetensors/      safetensors reader, writer and file mapping
 io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
 io/gguf/             GGUF reader and writer
+io/onnx/             ONNX model reader and interpreter
 examples/mnist/      trains an MLP or CNN on MNIST
 examples/gpt2/       trains a GPT-2 on a text file and samples from it
 examples/llama/      runs Llama-architecture GGUF models
+examples/vae/        trains a variational autoencoder on MNIST
+examples/gan/        trains a GAN on MNIST
+examples/diffusion/  trains a diffusion model on MNIST or two moons
+examples/gnn/        trains a GCN on a generated citation graph
+examples/rl/cartpole/        the CartPole environment
+examples/rl/dqn/     learns CartPole with a deep Q-network
+examples/rl/ppo/     learns CartPole with proximal policy optimization
+examples/onnx/       runs an ONNX model and times it
+examples/internal/grid/      writes samples of the generative examples as PNGs
 testdata/golden/     expected results from PyTorch or NumPy
 tools/asmgen/        generates the CPU assembly kernels with avo
 tools/devices/       lists the devices mimir can use
@@ -422,6 +580,8 @@ tools/bench/         PyTorch and NumPy counterparts of the benchmarks
 tools/golden/        golden-file generator (Python, development only)
 tools/parquet/       Parquet test-file generator (Python, development only)
 tools/gguf/          GGUF test-file generators (Python, development only)
+tools/onnx/          ONNX golden-model generator (Python, development only)
+ci/cuda/             CUDA tests and benchmarks on a Modal T4 or any NVIDIA machine
 ```
 
 ## Testing
@@ -434,6 +594,8 @@ MIMIR_EMULATE=1 go test -timeout=60m -run Kernels ./backend/...   # the GPU kern
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/gguf
+go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/onnx
+go test -run='^$' -fuzz=FuzzRun -fuzztime=60s ./io/onnx    # a node of every operator
 MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train   # the billion-row run
 ```
 
@@ -445,7 +607,9 @@ tools/parquet/gen.py` writes them again.
 `testdata/golden/` holds inputs and expected results: every operation's
 output, the gradients of operations and layers, every layer and loss, and
 optimizer steps and learning-rate schedules, scans, recurrent and
-transformer layers, and quantized weights. The committed files were computed
+transformer layers, quantized weights, factorizations, function
+transforms, probability distributions and special functions, and graph
+aggregations and layers. The committed files were computed
 with NumPy in float64, with gradients by central differences. CI regenerates
 them with PyTorch, using autograd in float64 for gradients, and runs the same
 tests against them:
@@ -459,6 +623,18 @@ MIMIR_GOLDEN_DIR=/tmp/golden go test -run TestGolden ./...
 `TestGradientsMatchFiniteDifferences` also checks every operation's gradient
 against finite differences in Go.
 
+`io/onnx/testdata` holds four small models, a perceptron, a CNN, a
+convolutional decoder and a causal transformer, with NumPy's outputs.
+`python3 tools/onnx/gen.py` writes them again with a protocol buffer
+writer that needs only NumPy, and with `--oracle torch` it exports the same
+networks with `torch.onnx.export` instead, which CI checks mimir against:
+
+```sh
+pip install numpy torch onnx
+python3 tools/onnx/gen.py --oracle torch --out /tmp/onnx
+MIMIR_ONNX_DIR=/tmp/onnx go test -run TestGolden ./io/onnx
+```
+
 GitHub has Apple silicon runners but no free NVIDIA ones, so the CUDA tests
 run on a [Modal](https://modal.com) T4 through `ci/cuda/modal_test.py`, which
 copies the checkout into a CUDA runtime container and runs `ci/cuda/test.sh`
@@ -466,8 +642,11 @@ there. The CI job `cuda` runs it when the repository has the secrets
 `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, and skips with a warning
 otherwise. `pip install modal && modal run ci/cuda/modal_test.py` runs it
 from a laptop, and `sh ci/cuda/test.sh` runs the same tests on any Linux
-machine with an NVIDIA GPU. The CUDA kernels are also compiled with the real
-NVRTC on every change, which needs no GPU.
+machine with an NVIDIA GPU. `ci/cuda/perf.sh` runs the GPU benchmarks
+there, each with CUDA graphs off and then on (`modal run
+ci/cuda/modal_test.py --script ci/cuda/perf.sh` on Modal). The CUDA
+kernels are also compiled with the real NVRTC on every change, which
+needs no GPU.
 
 ## Roadmap
 
@@ -482,8 +661,8 @@ NVRTC on every change, which needs no GPU.
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
 | M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
-| M7 Full coverage | distributions and generative models, linear algebra, differentiable gradients, forward mode and vmap, ONNX import, ROCm (in progress: function transforms, sorting, FFT and linear algebra done) |
-| M8 Multiple devices | data parallelism over NCCL, then tensor sharding modeled on `jax.sharding` |
+| M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ONNX import (done); ROCm through HIP (in progress) |
+| M8 Multiple devices | data parallelism over NCCL, then tensor sharding modeled on `jax.sharding` (next) |
 
 ## License
 
