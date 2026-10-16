@@ -500,3 +500,36 @@ func ExampleTensor_Backward() {
 	fmt.Println(g)
 	// Output: [2 4 6]
 }
+
+// TestSaturatedActivationGradients checks that the sigmoid, tanh and SiLU
+// have finite values and gradients far into their saturated tails, where
+// e^-x overflows float32.
+func TestSaturatedActivationGradients(t *testing.T) {
+	ctx := t.Context()
+	for name, f := range map[string]func(*tensor.Tensor) *tensor.Tensor{
+		"sigmoid": (*tensor.Tensor).Sigmoid,
+		"tanh":    (*tensor.Tensor).Tanh,
+		"silu":    (*tensor.Tensor).SiLU,
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := tensor.FromSlice([]float32{-1000, -100, -50, 50, 100, 1000}).RequiresGrad()
+			y := f(x)
+			if err := y.Sum().Backward(ctx); err != nil {
+				t.Fatal(err)
+			}
+			v, err := y.Data[float32](ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g, err := x.Grad().Data[float32](ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range v {
+				if math.IsNaN(float64(v[i])) || math.IsInf(float64(v[i]), 0) || math.IsNaN(float64(g[i])) || math.IsInf(float64(g[i]), 0) {
+					t.Errorf("at %d: value %v, gradient %v", i, v[i], g[i])
+				}
+			}
+		})
+	}
+}
