@@ -69,6 +69,22 @@ func TestConvolutionKernelsMatchFiniteDifferences(t *testing.T) {
 	}
 }
 
+// TestConvolutionKernelsSecondDerivatives checks Hessian-vector products
+// through convolutions on a backend that runs convolution kernels: a
+// product of the second order, whose epilogue reads more inputs than a
+// weight gradient kernel takes, must run as a product.
+func TestConvolutionKernelsSecondDerivatives(t *testing.T) {
+	for _, parts := range []int{1, 3} {
+		restore := tensor.SetDevice(newConvolver(parts))
+		for _, c := range gradCases() {
+			if strings.HasPrefix(c.name, "conv2d") {
+				t.Run(c.name, func(t *testing.T) { checkHessianVectorProducts(t, c) })
+			}
+		}
+		restore()
+	}
+}
+
 // TestConvolutionKernelsMatchProducts compares a convolution layer's
 // output and gradients computed by convolution kernels with those of
 // the products of windows.

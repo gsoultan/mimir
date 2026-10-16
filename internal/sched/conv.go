@@ -123,18 +123,19 @@ func (p *plan) convolve(n *graph.Node, w *work, private func(*graph.Node) bool) 
 			return true
 		}
 		// A weight gradient sums over the batch, unless it has one item.
+		// Its kernel takes no epilogue: a product of the second order,
+		// such as the derivative of a weight gradient, has one, and runs
+		// as a product.
 		u := convWindows(mm, mm.Inputs[1], true)
-		if u == nil || summed && !slices.Equal(w.gemm.Attrs.Axes, []int{0}) || !summed && mm.Shape[0] != 1 {
+		if u == nil || w.prog != nil || summed && !slices.Equal(w.gemm.Attrs.Axes, []int{0}) || !summed && mm.Shape[0] != 1 {
 			return false
 		}
 		w.conv = &conv{op: backend.OpConvWeight, window: windowAttrs(u), parts: 1}
 		w.deps[1] = u.Inputs[0]
-		if w.prog == nil {
-			k := &backend.Kernel{Op: backend.OpConvWeight, DType: n.DType, Shape: n.Shape, Attrs: w.conv.window,
-				In: []backend.View{backend.Contiguous(w.deps[0].Shape), backend.Contiguous(w.deps[1].Shape)}}
-			if _, err := backend.ConvOf(k); err == nil {
-				w.conv.parts = max(1, cv.ConvParts(k))
-			}
+		k := &backend.Kernel{Op: backend.OpConvWeight, DType: n.DType, Shape: n.Shape, Attrs: w.conv.window,
+			In: []backend.View{backend.Contiguous(w.deps[0].Shape), backend.Contiguous(w.deps[1].Shape)}}
+		if _, err := backend.ConvOf(k); err == nil {
+			w.conv.parts = max(1, cv.ConvParts(k))
 		}
 		return true
 	case n.Op == backend.OpFold && n.DType == backend.Float32:
