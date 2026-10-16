@@ -323,6 +323,60 @@ func TestPerExampleGradients(t *testing.T) {
 	}
 }
 
+// TestPerExampleGradientsOfCapturedWeight takes the gradients of a
+// weight the function reads, not an argument, for examples that are
+// vectors and matrices, against Grad looped over the examples, and
+// checks that mismatched shapes fail rather than panic.
+func TestPerExampleGradientsOfCapturedWeight(t *testing.T) {
+	w := tensor.Randn(1, 3, 2).RequiresGrad()
+	loss := func(x ...*tensor.Tensor) *tensor.Tensor { return x[0].MatMul(w).Tanh().Sum() }
+	perExample := tensor.VMap(func(x ...*tensor.Tensor) []*tensor.Tensor { return tensor.Gradients(loss(x...), w) })
+	for name, batch := range map[string]*tensor.Tensor{
+		"vectors":  tensor.Randn(2, 5, 3),
+		"matrices": tensor.Randn(2, 5, 4, 3),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := perExample(batch)[0]
+			want := make([]*tensor.Tensor, 5)
+			for k := range want {
+				xk := batch.Shrink(append([][2]int{{k, k + 1}}, full(batch.Shape()[1:])...)).Squeeze(0)
+				want[k] = tensor.Grad(func(v ...*tensor.Tensor) *tensor.Tensor {
+					return xk.MatMul(v[0]).Tanh().Sum()
+				})(w)[0]
+			}
+			near(t, "per-example gradients", got, tensor.Stack(0, want...), 1e-5, 1e-4)
+			if w.Grad() != nil {
+				t.Fatal("VMap of Gradients changed an accumulated gradient")
+			}
+		})
+	}
+
+	// A product of a batch with an unbatched matrix of the wrong shape, on
+	// either side, fails with ErrShape.
+	bad := tensor.Randn(3, 4, 2)
+	for name, f := range map[string]func(x ...*tensor.Tensor) []*tensor.Tensor{
+		"batch on the left": func(x ...*tensor.Tensor) []*tensor.Tensor {
+			return []*tensor.Tensor{x[0].MatMul(bad)}
+		},
+		"batch on the right": func(x ...*tensor.Tensor) []*tensor.Tensor {
+			return []*tensor.Tensor{bad.MatMul(x[0])}
+		},
+	} {
+		if err := tensor.VMap(f)(tensor.Randn(2, 5, 4, 3))[0].Err(); !errors.Is(err, tensor.ErrShape) {
+			t.Errorf("%s: %v, want ErrShape", name, err)
+		}
+	}
+}
+
+// full returns the ranges of the whole of each dimension of shape.
+func full(shape []int) [][2]int {
+	out := make([][2]int, len(shape))
+	for i, n := range shape {
+		out[i] = [2]int{0, n}
+	}
+	return out
+}
+
 func TestJacobianAndHessian(t *testing.T) {
 	r := rand.New(rand.NewPCG(7, 8))
 	w := tensor.FromSlice(vals(r, 3*5, -1, 1), 3, 5)
