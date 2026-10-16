@@ -27,6 +27,10 @@ Files:
     transforms.safetensors  Hessian-vector and Jacobian-vector products,
                         Jacobians, Hessians and per-example gradients
                         (package tensor)
+    distributions.safetensors  log densities, entropies, KL divergences and
+                        moments of probability distributions, and special
+                        functions, with their gradients (packages
+                        distributions and tensor)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -1496,6 +1500,246 @@ def evaluate_transform(oracle, kind, inputs, diff, np_fn, torch_fn, vec_rng):
     return {k: v.astype(F32) if v.dtype == np.float64 else v for k, v in result.items()}
 
 
+# ---------------------------------------------------------------------------
+# Probability distributions and special functions (distributions.safetensors,
+# packages distributions and tensor). The NumPy oracle writes out each
+# formula in float64; torch uses torch.distributions. Cases named special_*
+# are the special functions of package tensor.
+
+def np_digamma_scalar(x):
+    if x == 0:
+        return math.copysign(math.inf, -x)
+    if x < 0:
+        if x == math.floor(x):
+            return math.nan
+        return np_digamma_scalar(1 - x) - math.pi / math.tan(math.pi * x)
+    r = 0.0
+    while x < 10:
+        r -= 1 / x
+        x += 1
+    x2 = 1 / (x * x)
+    return r + math.log(x) - 0.5 / x - x2 * (1 / 12 - x2 * (1 / 120 - x2 * (1 / 252 - x2 * (1 / 240 - x2 / 132))))
+
+
+np_lgamma = np.vectorize(math.lgamma, otypes=[np.float64])
+np_digamma = np.vectorize(np_digamma_scalar, otypes=[np.float64])
+np_erf = np.vectorize(math.erf, otypes=[np.float64])
+
+
+def np_erfinv(y):
+    """The inverse of erf by bisection, to float64 precision."""
+    lo, hi = np.full(np.shape(y), -6.0), np.full(np.shape(y), 6.0)
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        below = np_erf(mid) < y
+        lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+    return (lo + hi) / 2
+
+
+def np_xlogy(x, y):
+    return np.where(x == 0, 0.0, x * np.log(np.where(x == 0, 1.0, y)))
+
+
+def np_softplus(x):
+    return np.maximum(x, 0) + np.log1p(np.exp(-np.abs(x)))
+
+
+def np_lbeta(a, b):
+    return np_lgamma(a) + np_lgamma(b) - np_lgamma(a + b)
+
+
+def np_mvn_log_prob(loc, L, x):
+    L = np.tril(L)
+    d = x - loc
+    L = np.broadcast_to(L, d.shape + (d.shape[-1],))
+    y = np.linalg.solve(L, d[..., None])[..., 0]
+    hld = np.log(np.diagonal(L, axis1=-2, axis2=-1)).sum(-1)
+    n = loc.shape[-1]
+    return -0.5 * (y * y).sum(-1) - hld - 0.5 * n * math.log(2 * math.pi)
+
+
+def np_mvn_kl(l1, s1, l2, s2):
+    s1, s2 = np.tril(s1), np.tril(s2)
+    s2 = np.broadcast_to(s2, s1.shape)
+    hld = lambda s: np.log(np.diagonal(s, axis1=-2, axis2=-1)).sum(-1)  # noqa: E731
+    m = np.linalg.solve(s2, s1)
+    d = np.linalg.solve(s2, (l2 - l1)[..., None])[..., 0]
+    n = l1.shape[-1]
+    return hld(s2) - hld(s1) + 0.5 * ((m * m).sum((-2, -1)) + (d * d).sum(-1) - n)
+
+
+def np_poisson_entropy(rate):
+    k = np.arange(1000.0)
+    lp = np_xlogy(k, rate[..., None]) - rate[..., None] - np_lgamma(k + 1)
+    return -(np.exp(lp) * lp).sum(-1)
+
+
+def torch_poisson_entropy(T, rate):
+    k = T.arange(1000, dtype=rate.dtype)
+    lp = T.xlogy(k, rate[..., None]) - rate[..., None] - T.lgamma(k + 1)
+    return -(T.exp(lp) * lp).sum(-1)
+
+
+def distribution_cases(rng):
+    """Cases as gradient cases: inputs are parameters and values, and diff
+    lists those the result is differentiated with respect to."""
+    c = {}
+
+    def case(name, inputs, diff, np_fn, torch_fn):
+        c[name] = (inputs, diff, np_fn, torch_fn)
+
+    def u(*shape, lo=-1.0, hi=1.0):
+        return uniform(rng, shape, lo, hi)
+
+    def D(T):
+        return T.distributions
+
+    for name, lo, hi, np_fn, torch_fn in [
+        ("log1p", -0.9, 5, np.log1p, lambda T, x: T.log1p(x)),
+        ("expm1", -3, 3, np.expm1, lambda T, x: T.expm1(x)),
+        ("erf", -2.5, 2.5, np_erf, lambda T, x: T.erf(x)),
+        ("erfinv", -0.95, 0.95, np_erfinv, lambda T, x: T.erfinv(x)),
+        ("lgamma", 0.1, 9, np_lgamma, lambda T, x: T.lgamma(x)),
+        ("lgamma_negative", -2.95, -2.05, np_lgamma, lambda T, x: T.lgamma(x)),
+        ("digamma", 0.2, 9, np_digamma, lambda T, x: T.digamma(x)),
+    ]:
+        case(f"special_{name}", [u(3, 5, lo=lo, hi=hi)], [0], np_fn, torch_fn)
+
+    # Normal: batch [3, 4] from loc [3, 1] and scale [4]; values [2, 3, 4].
+    loc, scale = u(3, 1), u(4, lo=0.5, hi=2)
+    case("normal_log_prob", [loc, scale, u(2, 3, 4, lo=-3, hi=3)], [0, 1, 2],
+         lambda m, s, x: -((x - m) ** 2) / (2 * s * s) - np.log(s) - 0.5 * math.log(2 * math.pi),
+         lambda T, m, s, x: D(T).Normal(m, s).log_prob(x))
+    case("normal_entropy", [loc, scale], [1],
+         lambda m, s: np.broadcast_to(0.5 + 0.5 * math.log(2 * math.pi) + np.log(s), np.broadcast_shapes(m.shape, s.shape)),
+         lambda T, m, s: D(T).Normal(m, s).entropy())
+    case("normal_cdf", [loc, scale, u(2, 3, 4, lo=-3, hi=3)], [0, 1, 2],
+         lambda m, s, x: 0.5 * (1 + np_erf((x - m) / (s * math.sqrt(2)))),
+         lambda T, m, s, x: D(T).Normal(m, s).cdf(x))
+    case("normal_icdf", [loc, scale, u(2, 3, 4, lo=0.05, hi=0.95)], [0, 1, 2],
+         lambda m, s, p: m + s * math.sqrt(2) * np_erfinv(2 * p - 1),
+         lambda T, m, s, p: D(T).Normal(m, s).icdf(p))
+    case("normal_kl", [u(3, 1), u(4, lo=0.5, hi=2), u(4), u(3, 1, lo=0.5, hi=2)], [0, 1, 2, 3],
+         lambda m1, s1, m2, s2: 0.5 * ((s1 / s2) ** 2 + ((m1 - m2) / s2) ** 2 - 1 - np.log((s1 / s2) ** 2)),
+         lambda T, m1, s1, m2, s2: D(T).kl_divergence(D(T).Normal(m1, s1), D(T).Normal(m2, s2)))
+
+    # Multivariate normal: batch [2], vectors of 3, values [4, 2, 3].
+    def tril(*shape):
+        return (np.tril(u(*shape, lo=-0.5, hi=0.5), -1) + np.eye(shape[-1]) * u(*shape[:-1], 1, lo=0.6, hi=1.5)).astype(F32)
+
+    mloc, mtril = u(2, 3), tril(2, 3, 3)
+    case("mvn_log_prob", [mloc, mtril, u(4, 2, 3, lo=-2, hi=2)], [0, 1, 2], np_mvn_log_prob,
+         lambda T, m, s, x: D(T).MultivariateNormal(m, scale_tril=s).log_prob(x))
+    case("mvn_entropy", [mloc, mtril], [1],
+         lambda m, s: 1.5 * (1 + math.log(2 * math.pi)) + np.log(np.diagonal(np.tril(s), axis1=-2, axis2=-1)).sum(-1),
+         lambda T, m, s: D(T).MultivariateNormal(m, scale_tril=s).entropy())
+    case("mvn_variance", [mloc, mtril], [1], lambda m, s: (np.tril(s) ** 2).sum(-1),
+         lambda T, m, s: D(T).MultivariateNormal(m, scale_tril=s).variance)
+    case("mvn_kl", [u(2, 3), tril(2, 3, 3), u(3), tril(3, 3)], [0, 1, 2, 3], np_mvn_kl,
+         lambda T, m1, s1, m2, s2: D(T).kl_divergence(
+             D(T).MultivariateNormal(m1, scale_tril=s1), D(T).MultivariateNormal(m2.expand(2, 3), scale_tril=s2.expand(2, 3, 3))))
+
+    # Bernoulli and categorical.
+    coin = rng.integers(0, 2, size=(3, 5)).astype(F32)
+    case("bernoulli_log_prob", [u(5, lo=-3, hi=3), coin], [0],
+         lambda l, x: l * x - np_softplus(l), lambda T, l, x: D(T).Bernoulli(logits=l).log_prob(x))
+    case("bernoulli_probs_log_prob", [u(5, lo=0.1, hi=0.9), coin], [0],
+         lambda p, x: x * np.log(p) + (1 - x) * np.log1p(-p), lambda T, p, x: D(T).Bernoulli(probs=p).log_prob(x))
+    case("bernoulli_entropy", [u(5, lo=-3, hi=3)], [0],
+         lambda l: np_softplus(l) - l / (1 + np.exp(-l)), lambda T, l: D(T).Bernoulli(logits=l).entropy())
+    case("bernoulli_kl", [u(5, lo=0.1, hi=0.9), u(5, lo=0.1, hi=0.9)], [0, 1],
+         lambda p, q: p * np.log(p / q) + (1 - p) * np.log((1 - p) / (1 - q)),
+         lambda T, p, q: D(T).kl_divergence(D(T).Bernoulli(probs=p), D(T).Bernoulli(probs=q)))
+    case("categorical_log_prob", [u(2, 3, 5, lo=-2, hi=2), ints(rng, (4, 2, 3), 0, 5)], [0],
+         lambda l, k: np.take_along_axis(np.broadcast_to(np_log_softmax(l, -1), k.shape + (5,)), k[..., None], -1)[..., 0],
+         lambda T, l, k: D(T).Categorical(logits=l).log_prob(k.long()))
+    case("categorical_probs_log_prob", [u(3, 4, lo=0.2, hi=2), ints(rng, (3,), 0, 4)], [0],
+         lambda p, k: np.log(np.take_along_axis(p / p.sum(-1, keepdims=True), k[:, None], -1)[:, 0]),
+         lambda T, p, k: D(T).Categorical(probs=p).log_prob(k.long()))
+    case("categorical_entropy", [u(2, 3, 5, lo=-2, hi=2)], [0],
+         lambda l: -(np.exp(np_log_softmax(l, -1)) * np_log_softmax(l, -1)).sum(-1),
+         lambda T, l: D(T).Categorical(logits=l).entropy())
+    case("categorical_kl", [u(2, 4, lo=-2, hi=2), u(4, lo=-2, hi=2)], [0, 1],
+         lambda a, b: (np.exp(np_log_softmax(a, -1)) * (np_log_softmax(a, -1) - np_log_softmax(b, -1))).sum(-1),
+         lambda T, a, b: D(T).kl_divergence(D(T).Categorical(logits=a), D(T).Categorical(logits=b.expand(2, 4))))
+
+    # Uniform, exponential and Laplace.
+    low = u(4, lo=-2, hi=0)
+    high = (low + u(4, lo=0.5, hi=2)).astype(F32)
+    inside = (low + (high - low) * u(3, 4, lo=0.05, hi=0.95)).astype(F32)
+    case("uniform_log_prob", [low, high, inside], [0, 1],
+         lambda a, b, x: np.broadcast_to(-np.log(b - a), x.shape), lambda T, a, b, x: D(T).Uniform(a, b).log_prob(x))
+    case("uniform_entropy", [low, high], [0, 1], lambda a, b: np.log(b - a), lambda T, a, b: D(T).Uniform(a, b).entropy())
+    case("uniform_kl", [low, high, (low - u(4, lo=0.1, hi=1)).astype(F32), (high + u(4, lo=0.1, hi=1)).astype(F32)], [0, 1, 2, 3],
+         lambda a, b, c, d: np.log((d - c) / (b - a)),
+         lambda T, a, b, c, d: D(T).kl_divergence(D(T).Uniform(a, b), D(T).Uniform(c, d)))
+    case("exponential_log_prob", [u(4, lo=0.3, hi=3), u(3, 4, lo=0.1, hi=4)], [0, 1],
+         lambda r, x: np.log(r) - r * x, lambda T, r, x: D(T).Exponential(r).log_prob(x))
+    case("exponential_entropy", [u(4, lo=0.3, hi=3)], [0], lambda r: 1 - np.log(r), lambda T, r: D(T).Exponential(r).entropy())
+    case("exponential_kl", [u(4, lo=0.3, hi=3), u(4, lo=0.3, hi=3)], [0, 1],
+         lambda p, q: np.log(p / q) + q / p - 1,
+         lambda T, p, q: D(T).kl_divergence(D(T).Exponential(p), D(T).Exponential(q)))
+    lap_loc, lap_x = u(4), u(3, 4, lo=-3, hi=3)
+    lap_x = np.where(np.abs(lap_x - lap_loc) < 0.1, lap_x + 0.3, lap_x).astype(F32)  # away from the kink
+    case("laplace_log_prob", [lap_loc, u(4, lo=0.5, hi=2), lap_x], [0, 1, 2],
+         lambda m, b, x: -np.log(2 * b) - np.abs(x - m) / b, lambda T, m, b, x: D(T).Laplace(m, b).log_prob(x))
+    case("laplace_entropy", [u(4), u(4, lo=0.5, hi=2)], [1],
+         lambda m, b: 1 + np.log(2 * b), lambda T, m, b: D(T).Laplace(m, b).entropy())
+    case("laplace_kl", [u(4), u(4, lo=0.5, hi=2), (u(4) + 2.5).astype(F32), u(4, lo=0.5, hi=2)], [0, 1, 2, 3],
+         lambda m1, b1, m2, b2: -np.log(b1 / b2) + np.abs(m1 - m2) / b2 + (b1 / b2) * np.exp(-np.abs(m1 - m2) / b1) - 1,
+         lambda T, m1, b1, m2, b2: D(T).kl_divergence(D(T).Laplace(m1, b1), D(T).Laplace(m2, b2)))
+
+    # Gamma, beta and Dirichlet.
+    conc, rate = u(3, 1, lo=0.5, hi=4), u(2, lo=0.5, hi=2)
+    case("gamma_log_prob", [conc, rate, u(2, 3, 2, lo=0.1, hi=5)], [0, 1, 2],
+         lambda a, b, x: a * np.log(b) + (a - 1) * np.log(x) - b * x - np_lgamma(a),
+         lambda T, a, b, x: D(T).Gamma(a, b).log_prob(x))
+    case("gamma_entropy", [conc, rate], [0, 1],
+         lambda a, b: a - np.log(b) + np_lgamma(a) + (1 - a) * np_digamma(a),
+         lambda T, a, b: D(T).Gamma(a, b).entropy())
+    case("gamma_kl", [conc, rate, u(2, lo=0.5, hi=4), u(3, 1, lo=0.5, hi=2)], [0, 1, 2, 3],
+         lambda a1, b1, a2, b2: a2 * np.log(b1 / b2) + np_lgamma(a2) - np_lgamma(a1) + (a1 - a2) * np_digamma(a1) + (b2 - b1) * a1 / b1,
+         lambda T, a1, b1, a2, b2: D(T).kl_divergence(D(T).Gamma(a1, b1), D(T).Gamma(a2, b2)))
+    c1, c0 = u(4, lo=0.5, hi=3), u(4, lo=0.5, hi=3)
+    case("beta_log_prob", [c1, c0, u(3, 4, lo=0.05, hi=0.95)], [0, 1, 2],
+         lambda a, b, x: (a - 1) * np.log(x) + (b - 1) * np.log1p(-x) - np_lbeta(a, b),
+         lambda T, a, b, x: D(T).Beta(a, b).log_prob(x))
+    case("beta_entropy", [c1, c0], [0, 1],
+         lambda a, b: np_lbeta(a, b) - (a - 1) * np_digamma(a) - (b - 1) * np_digamma(b) + (a + b - 2) * np_digamma(a + b),
+         lambda T, a, b: D(T).Beta(a, b).entropy())
+    case("beta_kl", [c1, c0, u(4, lo=0.5, hi=3), u(4, lo=0.5, hi=3)], [0, 1, 2, 3],
+         lambda a1, b1, a2, b2: np_lbeta(a2, b2) - np_lbeta(a1, b1) + (a1 - a2) * np_digamma(a1) + (b1 - b2) * np_digamma(b1)
+         + (a2 - a1 + b2 - b1) * np_digamma(a1 + b1),
+         lambda T, a1, b1, a2, b2: D(T).kl_divergence(D(T).Beta(a1, b1), D(T).Beta(a2, b2)))
+    alpha = u(2, 4, lo=0.5, hi=3)
+    simplex = u(3, 2, 4, lo=0.1, hi=1)
+    simplex = (simplex / simplex.sum(-1, keepdims=True)).astype(F32)
+    case("dirichlet_log_prob", [alpha, simplex], [0, 1],
+         lambda a, x: ((a - 1) * np.log(x)).sum(-1) + np_lgamma(a.sum(-1)) - np_lgamma(a).sum(-1),
+         lambda T, a, x: D(T).Dirichlet(a).log_prob(x))
+    case("dirichlet_entropy", [alpha], [0],
+         lambda a: np_lgamma(a).sum(-1) - np_lgamma(a.sum(-1)) - (4 - a.sum(-1)) * np_digamma(a.sum(-1))
+         - ((a - 1) * np_digamma(a)).sum(-1),
+         lambda T, a: D(T).Dirichlet(a).entropy())
+    case("dirichlet_variance", [alpha], [0],
+         lambda a: a * (a.sum(-1, keepdims=True) - a) / (a.sum(-1, keepdims=True) ** 2 * (a.sum(-1, keepdims=True) + 1)),
+         lambda T, a: D(T).Dirichlet(a).variance)
+    case("dirichlet_kl", [alpha, u(4, lo=0.5, hi=3)], [0, 1],
+         lambda a, b: np_lgamma(a.sum(-1)) - np_lgamma(b.sum(-1)) - (np_lgamma(a) - np_lgamma(b)).sum(-1)
+         + ((a - b) * (np_digamma(a) - np_digamma(a.sum(-1, keepdims=True)))).sum(-1),
+         lambda T, a, b: D(T).kl_divergence(D(T).Dirichlet(a), D(T).Dirichlet(b.expand(2, 4))))
+
+    # Poisson, with rates on both sides of where the entropy changes method.
+    prate = np.array([0.3, 2.5, 11, 23.5, 24.5, 40, 300], dtype=F32)
+    case("poisson_log_prob", [prate, ints(rng, (3, 7), 0, 30).astype(F32)], [0],
+         lambda r, k: np_xlogy(k, r) - r - np_lgamma(k + 1), lambda T, r, k: D(T).Poisson(r).log_prob(k))
+    case("poisson_entropy", [prate], [0], np_poisson_entropy, torch_poisson_entropy)
+    case("poisson_kl", [prate, prate[::-1].copy()], [0, 1],
+         lambda p, q: p * np.log(p / q) - (p - q),
+         lambda T, p, q: D(T).kl_divergence(D(T).Poisson(p), D(T).Poisson(q)))
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--oracle", choices=["torch", "numpy"], default="torch")
@@ -1606,6 +1850,17 @@ def main():
         for part, a in evaluate_transform(args.oracle, kind, inputs, diff, np_fn, torch_fn, vec_rng).items():
             tensors[f"{name}/{part}"] = a
     files["transforms"] = tensors
+
+    # Distributions and special functions, from their own streams at seed
+    # offset 10.
+    rng, gout_rng = np.random.default_rng(args.seed + 10), np.random.default_rng(args.seed + 110)
+    tensors = {}
+    for name, (inputs, diff, np_fn, torch_fn) in distribution_cases(rng).items():
+        for i, a in enumerate(inputs):
+            tensors[f"{name}/in{i}"] = a
+        for part, a in evaluate_grad(args.oracle, inputs, diff, np_fn, torch_fn, gout_rng).items():
+            tensors[f"{name}/{part}"] = a
+    files["distributions"] = tensors
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
