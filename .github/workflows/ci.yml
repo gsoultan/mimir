@@ -146,6 +146,18 @@ jobs:
       - run: go test -run='^$' -fuzz=FuzzParse -fuzztime=60s ./io/safetensors
       - run: go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 
+  scale:
+    name: a billion rows in flat memory
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train
+
   golden-parity:
     name: golden parity with PyTorch
     runs-on: ubuntu-latest

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gsoultan/mimir/backend/cpu"
 	"github.com/gsoultan/mimir/data"
 	"github.com/gsoultan/mimir/data/datasets"
 	"github.com/gsoultan/mimir/nn"
@@ -118,8 +119,27 @@ func mib(bytes uint64) string { return fmt.Sprintf("%.1f MiB", float64(bytes)/(1
 // operating system and samples what remains held.
 func measureMemory(step int) memorySample {
 	runtime.GC()
+	settleOffHeap()
 	debug.FreeOSMemory()
 	ms := []metrics.Sample{{Name: "/memory/classes/total:bytes"}, {Name: "/memory/classes/heap/released:bytes"}}
 	metrics.Read(ms)
 	return memorySample{step: step, held: ms[0].Value.Uint64() - ms[1].Value.Uint64(), resident: residentBytes()}
+}
+
+// settleOffHeap waits for the cleanups of dropped off-heap buffers, which
+// run on a goroutine of their own after a collection, to unmap them: it
+// returns once the bytes held off the heap have not fallen for a few
+// samples, or after a bound.
+func settleOffHeap() {
+	last, stable := cpu.OffHeapBytes(), 0
+	for range 200 {
+		time.Sleep(5 * time.Millisecond)
+		now := cpu.OffHeapBytes()
+		if now < last {
+			stable = 0
+		} else if stable++; stable == 3 {
+			return
+		}
+		last = now
+	}
 }
