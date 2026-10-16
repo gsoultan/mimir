@@ -48,6 +48,7 @@ type Optimizer struct {
 	params []*tensor.Param
 	rule   Rule
 	lr     float64
+	scale  float64 // the factor the gradients carry, which Step divides out
 	steps  int
 	states []State
 	err    error // a configuration error, reported by Step
@@ -56,7 +57,7 @@ type Optimizer struct {
 // New returns an optimizer that updates params with rule at learning rate
 // lr. SGD, Adam, AdamW and RMSprop are built on it.
 func New(params []*tensor.Param, lr float64, rule Rule) *Optimizer {
-	o := &Optimizer{params: params, rule: rule, lr: lr, states: make([]State, len(params))}
+	o := &Optimizer{params: params, rule: rule, lr: lr, scale: 1, states: make([]State, len(params))}
 	if lr < 0 || math.IsNaN(lr) {
 		o.err = fmt.Errorf("optim: learning rate %v: %w", lr, tensor.ErrShape)
 	}
@@ -69,6 +70,46 @@ func (o *Optimizer) LR() float64 { return o.lr }
 // SetLR sets the learning rate for later steps, as a Schedule does.
 func (o *Optimizer) SetLR(lr float64) { o.lr = lr }
 
+// GradScale returns the factor that the gradients carry; see SetGradScale.
+func (o *Optimizer) GradScale() float64 { return o.scale }
+
+// SetGradScale tells the optimizer that the gradients carry scale times
+// the gradient of the loss, as they do when the loss is multiplied by
+// scale before Backward to keep small gradients from underflowing (see
+// train.LossScale). Step divides each gradient by scale as it reads it,
+// folded into the rule's input, so the division fuses with the update
+// and costs no memory. The default is 1. A scale whose reciprocal is not
+// a positive, finite float32 is a configuration error that Step reports.
+func (o *Optimizer) SetGradScale(scale float64) { o.scale = scale }
+
+// GradsFinite reports whether every gradient that Step would use is
+// finite. It sums the gradients in one schedule and tests the sum on the
+// host: the sum is NaN or infinite exactly when a gradient is, or when
+// the gradients are so large that their sum overflows float32, which is
+// as good as infinite. train.DynamicLossScale skips such steps.
+func (o *Optimizer) GradsFinite(ctx context.Context) (bool, error) {
+	var total *tensor.Tensor
+	for _, p := range o.params {
+		g := p.Grad()
+		if g == nil || !p.Trainable() {
+			continue
+		}
+		if total == nil {
+			total = g.Sum()
+		} else {
+			total = total.Add(g.Sum())
+		}
+	}
+	if total == nil {
+		return true, nil
+	}
+	v, err := total.Item[float32](ctx)
+	if err != nil {
+		return false, err
+	}
+	return !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0), nil
+}
+
 // Steps returns the number of steps taken.
 func (o *Optimizer) Steps() int { return o.steps }
 
@@ -79,13 +120,19 @@ func (o *Optimizer) ZeroGrad() {
 	}
 }
 
-// Step updates every trainable parameter that has a gradient, writing the
-// new values and states over the old ones (see tensor.RealizeInto). If it
-// fails before it starts writing, nothing changes; cancelling ctx after
-// that does not stop it.
+// Step updates every trainable parameter that has a gradient, divided by
+// the gradient scale (see SetGradScale), writing the new values and
+// states over the old ones (see tensor.RealizeInto). The rule's value is
+// cast to the parameter's dtype, so a BFloat16 or Float16 parameter takes
+// an update computed in float32 rounded to its dtype (see MasterWeights).
+// If Step fails before it starts writing, nothing changes; cancelling ctx
+// after that does not stop it.
 func (o *Optimizer) Step(ctx context.Context) error {
 	if o.err != nil {
 		return o.err
+	}
+	if inv := float32(1 / o.scale); !(o.scale > 0) || !(inv > 0) || math.IsInf(float64(inv), 0) {
+		return fmt.Errorf("optim: gradient scale %v: %w", o.scale, tensor.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -103,6 +150,9 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		if g == nil || !p.Trainable() {
 			continue
 		}
+		if o.scale != 1 {
+			g = g.Mul(f32(1 / o.scale))
+		}
 		cur := p.Value().Detach()
 		v, s := o.rule(o.lr, step, cur, g, o.states[i])
 		if err := v.Err(); err != nil {
@@ -110,6 +160,9 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		}
 		if !slices.Equal(v.Shape(), cur.Shape()) {
 			return fmt.Errorf("optim: parameter %d: rule returned %v for %v: %w", i, v.Shape(), cur.Shape(), tensor.ErrShape)
+		}
+		if v.DType() != cur.DType() {
+			v = v.Cast(cur.DType())
 		}
 		for name, t := range s {
 			if t == g {
@@ -186,7 +239,7 @@ type Option func(*config)
 type config struct {
 	lr, momentum, dampening, weightDecay float64
 	beta1, beta2, eps, alpha             float64
-	nesterov                             bool
+	nesterov, master                     bool
 }
 
 // LR sets the learning rate.
@@ -214,6 +267,36 @@ func Eps(eps float64) Option { return func(c *config) { c.eps = eps } }
 
 // Alpha sets RMSprop's smoothing constant.
 func Alpha(a float64) Option { return func(c *config) { c.alpha = a } }
+
+// MasterWeights keeps a float32 master copy of every BFloat16 and Float16
+// parameter in its state, named "master", and updates that: the rule runs
+// on the master copy with the gradient cast to float32, and the parameter
+// takes the result rounded to its dtype. Without it a half parameter is
+// updated in its own precision, where an update smaller than half the
+// spacing of its values is lost: in BFloat16 a step of less than 1/512 of
+// a weight leaves it unchanged. Float32 parameters are updated as usual.
+// The master copy is saved and restored with the rest of the state.
+func MasterWeights() Option { return func(c *config) { c.master = true } }
+
+// master returns rule applied to the float32 master copy of each half
+// parameter, kept in the parameter's state as "master".
+func master(rule Rule) Rule {
+	return func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+		if p.DType() == tensor.Float32 {
+			return rule(lr, step, p, g, s)
+		}
+		m, ok := s["master"]
+		if !ok {
+			m = p.Cast(tensor.Float32)
+		}
+		v, next := rule(lr, step, m, g.Cast(tensor.Float32), s)
+		if next == nil {
+			next = State{}
+		}
+		next["master"] = v
+		return v.Cast(p.DType()), next
+	}
+}
 
 func configure(opts []Option, c config) (config, error) {
 	for _, o := range opts {
@@ -243,7 +326,11 @@ func configure(opts []Option, c config) (config, error) {
 
 // build returns an optimizer for rule, or one whose Step reports err.
 func build(params []*tensor.Param, c config, err error, rule func(c config) Rule) *Optimizer {
-	o := New(params, c.lr, rule(c))
+	r := rule(c)
+	if c.master {
+		r = master(r)
+	}
+	o := New(params, c.lr, r)
 	if err != nil {
 		o.err = err
 	}

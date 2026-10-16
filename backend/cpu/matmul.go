@@ -9,7 +9,7 @@ import (
 )
 
 // runMatMul runs a matmul kernel whose operands have the output's dtype.
-func runMatMul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, ins []backend.Buffer, epi *evaluator) error {
+func runMatMul[T number](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, ins []backend.Buffer, epi *evaluator) error {
 	out, err := data[T](outBuf)
 	if err != nil {
 		return err
@@ -59,7 +59,7 @@ func epilogue(k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) (*eva
 // streams a row of B and a row of the output. If epi is not nil, it
 // rewrites each part of the output once that part is computed, while it is
 // still in cache.
-func matmul[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, y []T, epi *evaluator) error {
+func matmul[T number](ctx context.Context, b *Backend, k *backend.Kernel, out, x, y []T, epi *evaluator) error {
 	if len(out) == 0 {
 		return nil
 	}

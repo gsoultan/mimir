@@ -16,6 +16,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"runtime"
 	"slices"
 )
 
@@ -43,6 +44,9 @@ type Tensor struct {
 type File struct {
 	Metadata map[string]string
 	tensors  map[string]Tensor
+	mapping  *mapping        // the mapping the tensors alias, when Open made one
+	cleanup  runtime.Cleanup // lets go of the mapping if the File is garbage
+	closed   bool            // Close ran; guarded by mapping.mu
 }
 
 type entry struct {
@@ -130,9 +134,14 @@ func (f *File) Tensor(name string) (Tensor, bool) {
 	return t, ok
 }
 
-// Float32s decodes an F32 tensor.
+// Float32s decodes an F32 tensor, or an F16 or BF16 tensor, whose every
+// element is a float32 value.
 func (t Tensor) Float32s() ([]float32, error) {
-	if t.DType != "F32" {
+	switch t.DType {
+	case "F16", "BF16":
+		return t.halfFloat32s(), nil
+	case "F32":
+	default:
 		return nil, fmt.Errorf("safetensors: %s tensor read as F32", t.DType)
 	}
 	out := make([]float32, len(t.Data)/4)

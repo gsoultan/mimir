@@ -1,22 +1,25 @@
 package sched
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
-// Elementwise nodes are fused: an elementwise node whose only consumer is
-// another elementwise node, and which is not a target, is computed inside
-// its consumer's kernel instead of into a buffer of its own. Each group of
-// fused nodes becomes one OpFused kernel whose program reads the group's
-// other inputs through their views, so a chain of elementwise ops reads
-// and writes memory once. Constants, through any views, become immediate
-// values of the programs that read them.
+// Elementwise nodes are fused: an elementwise node that is not a target,
+// and whose consumers are elementwise nodes computed by one kernel, is
+// computed inside that kernel instead of into a buffer of its own. Each
+// group of fused nodes becomes one OpFused kernel whose program reads the
+// group's other inputs through their views, so a chain of elementwise ops
+// reads and writes memory once, and a value the group reads several
+// times, such as a scaled gradient that both of Adam's moments read, is
+// computed once. Constants, through any views, become immediate values of
+// the programs that read them.
 //
-// A target computed elementwise for one elementwise consumer joins its
-// consumer's group too, and the group's kernel writes it as well as the
+// A target computed elementwise for elementwise consumers of one group
+// joins that group too, and the group's kernel writes it as well as the
 // group's own result. An optimizer step, which computes new moment
 // estimates and from them a new parameter value, then reads the gradient
 // and old state once and writes all three in one pass.
@@ -69,6 +72,73 @@ type store struct {
 	at int
 }
 
+// nodes returns the nodes that the kernel of n, computed as w plans,
+// writes: n, then the targets it stores.
+func (w *work) nodes(n *graph.Node) []*graph.Node {
+	nodes := make([]*graph.Node, 1, 1+len(w.stores))
+	nodes[0] = n
+	for _, s := range w.stores {
+		nodes = append(nodes, s.n)
+	}
+	return nodes
+}
+
+// kernel returns the kernel that computes n as w plans, reading the
+// results of w.deps through views, with an output for each of w.nodes(n)
+// (see resultView); or nil, and the view of its input's buffer that holds
+// n, when n is a view that needs no kernel. It is the one decision that
+// step runs and forecast predicts.
+func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, backend.View, error) {
+	if w.swap {
+		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
+		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
+			views[0].Permute(n.Attrs.Axes), views[1].Permute(n.Attrs.Axes),
+		}}
+		return k, backend.View{}, nil
+	}
+	switch n.Op {
+	case backend.OpLoad:
+		return nil, backend.View{}, fmt.Errorf("sched: load without data: %w", backend.ErrInternal)
+	case backend.OpConst:
+		// One element, broadcast to the full shape with zero strides.
+		return &backend.Kernel{Op: backend.OpConst, DType: n.DType, Attrs: n.Attrs}, backend.View{}, nil
+	case backend.OpPermute, backend.OpExpand, backend.OpShrink, backend.OpFlip, backend.OpReshape:
+		in := views[0]
+		if v, ok := viewOf(in, n); ok {
+			return nil, v, nil
+		}
+		// Only a reshape can fail, and copying makes it contiguous.
+		k := &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: in.Shape, In: []backend.View{in}}
+		return k, backend.View{}, nil
+	}
+
+	k := &backend.Kernel{Op: n.Op, DType: n.DType, Shape: n.Shape, In: slices.Clone(views), Attrs: n.Attrs}
+	switch {
+	case w.gemm != nil:
+		// The product, rewritten in place by any epilogue, holds n in
+		// row-major order. A summed product's axes are the batch axes it
+		// sums.
+		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog, Axes: w.gemm.Attrs.Axes}
+	case w.prog != nil:
+		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: w.prog}
+		for _, s := range w.stores {
+			k.Attrs.Stores = append(k.Attrs.Stores, s.at)
+		}
+	}
+	return k, backend.View{}, nil
+}
+
+// uses returns how many times the kernels of p read each node.
+func (p *plan) uses() map[*graph.Node]int {
+	uses := make(map[*graph.Node]int, len(p.order))
+	for _, n := range p.order {
+		for _, in := range p.work[n].deps {
+			uses[in]++
+		}
+	}
+	return uses
+}
+
 // newPlan plans the kernels for the unrealized nodes in order, which lists
 // every node before its consumers. over holds the storages that targets
 // may be written over; see candidates.
@@ -85,13 +155,18 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	private := func(n *graph.Node) bool {
 		return !n.Realized() && !isTarget[n] && len(users[n]) == 1
 	}
-	fusable := func(n *graph.Node) bool {
-		return n.Op.IsElementwise() && private(n) && users[n][0].Op.IsElementwise()
+	// joins reports whether n could be computed inside its consumers'
+	// kernel: an unrealized elementwise node read by elementwise nodes
+	// only.
+	joins := func(n *graph.Node) bool {
+		return n.Op.IsElementwise() && !n.Realized() && len(users[n]) > 0 &&
+			!slices.ContainsFunc(users[n], func(u *graph.Node) bool { return !u.Op.IsElementwise() })
 	}
 	// A group stops growing at maxProgram instructions, counting each load
-	// and constant as one: the inputs that would take it past are computed
-	// by kernels of their own. A GPU compiles each program, and a program
-	// of a long chain, such as a running sum, would be too large.
+	// and constant as one, and a value read several times once per
+	// reader: the inputs that would take it past are computed by kernels
+	// of their own. A GPU compiles each program, and a program of a long
+	// chain, such as a running sum, would be too large.
 	cut := map[*graph.Node]bool{}
 	size := make(map[*graph.Node]int, len(order))
 	for _, n := range order {
@@ -102,7 +177,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 		for i, in := range n.Inputs {
 			switch {
 			case slices.Contains(n.Inputs[:i], in):
-			case !fusable(in):
+			case !joins(in):
 				s++
 			case s+size[in] > maxProgram:
 				cut[in] = true
@@ -113,23 +188,34 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 		}
 		size[n] = s
 	}
-	inner := func(n *graph.Node) bool { return fusable(n) && !cut[n] }
-	// stored reports whether n is a target that the kernel of its one
-	// consumer's group computes and writes. That kernel's output holds
-	// the target, so it must have the same dtype; elementwise ops keep
-	// their inputs' shape.
-	var stored func(n *graph.Node) bool
-	root := func(n *graph.Node) *graph.Node {
-		for inner(n) || stored(n) {
-			n = users[n][0]
+	// roots maps each node to the node whose kernel computes it: itself,
+	// or the root of the group it joins, which is the root of all its
+	// consumers. A target joins only a group whose kernel's output can
+	// hold it, which needs the same dtype; elementwise ops keep their
+	// inputs' shape. Consumers come after their inputs in order, so each
+	// node finds its consumers' roots settled.
+	roots := make(map[*graph.Node]*graph.Node, len(order))
+	for _, n := range slices.Backward(order) {
+		roots[n] = n
+		if !joins(n) || cut[n] {
+			continue
 		}
-		return n
+		r := roots[users[n][0]]
+		if slices.ContainsFunc(users[n], func(u *graph.Node) bool { return roots[u] != r }) {
+			continue
+		}
+		if isTarget[n] && r.DType != n.DType {
+			continue
+		}
+		roots[n] = r
 	}
-	stored = func(n *graph.Node) bool {
-		return isTarget[n] && !n.Realized() && n.Op.IsElementwise() && len(users[n]) == 1 &&
-			users[n][0].Op.IsElementwise() && root(users[n][0]).DType == n.DType
+	member := func(n *graph.Node) bool {
+		r, ok := roots[n]
+		return ok && r != n
 	}
-	member := func(n *graph.Node) bool { return inner(n) || stored(n) }
+	// stored reports whether n is a target that the kernel of its
+	// consumers' group computes and writes.
+	stored := func(n *graph.Node) bool { return member(n) && isTarget[n] }
 
 	p := &plan{work: make(map[*graph.Node]*work, len(order)), storer: map[*graph.Node]*graph.Node{}}
 	for _, n := range order {
@@ -156,7 +242,7 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			}
 			if w.stores == nil && !slices.ContainsFunc(ins, overwritable) {
 				for i, x := range ins {
-					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType {
+					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType && n.DType == backend.Float32 {
 						w = epilogue(prog, ins, i, gemm)
 						break
 					}

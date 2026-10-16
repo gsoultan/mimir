@@ -48,6 +48,10 @@ const teamSpin = 5 * time.Millisecond
 // which the helpers contend for when they yield after every poll.
 const yieldEvery = 16
 
+// yieldBusy is how long a yield takes when another goroutine ran during
+// it. A yield with nothing else to run returns well within a microsecond.
+const yieldBusy = 20 * time.Microsecond
+
 // defaultTeam returns the process-wide team, with a helper for every
 // processor beyond the caller's, or nil if there is a single processor.
 var defaultTeam = sync.OnceValue(func() *team {
@@ -122,9 +126,17 @@ func (t *team) help() {
 				t.park()
 				idle = time.Now()
 			}
-			// Let other goroutines have the processor now and then.
+			// Let other goroutines have the processor now and then. One
+			// that takes it has work of its own, such as reading the next
+			// batch, which polling would only slow down: the helper parks
+			// instead, and run wakes it when the next loop starts.
 			if polls%yieldEvery == 0 {
+				yielded := time.Now()
 				runtime.Gosched()
+				if time.Since(yielded) > yieldBusy {
+					t.park()
+					idle = time.Now()
+				}
 			}
 		}
 		t.work()

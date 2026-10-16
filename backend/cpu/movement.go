@@ -9,7 +9,7 @@ import (
 // pad fills the output with Attrs.Value and copies the input into the
 // interior given by Attrs.Pads. Pads are non-negative; the graph checks.
 func pad[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T) error {
-	fill := T(k.Attrs.Value)
+	fill := valueOf[T](k.Attrs.Value)
 	if err := b.parallelFor(ctx, len(out), elementGrain, func(lo, hi int) error {
 		for i := lo; i < hi; i++ {
 			out[i] = fill

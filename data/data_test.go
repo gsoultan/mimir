@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/gsoultan/mimir/data"
@@ -93,6 +94,20 @@ func TestErrors(t *testing.T) {
 	for _, err := range d.All(ctx) {
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("cancelled epoch: %v", err)
+		}
+	}
+}
+
+func TestFromTensorsRejectsStreamOptions(t *testing.T) {
+	x, y := examples(4)
+	for name, opt := range map[string]data.Option{
+		"Prefetch":      data.Prefetch(2),
+		"ShuffleBuffer": data.ShuffleBuffer(5),
+		"ClassTargets":  data.ClassTargets(),
+		"Normalize":     data.Normalize(&data.Stats{}),
+	} {
+		if _, err := data.FromTensors(x, y, data.BatchSize(2), opt); !errors.Is(err, data.ErrOption) || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: %v, want ErrOption naming it", name, err)
 		}
 	}
 }

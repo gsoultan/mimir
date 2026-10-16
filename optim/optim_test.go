@@ -213,3 +213,63 @@ func TestRulesMayKeepTheGradientAsState(t *testing.T) {
 		t.Errorf("value after two steps = %v, %v; want [-0.5 0.5]", got, err)
 	}
 }
+
+func TestGradScaleDividesTheGradients(t *testing.T) {
+	p := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	opt := optim.SGD([]*tensor.Param{p}, optim.LR(0.5))
+	if opt.GradScale() != 1 {
+		t.Errorf("default gradient scale = %v, want 1", opt.GradScale())
+	}
+	// The gradient of 4·sum(p) is 4 everywhere; scaled down by 4 it is 1.
+	opt.SetGradScale(4)
+	if err := p.Value().Sum().Mul(tensor.Scalar[float32](4)).Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := opt.Step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	opt.ZeroGrad()
+	if got, err := p.Value().Data[float32](t.Context()); err != nil || got[0] != 0.5 || got[1] != 1.5 {
+		t.Errorf("value after a step at scale 4 = %v, %v; want [0.5 1.5]", got, err)
+	}
+	for _, scale := range []float64{0, -2, math.NaN(), math.Inf(1)} {
+		opt.SetGradScale(scale)
+		if err := p.Value().Sum().Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := opt.Step(t.Context()); !errors.Is(err, tensor.ErrShape) {
+			t.Errorf("step at gradient scale %v: %v, want ErrShape", scale, err)
+		}
+		opt.ZeroGrad()
+	}
+}
+
+func TestGradsFinite(t *testing.T) {
+	a := tensor.NewParam(tensor.FromSlice([]float32{1, 2}))
+	b := tensor.NewParam(tensor.FromSlice([]float32{3, 4, 5}))
+	opt := optim.SGD([]*tensor.Param{a, b})
+	if ok, err := opt.GradsFinite(t.Context()); !ok || err != nil {
+		t.Errorf("without gradients: %v, %v; want true", ok, err)
+	}
+	if err := a.Value().Sum().Add(b.Value().Sum()).Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := opt.GradsFinite(t.Context()); !ok || err != nil {
+		t.Errorf("with finite gradients: %v, %v; want true", ok, err)
+	}
+	opt.ZeroGrad()
+	// Each kind of non-finite value, in either parameter.
+	for _, bad := range []float32{float32(math.Inf(1)), float32(math.Inf(-1)), float32(math.NaN())} {
+		for i, p := range []*tensor.Param{a, b} {
+			w := make([]float32, p.Value().Size())
+			w[len(w)-1] = bad
+			if err := p.Value().Mul(tensor.FromSlice(w)).Sum().Add(a.Value().Sum()).Add(b.Value().Sum()).Backward(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := opt.GradsFinite(t.Context()); ok || err != nil {
+				t.Errorf("with %v in the gradient of parameter %d: %v, %v; want false", bad, i, ok, err)
+			}
+			opt.ZeroGrad()
+		}
+	}
+}
