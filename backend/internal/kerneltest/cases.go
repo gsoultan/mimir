@@ -332,7 +332,33 @@ func Movement(t *testing.T) []Case {
 			In: []backend.View{backend.Contiguous([]int{40}), backend.Contiguous([]int{40}), backend.Contiguous([]int{40})}},
 			Ins: []backend.Buffer{HostBuffer(t, rng, f, 40, 0, 0), HostBuffer(t, rng, i, 40, 30, 45), HostBuffer(t, rng, f, 40, 0, 0)}},
 	)
-	return cases
+	// Joins along each axis of inputs read through every kind of view, of
+	// every dtype, and the widest join a kernel takes.
+	kinds := []string{"contiguous", "transposed", "padded", "flipped", "broadcast"}
+	for _, dt := range []backend.DType{f, i, backend.BFloat16, backend.Float16} {
+		for axis := range 3 {
+			out := []int{3, 4, 5}
+			out[axis] = 0
+			var k backend.Kernel
+			var ins []backend.Buffer
+			for j, size := range []int{2, 1, 3} {
+				shape := []int{3, 4, 5}
+				shape[axis] = size
+				x := Views(shape)[kinds[(j+axis)%len(kinds)]]
+				k.In = append(k.In, x.V)
+				ins = append(ins, HostBuffer(t, rng, dt, x.N, -9, 9))
+				out[axis] += size
+			}
+			k.Op, k.DType, k.Shape, k.Attrs = backend.OpCat, dt, out, backend.Attrs{Axis: axis}
+			cases = append(cases, Case{Name: fmt.Sprintf("cat/%s/%d", dt, axis), K: k, Ins: ins})
+		}
+	}
+	wide := Case{Name: "cat/widest", K: backend.Kernel{Op: backend.OpCat, DType: f, Shape: []int{2, 3 * backend.MaxCatInputs}, Attrs: backend.Attrs{Axis: 1}}}
+	for range backend.MaxCatInputs {
+		wide.K.In = append(wide.K.In, backend.Contiguous([]int{2, 3}))
+		wide.Ins = append(wide.Ins, HostBuffer(t, rng, f, 6, 0, 0))
+	}
+	return append(cases, wide)
 }
 
 // Window returns cases of unfolds and folds.

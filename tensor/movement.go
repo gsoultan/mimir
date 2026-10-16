@@ -398,31 +398,138 @@ func Cat(axis int, ts ...*Tensor) *Tensor {
 	if err != nil {
 		return fail(err)
 	}
-	total := 0
 	for _, t := range ts {
 		s := t.node.Shape
 		if len(s) != len(first.Shape) || t.node.DType != first.DType ||
 			!slices.Equal(s[:a], first.Shape[:a]) || !slices.Equal(s[a+1:], first.Shape[a+1:]) {
 			return fail(fmt.Errorf("tensor: cat %s%v and %s%v along %d: %w", first.DType, first.Shape, t.node.DType, s, a, ErrShape))
 		}
-		total += s[a]
 	}
-	// Each part is padded to the full length and the parts are added, so
-	// every gradient is a slice of the result's.
-	var out *Tensor
+	return cat(a, ts)
+}
+
+// cat joins tensors that fit along axis a. A kernel joins at most
+// backend.MaxCatInputs, so more are joined in groups, and the groups
+// joined in turn: every element is copied once per level, and a level
+// joins MaxCatInputs times as many as the one before.
+func cat(a int, ts []*Tensor) *Tensor {
+	for len(ts) > backend.MaxCatInputs {
+		groups := (len(ts) + backend.MaxCatInputs - 1) / backend.MaxCatInputs
+		joined := make([]*Tensor, 0, groups)
+		for part := range slices.Chunk(ts, (len(ts)+groups-1)/groups) {
+			joined = append(joined, catPrim(a, part))
+		}
+		ts = joined
+	}
+	return catPrim(a, ts)
+}
+
+// catPrim is the join primitive: each input's gradient is a view of the
+// result's.
+func catPrim(a int, ts []*Tensor) *Tensor {
+	if err := firstErr(ts...); err != nil {
+		return fail(err)
+	}
+	if len(ts) == 1 {
+		return ts[0]
+	}
+	nodes := make([]*graph.Node, len(ts))
+	for i, t := range ts {
+		nodes[i] = t.node
+	}
+	out := wrap(graph.Cat(nodes, a))
+	if !tracked(ts...) || out.err != nil {
+		return out
+	}
+	shape := out.node.Shape
+	ranges := make([][2]int, len(ts))
 	at := 0
-	for _, t := range ts {
-		pads := make([][2]int, len(first.Shape))
-		pads[a] = [2]int{at, total - at - t.node.Shape[a]}
-		at += t.node.Shape[a]
-		p := t.pad(pads, 0)
-		if out == nil {
-			out = p
-		} else {
-			out = out.Add(p)
+	for i, t := range ts {
+		ranges[i] = [2]int{at, at + t.node.Shape[a]}
+		at = ranges[i][1]
+	}
+	return track(out, func(g *Tensor) []*Tensor {
+		gs := make([]*Tensor, len(ranges))
+		for i, r := range ranges {
+			gs[i] = g.shrink(rangeAxis(shape, a, r[0], r[1]))
+		}
+		return gs
+	}, ts...)
+}
+
+// split cuts t along the axis a into parts of the given sizes, which add
+// up to its length there, like torch.split. The parts are views of t.
+// Backward joins their gradients into t's with one Cat, where the
+// gradient of each view on its own would be padded to t's shape: a loop
+// over the parts would pay for that once per part.
+func (t *Tensor) split(a int, sizes []int) []*Tensor {
+	parts := make([]*Tensor, len(sizes))
+	if err := firstErr(t); err != nil {
+		for i := range parts {
+			parts[i] = fail(err)
+		}
+		return parts
+	}
+	x := t.detached()
+	var s *splitting
+	if t.tape != nil {
+		s = &splitting{axis: a, shapes: make([][]int, len(sizes))}
+	}
+	at := 0
+	for i, n := range sizes {
+		p := x.shrink(rangeAxis(t.node.Shape, a, at, at+n))
+		at += n
+		if s != nil && p.err == nil {
+			s.shapes[i] = p.node.Shape
+			p = &Tensor{node: p.node, tape: newTape(p.node.Shape, []*tape{t.tape}, nil)}
+			p.tape.part = &part{of: s, i: i}
+		}
+		parts[i] = p
+	}
+	return parts
+}
+
+// splitting is a tensor split into parts of shapes along axis.
+type splitting struct {
+	axis   int
+	shapes [][]int
+}
+
+// part is part i of a splitting.
+type part struct {
+	of *splitting
+	i  int
+}
+
+// joining collects the gradients of the parts of a splitting during
+// propagate: grads[i] is part i's, or nil if it received none.
+type joining struct {
+	of    *splitting
+	grads []*Tensor
+}
+
+// join returns the gradient of the split tensor: the parts' gradients
+// joined, with zeros for the parts that received none. Gradients of
+// different float dtypes join in Float32.
+func (j *joining) join() *Tensor {
+	var dt DType
+	for _, g := range j.grads {
+		switch {
+		case g == nil:
+		case dt == backend.Invalid:
+			dt = g.node.DType
+		case dt != g.node.DType:
+			dt = Float32
 		}
 	}
-	return out
+	parts := make([]*Tensor, len(j.grads))
+	for i, g := range j.grads {
+		if g == nil {
+			g = Zeros(dt, j.of.shapes[i]...)
+		}
+		parts[i] = g.Cast(dt)
+	}
+	return cat(j.of.axis, parts)
 }
 
 // Stack joins tensors of one shape along a new axis, like torch.stack.

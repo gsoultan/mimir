@@ -52,6 +52,10 @@ type tape struct {
 	// reads are the parameters that a checkpointed function read, with
 	// the values it read, on the tape of a checkpoint (see Checkpoint).
 	reads []paramRead
+	// part, if not nil, makes the tensor a part of its one parent's (see
+	// split): it has no rule, and propagate joins the gradients of the
+	// parts into the parent's.
+	part *part
 
 	leaf     bool
 	param    *Param  // the parameter a leaf stands for, or nil
@@ -256,7 +260,7 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	}
 	for _, n := range order {
 		if !n.leaf {
-			n.parents, n.vjp, n.effects, n.reads, n.released = nil, nil, nil, nil, true
+			n.parents, n.vjp, n.effects, n.reads, n.part, n.released = nil, nil, nil, nil, nil, true
 		}
 	}
 	return nil
@@ -329,8 +333,20 @@ func propagate(root *tape, g *Tensor) (order []*tape, effects []*Tensor, err err
 		return nil, nil, err
 	}
 	acc := map[*tape]*Tensor{root: g}
+	// The gradients of the parts of each split tensor, by the tensor's
+	// tape, are joined once every part has had its turn: the parts come
+	// after the tensor they were split from.
+	joins := map[*tape][]*joining{}
 	for _, n := range slices.Backward(order) {
 		effects = append(effects, n.effects...)
+		for _, j := range joins[n] {
+			gj := j.join()
+			if prev, ok := acc[n]; ok {
+				gj = prev.Add(gj)
+			}
+			acc[n] = gj
+		}
+		delete(joins, n)
 		g, ok := acc[n]
 		if !ok {
 			continue
@@ -338,6 +354,16 @@ func propagate(root *tape, g *Tensor) (order []*tape, effects []*Tensor, err err
 		delete(acc, n) // its inputs' gradients are all that is needed now
 		if n.leaf {
 			bwd.add(n, g)
+			continue
+		}
+		if p := n.part; p != nil {
+			whole := n.parents[0]
+			i := slices.IndexFunc(joins[whole], func(j *joining) bool { return j.of == p.of })
+			if i < 0 {
+				joins[whole] = append(joins[whole], &joining{of: p.of, grads: make([]*Tensor, len(p.of.shapes))})
+				i = len(joins[whole]) - 1
+			}
+			joins[whole][i].grads[p.i] = g
 			continue
 		}
 		gs := n.vjp(g)

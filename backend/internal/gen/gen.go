@@ -428,6 +428,8 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return g.matmul(n)
 	case op == backend.OpScan:
 		return planScan(d, k, outs, ins, n)
+	case op == backend.OpCat:
+		return g.cat(n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
@@ -849,4 +851,53 @@ func Numbered(src string) string {
 		fmt.Fprintf(&b, "%4d %s\n", i+1, l)
 	}
 	return b.String()
+}
+
+// cat copies each output element from the input whose range along the
+// axis holds it: input j covers the positions after those of inputs 0 to
+// j-1. Elements move as they are, half ones included.
+func (g *gen) cat(n int) (*Launch, error) {
+	axis, r := g.k.Attrs.Axis, len(g.k.Shape)
+	if len(g.k.In) == 0 || len(g.k.In) > backend.MaxCatInputs || axis < 0 || axis >= r {
+		return nil, fmt.Errorf("cat of %d inputs along axis %d of %v: %w", len(g.k.In), axis, g.k.Shape, backend.ErrInternal)
+	}
+	at := 0
+	for j, v := range g.k.In {
+		if len(v.Shape) != r || g.ins[j] != g.k.DType {
+			return nil, fmt.Errorf("cat input %s%v for output %s%v: %w", g.ins[j], v.Shape, g.k.DType, g.k.Shape, backend.ErrInternal)
+		}
+		for d, s := range v.Shape {
+			if d != axis && s != g.k.Shape[d] {
+				return nil, fmt.Errorf("cat input %v for output %v: %w", v.Shape, g.k.Shape, backend.ErrInternal)
+			}
+		}
+		at += v.Shape[axis]
+	}
+	if at != g.k.Shape[axis] {
+		return nil, fmt.Errorf("cat inputs of %d along axis %d for output %v: %w", at, axis, g.k.Shape, backend.ErrInternal)
+	}
+	coords := g.index("i", g.k.Shape)
+	at = 0
+	for j, v := range g.k.In {
+		size := v.Shape[axis]
+		if size == 0 {
+			continue
+		}
+		g.line("if (%s < %s) {", coords[axis], g.param(at+size))
+		g.line("\tint off = %s;", g.param(v.Offset))
+		for d, c := range coords {
+			if v.Strides[d] == 0 {
+				continue
+			}
+			if d == axis {
+				c = fmt.Sprintf("(%s - %s)", c, g.param(at))
+			}
+			g.line("\toff += %s * %s;", c, g.param(v.Strides[d]))
+		}
+		g.line("\to0[i] = i%d[off];", j)
+		g.line("\treturn;")
+		g.line("}")
+		at += size
+	}
+	return g.perElement(n)
 }
