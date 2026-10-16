@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/gsoultan/mimir/backend"
@@ -67,6 +68,73 @@ type work struct {
 type store struct {
 	n  *graph.Node
 	at int
+}
+
+// nodes returns the nodes that the kernel of n, computed as w plans,
+// writes: n, then the targets it stores.
+func (w *work) nodes(n *graph.Node) []*graph.Node {
+	nodes := make([]*graph.Node, 1, 1+len(w.stores))
+	nodes[0] = n
+	for _, s := range w.stores {
+		nodes = append(nodes, s.n)
+	}
+	return nodes
+}
+
+// kernel returns the kernel that computes n as w plans, reading the
+// results of w.deps through views, with an output for each of w.nodes(n)
+// (see resultView); or nil, and the view of its input's buffer that holds
+// n, when n is a view that needs no kernel. It is the one decision that
+// step runs and forecast predicts.
+func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, backend.View, error) {
+	if w.swap {
+		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
+		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
+			views[0].Permute(n.Attrs.Axes), views[1].Permute(n.Attrs.Axes),
+		}}
+		return k, backend.View{}, nil
+	}
+	switch n.Op {
+	case backend.OpLoad:
+		return nil, backend.View{}, fmt.Errorf("sched: load without data: %w", backend.ErrInternal)
+	case backend.OpConst:
+		// One element, broadcast to the full shape with zero strides.
+		return &backend.Kernel{Op: backend.OpConst, DType: n.DType, Attrs: n.Attrs}, backend.View{}, nil
+	case backend.OpPermute, backend.OpExpand, backend.OpShrink, backend.OpFlip, backend.OpReshape:
+		in := views[0]
+		if v, ok := viewOf(in, n); ok {
+			return nil, v, nil
+		}
+		// Only a reshape can fail, and copying makes it contiguous.
+		k := &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: in.Shape, In: []backend.View{in}}
+		return k, backend.View{}, nil
+	}
+
+	k := &backend.Kernel{Op: n.Op, DType: n.DType, Shape: n.Shape, In: slices.Clone(views), Attrs: n.Attrs}
+	switch {
+	case w.gemm != nil:
+		// The product, rewritten in place by any epilogue, holds n in
+		// row-major order. A summed product's axes are the batch axes it
+		// sums.
+		k.Op, k.Shape, k.Attrs = backend.OpMatMul, w.gemm.Shape, backend.Attrs{Program: w.prog, Axes: w.gemm.Attrs.Axes}
+	case w.prog != nil:
+		k.Op, k.Attrs = backend.OpFused, backend.Attrs{Program: w.prog}
+		for _, s := range w.stores {
+			k.Attrs.Stores = append(k.Attrs.Stores, s.at)
+		}
+	}
+	return k, backend.View{}, nil
+}
+
+// uses returns how many times the kernels of p read each node.
+func (p *plan) uses() map[*graph.Node]int {
+	uses := make(map[*graph.Node]int, len(p.order))
+	for _, n := range p.order {
+		for _, in := range p.work[n].deps {
+			uses[in]++
+		}
+	}
+	return uses
 }
 
 // newPlan plans the kernels for the unrealized nodes in order, which lists

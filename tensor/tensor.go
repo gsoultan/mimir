@@ -67,6 +67,10 @@ var (
 	ErrDivideByZero = backend.ErrDivideByZero
 	ErrOutOfMemory  = backend.ErrOutOfMemory
 	ErrInternal     = backend.ErrInternal
+	// ErrMemoryBudget reports a computation refused before it started
+	// because it would take its device past its memory budget (see
+	// SetMemoryBudget).
+	ErrMemoryBudget = backend.ErrMemoryBudget
 	ErrNilTensor    = errors.New("nil tensor")
 	// ErrOverwritten reports a tensor whose memory now holds other values,
 	// such as a parameter's value from before an optimizer step (see

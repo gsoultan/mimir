@@ -162,6 +162,19 @@ func SetDefaultDevice(d Device) Device {
 	return prev
 }
 
+// SetMemoryBudget limits the memory that computations on d may hold to
+// bytes, or removes the limit when bytes is 0. A computation that would
+// take the device past its budget fails with ErrMemoryBudget before it
+// allocates or computes anything, instead of running out of memory
+// midway. The budget counts the memory of computed tensors on d, held by
+// them or kept by the device for reuse, until they are garbage collected;
+// tensors uploaded with FromSlice are not counted. train.MemoryBudget
+// trains within a budget by splitting batches that do not fit.
+func SetMemoryBudget(d Device, bytes int64) { sched.SetBudget(d.backend(), bytes) }
+
+// MemoryBudget returns the memory budget of d, or 0 if it has none.
+func MemoryBudget(d Device) int64 { return sched.Budget(d.backend()) }
+
 // backendOf returns the backend that computes n: the device of its inputs
 // or memory, or the default device.
 func backendOf(n *graph.Node) backend.Backend {
