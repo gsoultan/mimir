@@ -146,34 +146,88 @@ func randomActivations(rng *rand.Rand, dt backend.DType, rows, k int) ([]byte, i
 	return out, stride
 }
 
+// saturated returns k weights of dt and rows of activations at the
+// extremes of the integers the kernels multiply: the largest scales, -128
+// quants of Q8_0, 15 of Q4_K and 63 of Q6_K, and activations of -127, so
+// that a sum that overflowed or saturated would show.
+func saturated(dt backend.DType, rows, k int) (w, x []byte, xstride int) {
+	w = make([]byte, k/dt.BlockSize()*dt.BlockBytes())
+	for b := 0; b < len(w); b += dt.BlockBytes() {
+		blk := w[b : b+dt.BlockBytes()]
+		switch dt {
+		case backend.Q8_0:
+			for i := range blk {
+				blk[i] = 0x80
+			}
+			blk[0], blk[1] = 0x00, 0x3c // 1
+		case backend.Q4_K:
+			for i := range blk {
+				blk[i] = 0xff
+			}
+			blk[0], blk[1], blk[2], blk[3] = 0x00, 0x3c, 0x00, 0x38 // 1, 0.5
+		case backend.Q6_K:
+			for i := range blk {
+				blk[i] = 0xff
+			}
+			for i := 192; i < 208; i++ {
+				blk[i] = 0x80 // -128
+			}
+			blk[208], blk[209] = 0x00, 0x3c
+		}
+	}
+	bs, bb := actBlock(dt)
+	xstride = k / bs * bb
+	x = make([]byte, rows*xstride)
+	v := make([]float32, k)
+	for i := range v {
+		v[i] = -1
+	}
+	for r := range rows {
+		quantizeRow(x[r*xstride:(r+1)*xstride], v, bs, bs == 256)
+	}
+	return w, x, xstride
+}
+
 func TestQDotKernelsMatchPortable(t *testing.T) {
+	t.Logf("%s kernels", qdotISA)
 	rng := rand.New(rand.NewPCG(7, 8))
+	portableKernels := map[backend.DType]func(int, []byte, []byte) float32{
+		backend.Q8_0: qdotQ8_0Go, backend.Q4_K: qdotQ4KGo, backend.Q6_K: qdotQ6KGo,
+	}
 	for _, dt := range quantTypes {
-		for _, nb := range []int{1, 2, 7} {
+		for _, nb := range []int{0, 1, 2, 7, 33} {
 			k := nb * dt.BlockSize()
 			w := quanttest.Random(rng, dt, k)
 			x, xstride := randomActivations(rng, dt, maxRows, k)
-			want := make([]float32, maxRows)
-			portableKernels := map[backend.DType]func(int, []byte, []byte) float32{
-				backend.Q8_0: qdotQ8_0Go, backend.Q4_K: qdotQ4KGo, backend.Q6_K: qdotQ6KGo,
-			}
-			for r := range want {
-				want[r] = portableKernels[dt](nb, w, x[r*xstride:])
-			}
-			for rows := 1; rows <= maxRows; rows++ {
-				const ldo = 3
-				got := make([]float32, maxRows*ldo)
-				qdots[dt][rows-1](nb, &w[0], &x[0], xstride, &got[0], ldo)
-				for r := range maxRows {
-					g := got[r*ldo]
-					if r >= rows {
-						if g != 0 {
-							t.Fatalf("%s, %d blocks, %d rows: wrote row %d", dt, nb, rows, r)
+			sw, sx, _ := saturated(dt, maxRows, k)
+			for _, c := range []struct {
+				name string
+				w, x []byte
+			}{{"random", w, x}, {"saturated", sw, sx}} {
+				want := make([]float32, maxRows)
+				for r := range want {
+					want[r] = portableKernels[dt](nb, c.w, c.x[r*xstride:])
+				}
+				// The kernels read no byte of an empty row.
+				wp, xp := new(byte), new(byte)
+				if nb > 0 {
+					wp, xp = &c.w[0], &c.x[0]
+				}
+				for rows := 1; rows <= maxRows; rows++ {
+					const ldo = 3
+					got := make([]float32, maxRows*ldo)
+					qdots[dt][rows-1](nb, wp, xp, xstride, &got[0], ldo)
+					for r := range maxRows {
+						g := got[r*ldo]
+						if r >= rows {
+							if g != 0 {
+								t.Fatalf("%s, %s, %d blocks, %d rows: wrote row %d", dt, c.name, nb, rows, r)
+							}
+							continue
 						}
-						continue
-					}
-					if math.Float32bits(g) != math.Float32bits(want[r]) {
-						t.Fatalf("%s, %d blocks, %d rows: row %d = %v, want %v", dt, nb, rows, r, g, want[r])
+						if math.Float32bits(g) != math.Float32bits(want[r]) && !(g != g && want[r] != want[r]) {
+							t.Fatalf("%s, %s, %d blocks, %d rows: row %d = %v, want %v", dt, c.name, nb, rows, r, g, want[r])
+						}
 					}
 				}
 			}
