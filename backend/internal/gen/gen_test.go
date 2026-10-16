@@ -40,6 +40,7 @@ func TestReduceKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.Reduce(
 func TestMovementKernels(t *testing.T)    { kerneltest.Run(t, kerneltest.Movement(t), emulators(t)) }
 func TestWindowKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.Window(t), emulators(t)) }
 func TestMatMulKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.MatMul(t), emulators(t)) }
+func TestScanKernels(t *testing.T)        { kerneltest.Run(t, kerneltest.Scan(t), emulators(t)) }
 
 // TestConstantsAreParameters checks that kernels differing only in their
 // constants, as an optimizer's update does from one step to the next,

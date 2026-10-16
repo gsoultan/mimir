@@ -426,6 +426,8 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return g.fold(n)
 	case op == backend.OpMatMul:
 		return g.matmul(n)
+	case op == backend.OpScan:
+		return planScan(d, k, outs, ins, n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
@@ -616,13 +618,18 @@ func (g *gen) gather(n int) (*Launch, error) {
 // out[m with m[axis] = idx[m]]. Each output element adds the updates that
 // land on it in the order of their position along axis, as the CPU
 // backend does, and the threads at position 0 along axis check the
-// indices of their column.
+// indices of their column. More than ScatterLines updates of 32-bit
+// elements per line run a thread per line instead (see scatterAddLines).
 func (g *gen) scatterAdd(n int) (*Launch, error) {
 	axis := g.k.Attrs.Axis
 	vd, vi, vu := g.k.In[0], g.k.In[1], g.k.In[2]
 	r := len(g.k.Shape)
 	if g.ins[1] != backend.Int32 || axis < 0 || axis >= r || len(vd.Shape) != r || len(vi.Shape) != r || !slices.Equal(vi.Shape, vu.Shape) {
 		return nil, fmt.Errorf("scatter add along axis %d: %w", axis, backend.ErrInternal)
+	}
+	if vi.Shape[axis] > ScatterLines && g.k.DType.Size() == 4 {
+		lines := &gen{d: g.d, k: g.k, outs: g.outs, ins: g.ins}
+		return lines.scatterAddLines(n)
 	}
 	coords := g.index("i", g.k.Shape)
 	g.line("int dst = %s;", g.param(vd.Offset))

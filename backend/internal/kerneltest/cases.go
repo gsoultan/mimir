@@ -308,6 +308,30 @@ func Movement(t *testing.T) []Case {
 			})
 		}
 	}
+	// Scatter adds of more than gen.ScatterLines updates per line, which
+	// a thread per line adds, along each axis and into an output larger
+	// than the index outside the axis.
+	for axis := range 3 {
+		for name, x := range Views([]int{3, 4, 5}) {
+			upd := []int{3, 3, 5}
+			upd[axis] = 70
+			m, _ := backend.NumElements(upd)
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("scatter add lines/%d/%s", axis, name),
+				K: backend.Kernel{Op: backend.OpScatterAdd, DType: f, Shape: []int{3, 4, 5},
+					In: []backend.View{x.V, backend.Contiguous(upd), backend.Contiguous(upd)}, Attrs: backend.Attrs{Axis: axis}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, f, x.N, 0, 0), HostBuffer(t, rng, i, m, 0, []int{3, 4, 5}[axis]), HostBuffer(t, rng, f, m, 0, 0)},
+			})
+		}
+	}
+	cases = append(cases,
+		Case{Name: "scatter add lines/int", K: backend.Kernel{Op: backend.OpScatterAdd, DType: i, Shape: []int{2, 9},
+			In: []backend.View{backend.Contiguous([]int{2, 9}), backend.Contiguous([]int{2, 50}), backend.Contiguous([]int{50, 2}).Permute([]int{1, 0})}, Attrs: backend.Attrs{Axis: 1}},
+			Ins: []backend.Buffer{HostBuffer(t, rng, i, 18, -9, 9), HostBuffer(t, rng, i, 100, 0, 9), HostBuffer(t, rng, i, 100, -9, 9)}},
+		Case{Name: "scatter add lines/out of range", K: backend.Kernel{Op: backend.OpScatterAdd, DType: f, Shape: []int{40},
+			In: []backend.View{backend.Contiguous([]int{40}), backend.Contiguous([]int{40}), backend.Contiguous([]int{40})}},
+			Ins: []backend.Buffer{HostBuffer(t, rng, f, 40, 0, 0), HostBuffer(t, rng, i, 40, 30, 45), HostBuffer(t, rng, f, 40, 0, 0)}},
+	)
 	return cases
 }
 

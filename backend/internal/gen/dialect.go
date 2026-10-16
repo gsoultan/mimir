@@ -20,6 +20,7 @@ import (
 //	md(a, b, err)   the truncated remainder; int division by zero reports
 //	bf2f(h), h2f(h) the float of the bfloat16 or binary16 element h
 //	f2bf(f), f2h(f) the nearest bfloat16 or binary16 element, ties to even
+//	lse(a, b)       log(exp(a) + exp(b)) of floats, without overflow
 //
 // and declares the variables gid, the thread's index in the launch, tid,
 // its index in its group, and bid, its group's index. The half
@@ -71,7 +72,7 @@ static inline int md(int a, int b, device atomic_uint* err) {
 	return b == -1 ? 0 : a % b;
 }
 static inline float md(float a, float b, device atomic_uint* err) { return fmod(a, b); }
-` + halfPrelude("static inline"),
+` + halfPrelude("static inline") + lsePrelude("static inline"),
 	signature: func(s *strings.Builder, outs, ins []backend.DType, params int) {
 		var args []string
 		for i, dt := range outs {
@@ -124,7 +125,7 @@ static __device__ inline int md(int a, int b, uint* err) {
 	return b == -1 ? 0 : a % b;
 }
 static __device__ inline float md(float a, float b, uint* err) { return fmodf(a, b); }
-` + halfPrelude("static __device__ inline"),
+` + halfPrelude("static __device__ inline") + lsePrelude("static __device__ inline"),
 	signature: func(s *strings.Builder, outs, ins []backend.DType, params int) {
 		fmt.Fprintf(s, "struct Params { int v[%d]; };\n\n", params)
 		var args []string
