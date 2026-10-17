@@ -103,7 +103,7 @@ func BenchmarkDataParallel(b *testing.B) {
 								b.Fatal(err)
 							}
 							start := time.Now()
-							if err := opt.Step(b.Context()); err != nil {
+							if err := dp.Step(b.Context(), opt); err != nil {
 								b.Fatal(err)
 							}
 							opt.ZeroGrad()

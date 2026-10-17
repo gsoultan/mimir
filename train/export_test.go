@@ -18,3 +18,7 @@ func SetWaitPhases(on bool) (restore func()) {
 	waitPhases = on
 	return func() { waitPhases = was }
 }
+
+// AllReduced reports whether p's last Backward reduced the gradients into
+// every replica's.
+func AllReduced(p *Parallel) bool { return p.allReduced }
