@@ -145,11 +145,16 @@ func (b *Backend) RunBatch(ctx context.Context, bt *backend.Batch) error {
 		}
 		c.args = append(c.args[:0], st.scratch...)
 		j := 0
-		for _, bufs := range [2][]backend.Buffer{outs, ins} {
+		for side, bufs := range [2][]backend.Buffer{outs, ins} {
 			for _, buf := range bufs {
 				cb, err := b.own(buf)
 				if err != nil {
 					return err
+				}
+				if side == 0 && len(b.reads) > 0 {
+					if err := b.settle(cb.ptr); err != nil {
+						return err
+					}
 				}
 				if c.ptrs[j] != cb.ptr {
 					c.ptrs[j], c.dirty = cb.ptr, true

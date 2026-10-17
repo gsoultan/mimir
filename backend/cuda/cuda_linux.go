@@ -57,6 +57,10 @@ type Backend struct {
 	// peers holds the devices whose access to this device's memory pool
 	// CopyPeer has settled, granted or not (see peer_linux.go).
 	peers map[int32]bool
+	// reads holds the copies to other devices that read this device's
+	// memory, by address, which work that writes over it waits for (see
+	// settle).
+	reads map[uint64][]peerRead
 }
 
 // buffer is device memory.
@@ -258,9 +262,15 @@ func (b *Backend) free(ptr uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.enter()()
+	_, read := b.reads[ptr]
+	_ = b.settle(ptr)
 	if b.pools {
 		cuMemFreeAsync(ptr, b.stream)
 	} else {
+		if read {
+			// cuMemFree does not wait for the stream.
+			cuStreamSynchronize(b.stream)
+		}
 		cuMemFree(ptr)
 	}
 }
@@ -299,6 +309,9 @@ func (b *Backend) Upload(ctx context.Context, dst backend.Buffer, src []byte) er
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.enter()()
+	if err := b.settle(cb.ptr); err != nil {
+		return err
+	}
 	if len(src) > 0 {
 		if r := cuMemcpyHtoDAsync(cb.ptr, unsafe.Pointer(&src[0]), uintptr(len(src)), b.stream); r != cudaSuccess {
 			return check(r, "upload")
@@ -381,6 +394,11 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.enter()()
+	for _, ptr := range ptrs[:len(outs)] {
+		if err := b.settle(ptr); err != nil {
+			return err
+		}
+	}
 	var c call
 	if err := b.plan(&c, k, outs, ins); err != nil {
 		return err
