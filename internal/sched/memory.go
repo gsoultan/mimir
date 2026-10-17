@@ -48,6 +48,8 @@ type pool struct {
 	// prediction was exact.
 	obtained, predicted int64
 
+	programs cache // the programs of recent schedules (see cache.go)
+
 	acct      sync.Mutex
 	allocated int64                         // bytes obtained from be whose buffers are alive
 	owned     map[weak.Pointer[byte]]*entry // the alive buffers obtained from be
@@ -59,7 +61,13 @@ type poolKey struct {
 }
 
 // bytes returns the size of a buffer of key.
-func (k poolKey) bytes() int64 { return int64(k.n) * int64(k.dt.Size()) }
+func (k poolKey) bytes() int64 { return bufferBytes(k.dt, k.n) }
+
+// bufferBytes returns the size of a buffer of n elements of dt.
+func bufferBytes(dt backend.DType, n int) int64 {
+	size, _ := dt.Bytes(n)
+	return int64(size)
+}
 
 type pooled struct {
 	buf   backend.Buffer
@@ -89,18 +97,51 @@ func poolOf(be backend.Backend) *pool {
 // alloc returns a buffer of n elements of dt with unspecified contents,
 // the most recently freed one if the pool has one.
 func (p *pool) alloc(dt backend.DType, n int) (backend.Buffer, error) {
-	key := poolKey{dt, n}
+	buf, _, err := p.take(poolKey{dt, n}, 0, false)
+	return buf, err
+}
+
+// take returns a buffer of key with unspecified contents: the one at
+// address at if the pool holds it; otherwise a new one from the backend
+// if obtain is set or the pool has none of key, and otherwise the most
+// recently freed one. It reports whether the buffer is new.
+//
+// A program asks for the buffers it took in its last run, so that a
+// replayed schedule runs over the same buffers every time, rather than
+// ones the order of the pool shuffled, and a backend can keep what it
+// derived from them, such as a CUDA graph. A buffer that a result took
+// away leaves the pool, so the program's run must obtain a new one from
+// the backend: it does so for the buffer that went missing (obtain)
+// rather than take the buffer of another, which would have to take
+// another's in turn. The address is a preference only: a newer buffer at
+// the address of a collected one serves as well as any other.
+func (p *pool) take(key poolKey, at uintptr, obtain bool) (backend.Buffer, bool, error) {
 	if bufs := p.free[key]; len(bufs) > 0 {
-		p.free[key] = bufs[:len(bufs)-1]
-		return bufs[len(bufs)-1].buf, nil
+		i := -1
+		if at != 0 {
+			for j := len(bufs) - 1; j >= 0; j-- {
+				if uintptr(addressOf(bufs[j].buf)) == at {
+					i = j
+					break
+				}
+			}
+		}
+		if i >= 0 || !obtain {
+			if i < 0 {
+				i = len(bufs) - 1
+			}
+			buf := bufs[i].buf
+			p.free[key] = append(bufs[:i], bufs[i+1:]...)
+			return buf, false, nil
+		}
 	}
-	buf, err := p.be.Alloc(dt, n)
+	buf, err := p.be.Alloc(key.dt, key.n)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	p.obtained += key.bytes()
 	p.track(buf)
-	return buf, nil
+	return buf, true, nil
 }
 
 // release returns buf to the pool.
@@ -129,10 +170,13 @@ func (p *pool) evict(key poolKey, n int) {
 		p.untrack(b.buf)
 		p.be.Free(b.buf)
 	}
+	// A list that alloc emptied keeps its key and capacity, so that a
+	// buffer released to it in every schedule allocates nothing.
 	switch {
+	case n == 0:
 	case n == len(bufs):
 		delete(p.free, key)
-	case n > 0:
+	default:
 		p.free[key] = append(bufs[:0], bufs[n:]...)
 	}
 }
@@ -162,12 +206,13 @@ func (p *pool) track(buf backend.Buffer) {
 	if ptr == nil {
 		return
 	}
-	e := &entry{bytes: int64(buf.Len()) * int64(buf.DType().Size()), ref: weak.Make((*byte)(ptr))}
+	ref := weak.Make((*byte)(ptr))
 	p.acct.Lock()
 	defer p.acct.Unlock()
-	if p.owned[e.ref] != nil {
+	if p.owned[ref] != nil {
 		return
 	}
+	e := &entry{bytes: bufferBytes(buf.DType(), buf.Len()), ref: ref}
 	p.allocated += e.bytes
 	p.owned[e.ref] = e
 	e.stop = runtime.AddCleanup((*byte)(ptr), p.settle, e)

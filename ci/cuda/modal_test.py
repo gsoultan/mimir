@@ -7,6 +7,12 @@ copies this checkout into a container with the CUDA runtime libraries on
 a T4 and runs ci/cuda/test.sh there. The Go module and build caches live
 in a Modal volume, so a run compiles only what changed. The exit code is
 the script's.
+
+    modal run ci/cuda/modal_test.py --gpus 4 --script ci/cuda/parallel.sh
+
+runs the data-parallel tests and scaling benchmark on a host with four
+T4s instead (--gpu-type picks another model, such as L4 or A100). Modal
+bills every GPU of the host, so run it on purpose, not on every change.
 """
 
 import os
@@ -52,5 +58,8 @@ def run(script: str) -> int:
 
 
 @app.local_entrypoint()
-def main(script: str = "ci/cuda/test.sh"):
-    sys.exit(run.remote(script))
+def main(script: str = "ci/cuda/test.sh", gpus: int = 1, gpu_type: str = GPU):
+    fn = run
+    if gpus != 1 or gpu_type != GPU:
+        fn = run.with_options(gpu=f"{gpu_type}:{gpus}")
+    sys.exit(fn.remote(script))

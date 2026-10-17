@@ -124,7 +124,11 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 	case sums == 1 && outputs > 1 && m >= n && shared && wideEnough(g, m, n, k, outputs, be.workers):
 		a.off = offA[0]
 		return be.sgemmWide(ctx, g, out, a, b, offB, m, n, k, epi)
-	case groups > 1:
+	case groups > 1 || sums > 1 && outputs < be.workers:
+		// Summing in groups, or, with too little memory for partial sums,
+		// in one group whose parts compute every product independently:
+		// the alternative, sgemmShared, waits for every worker after each
+		// product, and so for the slowest one, many times.
 		return be.sgemmGrouped(ctx, g, out, a, offA, b, offB, m, n, k, sums, groups, epi)
 	case outputs >= be.workers || flops < 4*minUnitFlops:
 		return be.parallelFor(ctx, outputs, max(1, minUnitFlops/flops), func(lo, hi int) error {
@@ -150,11 +154,11 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 }
 
 // sgemmGrouped computes out like sgemm, splitting the sums products of
-// each output into groups of consecutive ones. It sums the groups of every
-// output in parallel, the first into out and the others into partial
-// sums, and then adds the partial sums to out in order. When there are
-// fewer groups than workers it splits each group's output too; see
-// groupWorkers.
+// each output into groups of consecutive ones, or keeping them in one. It
+// sums the groups of every output in parallel, the first into out and the
+// others into partial sums, and then adds the partial sums to out in
+// order. When there are fewer groups than workers it splits each group's
+// output too; see groupWorkers. Each part packs the operands it needs.
 func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, sums, groups int, epi *evaluator) error {
 	size := m * n
 	outputs := len(out) / size
@@ -163,7 +167,7 @@ func (be *Backend) sgemmGrouped(ctx context.Context, g *gemmKernel, out []float3
 	shared.partials = grow(shared.partials, (groups-1)*len(out))
 	partials := shared.partials
 	depth := k * (sums / groups) // of a group's products, at least
-	p := planGEMM(g, m, n, depth, groupWorkers(outputs*groups, be.workers))
+	p := planParts(g, m, n, depth, groupWorkers(outputs*groups, be.workers))
 	parts := p.mParts * p.nParts
 	flops := max(2*size*depth/parts, 1)
 	err := be.parallelFor(ctx, outputs*groups*parts, max(1, minUnitFlops/flops), func(lo, hi int) error {
@@ -234,7 +238,7 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a operand, of
 	defer gemmWorkspaces.Put(shared)
 	for jc := 0; jc < n; jc += g.nc {
 		nc := min(g.nc, n-jc)
-		p := planGEMM(g, m, nc, k, be.workers)
+		p := spreadRows(g, planGEMM(g, m, nc, k, be.workers), m, min(k, g.kc), be.workers)
 		for t := range offA {
 			at, bt := a, b
 			at.off, bt.off = offA[t], offB[t]
@@ -311,7 +315,7 @@ func (be *Backend) sgemmWide(ctx context.Context, g *gemmKernel, out []float32, 
 	defer gemmWorkspaces.Put(shared)
 	for q0 := 0; q0 < total; q0 += block {
 		q1 := min(q0+block, total)
-		p := planGEMM(g, m, (q1-q0)*g.nr, k, be.workers)
+		p := spreadRows(g, planGEMM(g, m, (q1-q0)*g.nr, k, be.workers), m, min(k, g.kc), be.workers)
 		for pc := 0; pc < k; pc += g.kc {
 			kc := min(g.kc, k-pc)
 			shared.b = grow(shared.b, (q1-q0)*g.nr*kc+packSlack)
@@ -379,6 +383,45 @@ type gemmPlan struct {
 // the columns repeats that packing. The plan minimizes the work of the
 // busiest worker, counting a packed element of A as packCost multiply-adds.
 func planGEMM(g *gemmKernel, m, n, k, workers int) gemmPlan {
+	return planSplit(g, m, n, k, workers, false)
+}
+
+// spreadParts is how many parts per worker spreadRows aims for.
+const spreadParts = 4
+
+// spreadFlops is the fewest multiply-adds, times two, that spreadRows
+// leaves in a part: enough that claiming it costs little.
+const spreadFlops = 32 * minUnitFlops
+
+// spreadRows splits the rows of the parts of plan p, of an m-row output
+// whose B panels are packed once for all parts, kc deep, into about
+// spreadParts parts per worker. Rows cost no extra packing to split, as
+// each part packs the rows of A it needs anyway, and the finer parts
+// balance the work: a worker that finishes early, or that other
+// processes on the machine leave more time, takes more of them instead of
+// waiting for the slowest.
+func spreadRows(g *gemmKernel, p gemmPlan, m, kc, workers int) gemmPlan {
+	parts := p.mParts * p.nParts
+	if parts < 2 {
+		return p
+	}
+	want := (spreadParts*workers + p.nParts - 1) / p.nParts
+	least := roundUp(max(1, spreadFlops/max(2*p.nStep*kc, 1)), g.mr)
+	step := max(roundUp((m+want-1)/want, g.mr), least)
+	if step >= p.mStep {
+		return p
+	}
+	p.mStep, p.mParts = step, (m+step-1)/step
+	return p
+}
+
+// planParts is planGEMM for parts that each pack the columns of B they
+// need too, so that splitting the rows repeats that packing as well.
+func planParts(g *gemmKernel, m, n, k, workers int) gemmPlan {
+	return planSplit(g, m, n, k, workers, true)
+}
+
+func planSplit(g *gemmKernel, m, n, k, workers int, packsB bool) gemmPlan {
 	p := gemmPlan{mStep: max(m, 1), nStep: max(n, 1), mParts: 1, nParts: 1}
 	want := min(workers, 2*m*n*max(k, 1)/minUnitFlops)
 	if want <= 1 {
@@ -390,7 +433,13 @@ func planGEMM(g *gemmKernel, m, n, k, workers int) gemmPlan {
 		pm := min((want+pn-1)/pn, mt)
 		mTiles, nTiles := (mt+pm-1)/pm, (nt+pn-1)/pn
 		rounds := (pm*pn + workers - 1) / workers
-		if cost := rounds * mTiles * (nTiles*g.nr + packCost); best < 0 || cost < best {
+		// In multiply-adds per element of k, for rows of A packed and
+		// columns of B packed by each part.
+		cost := rounds * mTiles * g.mr * (nTiles*g.nr + packCost)
+		if packsB {
+			cost += rounds * nTiles * g.nr * packCost
+		}
+		if best < 0 || cost < best {
 			best = cost
 			p.mStep, p.nStep = mTiles*g.mr, nTiles*g.nr
 		}

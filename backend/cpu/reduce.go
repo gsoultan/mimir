@@ -264,6 +264,9 @@ func sumInto[T number, A float64 | number, S elem](ctx context.Context, b *Backe
 	if p.rowLen == 1 {
 		runs = newWalker(outer)
 	} else {
+		if redSize := p.red.Size(); redSize >= 2*sumBlock && len(out)/p.rowLen*((p.rowLen+rowChunk-1)/rowChunk) < b.workers {
+			return sumInBlocks[T, A](ctx, b, p, out, in, redSize)
+		}
 		red = newWalker(p.red)
 	}
 	element := func(i, off int) {
@@ -283,19 +286,7 @@ func sumInto[T number, A float64 | number, S elem](ctx context.Context, b *Backe
 	}
 	row := func(i, off int, acc []A) {
 		clear(acc)
-		red.walk(func(o int) {
-			src := off + o
-			if p.rowStep == 1 {
-				for j, x := range in[src : src+len(acc)] {
-					acc[j] += conv[A](x)
-				}
-				return
-			}
-			for j := range acc {
-				acc[j] += conv[A](in[src])
-				src += p.rowStep
-			}
-		})
+		red.walk(func(o int) { addRow(acc, in, off+o, p.rowStep) })
 		for j, a := range acc {
 			out[i+j] = T(a)
 		}
@@ -303,9 +294,80 @@ func sumInto[T number, A float64 | number, S elem](ctx context.Context, b *Backe
 	return forReduction(ctx, b, p, len(out), element, row)
 }
 
+// sumBlock is how many reduced positions sumInBlocks sums in a block.
+const sumBlock = 64
+
+// sumInBlocks sums the reduced elements of a reduction planned in rows,
+// which has too few rows to give every worker one, such as the gradient
+// of a bias summed over a batch: it splits the reduced positions into
+// blocks of sumBlock, sums the blocks of every row in parallel and then
+// adds each row's block sums in order. The blocks depend only on the
+// shape, so the result does not depend on the number of workers.
+func sumInBlocks[T number, A float64 | number, S elem](ctx context.Context, b *Backend, p reduction, out []T, in []S, redSize int) error {
+	offs := make([]int, 0, redSize)
+	walk(p.red, func(o int) { offs = append(offs, o) })
+	rows := len(out) / p.rowLen
+	blocks := (redSize + sumBlock - 1) / sumBlock
+	parts := make([]A, blocks*len(out))
+	err := b.parallelFor(ctx, rows*blocks, 1, func(lo, hi int) error {
+		for u := lo; u < hi; u++ {
+			r, blk := u/blocks, u%blocks
+			base := newCursor(p.rows.Shape, []backend.View{p.rows}, r).offs[0]
+			acc := parts[blk*len(out)+r*p.rowLen:][:p.rowLen]
+			for _, o := range offs[blk*sumBlock : min(redSize, (blk+1)*sumBlock)] {
+				addRow(acc, in, base+o, p.rowStep)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return b.parallelFor(ctx, len(out), elementGrain/blocks, func(lo, hi int) error {
+		for i := lo; i < hi; i++ {
+			var sum A
+			for blk := range blocks {
+				sum += parts[blk*len(out)+i]
+			}
+			out[i] = T(sum)
+		}
+		return nil
+	})
+}
+
+// addRow adds the len(acc) elements of in from src on, step apart, to
+// acc.
+func addRow[A float64 | number, S elem](acc []A, in []S, src, step int) {
+	if step == 1 {
+		x := in[src : src+len(acc)]
+		// Converting each element through conv costs a call.
+		if a, ok := any(acc).([]float64); ok {
+			if f, ok := any(x).([]float32); ok {
+				for j, v := range f[:len(a)] {
+					a[j] += float64(v)
+				}
+				return
+			}
+		}
+		for j, v := range x {
+			acc[j] += conv[A](v)
+		}
+		return
+	}
+	for j := range acc {
+		acc[j] += conv[A](in[src])
+		src += step
+	}
+}
+
 // sumRun returns the sum of x. Four running sums let the additions
 // overlap instead of each waiting for the one before.
 func sumRun[A float64 | number, S elem](x []S) A {
+	if f, ok := any(x).([]float32); ok {
+		if _, ok := any(A(0)).(float64); ok {
+			return A(sumFloats(f))
+		}
+	}
 	var a0, a1, a2, a3 A
 	for len(x) >= 4 {
 		a0 += conv[A](x[0])
@@ -316,6 +378,23 @@ func sumRun[A float64 | number, S elem](x []S) A {
 	}
 	for _, v := range x {
 		a0 += conv[A](v)
+	}
+	return (a0 + a1) + (a2 + a3)
+}
+
+// sumFloats is sumRun of float32 elements in float64, without a call to
+// convert each.
+func sumFloats(x []float32) float64 {
+	var a0, a1, a2, a3 float64
+	for len(x) >= 4 {
+		a0 += float64(x[0])
+		a1 += float64(x[1])
+		a2 += float64(x[2])
+		a3 += float64(x[3])
+		x = x[4:]
+	}
+	for _, v := range x {
+		a0 += float64(v)
 	}
 	return (a0 + a1) + (a2 + a3)
 }

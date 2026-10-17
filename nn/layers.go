@@ -10,7 +10,10 @@ import (
 )
 
 // Linear applies y = x Wᵀ + b over the last dimension, like
-// torch.nn.Linear.
+// torch.nn.Linear. For inference with weights quantized as a GGUF file
+// holds them, Weight may be a buffer (tensor.NewBuffer) of a
+// block-quantized dtype, which the product reads without dequantizing
+// (see tensor.Tensor.MatMulT).
 type Linear struct {
 	Weight *tensor.Param // [out, in]
 	Bias   *tensor.Param // [out], or nil
@@ -30,7 +33,7 @@ func NewLinear(in, out int, opts ...Option) *Linear {
 
 // Forward maps [..., in] to [..., out].
 func (l *Linear) Forward(x *tensor.Tensor) *tensor.Tensor {
-	y := x.MatMul(l.Weight.Value().Transpose(0, 1))
+	y := x.MatMulT(l.Weight.Value())
 	if l.Bias != nil {
 		y = y.Add(l.Bias.Value())
 	}

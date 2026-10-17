@@ -3,7 +3,6 @@ package tensor
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
@@ -19,16 +18,19 @@ var hostIsLittleEndian = binary.NativeEndian.Uint32([]byte{1, 2, 3, 4}) == binar
 
 // FromBytes returns a tensor on the CPU whose elements of dt are the
 // little-endian bytes of data, as a safetensors file stores them. With no
-// shape it is one-dimensional; otherwise the shape must hold exactly
-// len(data)/dt.Size() elements.
+// shape it is one-dimensional; otherwise the shape must hold exactly the
+// elements of data: len(data)/dt.Size() of them, or for a block-quantized
+// dt the elements of len(data)/dt.BlockBytes() blocks, which fill whole
+// rows of the last dimension.
 //
 // The tensor reads data in place, without copying, when data starts at an
 // address that is a multiple of the element size and the host is
-// little-endian; otherwise it holds a copy, as FromSlice does. In place,
-// the caller keeps data valid for as long as the tensor, or any view of
-// it, is in use; FromBytesFunc tells the caller when that is. An
-// operation that writes over the tensor's memory, as an optimizer step
-// does over a parameter set from it (see Param.Set), writes the bytes.
+// little-endian, and always for a block-quantized dt; otherwise it holds
+// a copy, as FromSlice does. In place, the caller keeps data valid for as
+// long as the tensor, or any view of it, is in use; FromBytesFunc tells
+// the caller when that is. An operation that writes over the tensor's
+// memory, as an optimizer step does over a parameter set from it (see
+// Param.Set), writes the bytes.
 //
 // The tensor lives on the CPU whatever the default device; To moves it.
 func FromBytes(dt DType, data []byte, shape ...int) *Tensor {
@@ -52,20 +54,21 @@ func FromBytesFunc(dt DType, data []byte, release func(), shape ...int) *Tensor 
 		done()
 		return fail(defaultErr)
 	}
-	size := dt.Size()
-	if size == 0 {
+	bs, bb := dt.BlockSize(), dt.BlockBytes()
+	if bb == 0 {
 		done()
 		return fail(fmt.Errorf("tensor: FromBytes of %s: %w", dt, ErrDType))
 	}
 	if len(shape) == 0 {
-		shape = []int{len(data) / size}
+		shape = []int{len(data) / bb * bs}
 	}
 	n, ok := backend.NumElements(shape)
-	if !ok || n > math.MaxInt/size || n*size != len(data) {
+	size, whole := dt.Bytes(n)
+	if !ok || !whole || size != len(data) {
 		done()
 		return fail(fmt.Errorf("tensor: %d bytes of %s for shape %v: %w", len(data), dt, shape, ErrShape))
 	}
-	if hostIsLittleEndian && aligned(data, size) {
+	if dt.IsQuantized() || hostIsLittleEndian && aligned(data, bb) {
 		buf, err := cpu.WrapFunc(dt, data, release)
 		if err != nil {
 			done()
@@ -74,7 +77,7 @@ func FromBytesFunc(dt DType, data []byte, release func(), shape ...int) *Tensor 
 		return wrap(graph.Load(cpuBackend, buf, shape))
 	}
 	defer done() // upload copies data
-	return upload(cpuBackend, dt, hostOrder(size, data), shape)
+	return upload(cpuBackend, dt, hostOrder(bb, data), shape)
 }
 
 // aligned reports whether data starts at a multiple of size bytes.

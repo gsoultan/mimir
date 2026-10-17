@@ -123,6 +123,13 @@ func TestSchedulesPredictTheirAllocationsExactly(t *testing.T) {
 			u := must(graph.Unfold(p, w, 0))
 			return []*graph.Node{u}, (2*7*7 + 2*3*3*5*5) * f
 		}},
+		{"scan of a view, scanned again", func(t *testing.T, be backend.Backend) ([]*graph.Node, int64) {
+			// The scan reads the transposed input in place; the second
+			// scan reads the first, which is freed after it.
+			x := realized(t, be, []int{4, 6}, 1)
+			s := must(graph.Scan(must(graph.Permute(x, []int{1, 0})), 0, backend.CombineSum))
+			return []*graph.Node{must(graph.Scan(s, 1, backend.CombineMax))}, 2 * 6 * 4 * f
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -333,12 +340,12 @@ func TestDownloadsCheckTheirCopyAgainstTheBudget(t *testing.T) {
 	held := MemoryOf(be).Allocated
 	out := make([]byte, 24*4)
 	SetBudget(be, held+24*4-1)
-	if err := Download(t.Context(), be, p, out); !errors.Is(err, backend.ErrMemoryBudget) {
+	if err := Download(t.Context(), be, p, out, nil); !errors.Is(err, backend.ErrMemoryBudget) {
 		t.Fatalf("got %v, want ErrMemoryBudget", err)
 	}
 	SetBudget(be, held+24*4)
 	before := MemoryOf(be)
-	if err := Download(t.Context(), be, p, out); err != nil {
+	if err := Download(t.Context(), be, p, out, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := predictedExactly(t, be, before); got != 24*4 {

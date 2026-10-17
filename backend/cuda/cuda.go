@@ -24,62 +24,7 @@
 // a static binary again.
 package cuda
 
-import (
-	"errors"
-
-	"github.com/gsoultan/mimir/backend/internal/gen"
-)
+import "errors"
 
 // ErrUnavailable reports that no CUDA device can be used.
 var ErrUnavailable = errors.New("cuda unavailable")
-
-// sgemm is a call of cublasSgemmStridedBatched: batch products of an m ×
-// k and a k × n matrix, each read in column-major order and transposed if
-// the operand says, into m × n column-major results ldc elements per
-// column and strideC elements apart.
-//
-// cuBLAS reads matrices in column-major order, which is row-major order
-// transposed, so the backend computes the transpose of the row-major
-// result C = A·B as Cᵀ = Bᵀ·Aᵀ: cuBLAS's first operand is the product's
-// right one, input 1, and its second the left one, input 0.
-type sgemm struct {
-	m, n, k      int
-	a, b         operand
-	ldc, strideC int
-	batch        int
-}
-
-// operand is how cuBLAS reads one operand: the matrices of input in,
-// column-major with ld elements per column and stride elements apart,
-// from element offset, transposed if trans is set.
-type operand struct {
-	in                 int
-	offset, ld, stride int
-	trans              bool
-}
-
-// planSgemm returns the cuBLAS call that computes the product g.
-func planSgemm(g gen.GEMM) sgemm {
-	// A row-major matrix stored with ld elements per row is, read in
-	// column-major order with ld elements per column, its transpose. So
-	// the right operand as stored is Bᵀ, which cuBLAS reads as it is,
-	// unless the operand is stored transposed: then it is B, and cuBLAS
-	// transposes it. Likewise the left one.
-	return sgemm{
-		m: g.N, n: g.M, k: g.K,
-		a:       operand{in: 1, offset: g.B.Offset, ld: g.B.LD, stride: g.B.Stride, trans: g.B.Trans},
-		b:       operand{in: 0, offset: g.A.Offset, ld: g.A.LD, stride: g.A.Stride, trans: g.A.Trans},
-		ldc:     g.N,
-		strideC: g.ResultSize,
-		batch:   g.Batch,
-	}
-}
-
-// at returns the element of the buffer that holds element (i, j) of
-// matrix b of the operand o stands for, as cuBLAS reads it.
-func (o operand) at(b, i, j int) int {
-	if o.trans {
-		i, j = j, i
-	}
-	return o.offset + b*o.stride + j*o.ld + i
-}

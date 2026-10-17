@@ -1,34 +1,12 @@
 package safetensors
 
 import (
+	"errors"
 	"fmt"
-	"io"
-	"math"
-	"os"
 	"runtime"
-	"sync"
+
+	"github.com/gsoultan/mimir/internal/filemap"
 )
-
-// mapping is a file mapped into memory that the tensors of a File alias.
-// It counts its holders, the File until Close and each reader that Hold
-// added, and is unmapped when the last lets go.
-type mapping struct {
-	mu    sync.Mutex
-	holds int          // the File's, until Close, and each of Hold's
-	unmap func() error // nil once unmapped
-}
-
-// release lets go of one hold, and unmaps the file if it was the last.
-func (m *mapping) release() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.holds--; m.holds > 0 || m.unmap == nil {
-		return nil
-	}
-	err := m.unmap()
-	m.unmap = nil
-	return err
-}
 
 // Open parses the file at path. On Unix systems, Linux and macOS among
 // them, and on Windows, Open maps the file into memory instead of reading
@@ -44,41 +22,23 @@ func (m *mapping) release() error {
 // another process truncates while it is mapped faults when the truncated
 // pages are read.
 func Open(path string) (*File, error) {
-	fd, err := os.Open(path)
+	data, m, err := filemap.Read(path)
+	if errors.Is(err, filemap.ErrTooLarge) {
+		return nil, fmt.Errorf("safetensors: %s: %w: %w", path, err, ErrFormat)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("safetensors: %w", err)
-	}
-	defer fd.Close()
-	info, err := fd.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("safetensors: %w", err)
-	}
-	if info.Size() > math.MaxInt {
-		return nil, fmt.Errorf("safetensors: %s holds %d bytes, more than can be addressed: %w", path, info.Size(), ErrFormat)
-	}
-	var data []byte
-	var unmap func() error
-	if size := int(info.Size()); size > 0 {
-		// A file that cannot be mapped, as on a file system without
-		// mappings, is read instead.
-		data, unmap, _ = mapFile(fd, size)
-	}
-	if unmap == nil {
-		if data, err = io.ReadAll(fd); err != nil {
-			return nil, fmt.Errorf("safetensors: %w", err)
-		}
 	}
 	f, err := Parse(data)
 	if err != nil {
-		if unmap != nil {
-			_ = unmap()
+		if m != nil {
+			_ = m.Close()
 		}
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if unmap != nil {
-		m := &mapping{holds: 1, unmap: unmap}
+	if m != nil {
 		f.mapping = m
-		f.cleanup = runtime.AddCleanup(f, func(m *mapping) { _ = m.release() }, m)
+		f.cleanup = runtime.AddCleanup(f, func(m *filemap.Mapping) { _ = m.Close() }, m)
 	}
 	return f, nil
 }
@@ -96,17 +56,10 @@ func (f *File) Mapped() bool { return f.mapping != nil }
 // function that does nothing: the bytes of a file that is not mapped stay
 // valid as long as they are referenced, and a closed file has no tensors.
 func (f *File) Hold() func() {
-	m := f.mapping
-	if m == nil {
+	if f.mapping == nil {
 		return func() {}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if f.closed || m.unmap == nil {
-		return func() {}
-	}
-	m.holds++
-	return sync.OnceFunc(func() { _ = m.release() })
+	return f.mapping.Hold()
 }
 
 // Close lets go of the File's hold on the mapping of a file that Open
@@ -115,17 +68,10 @@ func (f *File) Hold() func() {
 // from it before must not be used except through such a reader. Closing
 // a file that is not mapped, or closing again, does nothing.
 func (f *File) Close() error {
-	m := f.mapping
-	if m == nil {
+	if f.mapping == nil {
 		return nil
 	}
-	m.mu.Lock()
-	if f.closed {
-		m.mu.Unlock()
-		return nil
-	}
-	f.closed, f.tensors = true, nil
-	m.mu.Unlock()
 	f.cleanup.Stop()
-	return m.release()
+	f.tensors = nil
+	return f.mapping.Close()
 }

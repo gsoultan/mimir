@@ -34,3 +34,39 @@ func pad[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, in []T
 		}
 	})
 }
+
+// sliceScatter copies x into out, unless out is x's buffer already, and
+// then src over the block k.Attrs.Ranges of out.
+func sliceScatter[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x, src []T, inPlace bool) error {
+	whole := backend.Contiguous(k.Shape)
+	if !inPlace {
+		err := forRows(ctx, b, k.Shape, []backend.View{k.In[0], whole}, func(_ int, offs, steps []int, n int) {
+			from, to := offs[0], offs[1]
+			if steps[0] == 1 && steps[1] == 1 {
+				copy(out[to:to+n], x[from:from+n])
+				return
+			}
+			for range n {
+				out[to] = x[from]
+				from += steps[0]
+				to += steps[1]
+			}
+		})
+		if err != nil {
+			return err
+		}
+	}
+	block := whole.Shrink(k.Attrs.Ranges)
+	return forRows(ctx, b, k.In[1].Shape, []backend.View{k.In[1], block}, func(_ int, offs, steps []int, n int) {
+		from, to := offs[0], offs[1]
+		if steps[0] == 1 && steps[1] == 1 {
+			copy(out[to:to+n], src[from:from+n])
+			return
+		}
+		for range n {
+			out[to] = src[from]
+			from += steps[0]
+			to += steps[1]
+		}
+	})
+}

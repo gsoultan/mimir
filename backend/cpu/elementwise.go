@@ -110,7 +110,7 @@ func floatOnly(op backend.Op) bool {
 	case backend.OpExp2, backend.OpLog2, backend.OpSin, backend.OpSqrt, backend.OpRecip:
 		return true
 	}
-	return false
+	return op.IsSpecial()
 }
 
 // singleOp returns the program of a kernel that applies one elementwise op
@@ -326,11 +326,31 @@ func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backe
 		return err
 	}
 	total, _ := backend.NumElements(k.Shape)
-	return b.parallelFor(ctx, total, elementGrain, func(lo, hi int) error {
+	return b.parallelFor(ctx, total, programGrain(prog), func(lo, hi int) error {
 		s := scratchPool.Get().(*scratch)
 		defer scratchPool.Put(s)
 		return e.run(s, lo, hi)
 	})
+}
+
+// programGrain returns the fewest elements of prog worth a goroutine:
+// elementGrain for a single binary op, and proportionally fewer for
+// programs that cost more per element, counting a transcendental op as
+// many simple ones. A recurrent step's gate math, tens of operations over
+// a few thousand elements, is then spread over the workers too.
+func programGrain(prog []backend.Instr) int {
+	cost := 0
+	for _, in := range prog {
+		switch in.Op {
+		case backend.OpExp2, backend.OpLog2, backend.OpSin:
+			cost += 16
+		case backend.OpLog1p, backend.OpExpm1, backend.OpErf, backend.OpErfinv, backend.OpLgamma, backend.OpDigamma, backend.OpTrigamma:
+			cost += 48
+		default:
+			cost++
+		}
+	}
+	return max(tileLen, elementGrain*3/max(cost, 1))
 }
 
 // evaluator computes an elementwise program over ranges of its output.
@@ -783,6 +803,13 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 			dst[i] = -x
 		}
 	case backend.OpRecip:
+		if d, ok := any(dst).([]float32); ok && rowVector != nil {
+			n := vectorPart(len(d))
+			if n > 0 {
+				rowVector.recip(&d[0], &any(a).([]float32)[0], n)
+			}
+			dst, a = dst[n:], a[n:]
+		}
 		for i, x := range a {
 			dst[i] = 1 / x
 		}
@@ -791,8 +818,12 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 			dst[i] = T(math.Sqrt(float64(x)))
 		}
 	case backend.OpExp2:
+		if d, ok := any(dst).([]float32); ok && rowVector != nil {
+			exp2Floats(d, any(a).([]float32))
+			return
+		}
 		for i, x := range a {
-			dst[i] = T(math.Exp2(float64(x)))
+			dst[i] = T(exp2f(float32(x)))
 		}
 	case backend.OpLog2:
 		for i, x := range a {
@@ -802,6 +833,8 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 		for i, x := range a {
 			dst[i] = T(math.Sin(float64(x)))
 		}
+	default:
+		specialLoop(op, dst, a)
 	}
 }
 
@@ -830,6 +863,17 @@ func binaryLane[T number](op backend.Op, dst *lane[T], buf []T, x, y lane[T]) er
 // binaryVV sets dst[i] = a[i] op b[i].
 func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 	a, b = a[:len(dst)], b[:len(dst)]
+	if d, ok := any(dst).([]float32); ok && rowVector != nil && (op == backend.OpAdd || op == backend.OpMul) {
+		if n := vectorPart(len(d)); n > 0 {
+			x, y := any(a).([]float32), any(b).([]float32)
+			if op == backend.OpAdd {
+				rowVector.addVV(&d[0], &x[0], &y[0], n)
+			} else {
+				rowVector.mulVV(&d[0], &x[0], &y[0], n)
+			}
+			dst, a, b = dst[n:], a[n:], b[n:]
+		}
+	}
 	switch op {
 	case backend.OpAdd:
 		for i := range dst {
@@ -866,6 +910,17 @@ func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 // binaryVS sets dst[i] = a[i] op s.
 func binaryVS[T number](op backend.Op, dst, a []T, s T) error {
 	a = a[:len(dst)]
+	if d, ok := any(dst).([]float32); ok && rowVector != nil && (op == backend.OpAdd || op == backend.OpMul) {
+		if n := vectorPart(len(d)); n > 0 {
+			x, v := any(a).([]float32), float32(s)
+			if op == backend.OpAdd {
+				rowVector.addVS(&d[0], &x[0], v, n)
+			} else {
+				rowVector.mulVS(&d[0], &x[0], v, n)
+			}
+			dst, a = dst[n:], a[n:]
+		}
+	}
 	switch op {
 	case backend.OpAdd:
 		for i, x := range a {

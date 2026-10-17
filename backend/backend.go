@@ -34,6 +34,9 @@ var (
 	// ErrInternal reports a defect inside mimir, such as a recovered panic
 	// in a kernel. It is never expected; please report it.
 	ErrInternal = errors.New("internal error")
+	// ErrSingular reports a matrix that a solve cannot invert, or a
+	// Cholesky factorization of one that is not positive definite.
+	ErrSingular = errors.New("singular matrix")
 )
 
 // DType is the element type of a tensor.
@@ -45,6 +48,13 @@ var (
 // a fused program computes what the operations compute one by one.
 // Reductions of half inputs accumulate in float32 and write Float32
 // outputs; matrix products and random numbers are Float32 only.
+//
+// Q8_0, Q4_K and Q6_K are block-quantized storage types, read-only and
+// laid out as ggml stores them (see BlockSize): a buffer of one holds the
+// bytes of whole blocks, and its Len counts their elements. Kernels read
+// them only to dequantize them to Float32: OpCast, OpGather from them and
+// OpQMatMul. They have no Size; Bytes gives the size of a buffer of any
+// dtype.
 type DType uint8
 
 // Supported element types.
@@ -54,9 +64,19 @@ const (
 	Int32
 	BFloat16 // IEEE 754 binary32 truncated to its top 16 bits: 8 exponent and 7 fraction bits
 	Float16  // IEEE 754 binary16: 5 exponent and 10 fraction bits
+
+	// Block-quantized types, in the layouts of ggml (ggml-common.h). A
+	// block's values are its quants times scales that the block stores
+	// as binary16, each element of a block computed as ggml's
+	// dequantize_row functions compute it, rounding after every
+	// operation.
+	Q8_0 // blocks of 32: a binary16 scale d, then 32 int8 quants q; d·q
+	Q4_K // super-blocks of 256: binary16 d and dmin, 12 bytes of eight 6-bit scales and mins, 128 bytes of 4-bit quants
+	Q6_K // super-blocks of 256: 128 bytes of the low 4 bits of the quants, 64 of the high 2 bits, sixteen int8 scales, binary16 d
 )
 
-// Size returns the size of one element in bytes.
+// Size returns the size of one element in bytes, or 0 for a
+// block-quantized type, whose elements share the bytes of their block.
 func (d DType) Size() int {
 	switch d {
 	case Float32, Int32:
@@ -81,6 +101,12 @@ func (d DType) String() string {
 		return "bfloat16"
 	case Float16:
 		return "float16"
+	case Q8_0:
+		return "q8_0"
+	case Q4_K:
+		return "q4_K"
+	case Q6_K:
+		return "q6_K"
 	default:
 		return fmt.Sprintf("DType(%d)", uint8(d))
 	}
@@ -120,7 +146,10 @@ type Backend interface {
 	// OpWhere or OpContiguous) may write an output over an input it reads
 	// through Contiguous(k.Shape): it reads every element of that input
 	// before it writes any element of that output, as an in-place update
-	// needs. No other kernel shares memory between its inputs and outputs.
+	// needs. An OpSliceScatter kernel may write its output over input 0
+	// when it reads it through Contiguous(k.Shape): it then writes only
+	// the block, which leaves the rest of input 0 as the output's values.
+	// No other kernel shares memory between its inputs and outputs.
 	Run(ctx context.Context, k *Kernel, outs []Buffer, ins []Buffer) error
 	// Sync waits until all submitted work has finished.
 	Sync(ctx context.Context) error
@@ -139,11 +168,11 @@ type Kernel struct {
 // Each Op documents which fields it uses.
 type Attrs struct {
 	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
-	Axis   int      // Gather, ScatterAdd: the indexed axis.
+	Axis   int      // Gather, ScatterAdd: the indexed axis. Scan: the scanned axis. Cat: the joined axis. Argsort, FFT: the transformed axis.
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
-	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension.
+	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension. SliceScatter: the block replaced.
 	Value  float64  // Const, Pad, Unfold: the fill value.
-	Seed   uint64   // RandUniform, RandNormal: the Philox key.
+	Seed   uint64   // RandUniform, RandNormal, RandGamma, RandPoisson: the Philox key.
 
 	// Unfold, Fold: the window size, step and spacing of its elements in
 	// each windowed dimension.
@@ -155,6 +184,24 @@ type Attrs struct {
 	// Stores[i] into output i+1. Stored values have the output's dtype
 	// and are computed, not loaded: a copy of an input is OpContiguous.
 	Stores []int
+
+	// Scan: how the elements along Axis combine. Segment: how the rows
+	// of a segment combine.
+	Combine Combine
+
+	// Attention, AttentionGrad: the factor applied to the scores q·k, and
+	// whether to hide key j from query i when j > i + CausalOffset.
+	Scale        float64
+	Causal       bool
+	CausalOffset int
+
+	// Argsort: whether to sort in descending order.
+	Descending bool
+	// FFT: whether to transform with e^(+2πijk/n), the inverse direction.
+	Inverse bool
+	// TriangularSolve: whether the matrix is upper triangular rather than
+	// lower, and whether its diagonal holds ones, which it does not read.
+	Upper, Unit bool
 }
 
 // Instr is one instruction of a fused program. Instruction i computes

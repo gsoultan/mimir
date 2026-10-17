@@ -17,16 +17,25 @@ import (
 // optimizer step.
 var ErrOverwritten = errors.New("tensor memory was overwritten")
 
+// ErrDonated reports a read of a realized node whose memory a schedule
+// took for its own after the node was donated to it. Errors that wrap it
+// wrap ErrOverwritten too.
+var ErrDonated = errors.New("tensor memory was donated")
+
 // Node is one primitive operation. Op, DType, Shape and Attrs never change
 // after construction. Mem, Ver, View and Inputs are owned by the scheduler:
 // once a node is realized it holds its result and drops its inputs, so a
 // realized tensor does not keep the graph that produced it alive.
 type Node struct {
-	Op     backend.Op
-	DType  backend.DType
-	Shape  []int
-	Attrs  backend.Attrs
-	Inputs []*Node
+	Op    backend.Op
+	DType backend.DType
+	// Placeholder marks a node that no graph computes, set when it is
+	// made: it stands for values computed elsewhere, as a tensor inside
+	// tensor.VMap stands for one example of a batch.
+	Placeholder bool
+	Shape       []int
+	Attrs       backend.Attrs
+	Inputs      []*Node
 
 	// Dev is the device that holds the node's inputs, and so computes
 	// it, or nil if it is computed from constants alone and runs on any
@@ -36,6 +45,22 @@ type Node struct {
 	Mem  *Storage     // set once realized
 	Ver  int          // the version of Mem that holds the result
 	View backend.View // how Shape is read from Mem.Buf
+	// Donated marks a realized node whose memory its owner hands over:
+	// the next schedule that reads it may take that memory for its own
+	// results and temporaries.
+	Donated bool
+
+	// Mark is the scheduler's scratch space, which it uses under its lock
+	// while it walks a graph.
+	Mark Mark
+}
+
+// Mark numbers a node or storage within one walk of the scheduler over a
+// graph: Num is meaningful only while Walk is the walk's number, so a new
+// walk starts with every mark cleared without touching them.
+type Mark struct {
+	Walk uint64
+	Num  int32
 }
 
 // Storage is a buffer that realized nodes read, each through its own view.
@@ -46,6 +71,15 @@ type Storage struct {
 	Dev     backend.Backend // the backend that owns Buf
 	Version int
 	Refs    int // the nodes realized into the storage since Version changed
+	// Pooled marks a buffer that the scheduler or an upload obtained
+	// from the backend, which a schedule may take over when it is
+	// donated, unlike memory a caller lent, such as a mapped file.
+	Pooled bool
+	// Donated is set once a schedule took Buf over, so that a read of a
+	// node realized into it reports ErrDonated.
+	Donated bool
+
+	Mark Mark // the scheduler's scratch space, like Node.Mark
 }
 
 // Realized reports whether the node holds its result.
@@ -83,8 +117,14 @@ func checkDType(op backend.Op, dt backend.DType) error {
 }
 
 // newNode completes n, whose inputs must share a device, with that
-// device.
+// device. Block-quantized inputs are refused except where n dequantizes
+// them (see readsQuantized).
 func newNode(n *Node) (*Node, error) {
+	for i, in := range n.Inputs {
+		if in.DType.IsQuantized() && !readsQuantized(n.Op, i) {
+			return nil, errorf(n.Op, backend.ErrDType, "%s input %d", in.DType, i)
+		}
+	}
 	for _, in := range n.Inputs {
 		switch d := in.Dev; {
 		case d == nil:
@@ -97,13 +137,31 @@ func newNode(n *Node) (*Node, error) {
 	return n, nil
 }
 
+// readsQuantized reports whether input i of an op may be block-quantized:
+// the input of a cast, which dequantizes it, the source of a gather, which
+// dequantizes what it reads, and the weights of a quantized product.
+func readsQuantized(op backend.Op, i int) bool {
+	switch op {
+	case backend.OpCast, backend.OpGather:
+		return i == 0
+	case backend.OpQMatMul:
+		return i == 1
+	}
+	return false
+}
+
 // Load wraps a buffer of dev that already holds data of the given shape.
+// A buffer of a block-quantized type holds whole blocks along the last
+// dimension.
 func Load(dev backend.Backend, buf backend.Buffer, shape []int) (*Node, error) {
 	if err := checkShape(backend.OpLoad, shape); err != nil {
 		return nil, err
 	}
 	if n, _ := backend.NumElements(shape); buf.Len() != n {
 		return nil, errorf(backend.OpLoad, backend.ErrShape, "%d elements for shape %v", buf.Len(), shape)
+	}
+	if dt := buf.DType(); dt.IsQuantized() && (len(shape) == 0 || shape[len(shape)-1]%dt.BlockSize() != 0) {
+		return nil, errorf(backend.OpLoad, backend.ErrShape, "%s of shape %v: rows of whole blocks of %d", dt, shape, dt.BlockSize())
 	}
 	mem := &Storage{Buf: buf, Dev: dev, Refs: 1}
 	return &Node{Op: backend.OpLoad, DType: buf.DType(), Shape: slices.Clone(shape), Dev: dev, Mem: mem, View: backend.Contiguous(shape)}, nil
@@ -134,8 +192,8 @@ func Rand(shape []int, seed uint64, normal bool) (*Node, error) {
 	return &Node{Op: op, DType: backend.Float32, Shape: slices.Clone(shape), Attrs: backend.Attrs{Seed: seed}}, nil
 }
 
-// Unary applies an elementwise op. Exp2, Log2, Sin, Sqrt and Recip accept
-// only float types.
+// Unary applies an elementwise op. Every op but Neg accepts only float
+// types.
 func Unary(op backend.Op, x *Node) (*Node, error) {
 	if !op.IsUnary() || op == backend.OpCast {
 		return nil, errorf(op, backend.ErrInternal, "not a unary op")
@@ -147,10 +205,14 @@ func Unary(op backend.Op, x *Node) (*Node, error) {
 }
 
 // Cast converts x to dt. Float to integer truncates toward zero; float to
-// a narrower float rounds to nearest even.
+// a narrower float rounds to nearest even. A block-quantized x is
+// dequantized, to a float dt only.
 func Cast(x *Node, dt backend.DType) (*Node, error) {
 	if err := checkDType(backend.OpCast, dt); err != nil {
 		return nil, err
+	}
+	if x.DType.IsQuantized() && !dt.IsFloat() {
+		return nil, errorf(backend.OpCast, backend.ErrDType, "%s to %s", x.DType, dt)
 	}
 	return newNode(&Node{Op: backend.OpCast, DType: dt, Shape: x.Shape, Inputs: []*Node{x}})
 }
@@ -332,11 +394,31 @@ func checkIndex(op backend.Op, x, idx *Node, axis int) error {
 
 // Gather reads x along axis at Int32 positions idx, like torch.gather. The
 // result has the shape of idx. Positions are checked when the graph runs.
+// A gather from a block-quantized x dequantizes what it reads into a
+// Float32 result.
 func Gather(x, idx *Node, axis int) (*Node, error) {
 	if err := checkIndex(backend.OpGather, x, idx, axis); err != nil {
 		return nil, err
 	}
-	return newNode(&Node{Op: backend.OpGather, DType: x.DType, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}})
+	dt := x.DType
+	if dt.IsQuantized() {
+		dt = backend.Float32
+	}
+	return newNode(&Node{Op: backend.OpGather, DType: dt, Shape: idx.Shape, Inputs: []*Node{x, idx}, Attrs: backend.Attrs{Axis: axis}})
+}
+
+// QMatMul multiplies x, Float32 [..., K], by the transpose of w, a
+// block-quantized [N, K], into a Float32 [..., N]; see backend.OpQMatMul.
+func QMatMul(x, w *Node) (*Node, error) {
+	if x.DType != backend.Float32 || !w.DType.IsQuantized() {
+		return nil, errorf(backend.OpQMatMul, backend.ErrDType, "%s by %s", x.DType, w.DType)
+	}
+	r := len(x.Shape)
+	if r == 0 || len(w.Shape) != 2 || x.Shape[r-1] != w.Shape[1] {
+		return nil, errorf(backend.OpQMatMul, backend.ErrShape, "%v by the transpose of %v", x.Shape, w.Shape)
+	}
+	shape := append(slices.Clone(x.Shape[:r-1]), w.Shape[0])
+	return newNode(&Node{Op: backend.OpQMatMul, DType: backend.Float32, Shape: shape, Inputs: []*Node{x, w}})
 }
 
 // ScatterAdd returns x with src added at Int32 positions idx along axis,
@@ -432,4 +514,268 @@ func Fold(x *Node, spatial []int, w Window) (*Node, error) {
 		return nil, err
 	}
 	return newNode(&Node{Op: backend.OpFold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)})
+}
+
+// Scan is the inclusive scan of x along axis by combine; see
+// backend.OpScan. The result has x's shape and dtype. CombineLogSumExp
+// accepts only float types.
+func Scan(x *Node, axis int, combine backend.Combine) (*Node, error) {
+	if axis < 0 || axis >= len(x.Shape) {
+		return nil, errorf(backend.OpScan, backend.ErrShape, "axis %d for shape %v", axis, x.Shape)
+	}
+	switch combine {
+	case backend.CombineSum, backend.CombineMax:
+	case backend.CombineLogSumExp:
+		if !x.DType.IsFloat() {
+			return nil, errorf(backend.OpScan, backend.ErrDType, "%s of %s", combine, x.DType)
+		}
+	default:
+		return nil, errorf(backend.OpScan, backend.ErrInternal, "no combine %s", combine)
+	}
+	return newNode(&Node{Op: backend.OpScan, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Combine: combine}})
+}
+
+// Cat joins xs along axis, each after the ones before it. They share a
+// dtype, a rank and every dimension but axis; there are 1 to
+// backend.MaxCatInputs of them.
+func Cat(xs []*Node, axis int) (*Node, error) {
+	if len(xs) == 0 || len(xs) > backend.MaxCatInputs {
+		return nil, errorf(backend.OpCat, backend.ErrInternal, "%d inputs", len(xs))
+	}
+	first := xs[0]
+	if axis < 0 || axis >= len(first.Shape) {
+		return nil, errorf(backend.OpCat, backend.ErrShape, "axis %d of %v", axis, first.Shape)
+	}
+	shape := slices.Clone(first.Shape)
+	shape[axis] = 0
+	for _, x := range xs {
+		if x.DType != first.DType {
+			return nil, errorf(backend.OpCat, backend.ErrDType, "%s and %s", first.DType, x.DType)
+		}
+		if len(x.Shape) != len(shape) || !slices.Equal(x.Shape[:axis], shape[:axis]) || !slices.Equal(x.Shape[axis+1:], shape[axis+1:]) {
+			return nil, errorf(backend.OpCat, backend.ErrShape, "%v and %v along axis %d", first.Shape, x.Shape, axis)
+		}
+		shape[axis] += x.Shape[axis]
+	}
+	if err := checkShape(backend.OpCat, shape); err != nil {
+		return nil, err
+	}
+	return newNode(&Node{Op: backend.OpCat, DType: first.DType, Shape: shape, Inputs: slices.Clone(xs), Attrs: backend.Attrs{Axis: axis}})
+}
+
+// AttentionAttrs configures an attention: the factor applied to the
+// scores, and whether to hide key j from query i when j > i + Offset.
+type AttentionAttrs struct {
+	Scale  float64
+	Causal bool
+	Offset int
+}
+
+func (a AttentionAttrs) attrs() backend.Attrs {
+	return backend.Attrs{Scale: a.Scale, Causal: a.Causal, CausalOffset: a.Offset}
+}
+
+// attentionShape checks the float inputs of an attention, and its mask
+// unless it is nil, and returns its geometry.
+func attentionShape(op backend.Op, q, k, v, mask *Node) (backend.AttentionShape, error) {
+	ins := []*Node{q, k, v}
+	var m []int
+	if mask != nil {
+		ins, m = append(ins, mask), mask.Shape
+	}
+	for _, in := range ins {
+		if !in.DType.IsFloat() {
+			return backend.AttentionShape{}, errorf(op, backend.ErrDType, "%s input", in.DType)
+		}
+	}
+	s, err := backend.NewAttentionShape(q.Shape, k.Shape, v.Shape, m)
+	if err != nil {
+		return s, fmt.Errorf("%s: %w", op, err)
+	}
+	return s, nil
+}
+
+// Attention computes softmax(scale·q·kᵀ + mask)·v over queries
+// [B..., H, Q, D], keys [B..., HK, K, D] and values [B..., HK, K, DV] of
+// any float dtypes, adding mask, [B..., H, Q, K], unless it is nil. The
+// Float32 result is one-dimensional: the attention's result, followed by
+// the logsumexp of each query's scores (see backend.OpAttention).
+func Attention(q, k, v, mask *Node, a AttentionAttrs) (*Node, error) {
+	s, err := attentionShape(backend.OpAttention, q, k, v, mask)
+	if err != nil {
+		return nil, err
+	}
+	ins := []*Node{q, k, v}
+	if mask != nil {
+		ins = append(ins, mask)
+	}
+	return newNode(&Node{Op: backend.OpAttention, DType: backend.Float32, Shape: []int{s.Size()}, Inputs: ins, Attrs: a.attrs()})
+}
+
+// AttentionGrad computes the gradients of the attention of q, k and v
+// with mask and a, from its result out, its logsumexp lse and the
+// gradient of its result gout, which have float dtypes. The Float32
+// result is one-dimensional: the gradients of q, k and v in turn.
+func AttentionGrad(q, k, v, mask, out, lse, gout *Node, a AttentionAttrs) (*Node, error) {
+	s, err := attentionShape(backend.OpAttentionGrad, q, k, v, mask)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(out.Shape, s.OutShape()) || !slices.Equal(gout.Shape, s.OutShape()) || !slices.Equal(lse.Shape, s.LSEShape()) {
+		return nil, errorf(backend.OpAttentionGrad, backend.ErrShape, "result %v, logsumexp %v and gradient %v for %v", out.Shape, lse.Shape, gout.Shape, s.OutShape())
+	}
+	if !out.DType.IsFloat() || !gout.DType.IsFloat() || lse.DType != backend.Float32 {
+		return nil, errorf(backend.OpAttentionGrad, backend.ErrDType, "result %s, logsumexp %s and gradient %s", out.DType, lse.DType, gout.DType)
+	}
+	ins := []*Node{q, k, v, out, lse, gout}
+	if mask != nil {
+		ins = append(ins, mask)
+	}
+	return newNode(&Node{Op: backend.OpAttentionGrad, DType: backend.Float32, Shape: []int{s.GradSize()}, Inputs: ins, Attrs: a.attrs()})
+}
+
+// SliceScatter returns x with the block ranges, half-open in each
+// dimension, replaced by src, which has the block's shape and x's dtype.
+func SliceScatter(x, src *Node, ranges [][2]int) (*Node, error) {
+	if len(ranges) != len(x.Shape) || len(src.Shape) != len(x.Shape) {
+		return nil, errorf(backend.OpSliceScatter, backend.ErrShape, "%v into %v at %v", src.Shape, x.Shape, ranges)
+	}
+	for i, r := range ranges {
+		if r[0] < 0 || r[0] > r[1] || r[1] > x.Shape[i] || src.Shape[i] != r[1]-r[0] {
+			return nil, errorf(backend.OpSliceScatter, backend.ErrShape, "%v into %v at %v", src.Shape, x.Shape, ranges)
+		}
+	}
+	if x.DType != src.DType {
+		return nil, errorf(backend.OpSliceScatter, backend.ErrDType, "%s into %s", src.DType, x.DType)
+	}
+	return newNode(&Node{Op: backend.OpSliceScatter, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, src}, Attrs: backend.Attrs{Ranges: slices.Clone(ranges)}})
+}
+
+// Argsort is the Int32 positions along axis of the first k elements of
+// the stable sort of x along it, ascending or descending; see
+// backend.OpArgsort. k is x's length along axis, or at most
+// backend.MaxTopK of it.
+func Argsort(x *Node, axis, k int, descending bool) (*Node, error) {
+	if axis < 0 || axis >= len(x.Shape) {
+		return nil, errorf(backend.OpArgsort, backend.ErrShape, "axis %d for shape %v", axis, x.Shape)
+	}
+	if n := x.Shape[axis]; k < 0 || k > n || k < n && k > backend.MaxTopK {
+		return nil, errorf(backend.OpArgsort, backend.ErrShape, "%d of %d positions along axis %d", k, n, axis)
+	}
+	if err := checkDType(backend.OpArgsort, x.DType); err != nil {
+		return nil, err
+	}
+	shape := slices.Clone(x.Shape)
+	shape[axis] = k
+	return newNode(&Node{Op: backend.OpArgsort, DType: backend.Int32, Shape: shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Descending: descending}})
+}
+
+// FFT is the discrete Fourier transform of the complex Float32 x,
+// [..., 2], along axis, which is not its last; see backend.OpFFT.
+func FFT(x *Node, axis int, inverse bool) (*Node, error) {
+	r := len(x.Shape)
+	if r < 2 || x.Shape[r-1] != 2 || axis < 0 || axis >= r-1 {
+		return nil, errorf(backend.OpFFT, backend.ErrShape, "axis %d of complex %v", axis, x.Shape)
+	}
+	if x.DType != backend.Float32 {
+		return nil, errorf(backend.OpFFT, backend.ErrDType, "%s input", x.DType)
+	}
+	return newNode(&Node{Op: backend.OpFFT, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Axis: axis, Inverse: inverse}})
+}
+
+// checkMatrices validates Float32 matrices of shape [B..., m, n], square
+// if square is set.
+func checkMatrices(op backend.Op, x *Node, square bool) error {
+	r := len(x.Shape)
+	if r < 2 || square && x.Shape[r-2] != x.Shape[r-1] {
+		return errorf(op, backend.ErrShape, "matrices of shape %v", x.Shape)
+	}
+	if x.DType != backend.Float32 {
+		return errorf(op, backend.ErrDType, "%s input", x.DType)
+	}
+	return nil
+}
+
+// Factor factorizes the Float32 matrices x, [B..., m, n], by op:
+// OpCholesky, whose result is shaped like x, or OpLU, OpQR, OpSVD or
+// OpEigh, whose one-dimensional result holds the parts that
+// backend.FactorParts describes.
+func Factor(op backend.Op, x *Node) (*Node, error) {
+	if op == backend.OpCholesky {
+		if err := checkMatrices(op, x, true); err != nil {
+			return nil, err
+		}
+		return newNode(&Node{Op: op, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{x}})
+	}
+	if err := checkMatrices(op, x, op == backend.OpLU || op == backend.OpEigh); err != nil {
+		return nil, err
+	}
+	_, size, err := backend.FactorParts(op, x.Shape)
+	if err != nil {
+		return nil, err
+	}
+	return newNode(&Node{Op: op, DType: backend.Float32, Shape: []int{size}, Inputs: []*Node{x}})
+}
+
+// TriangularSolve is X of a·X = b for the triangular Float32 matrices a,
+// [B..., n, n], and b, [B..., n, k]; see backend.OpTriangularSolve.
+func TriangularSolve(a, b *Node, upper, unit bool) (*Node, error) {
+	if err := checkMatrices(backend.OpTriangularSolve, a, true); err != nil {
+		return nil, err
+	}
+	if err := checkMatrices(backend.OpTriangularSolve, b, false); err != nil {
+		return nil, err
+	}
+	r := len(a.Shape)
+	if len(b.Shape) != r || !slices.Equal(a.Shape[:r-1], b.Shape[:r-1]) {
+		return nil, errorf(backend.OpTriangularSolve, backend.ErrShape, "%v by %v", a.Shape, b.Shape)
+	}
+	return newNode(&Node{Op: backend.OpTriangularSolve, DType: backend.Float32, Shape: b.Shape, Inputs: []*Node{a, b}, Attrs: backend.Attrs{Upper: upper, Unit: unit}})
+}
+
+// Sample draws a Float32 sample for each element of the Float32
+// parameters x by op, backend.OpRandGamma or backend.OpRandPoisson, keyed
+// by seed.
+func Sample(op backend.Op, x *Node, seed uint64) (*Node, error) {
+	if op != backend.OpRandGamma && op != backend.OpRandPoisson {
+		return nil, errorf(op, backend.ErrInternal, "not a sampler")
+	}
+	if x.DType != backend.Float32 {
+		return nil, errorf(op, backend.ErrDType, "%s input", x.DType)
+	}
+	return newNode(&Node{Op: op, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{x}, Attrs: backend.Attrs{Seed: seed}})
+}
+
+// GammaGrad is the derivative of the samples x of Gamma(alpha, 1) with
+// respect to alpha, both Float32 of one shape; see backend.OpGammaGrad.
+func GammaGrad(alpha, x *Node) (*Node, error) {
+	if alpha.DType != backend.Float32 || x.DType != backend.Float32 {
+		return nil, errorf(backend.OpGammaGrad, backend.ErrDType, "%s and %s", alpha.DType, x.DType)
+	}
+	if !slices.Equal(alpha.Shape, x.Shape) {
+		return nil, errorf(backend.OpGammaGrad, backend.ErrShape, "%v and %v", alpha.Shape, x.Shape)
+	}
+	return newNode(&Node{Op: backend.OpGammaGrad, DType: backend.Float32, Shape: x.Shape, Inputs: []*Node{alpha, x}})
+}
+
+// Segment combines rows of x, [R, D...], in the segments that offsets,
+// Int32 [S+1], cuts the Int32 row list rows into, by combine, CombineSum
+// or CombineMax, into [S, D...]; see backend.OpSegment. Offsets and rows
+// are checked when the graph runs.
+func Segment(x, offsets, rows *Node, combine backend.Combine) (*Node, error) {
+	if offsets.DType != backend.Int32 || rows.DType != backend.Int32 {
+		return nil, errorf(backend.OpSegment, backend.ErrDType, "%s offsets and %s rows", offsets.DType, rows.DType)
+	}
+	if err := checkDType(backend.OpSegment, x.DType); err != nil {
+		return nil, err
+	}
+	if len(x.Shape) == 0 || len(offsets.Shape) != 1 || offsets.Shape[0] == 0 || len(rows.Shape) != 1 {
+		return nil, errorf(backend.OpSegment, backend.ErrShape, "rows of %v in segments %v of %v", x.Shape, offsets.Shape, rows.Shape)
+	}
+	if combine != backend.CombineSum && combine != backend.CombineMax {
+		return nil, errorf(backend.OpSegment, backend.ErrShape, "segments combined by %s", combine)
+	}
+	shape := slices.Clone(x.Shape)
+	shape[0] = offsets.Shape[0] - 1
+	return newNode(&Node{Op: backend.OpSegment, DType: x.DType, Shape: shape, Inputs: []*Node{x, offsets, rows}, Attrs: backend.Attrs{Combine: combine}})
 }

@@ -157,6 +157,78 @@ func gradCases() []gradCase {
 	add("max_pool2d_gapped", func(x []*tensor.Tensor) *tensor.Tensor {
 		return x[0].MaxPool2d(2, tensor.ConvOptions{Stride: 3})
 	}, u(-2, 2, 1, 2, 7, 8))
+
+	// Scans. Running maxima take distinct values, so that no step of the
+	// finite differences changes which element is the maximum.
+	distinct := func(shape ...int) func() ([]float32, []int) {
+		return func() ([]float32, []int) {
+			v := make([]float32, n(shape...))
+			for i, p := range r.Perm(len(v)) {
+				v[i] = -2 + 0.2*float32(p)
+			}
+			return v, shape
+		}
+	}
+	mov("cumsum", func(x *tensor.Tensor) *tensor.Tensor { return x.CumSum(1) })
+	mov("cumsum_last_of_transposed", func(x *tensor.Tensor) *tensor.Tensor { return x.Transpose(0, 2).CumSum(-1) })
+	add("cummax", func(x []*tensor.Tensor) *tensor.Tensor { v, _ := x[0].CumMax(2); return v }, distinct(2, 3, 4))
+	add("cummax_outer", func(x []*tensor.Tensor) *tensor.Tensor { v, _ := x[0].CumMax(0); return v }, distinct(5, 3))
+	add("logcumsumexp", func(x []*tensor.Tensor) *tensor.Tensor { return x[0].LogCumSumExp(-1) }, u(-3, 3, 2, 3, 5))
+	add("logcumsumexp_outer", func(x []*tensor.Tensor) *tensor.Tensor { return x[0].LogCumSumExp(0) }, u(-3, 3, 4, 3))
+
+	add("attention", func(x []*tensor.Tensor) *tensor.Tensor {
+		mask := tensor.FromSlice([]float32{0, -1, 0.5, 0, 2, -3, 0, 0, 1, 0, 0, 0.3, -0.2, 0, 1}, 3, 5)
+		return tensor.ScaledDotProductAttention(x[0], x[1], x[2], tensor.AdditiveMask(mask))
+	}, u(-1, 1, 2, 2, 3, 4), u(-1, 1, 2, 2, 5, 4), u(-1, 1, 2, 2, 5, 3))
+	add("attention_grouped_causal", func(x []*tensor.Tensor) *tensor.Tensor {
+		return tensor.ScaledDotProductAttention(x[0], x[1], x[2], tensor.CausalOffset(1), tensor.AttentionScale(0.7))
+	}, u(-1, 1, 1, 4, 3, 4), u(-1, 1, 1, 2, 4, 4), u(-1, 1, 1, 2, 4, 2))
+	add("slice_scatter", func(x []*tensor.Tensor) *tensor.Tensor {
+		return x[0].Exp().SliceScatter(x[1].Mul(x[1]), [][2]int{{1, 3}, {0, 2}})
+	}, u(-1, 1, 3, 4), u(-1, 1, 2, 2))
+
+	// A recurrence, plain and checkpointed two steps at a time, reading
+	// its weight from its surroundings.
+	for _, c := range []struct {
+		name string
+		opts []tensor.ScanOption
+	}{{"scan_loop", nil}, {"scan_loop_checkpointed", []tensor.ScanOption{tensor.ScanCheckpoint(2), tensor.ScanReverse()}}} {
+		opts := c.opts
+		add(c.name, func(x []*tensor.Tensor) *tensor.Tensor {
+			step := func(carry, xs []*tensor.Tensor) (next, ys []*tensor.Tensor) {
+				h := carry[0].MatMul(x[2]).Add(xs[0]).Tanh()
+				return []*tensor.Tensor{h}, []*tensor.Tensor{h.Mul(xs[0])}
+			}
+			carry, ys := tensor.Scan(step, []*tensor.Tensor{x[1]}, []*tensor.Tensor{x[0]}, 0, opts...)
+			return ys[0].Sum(0).Add(carry[0])
+		}, u(-1, 1, 5, 2, 3), u(-1, 1, 2, 3), u(-1, 1, 3, 3))
+	}
+
+	add("fft", func(x []*tensor.Tensor) *tensor.Tensor {
+		y := x[0].FFT(1)
+		return y.Mul(y).IFFT(0)
+	}, u(-1, 1, 3, 4, 2))
+	add("sort_topk", func(x []*tensor.Tensor) *tensor.Tensor {
+		v, _ := x[0].Sort(1, false)
+		top, _ := x[0].TopK(2, 1, true)
+		return tensor.Cat(1, v.Mul(v), top.Exp())
+	}, distinct(3, 4))
+	add("split", func(x []*tensor.Tensor) *tensor.Tensor {
+		// The middle part gets no gradient.
+		p := x[0].Split(1, 2, 1, 3)
+		return tensor.Cat(1, p[2].Exp(), p[0].Mul(p[0]))
+	}, u(-1, 1, 3, 6))
+
+	// Products and maxima by a sparse pattern, with repeated entries and
+	// a row without any.
+	pat, err := tensor.NewPattern(4, 5, []int32{0, 0, 2, 2, 2, 3, 3, 0}, []int32{1, 4, 0, 1, 3, 2, 2, 1})
+	if err != nil {
+		panic(err)
+	}
+	add("pattern matmul", func(x []*tensor.Tensor) *tensor.Tensor { return pat.MatMul(x[0]) }, u(-1, 1, 5, 3))
+	add("pattern transpose", func(x []*tensor.Tensor) *tensor.Tensor { return pat.T().MatMul(x[0].Mul(x[0])) }, u(-1, 1, 4, 2, 2))
+	add("pattern mean", func(x []*tensor.Tensor) *tensor.Tensor { return pat.Mean(x[0]) }, u(-1, 1, 5, 3))
+	add("pattern max", func(x []*tensor.Tensor) *tensor.Tensor { return pat.Max(x[0]) }, distinct(5, 3))
 	return cases
 }
 
@@ -180,58 +252,63 @@ func weighted(ctx context.Context, f func([]*tensor.Tensor) *tensor.Tensor, x []
 }
 
 func TestGradientsMatchFiniteDifferences(t *testing.T) {
-	const h = 1e-2
 	for _, c := range gradCases() {
-		t.Run(c.name, func(t *testing.T) {
-			ctx := t.Context()
-			x := make([]*tensor.Tensor, len(c.in))
-			for i, v := range c.in {
-				x[i] = tensor.FromSlice(v, c.dims[i]...).RequiresGrad()
-			}
-			loss, err := weighted(ctx, c.f, x)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := loss.Backward(ctx); err != nil {
-				t.Fatal(err)
-			}
-			for i, v := range c.in {
-				g := x[i].Grad()
-				if g == nil {
-					t.Fatalf("input %d has no gradient", i)
-				}
-				if !slices.Equal(g.Shape(), c.dims[i]) {
-					t.Fatalf("input %d: gradient shape %v, want %v", i, g.Shape(), c.dims[i])
-				}
-				got := data[float32](t, g)
-				for j := range v {
-					at := func(d float32) float64 {
-						p := slices.Clone(v)
-						p[j] += d
-						y := slices.Clone(x)
-						y[i] = tensor.FromSlice(p, c.dims[i]...)
-						for k := range y {
-							if k != i {
-								y[k] = y[k].Detach()
-							}
-						}
-						l, err := weighted(ctx, c.f, y)
-						if err != nil {
-							t.Fatal(err)
-						}
-						s, err := l.Item[float32](ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						return float64(s)
-					}
-					want := (at(h) - at(-h)) / (2 * h)
-					if diff := math.Abs(float64(got[j]) - want); diff > 5e-3+1e-2*math.Abs(want) {
-						t.Errorf("input %d element %d: gradient %v, finite difference %v", i, j, got[j], want)
+		t.Run(c.name, func(t *testing.T) { checkFiniteDifferences(t, c) })
+	}
+}
+
+// checkFiniteDifferences compares the gradient Backward computes for each
+// input of c with central differences.
+func checkFiniteDifferences(t *testing.T, c gradCase) {
+	t.Helper()
+	const h = 1e-2
+	ctx := t.Context()
+	x := make([]*tensor.Tensor, len(c.in))
+	for i, v := range c.in {
+		x[i] = tensor.FromSlice(v, c.dims[i]...).RequiresGrad()
+	}
+	loss, err := weighted(ctx, c.f, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loss.Backward(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range c.in {
+		g := x[i].Grad()
+		if g == nil {
+			t.Fatalf("input %d has no gradient", i)
+		}
+		if !slices.Equal(g.Shape(), c.dims[i]) {
+			t.Fatalf("input %d: gradient shape %v, want %v", i, g.Shape(), c.dims[i])
+		}
+		got := data[float32](t, g)
+		for j := range v {
+			at := func(d float32) float64 {
+				p := slices.Clone(v)
+				p[j] += d
+				y := slices.Clone(x)
+				y[i] = tensor.FromSlice(p, c.dims[i]...)
+				for k := range y {
+					if k != i {
+						y[k] = y[k].Detach()
 					}
 				}
+				l, err := weighted(ctx, c.f, y)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s, err := l.Item[float32](ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return float64(s)
 			}
-		})
+			want := (at(h) - at(-h)) / (2 * h)
+			if diff := math.Abs(float64(got[j]) - want); diff > 5e-3+1e-2*math.Abs(want) {
+				t.Errorf("input %d element %d: gradient %v, finite difference %v", i, j, got[j], want)
+			}
+		}
 	}
 }
 
@@ -433,4 +510,37 @@ func ExampleTensor_Backward() {
 	g, _ := w.Grad().Data[float32](ctx)
 	fmt.Println(g)
 	// Output: [2 4 6]
+}
+
+// TestSaturatedActivationGradients checks that the sigmoid, tanh and SiLU
+// have finite values and gradients far into their saturated tails, where
+// e^-x overflows float32.
+func TestSaturatedActivationGradients(t *testing.T) {
+	ctx := t.Context()
+	for name, f := range map[string]func(*tensor.Tensor) *tensor.Tensor{
+		"sigmoid": (*tensor.Tensor).Sigmoid,
+		"tanh":    (*tensor.Tensor).Tanh,
+		"silu":    (*tensor.Tensor).SiLU,
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := tensor.FromSlice([]float32{-1000, -100, -50, 50, 100, 1000}).RequiresGrad()
+			y := f(x)
+			if err := y.Sum().Backward(ctx); err != nil {
+				t.Fatal(err)
+			}
+			v, err := y.Data[float32](ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g, err := x.Grad().Data[float32](ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range v {
+				if math.IsNaN(float64(v[i])) || math.IsInf(float64(v[i]), 0) || math.IsNaN(float64(g[i])) || math.IsInf(float64(g[i]), 0) {
+					t.Errorf("at %d: value %v, gradient %v", i, v[i], g[i])
+				}
+			}
+		})
+	}
 }

@@ -49,15 +49,28 @@
 // BFloat16 with Float16, computes in Float32 and returns Float32; Int32
 // combines with no float type. Reductions, and the operations built on
 // them (Sum, Max, Min, Mean, Var, Softmax, LogSoftmax), accumulate half
-// inputs in float32 and return Float32. Matrix products (MatMul, Conv2d)
-// of half operands run in Float32 and return the operands' type, so every
-// device multiplies in float32. Rand and Randn are Float32.
+// inputs in float32 and return Float32; scans (CumSum, CumMax,
+// LogCumSumExp) combine them in float32 and return their type, rounded
+// once. Matrix products (MatMul, Conv2d) of half operands run in Float32
+// and return the operands' type, so every device multiplies in float32.
+// Rand and Randn are Float32.
 //
 // FromSlice, Data and Item exchange float32 and int32 values: a half
 // tensor is read by casting it to Float32 first. Gradients have the type
 // the chain rule gives them, so a half leaf may accumulate a Float32
 // gradient; an optimizer casts each update to its parameter's type, and
 // optim.MasterWeights keeps Float32 copies of half parameters to update.
+//
+// # Quantized weights
+//
+// Q8_0, Q4_K and Q6_K hold weights quantized in blocks, as ggml and GGUF
+// files store them (see backend.DType): FromBytes reads their blocks in
+// place, as io/gguf maps them. They are read-only and have no gradient.
+// Cast dequantizes one to a float type, bit for bit as ggml does, Gather
+// dequantizes the elements it reads, so a quantized table serves an
+// embedding, and MatMulT multiplies by the transpose of a quantized
+// matrix without dequantizing it, as a linear layer does. Every other
+// operation on one fails with ErrDType.
 package tensor
 
 import (
@@ -79,12 +92,16 @@ import (
 type DType = backend.DType
 
 // Element types. BFloat16 and Float16 are storage types computed in
-// float32; see the package documentation.
+// float32, and Q8_0, Q4_K and Q6_K block-quantized weights; see the
+// package documentation.
 const (
 	Float32  = backend.Float32
 	Int32    = backend.Int32
 	BFloat16 = backend.BFloat16
 	Float16  = backend.Float16
+	Q8_0     = backend.Q8_0
+	Q4_K     = backend.Q4_K
+	Q6_K     = backend.Q6_K
 )
 
 // Elem is the set of Go types that FromSlice, Data and Item exchange with
@@ -108,6 +125,10 @@ var (
 	// such as a parameter's value from before an optimizer step (see
 	// RealizeInto).
 	ErrOverwritten = graph.ErrOverwritten
+	// ErrDonated reports a tensor whose memory a computation took over
+	// after the tensor was donated to it (see Donate). An error that
+	// wraps it wraps ErrOverwritten too.
+	ErrDonated = graph.ErrDonated
 )
 
 // eager computes each operation as soon as it is created.
@@ -141,8 +162,16 @@ func wrap(n *graph.Node, err error) *Tensor {
 	if err != nil {
 		return fail(err)
 	}
+	// An operation reaches a tensor inside VMap only through its batching
+	// rule, which builds the node from the batch: one without a rule
+	// cannot run inside VMap.
+	for _, in := range n.Inputs {
+		if in.Placeholder {
+			return fail(fmt.Errorf("tensor: %s inside VMap has no batching rule: %w", n.Op, ErrNotBatchable))
+		}
+	}
 	if eager {
-		if err := sched.Realize(context.Background(), backendOf(n), n); err != nil {
+		if err := realizeOn(context.Background(), backendOf(n), []*graph.Node{n}, nil); err != nil {
 			return fail(err)
 		}
 	}
@@ -291,6 +320,9 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 	if err := firstErr(ts...); err != nil {
 		return err
 	}
+	if err := computable(ts...); err != nil {
+		return err
+	}
 	nodes := make([]*graph.Node, len(ts))
 	for i, t := range ts {
 		nodes[i] = t.node
@@ -300,7 +332,7 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 		for j, i := range idx {
 			group[j] = nodes[i]
 		}
-		if err := sched.Realize(ctx, be, group...); err != nil {
+		if err := realizeOn(ctx, be, group, nil); err != nil {
 			return err
 		}
 	}
@@ -336,10 +368,16 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 	if err := firstErr(srcs...); err != nil {
 		return err
 	}
+	if err := computable(srcs...); err != nil {
+		return err
+	}
 	targets := make([]*graph.Node, len(srcs))
 	into := make([]*graph.Node, len(srcs))
+	// where is the node whose device computes each target: its own, or
+	// for one computed from constants alone, its sharded destination's.
+	where := make([]*graph.Node, len(srcs))
 	for i, src := range srcs {
-		targets[i] = src.node
+		targets[i], where[i] = src.node, src.node
 		d := dsts[i]
 		if d == nil {
 			continue
@@ -347,21 +385,63 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 		if err := firstErr(d); err != nil {
 			return err
 		}
+		if err := computable(d); err != nil {
+			return err
+		}
 		if !slices.Equal(d.node.Shape, src.node.Shape) || d.node.DType != src.node.DType {
 			return fmt.Errorf("tensor: RealizeInto: %s%v into %s%v: %w", src.node.DType, src.node.Shape, d.node.DType, d.node.Shape, ErrShape)
 		}
 		into[i] = d.node
+		if sched.Device(src.node) == nil && meshOf(d.node) != nil {
+			where[i] = d.node
+		}
 	}
-	for be, idx := range byDevice(targets) {
+	for be, idx := range byDevice(where) {
 		ts, ds := make([]*graph.Node, len(idx)), make([]*graph.Node, len(idx))
 		for j, i := range idx {
 			ts[j], ds[j] = targets[i], into[i]
 		}
-		if err := sched.RealizeInto(ctx, be, ts, ds, lazy.values); err != nil {
+		if err := realizeOn(ctx, be, ts, ds); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// Donate hands t's memory over to the next computation that reads t, as
+// jax.jit donates its arguments, and returns t. The caller must be done
+// with t, as a training loop is with a batch once the step that reads it
+// has run: that step may then compute its own results and temporaries
+// into t's memory instead of new memory, and the next FromSlice of the
+// same size may reuse it too, so that a loop that uploads and donates a
+// batch every step allocates nothing for it.
+//
+// The computation that next reads t, once t is computed, takes its
+// memory if t is the only tensor in it, as a tensor of FromSlice or To,
+// or one computed into memory of its own is. From then on t, and every
+// tensor that shares t's memory, such as one of the same values without
+// gradients, is stale: reading it, or computing a tensor built from it,
+// returns ErrDonated (and ErrOverwritten). Read everything you need of t
+// in that computation, such as a loss and its gradients in one Backward,
+// or donate a Clone. The memory is taken even if the computation fails
+// once it has started; one refused before it starts, as one past the
+// memory budget is, leaves t alone.
+//
+// Donating a tensor that is not computed yet does nothing: the
+// computation that reads it frees the memory it uses anyway. Memory that t does not own alone is never taken: a
+// mapped file's (see FromBytes), or memory that another tensor views
+// too, or that a parameter's value not computed yet reads, such as a
+// batch that batch normalization's running statistics are computed
+// from; nor is the memory of a tensor that the computation writes over
+// (see RealizeInto) or returns. Never donate a parameter's value. With
+// MIMIR_EAGER=1, which computes each operation as it is created, Donate
+// does nothing.
+func (t *Tensor) Donate() *Tensor {
+	if firstErr(t) != nil || eager {
+		return t
+	}
+	donate(t.node)
+	return t
 }
 
 // byDevice groups the indexes of nodes by the device that computes them,
@@ -391,8 +471,11 @@ func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err := firstErr(t); err != nil {
 		return nil, err
 	}
+	if err := computable(t); err != nil {
+		return nil, err
+	}
 	if want := dtypeOf[T](); t.node.DType != want {
-		if t.node.DType.Size() == 2 {
+		if t.node.DType.Size() == 2 || t.node.DType.IsQuantized() {
 			return nil, fmt.Errorf("tensor: Data[%s] of %s tensor: cast it to float32 first: %w", want, t.node.DType, ErrDType)
 		}
 		return nil, fmt.Errorf("tensor: Data[%s] of %s tensor: %w", want, t.node.DType, ErrDType)
@@ -401,7 +484,7 @@ func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := sched.Download(ctx, backendOf(t.node), t.node, asBytes(out)); err != nil {
+	if err := download(ctx, t.node, asBytes(out)); err != nil {
 		return nil, err
 	}
 	return out, nil

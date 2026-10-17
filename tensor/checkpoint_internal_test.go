@@ -30,20 +30,17 @@ func TestCheckpointComputesTheEffectsOfTheCallOnce(t *testing.T) {
 	if !eager && sched.Realized(effects[1].node) {
 		t.Error("the recompute's effect was computed")
 	}
-	if bwd.acc != nil || bwd.err != nil {
-		t.Error("Backward left its state behind")
-	}
 }
 
 func TestCheckpointNodeHasNoTapeOfItsOwn(t *testing.T) {
 	w := FromSlice([]float32{1, 2}).RequiresGrad()
 	y := Checkpoint(func(in ...*Tensor) *Tensor { return in[0].Exp().Mul(w) }, FromSlice([]float32{3, 4}))
-	if y.tape == nil || len(y.tape.parents) != 1 || y.tape.parents[0] != nil {
-		t.Fatalf("checkpoint over an untracked input has tape %+v, want one with a nil parent", y.tape)
+	if y.tape == nil || len(y.tape.ins) != 1 || y.tape.ins[0].tape != nil {
+		t.Fatalf("checkpoint over an untracked input has tape %+v, want one with an untracked input", y.tape)
 	}
 	// Nothing but the checkpoint's own rule stands between the result
 	// and w: the exponential inside is not kept for the backward pass.
-	if captured, _, _ := scan(y.tape, y.tape.seq-1); captured {
+	if captured, _ := new(checkpointCall).scan(y.tape, y.tape.seq-1); captured {
 		t.Error("the checkpoint's tape reaches tapes made before it")
 	}
 }
