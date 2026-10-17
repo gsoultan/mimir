@@ -57,8 +57,13 @@ func TestReplicate(t *testing.T) {
 			x := tensor.Randn(5, c.input...)
 			want := data(t, m.Forward(x))
 			got := data(t, r.Forward(x.To(dev)))
-			if !slices.Equal(got, want) {
-				t.Errorf("replica computes %v, want %v", got[:4], want[:4])
+			if tensor.DefaultDevice().Equal(tensor.CPU()) {
+				if !slices.Equal(got, want) {
+					t.Errorf("replica computes %v, want %v", got[:4], want[:4])
+				}
+			} else {
+				// The original runs on a GPU, whose kernels round otherwise.
+				near(t, "replica's output", got, want, 1e-5)
 			}
 			// Training one leaves the other alone.
 			if err := r.Forward(x.To(dev)).Sum().Backward(t.Context()); err != nil {
