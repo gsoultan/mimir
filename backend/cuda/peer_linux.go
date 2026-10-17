@@ -24,9 +24,9 @@ func (b *Backend) CopiesFrom(from backend.Backend) bool {
 
 // CopyPeer queues a copy of src, a buffer of the CUDA device from, into
 // dst on b's stream (see backend.PeerCopier). b's stream waits for an
-// event recorded on from's after the work queued there so far, and
-// from's stream waits for one recorded on b's after the copy, so from's
-// later work, such as writing over src or freeing it, runs after the copy.
+// event recorded on from's after the work queued there so far. from's
+// stream goes on with its own work while the copy runs: only its next
+// work that writes over src or frees it waits for the copy (see settle).
 // The copy goes between the devices directly where they can reach each
 // other's memory, and through the host otherwise, but the host never waits.
 func (b *Backend) CopyPeer(ctx context.Context, dst backend.Buffer, from backend.Backend, src backend.Buffer) error {
@@ -73,6 +73,9 @@ func (b *Backend) CopyPeer(ctx context.Context, dst backend.Buffer, from backend
 	if r != cudaSuccess {
 		return check(r, "wait for the source device")
 	}
+	if err := b.settle(cd.ptr); err != nil {
+		return err
+	}
 	if r := cuMemcpyPeerAsync(cd.ptr, b.ctx, cs.ptr, f.ctx, uintptr(cd.size()), b.stream); r != cudaSuccess {
 		return check(r, "copy between devices")
 	}
@@ -80,10 +83,68 @@ func (b *Backend) CopyPeer(ctx context.Context, dst backend.Buffer, from backend
 	if err != nil {
 		return err
 	}
-	cuCtxSetCurrent(f.ctx)
-	r = cuStreamWaitEvent(f.stream, done, 0)
-	cuEventDestroy(done)
-	return check(r, "wait for the copy")
+	f.readBy(cs.ptr, b.dev, done)
+	return nil
+}
+
+// peerRead is a copy from a buffer of one device to the device dev, whose
+// event done is recorded on dev's stream after the copy.
+type peerRead struct {
+	dev  int32
+	done uintptr
+}
+
+// readBy notes that a copy to peer reads the memory at ptr, until the
+// event done. b.mu is held.
+func (b *Backend) readBy(ptr uint64, peer int32, done uintptr) {
+	if b.reads == nil {
+		b.reads = map[uint64][]peerRead{}
+	}
+	rs := b.reads[ptr]
+	for i := range rs {
+		if rs[i].dev == peer {
+			// peer's stream runs its copies in order, so the new copy's
+			// event follows the old one's.
+			cuEventDestroy(rs[i].done)
+			rs[i].done = done
+			return
+		}
+	}
+	b.reads[ptr] = append(rs, peerRead{peer, done})
+}
+
+// settle makes b's stream wait for the copies to other devices that read
+// its memory at ptr, before the work queued next, which writes over it or
+// frees it. Copies that read from b leave b's stream free to compute
+// meanwhile: the source of the shares of a data-parallel batch computes
+// its own share while the others' are copied. b.mu is held and b's
+// context is current.
+func (b *Backend) settle(ptr uint64) error {
+	rs, ok := b.reads[ptr]
+	if !ok {
+		return nil
+	}
+	delete(b.reads, ptr)
+	var err error
+	for _, r := range rs {
+		if res := cuStreamWaitEvent(b.stream, r.done, 0); res != cudaSuccess && err == nil {
+			err = check(res, "wait for a copy to another device")
+		}
+		cuEventDestroy(r.done)
+	}
+	return err
+}
+
+// settleAll makes b's stream wait for every copy to another device that
+// reads its memory, as settle does for one buffer.
+func (b *Backend) settleAll() error {
+	var err error
+	for ptr := range b.reads {
+		if serr := b.settle(ptr); err == nil {
+			err = serr
+		}
+	}
+	return err
 }
 
 // record returns an event recorded on b's stream after the work queued
