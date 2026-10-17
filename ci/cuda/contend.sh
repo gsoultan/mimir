@@ -3,12 +3,14 @@
 # code: times the single-GPU gpt2 and cnn x8 steps alone on GPU 0, then
 # in one process per GPU, all at once, then the data-parallel step on
 # every GPU, sampling each GPU's power, clocks and PCIe traffic with
-# nvidia-smi dmon throughout:
+# nvidia-smi dmon throughout. It first checks that training steps over
+# batches uploaded every step launch as CUDA graphs:
 #
 #	modal run ci/cuda/modal_test.py --gpus 4 --script ci/cuda/contend.sh
 set -eu
 nvidia-smi -L || true
 gpus=$(nvidia-smi -L | grep -c '^GPU')
+go test -count=1 -v -run TestTrainingStepsRunAsCUDAGraphs ./backend/cuda
 tmp=$(mktemp -d)
 bin=$tmp/train.test
 go test -c -o "$bin" ./train
