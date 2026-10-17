@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/internal/diskcache"
 	"github.com/gsoultan/mimir/backend/internal/gen"
 )
 
@@ -35,7 +36,7 @@ type Backend struct {
 	// emits machine code for it rather than PTX the driver compiles.
 	arch  string
 	cubin bool
-	disk  *diskCache
+	disk  *diskcache.Cache
 
 	blas uintptr // cuBLAS handle
 	// blasMin is the work, in multiply-adds, from which float32 products
@@ -99,7 +100,7 @@ func NewDevice(ordinal int) (*Backend, error) {
 			return nil, fmt.Errorf("cuda: %v: %w", err, ErrUnavailable)
 		}
 	}
-	b := &Backend{funcs: map[string]uintptr{}, disk: openDiskCache()}
+	b := &Backend{funcs: map[string]uintptr{}, disk: diskcache.Open("cuda")}
 	if r := cuDeviceGet(&b.dev, int32(ordinal)); r != cudaSuccess {
 		return nil, check(r, "open device")
 	}
@@ -387,7 +388,7 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 // set, then the generated kernel l, if it is set, which is the product's
 // epilogue or the kernel itself.
 type call struct {
-	gemm *sgemm
+	gemm *gen.ColumnMajor
 	l    *gen.Launch
 	fn   uintptr // the compiled kernel of l
 }
@@ -402,7 +403,7 @@ func (b *Backend) plan(c *call, k *backend.Kernel, outs, ins []backend.Buffer) e
 	}
 	var err error
 	if g, isGEMM := gen.PlanGEMM(k, lens); isGEMM && b.blasMin >= 0 && g.Batch*g.M*g.N*g.K >= b.blasMin {
-		s := planSgemm(g)
+		s := g.ColumnMajor()
 		c.gemm = &s
 		if k.Attrs.Program != nil {
 			c.l, err = gen.PlanEpilogue(gen.CUDA, k, outs, ins)
@@ -453,7 +454,7 @@ func kernelArgs(args []unsafe.Pointer, ptrs []uint64, l *gen.Launch, errDev *uin
 
 // sgemm queues the cuBLAS call s over the device pointers ptrs of the
 // output, then the inputs. b.mu is held and the context is current.
-func (b *Backend) sgemm(s sgemm, ptrs []uint64) error {
+func (b *Backend) sgemm(s gen.ColumnMajor, ptrs []uint64) error {
 	alpha, beta := float32(1), float32(0)
 	op := func(trans bool) int32 {
 		if trans {
@@ -461,10 +462,10 @@ func (b *Backend) sgemm(s sgemm, ptrs []uint64) error {
 		}
 		return blasOpN
 	}
-	at := func(o operand) uint64 { return ptrs[1+o.in] + 4*uint64(o.offset) }
-	st := cublasSgemmStridedBatched(b.blas, op(s.a.trans), op(s.b.trans), int32(s.m), int32(s.n), int32(s.k),
-		&alpha, at(s.a), int32(s.a.ld), int64(s.a.stride), at(s.b), int32(s.b.ld), int64(s.b.stride),
-		&beta, ptrs[0], int32(s.ldc), int64(s.strideC), int32(s.batch))
+	at := func(o gen.Operand) uint64 { return ptrs[1+o.In] + 4*uint64(o.Offset) }
+	st := cublasSgemmStridedBatched(b.blas, op(s.A.Trans), op(s.B.Trans), int32(s.M), int32(s.N), int32(s.K),
+		&alpha, at(s.A), int32(s.A.LD), int64(s.A.Stride), at(s.B), int32(s.B.LD), int64(s.B.Stride),
+		&beta, ptrs[0], int32(s.LDC), int64(s.StrideC), int32(s.Batch))
 	if st != blasSuccess {
 		return fmt.Errorf("cuda: cuBLAS sgemm: status %d: %w", st, backend.ErrInternal)
 	}
@@ -505,15 +506,15 @@ func (b *Backend) function(src string, threads int) (uintptr, error) {
 // the disk cache if it has it.
 func (b *Backend) compile(src string) ([]byte, error) {
 	options := []string{b.arch, "--fmad=false"}
-	key := b.disk.key(compilerVersion(), options, src)
-	if image, ok := b.disk.get(key); ok {
+	key := b.disk.Key(compilerVersion(), options, src)
+	if image, ok := b.disk.Get(key); ok {
 		return image, nil
 	}
 	image, err := compileNVRTC(src, options, b.cubin)
 	if err != nil {
 		return nil, err
 	}
-	b.disk.put(key, image)
+	b.disk.Put(key, image)
 	return image, nil
 }
 

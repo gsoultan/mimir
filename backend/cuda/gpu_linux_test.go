@@ -163,27 +163,6 @@ func TestKernelsCompileWithNVRTC(t *testing.T) {
 	t.Logf("compiled %d kernels", len(sources))
 }
 
-// TestDiskCacheRoundTrips checks that a compiled kernel stored in the
-// cache comes back as it was.
-func TestDiskCacheRoundTrips(t *testing.T) {
-	t.Setenv("MIMIR_CACHE_DIR", t.TempDir())
-	c := openDiskCache()
-	if c == nil {
-		t.Fatal("no cache")
-	}
-	key := c.key("nvrtc 12.9", []string{"--gpu-architecture=sm_75"}, "kernel")
-	if _, ok := c.get(key); ok {
-		t.Fatal("entry before put")
-	}
-	c.put(key, []byte("image"))
-	if got, ok := c.get(key); !ok || string(got) != "image" {
-		t.Fatalf("got %q, %t", got, ok)
-	}
-	if other := c.key("nvrtc 12.9", []string{"--gpu-architecture=sm_86"}, "kernel"); other == key {
-		t.Error("the key ignores the options")
-	}
-}
-
 // BenchmarkMatMul times square float32 products on the CPU, with the
 // generated kernel and on cuBLAS, each waiting for the result.
 func BenchmarkMatMul(b *testing.B) {
