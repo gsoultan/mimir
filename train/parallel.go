@@ -149,14 +149,30 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 	if err := tensor.Realize(ctx, x, y); err != nil {
 		return 0, err
 	}
-	losses := make([]*tensor.Tensor, 0, n)
+	// Every share reaches its device before any device computes: a copy
+	// between devices goes through the host, which waits for the source
+	// device to finish what it was given, and so would wait for the
+	// replica on that device to run its whole step.
+	xs, ys := make([]*tensor.Tensor, n), make([]*tensor.Tensor, n)
+	moved := make([]*tensor.Tensor, 0, 2*n)
 	for r, d := range p.devs {
 		lo, hi := rows*r/n, rows*(r+1)/n
 		if lo == hi {
 			continue
 		}
-		xr, yr := share(rowsOf(x, lo, hi), d), share(rowsOf(y, lo, hi), d)
-		l := lossFn(p.replicas[r].Forward(xr), yr)
+		xs[r], ys[r] = share(rowsOf(x, lo, hi), d), share(rowsOf(y, lo, hi), d)
+		moved = append(moved, xs[r], ys[r])
+	}
+	if err := tensor.Realize(ctx, moved...); err != nil {
+		return 0, err
+	}
+	losses := make([]*tensor.Tensor, 0, n)
+	for r := range p.devs {
+		lo, hi := rows*r/n, rows*(r+1)/n
+		if lo == hi {
+			continue
+		}
+		l := lossFn(p.replicas[r].Forward(xs[r]), ys[r])
 		if hi-lo != rows {
 			l = l.Mul(tensor.Scalar(float32(hi-lo) / float32(rows)))
 		}
