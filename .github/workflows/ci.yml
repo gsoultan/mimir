@@ -53,8 +53,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: emulate the Metal and CUDA kernels
-        run: go test -count=1 -timeout=60m -run Kernels ./backend/...
+      - name: emulate the Metal, CUDA and HIP kernels
+        run: go test -count=1 -timeout=100m -run Kernels ./backend/...
         env:
           MIMIR_EMULATE: '1'
       - name: compile the CUDA kernels with NVRTC
@@ -62,6 +62,13 @@ jobs:
           pip install nvidia-cuda-nvrtc-cu12
           export LD_LIBRARY_PATH=$(python -c "import site, os; print(os.path.join(site.getsitepackages()[0], 'nvidia', 'cuda_nvrtc', 'lib'))")
           go test -count=1 -v -run NVRTC ./backend/cuda
+      - name: compile the HIP kernels with hiprtc
+        # The ROCm 5.4 runtime, with hiprtc inside, comes in this wheel.
+        run: |
+          pip download --no-deps --only-binary=:all: --python-version 3.11 --platform manylinux_2_17_x86_64 -d "$RUNNER_TEMP/whl" pytorch-triton-rocm==2.1.0
+          unzip -q "$RUNNER_TEMP"/whl/*.whl 'triton/third_party/rocm/lib/*' -d "$RUNNER_TEMP/rocm"
+          lib=$RUNNER_TEMP/rocm/triton/third_party/rocm/lib
+          MIMIR_HIPRTC=$lib/libamdhip64.so LD_LIBRARY_PATH=$lib go test -count=1 -timeout=30m -v -run HIPRTC ./backend/rocm
 
   cuda:
     name: GPU (CUDA on a Modal T4)
