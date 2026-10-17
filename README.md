@@ -4,11 +4,13 @@ mimir is a machine learning framework written in Go. It aims to train and run
 neural networks as fast as PyTorch, on CPU and on GPU, from one pure-Go
 codebase with no cgo and no Python.
 
-> **Status: milestone 7.** mimir trains neural networks on the CPU with
+> **Status: milestone 8.** mimir trains neural networks on the CPU with
 > SIMD matrix kernels, fused elementwise kernels and in-place updates, and
-> runs the same code on Apple GPUs through Metal and on NVIDIA GPUs through
-> CUDA: autograd, layers, losses, optimizers, data loading and a training
-> loop, each checked against PyTorch. It streams training sets larger than
+> runs the same code on Apple GPUs through Metal, on NVIDIA GPUs through
+> CUDA and on AMD GPUs through ROCm: autograd, layers, losses, optimizers,
+> data loading and a training loop, each checked against PyTorch. It trains
+> over several devices at once, data-parallel or sharded over a mesh in
+> the manner of `jax.sharding`. It streams training sets larger than
 > memory from Parquet and CSV shards in flat memory, plans every
 > computation against a memory budget, stores tensors in bfloat16 and
 > float16, and replays repeated training steps from a cached schedule. It
@@ -107,24 +109,33 @@ tensors on different devices returns `tensor.ErrDevice`. `go run
 ./examples/mnist -device auto` trains on the GPU when there is one.
 
 On Apple silicon the GPU runs through Metal, and on Linux an NVIDIA GPU runs
-through CUDA, both called from Go with
+through CUDA and an AMD GPU through ROCm's HIP, all called from Go with
 [purego](https://github.com/ebitengine/purego), so there is still no cgo and
-the binary cross-compiles. One generator writes every kernel in Metal Shading
-Language or CUDA C++, compiled at run time once per kernel structure (CUDA
-kernels are cached on disk), and float32 matrix products run on Metal
-Performance Shaders, on Metal 4 tensor operations on M5 GPUs under macOS 26,
-or on cuBLAS. On a Mac, CPU and GPU share memory, so moving a tensor is a
-copy within RAM; on CUDA, device memory comes from a pool that keeps freed
-buffers, so a training step allocates nothing from the driver once it has
-run. Every operation runs the same conformance tests on every device, and
-the generated kernels of both dialects are also compiled and run on the CPU
-in CI.
+the binary cross-compiles. `gpu` takes Metal, then CUDA, then ROCm, and
+`MIMIR_DEVICE=metal`, `cuda` or `rocm` opens only that backend, so `rocm`
+uses an AMD GPU even beside an NVIDIA one; when there is no GPU, the error
+says why for each backend the platform could have. One generator writes
+every kernel in Metal Shading Language, CUDA C++ or HIP C++, the last for
+AMD wavefronts of 64 or 32 threads, compiled at run time once per kernel
+structure (CUDA and HIP kernels are cached on disk), and float32 matrix
+products run on Metal Performance Shaders, on Metal 4 tensor operations on
+M5 GPUs under macOS 26, on cuBLAS, or on hipBLAS. On a Mac, CPU and GPU
+share memory, so moving a tensor is a copy within RAM; on CUDA and ROCm,
+device memory comes from a pool that keeps freed buffers, so a training
+step allocates nothing from the driver once it has run. Every operation
+runs the same conformance tests on every device, and the generated kernels
+of all four dialects are also compiled and run on the CPU in CI.
 
 CUDA needs the NVIDIA driver and `libcuda.so.1`, `libnvrtc.so.12` and
 `libcublas.so.12`, as the `nvidia/cuda` runtime images and the CUDA toolkit
-install them. Loading them needs the C library, so on Linux a program that
+install them. ROCm needs ROCm 5.4 or later, `libamdhip64` and hiprtc, as the
+`rocm/dev` images and the ROCm packages install them; hipBLAS is optional,
+and without it products run on the generated kernel. `MIMIR_HIP`,
+`MIMIR_HIPRTC` and `MIMIR_HIPBLAS` name the libraries where the loader would
+not find them. Loading them needs the C library, so on Linux a program that
 uses the `tensor` package is linked dynamically even with `CGO_ENABLED=0`;
-`go build -tags nocuda` leaves the backend out and keeps the binary static.
+`go build -tags nocuda,norocm` leaves both backends out and keeps the binary
+static.
 
 ## Gradients
 
@@ -205,14 +216,15 @@ had in the last run. On Metal the replayed kernels are encoded into one
 command buffer. On CUDA they launch one by one by default;
 `MIMIR_CUDA_GRAPHS=1` runs a step's kernels and cuBLAS calls as one CUDA
 graph, captured once a run has repeated the last one's products and
-updated in place when only arguments change. On the GPUs, convolutions run
+updated in place when only arguments change, and `MIMIR_ROCM_GRAPHS=1` does
+the same with HIP graphs on ROCm. On the GPUs, convolutions run
 as tiled implicit-GEMM kernels that read their windows from the image
 where they lie, for the forward pass and both gradients; the CPU
-multiplies unfolded windows with its GEMM microkernels. On CUDA, a
+multiplies unfolded windows with its GEMM microkernels. On CUDA and ROCm, a
 convolution too deep for its image to fill the device with tiles, such as
 a 512-channel layer over a small image, runs as unfold, cuBLAS product and
 fold instead, and products summed over batch axes or whose operand every
-batch shares run on cuBLAS too.
+batch shares run on cuBLAS or hipBLAS too.
 
 On an M5 Pro under macOS 26, the GPU's neural accelerators run float32
 products through Metal 4 tensor operations at 5,790 GFLOP/s for 2048 × 2048
@@ -292,6 +304,114 @@ out. `nn.Cast` converts a model, `optim.MasterWeights` keeps a float32
 copy of each half parameter for the optimizer to update, and
 `train.LossScale` or `train.DynamicLossScale` scale the loss so small
 gradients survive float16.
+
+## Multiple devices
+
+`tensor.GPUs` returns every GPU mimir can use, and `tensor.CPUs(n)` returns
+n CPU devices that share the host's cores, each running its kernels in
+order on a goroutine of its own, as a GPU runs them on a stream.
+`train.DataParallel` trains on all of them at once:
+
+```go
+err = train.Fit(ctx, model, opt, trainSet,
+	train.Loss(loss.CrossEntropy),
+	train.Epochs(10),
+	train.DataParallel(tensor.GPUs()...))
+```
+
+`Fit` moves the model to the first device, replicates it onto the others
+with `nn.Replicate`, and splits each batch between them along its first
+axis. Each replica computes the loss and gradients of its share, the
+gradients are reduced into the first device's model, weighted by each
+share's part of the batch, the optimizer steps once there, and the
+replicas take the new parameters and buffers before the next batch, so
+every replica holds the same values bit for bit. Evaluation and checkpoints
+use the model on the first device. `train.NewParallel` does the same in a
+loop you write: its `Backward` takes a batch and leaves the whole batch's
+gradients on the model, as PyTorch's `DistributedDataParallel` does within
+one process. Two and four CPU devices match one device over the whole
+batch. `DataParallel` does not combine with `MicroBatch` or `MemoryBudget`.
+
+Underneath, `tensor.NewGroup` connects devices of one kind, the CPU
+devices or CUDA GPUs, like a group of NCCL ranks in one process. Its
+`AllReduce`, `Broadcast`, `AllGather` and `ReduceScatter` take one tensor
+per device and return realized tensors on every device, and
+`ReduceGrads` and `BroadcastParams` work on parameters in place, in
+buckets of about 25 MiB as `DistributedDataParallel` does. CUDA devices
+communicate through NCCL, which needs `libnccl.so.2`, and CPU devices
+through host memory. The devices of a group run asynchronously: the host
+queues a step on each without waiting for the last, so a kernel's error
+surfaces at the next read of a value from its device.
+
+## Sharding
+
+Sharding is modeled on `jax.sharding`. `tensor.NewMesh` arranges devices in
+n dimensions with named axes, and `tensor.Shard` places a tensor on the mesh
+as a `PartitionSpec` says, each device holding its block. `tensor.P` builds
+one, naming the mesh axis that splits each axis of the tensor, and
+`WithSections` cuts an axis into sections, such as the query, key and value
+of a fused projection, before it is split:
+
+```go
+mesh, err := tensor.NewMesh([]int{2, 2}, []string{"data", "model"}, tensor.CPUs(4)...)
+if err != nil {
+	return err
+}
+defer mesh.Close()
+x := tensor.Shard(batch, mesh, tensor.P("data"))       // rows split over "data"
+w := tensor.Shard(weight, mesh, tensor.P("", "model")) // columns over "model"
+y := x.MatMul(w).ReLU()                                // each device computes its block
+s, _ := y.Sharding()                                   // P("data", "model")
+```
+
+A sharded tensor is an ordinary lazy tensor whose device is the mesh, so
+autograd is unchanged, and realizing it partitions the graph. Each
+operation gets a layout by a few rules. Elementwise operations stay local.
+A product over a split contracted axis gives partial sums, which an
+all-reduce adds up, or a reduce-scatter when the result stays split; a
+reduction over a split axis reduces locally and then across devices.
+Movement operations carry splits along, and attention splits over batch
+and heads. Where a product's operands disagree, the one split along its
+rows or batch keeps its split and the other is gathered, so the
+activations of data parallelism stay split and fully sharded weights are
+gathered where they are used. Anything else is made whole on every device
+first, which is correct but slower, so every result matches one device's.
+`tensor.WithSharding` constrains a layout, like
+`jax.lax.with_sharding_constraint`, `Sharding` reports one before
+anything runs, `To` gathers a tensor onto one device, and `Mesh.Traffic`
+counts the collectives that have run.
+
+`Param.Shard` and `nn.Shard` lay a model's parameters out over a mesh as a
+rule says, and `train.Sharded` trains such a model, splitting each batch
+over the mesh axis named `data`:
+
+```go
+mesh, err := tensor.NewMesh([]int{2, 4}, []string{"data", "model"}, tensor.GPUs()...)
+if err != nil {
+	return err
+}
+defer mesh.Close()
+err = train.Fit(ctx, model, opt, trainSet,
+	train.Loss(loss.CrossEntropy),
+	train.Sharded(mesh, nn.TensorParallel(model, mesh, "model")))
+```
+
+With no rule a mesh trains data-parallel and matches `DataParallel`.
+`nn.TensorParallel` gives Megatron's layout: column- then row-parallel
+MLPs and attention split by heads, one all-reduce per row-parallel layer.
+`nn.FullyShard` splits every parameter along its first evenly divisible
+axis, as FSDP and ZeRO-3 do, so products gather weights where they are
+used and gradients and optimizer states are sharded alike. `nn.Rules`
+combines rules, for data-parallel replicas of a tensor-parallel model or
+FSDP with tensor parallelism. An MLP and a GPT-2 block trained each way,
+and on 2 × 2 meshes, match one device.
+
+Splits must be even: an axis's length must divide by the size of the mesh
+axis that splits it. `Sharded` does not combine with `Checkpoint`,
+`MicroBatch`, `MemoryBudget` or `DataParallel`. Random tensors, such as
+dropout's masks, are drawn whole on every device and then cut, and there
+is no all-to-all yet, so moving a split from one axis to another gathers
+the tensor and cuts it again.
 
 ## Sequences, transformers and LLMs
 
@@ -463,7 +583,7 @@ go run ./examples/onnx -model io/onnx/testdata/transformer.onnx -dim batch=4 -di
 
 Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
 mimir depends on two modules: [purego](https://github.com/ebitengine/purego)
-to call Metal and CUDA without cgo, and
+to call Metal, CUDA, NCCL and ROCm without cgo, and
 [klauspost/compress](https://github.com/klauspost/compress) for the
 Snappy and zstd pages of Parquet files, which the standard library cannot
 read.
@@ -471,7 +591,8 @@ read.
 ## Goals
 
 - **Fast on CPU and GPU.** One graph, one set of kernels per device, chosen at
-  run time: Apple Metal and NVIDIA CUDA today.
+  run time: Apple Metal, NVIDIA CUDA and AMD ROCm today, and several
+  devices at once, data-parallel or sharded over a mesh.
 - **Never panic, never run out of memory.** Shape and dtype errors are
   values; kernels recover internal faults as `ErrInternal`; requests larger
   than the runtime can address return `ErrOutOfMemory`; intermediate buffers
@@ -518,15 +639,18 @@ read.
 | Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
 | Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
 | Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `Donate`, `ErrDonated`, `FromBytes` over mapped files |
+| Devices | `CPUs`, `GPUs`, `NewGroup` with `AllReduce`, `Broadcast`, `AllGather`, `ReduceScatter`, `ReduceGrads`, `BroadcastParams` (CPU devices, or CUDA GPUs over NCCL) |
+| Sharding | `NewMesh`, `P`, `PartitionSpec` (`WithSections`), `Shard`, `WithSharding`, `Sharding`, `Param.Shard`, `Mesh.Traffic` |
 | Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `Flatten`, `Cast` |
 | Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
 | Graph layers (`nn`) | `Graph` (`Source`, `Target`, `Sum`, `Mean`, `Max`, `Softmax`, `Adjacency`), `GCNConv`, `SAGEConv`, `GATConv` |
+| Placement (`nn`) | `Replicate`, `Shard`, `Rules`, `FullyShard`, `TensorParallel` |
 | Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `MSE`, `L1`, `Huber` |
 | Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
 | Distributions (`distributions`) | `Normal`, `MultivariateNormal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet`, `Poisson`; `Sample`, `RSample`, `LogProb`, `Entropy`, `Mean`, `Variance`, `KL` |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
 | Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22) |
-| Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`; `Accuracy` |
+| Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
 block-quantized `Q8_0`, `Q4_K` and `Q6_K` for weights. Broadcasting follows NumPy.
@@ -537,23 +661,25 @@ registration.
 ## Layout
 
 ```
-tensor/              public Tensor API and autograd
-nn/                  layers, parameter discovery, save and load
+tensor/              public Tensor API, autograd, device groups, meshes and sharding
+nn/                  layers, parameter discovery, save and load, replicas and sharding rules
 nn/loss/             loss functions
 optim/               optimizers and learning-rate schedules
 distributions/       probability distributions, sampling, log densities and KL divergences
 data/                datasets, batching, streams of shards and their statistics
 data/datasets/       MNIST, CSV, CSV and Parquet shards, mapped safetensors, synthetic rows
-train/               Fit, evaluation, checkpoints
+train/               Fit, evaluation, checkpoints, data-parallel and sharded training
 metrics/             accuracy
-backend/             Backend interface, DType, Op, View, Kernel
-backend/cpu/         pure-Go kernels and worker pool
+backend/             Backend interface, DType, Op, View, Kernel, collectives
+backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives
 backend/metal/       Metal backend: Metal Performance Shaders and tensor operations, through purego
-backend/cuda/        CUDA backend: driver API, NVRTC and cuBLAS, through purego
-backend/internal/gen/        generates the kernels, in Metal Shading Language or CUDA C++
-backend/internal/kerneltest/ kernel cases for every device, and a CPU emulator for both dialects
+backend/cuda/        CUDA backend: driver API, NVRTC, cuBLAS and NCCL, through purego
+backend/rocm/        ROCm backend: HIP runtime, hiprtc and hipBLAS, through purego
+backend/internal/gen/        generates the kernels, in Metal Shading Language, CUDA C++ or HIP C++
+backend/internal/kerneltest/ kernel cases for every device, and a CPU emulator for all four dialects
+backend/internal/diskcache/  the on-disk cache of compiled CUDA and HIP kernels
 internal/graph/      lazy IR with shape and dtype checks
-internal/sched/      runs graphs: views, buffer reuse, freeing, the schedule cache
+internal/sched/      runs graphs: views, buffer reuse, freeing, the schedule cache, collectives
 internal/filemap/    read-only file mappings
 internal/goldentest/ golden-file loading and comparison
 internal/quanttest/  reference quantization for tests
@@ -581,7 +707,8 @@ tools/golden/        golden-file generator (Python, development only)
 tools/parquet/       Parquet test-file generator (Python, development only)
 tools/gguf/          GGUF test-file generators (Python, development only)
 tools/onnx/          ONNX golden-model generator (Python, development only)
-ci/cuda/             CUDA tests and benchmarks on a Modal T4 or any NVIDIA machine
+ci/cuda/             CUDA tests and benchmarks on a Modal T4 or any NVIDIA machine, and multi-GPU runs
+ci/rocm/             ROCm tests and benchmarks on any AMD machine
 ```
 
 ## Testing
@@ -589,8 +716,8 @@ ci/cuda/             CUDA tests and benchmarks on a Modal T4 or any NVIDIA machi
 ```sh
 go test -race ./...
 MIMIR_EAGER=1 go test ./...
-MIMIR_DEVICE=gpu go test ./...   # on a Mac or an NVIDIA machine: every test on the GPU
-MIMIR_EMULATE=1 go test -timeout=60m -run Kernels ./backend/...   # the GPU kernels on the CPU, with clang++
+MIMIR_DEVICE=gpu go test ./...   # on a Mac, an NVIDIA or an AMD machine: every test on the GPU
+MIMIR_EMULATE=1 go test -timeout=100m -run Kernels ./backend/...   # the GPU kernels of four dialects on the CPU, with clang++
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/gguf
@@ -648,6 +775,36 @@ ci/cuda/modal_test.py --script ci/cuda/perf.sh` on Modal). The CUDA
 kernels are also compiled with the real NVRTC on every change, which
 needs no GPU.
 
+The multi-GPU tests run on demand, on paid Modal hosts with several GPUs,
+not on every change. `ci/cuda/parallel.sh` runs NCCL's collectives,
+replicas and data-parallel training on every GPU against one device, and
+the data-parallel scaling benchmark; `ci/cuda/shard.sh` runs sharded
+training against one device and the sharded scaling benchmark, and ends
+with the 8-GPU gate, which fails when examples per second on 8 GPUs fall
+below 85% of 8 times those on one:
+
+```sh
+modal run ci/cuda/modal_test.py --gpus 4 --script ci/cuda/parallel.sh
+modal run ci/cuda/modal_test.py --gpus 8 --gpu-type H100 --script ci/cuda/shard.sh
+```
+
+Without several GPUs, the same tests run on `tensor.CPUs` devices, and
+`BenchmarkDataParallel` and `BenchmarkSharded` in `train` report examples
+per second, efficiency and, for sharding, communication per step on 1 to
+4 of them.
+
+GitHub has no AMD GPU runners either, and no CI job needs one.
+`sh ci/rocm/test.sh` runs every test with `MIMIR_DEVICE=rocm`, then again
+with HIP graphs, on any Linux machine with an AMD GPU, ROCm 5.4 or later
+and Go, and `ci/rocm/perf.sh` runs the GPU benchmarks there with HIP
+graphs off and then on. Without one, the ROCm tests check the graph logic
+against a fake runtime and the hipBLAS calls on the emulator, and wherever
+hiprtc is installed, or `MIMIR_HIPRTC` names it, `go test -run HIPRTC
+./backend/rocm` compiles every generated kernel for gfx90a, gfx940, gfx942
+and gfx1100, or the architectures `MIMIR_HIPRTC_ARCHS` lists, which needs
+no GPU. CI does that on every change with the hiprtc of ROCm 5.4, taken
+from the `pytorch-triton-rocm` wheel.
+
 ## Roadmap
 
 | Milestone | Delivers |
@@ -661,8 +818,8 @@ needs no GPU.
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
 | M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
-| M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ONNX import (done); ROCm through HIP (in progress) |
-| M8 Multiple devices | data parallelism over NCCL, then tensor sharding modeled on `jax.sharding` (next) |
+| M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ONNX import, ROCm through HIP, hiprtc and hipBLAS (done; ROCm pending validation on AMD hardware) |
+| M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism (in progress: built and tested on CPU devices, awaiting multi-GPU runs and the 8-GPU gate of 85% scaling efficiency) |
 
 ## License
 
