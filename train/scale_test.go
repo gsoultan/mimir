@@ -115,7 +115,7 @@ func TestFlatMemoryOverManyRows(t *testing.T) {
 type memorySample struct {
 	step     int
 	held     uint64 // bytes the Go runtime holds from the operating system
-	resident uint64 // the process's resident set, or 0 where it is not read
+	resident uint64 // the process's resident set, or 0 where it is not read, less the mappings cached for reuse
 }
 
 func (s memorySample) String() string {
@@ -135,7 +135,12 @@ func measureMemory(step int) memorySample {
 	settleOffHeap()
 	ms := []metrics.Sample{{Name: "/memory/classes/total:bytes"}, {Name: "/memory/classes/heap/released:bytes"}}
 	metrics.Read(ms)
-	return memorySample{step: step, held: ms[0].Value.Uint64() - ms[1].Value.Uint64(), resident: residentBytes()}
+	// The CPU backend keeps up to 64 MiB of freed mappings for reuse, more
+	// with more buffers in use, whose pages count as resident until the
+	// kernel takes them; they are not memory a step holds.
+	resident := residentBytes()
+	resident -= min(resident, uint64(cpu.CachedMapBytes()))
+	return memorySample{step: step, held: ms[0].Value.Uint64() - ms[1].Value.Uint64(), resident: resident}
 }
 
 // settleOffHeap waits for the cleanups of dropped off-heap buffers, which
