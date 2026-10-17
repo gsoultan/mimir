@@ -28,9 +28,11 @@ import (
 // reports the host's time per step in each phase of Parallel.Backward,
 // those of one device numbered with its rank, and in the optimizer's
 // step: a phase that waits for a device shows that device's work. With
-// MIMIR_DP_WAITS=1 the step also waits for the devices after each phase
-// and reports the waits, named gpu-..., though they stop the devices from
-// overlapping one phase with the next.
+// MIMIR_DP_WAITS=1 the step also waits for the devices after each phase,
+// the optimizer's step included, and reports the waits, named gpu-...,
+// though they stop the devices from overlapping one phase with the next.
+// The optimizer steps every replica through Parallel.Step, or the model
+// alone with MIMIR_DP_STEP=model, for the replicas to take its values.
 //
 // Each reports examples per second, the speedup over one device and the
 // efficiency, the speedup divided by the devices: 1 when n devices
@@ -98,17 +100,35 @@ func BenchmarkDataParallel(b *testing.B) {
 							b.Fatal(err)
 						}
 						var spent map[string]time.Duration // host time per phase
+						waits := false                     // MIMIR_DP_WAITS=1, from the first timed step
+						optStep := func() error { return dp.Step(b.Context(), opt) }
+						if os.Getenv("MIMIR_DP_STEP") == "model" {
+							optStep = func() error { return opt.Step(b.Context()) }
+						}
 						step := func() {
 							if _, err := dp.Backward(b.Context(), bm.loss, x, y); err != nil {
 								b.Fatal(err)
 							}
 							start := time.Now()
-							if err := dp.Step(b.Context(), opt); err != nil {
+							if err := optStep(); err != nil {
 								b.Fatal(err)
 							}
 							opt.ZeroGrad()
 							if spent != nil {
 								spent["step"] += time.Since(start)
+							}
+							if waits {
+								// The step has run once the last replica's
+								// first parameter, or the model's when the
+								// replicas take its values at the next
+								// Backward, is computed.
+								start := time.Now()
+								reps := dp.Replicas()
+								prm := nn.Parameters(reps[len(reps)-1])[0]
+								if _, err := prm.Value().Reshape(-1).Sum().Item[float32](b.Context()); err != nil {
+									b.Fatal(err)
+								}
+								spent["gpu-step"] += time.Since(start)
 							}
 						}
 						for range 3 {
@@ -123,6 +143,7 @@ func BenchmarkDataParallel(b *testing.B) {
 						})()
 						if os.Getenv("MIMIR_DP_WAITS") == "1" {
 							defer train.SetWaitPhases(true)()
+							waits = true
 						}
 						for b.Loop() {
 							step()
