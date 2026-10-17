@@ -171,7 +171,7 @@ func wrap(n *graph.Node, err error) *Tensor {
 		}
 	}
 	if eager {
-		if err := sched.Realize(context.Background(), backendOf(n), n); err != nil {
+		if err := realizeOn(context.Background(), backendOf(n), []*graph.Node{n}, nil); err != nil {
 			return fail(err)
 		}
 	}
@@ -332,7 +332,7 @@ func Realize(ctx context.Context, ts ...*Tensor) error {
 		for j, i := range idx {
 			group[j] = nodes[i]
 		}
-		if err := sched.RealizeInto(ctx, be, group, nil, lazy.values); err != nil {
+		if err := realizeOn(ctx, be, group, nil); err != nil {
 			return err
 		}
 	}
@@ -373,8 +373,11 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 	}
 	targets := make([]*graph.Node, len(srcs))
 	into := make([]*graph.Node, len(srcs))
+	// where is the node whose device computes each target: its own, or
+	// for one computed from constants alone, its sharded destination's.
+	where := make([]*graph.Node, len(srcs))
 	for i, src := range srcs {
-		targets[i] = src.node
+		targets[i], where[i] = src.node, src.node
 		d := dsts[i]
 		if d == nil {
 			continue
@@ -389,13 +392,16 @@ func RealizeInto(ctx context.Context, dsts, srcs []*Tensor) error {
 			return fmt.Errorf("tensor: RealizeInto: %s%v into %s%v: %w", src.node.DType, src.node.Shape, d.node.DType, d.node.Shape, ErrShape)
 		}
 		into[i] = d.node
+		if sched.Device(src.node) == nil && meshOf(d.node) != nil {
+			where[i] = d.node
+		}
 	}
-	for be, idx := range byDevice(targets) {
+	for be, idx := range byDevice(where) {
 		ts, ds := make([]*graph.Node, len(idx)), make([]*graph.Node, len(idx))
 		for j, i := range idx {
 			ts[j], ds[j] = targets[i], into[i]
 		}
-		if err := sched.RealizeInto(ctx, be, ts, ds, lazy.values); err != nil {
+		if err := realizeOn(ctx, be, ts, ds); err != nil {
 			return err
 		}
 	}
@@ -434,7 +440,7 @@ func (t *Tensor) Donate() *Tensor {
 	if firstErr(t) != nil || eager {
 		return t
 	}
-	sched.Donate(t.node)
+	donate(t.node)
 	return t
 }
 
@@ -478,7 +484,7 @@ func (t *Tensor) Data[T Elem](ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := sched.Download(ctx, backendOf(t.node), t.node, asBytes(out), lazy.values); err != nil {
+	if err := download(ctx, t.node, asBytes(out)); err != nil {
 		return nil, err
 	}
 	return out, nil

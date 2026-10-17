@@ -283,7 +283,7 @@ func (t *Tensor) ZeroGrad() {
 	gradMu.Lock()
 	defer gradMu.Unlock()
 	if g := t.tape.grad; g != nil && t.tape.own {
-		sched.Release(g.node, lazy.values)
+		release(g.node)
 	}
 	t.tape.grad, t.tape.own = nil, false
 }
@@ -355,7 +355,12 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	dsts := make([]*Tensor, 1, cap(targets))
 	computed := map[*graph.Node]bool{t.node: true}
 	for i, l := range leaves {
-		sums[i] = r.got[l]
+		// A sharded leaf's gradient is laid out like the leaf.
+		ref := l.node
+		if l.param != nil {
+			ref = l.param.Value().node
+		}
+		sums[i] = constrainLike(r.got[l], ref)
 		var dst *Tensor
 		if l.grad != nil {
 			sums[i] = l.grad.Add(sums[i])
@@ -877,11 +882,18 @@ func (p *Param) set(v *Tensor) error {
 // To moves the parameter's value, and the gradient accumulated since the
 // last ZeroGrad, to d. Tensors built from the old value keep it.
 func (p *Param) To(d Device) error {
+	return p.move(d.String(), func(t *Tensor) *Tensor { return t.To(d) })
+}
+
+// move replaces the parameter's value, and the gradient accumulated since
+// the last ZeroGrad, by what to makes of them, computed now, as To moves
+// them to where.
+func (p *Param) move(where string, to func(*Tensor) *Tensor) error {
 	v := p.Value()
 	if err := firstErr(v); err != nil {
 		return err
 	}
-	moved := v.Detach().To(d)
+	moved := to(v.Detach())
 	if err := moved.Realize(context.Background()); err != nil {
 		return err
 	}
@@ -893,7 +905,7 @@ func (p *Param) To(d Device) error {
 	var grad *Tensor
 	if v.tape != nil && v.tape.grad != nil {
 		g := v.tape.grad
-		if grad = g.To(d); grad.err == nil {
+		if grad = to(g); grad.err == nil {
 			grad.err = grad.Realize(context.Background())
 		}
 		if grad.err != nil {
@@ -903,11 +915,11 @@ func (p *Param) To(d Device) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.value != v {
-		return fmt.Errorf("tensor: parameter set while moving to %v: %w", d, ErrInternal)
+		return fmt.Errorf("tensor: parameter set while moving to %s: %w", where, ErrInternal)
 	}
 	p.value = &Tensor{node: moved.node, tape: v.tape}
-	// On the device it is on already the gradient is not copied, and
-	// keeps whether its memory is the tape's.
+	// Where it is already the gradient is not copied, and keeps whether
+	// its memory is the tape's.
 	if grad != nil && grad != v.tape.grad {
 		v.tape.grad, v.tape.own = grad, true
 	}

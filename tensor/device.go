@@ -196,7 +196,8 @@ func (t *Tensor) Device() Device {
 
 // To returns t's values on d. If t is on d already, it returns t; otherwise
 // it computes t and copies its values, and gradients flow back through the
-// copy to t.
+// copy to t. A sharded tensor's shards are gathered, and To a mesh's
+// device shards t whole on every device of the mesh (see Shard).
 func (t *Tensor) To(d Device) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
@@ -205,18 +206,22 @@ func (t *Tensor) To(d Device) *Tensor {
 	if from == to {
 		return t
 	}
+	if md, ok := to.(*meshDevice); ok {
+		return Shard(t, md.mesh, nil)
+	}
 	src := Device{from}
 	toRule := rule{
 		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.To(src)) },
 		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].To(d) },
 	}
+	if s, ok := t.Sharding(); ok {
+		toRule.vjp = func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(Shard(g, s.Mesh, s.Spec)) }
+	}
 	if l := batchLevel(t); l != 0 {
 		return record(batchTo(l, t, d), toRule, t)
 	}
-	ctx := context.Background()
-	size, _ := t.node.DType.Bytes(t.node.Size())
-	data := make([]byte, size)
-	if err := sched.Download(ctx, from, t.node, data, lazy.values); err != nil {
+	data, err := hostBytes(context.Background(), t.node)
+	if err != nil {
 		return fail(err)
 	}
 	return record(upload(to, t.node.DType, data, t.node.Shape), toRule, t)
