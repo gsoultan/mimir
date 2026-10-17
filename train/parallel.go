@@ -137,6 +137,15 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 		return 0, err
 	}
 	mark("broadcast", -1)
+	if waitPhases && len(p.params[0]) > 0 {
+		// The broadcast has reached every replica once the last can read
+		// a value it wrote.
+		last := p.params[len(p.params)-1][0].Value()
+		if _, err := last.Reshape(-1).Sum().Item[float32](ctx); err != nil {
+			return 0, err
+		}
+		mark("gpu-broadcast", -1)
+	}
 	if err := x.Err(); err != nil {
 		return 0, err
 	}
@@ -190,12 +199,29 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 		mark("backward", r)
 		losses = append(losses, l)
 	}
+	if waitPhases {
+		// Each device's wait is the time it took past the one before it.
+		for i, l := range losses {
+			if _, err := l.Item[float32](ctx); err != nil {
+				return 0, err
+			}
+			mark("gpu-backward", i)
+		}
+	}
 	err := p.group.ReduceGrads(ctx, tensor.ReduceSum, 0, p.trained...)
 	p.discard()
 	if err != nil {
 		return 0, err
 	}
 	mark("reduce", -1)
+	if waitPhases {
+		if g := p.trained[0][0].Grad(); g != nil {
+			if _, err := g.Reshape(-1).Sum().Item[float32](ctx); err != nil {
+				return 0, err
+			}
+		}
+		mark("gpu-reduce", -1)
+	}
 	var sum float64
 	for _, l := range losses {
 		v, err := l.Item[float32](ctx) // computed by Backward
@@ -212,6 +238,14 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 // Parallel.Backward: the phase's name, the rank it ran for or -1, and its
 // duration.
 var phases func(phase string, rank int, d time.Duration)
+
+// waitPhases, when a test sets it with phases, makes Parallel.Backward
+// wait for the devices after the broadcast, after each device's backward
+// pass and after the reduction, and report the waits as phases named
+// gpu-..., to tell how long the devices take in each. The waits keep the
+// devices from overlapping one phase with the next, so a step takes
+// longer.
+var waitPhases bool
 
 // phaseTimer returns a function that reports to phases the time since
 // its last call, or since phaseTimer's, and does nothing when phases is

@@ -9,3 +9,12 @@ func SetPhases(f func(phase string, rank int, d time.Duration)) (restore func())
 	phases = f
 	return func() { phases = was }
 }
+
+// SetWaitPhases makes Parallel.Backward wait for the devices after each
+// phase and report the waits to the function SetPhases set, until restore
+// is called.
+func SetWaitPhases(on bool) (restore func()) {
+	was := waitPhases
+	waitPhases = on
+	return func() { waitPhases = was }
+}
