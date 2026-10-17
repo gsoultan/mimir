@@ -3,8 +3,10 @@ package train_test
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
@@ -22,7 +24,10 @@ import (
 // and otherwise the devices of tensor.CPUs, which share the host's cores.
 // On GPUs, the sub-benchmarks named x8 repeat them with 8 times the
 // examples per device, which tells whether a GPU's share of the small
-// batches leaves it waiting on the host rather than computing.
+// batches leaves it waiting on the host rather than computing. Each also
+// reports the host's time per step in each phase of Parallel.Backward,
+// those of one device numbered with its rank, and in the optimizer's
+// step: a phase that waits for a device shows that device's work.
 //
 // Each reports examples per second, the speedup over one device and the
 // efficiency, the speedup divided by the devices: 1 when n devices
@@ -89,20 +94,35 @@ func BenchmarkDataParallel(b *testing.B) {
 						if err := tensor.Realize(b.Context(), x, y); err != nil {
 							b.Fatal(err)
 						}
+						var spent map[string]time.Duration // host time per phase
 						step := func() {
 							if _, err := dp.Backward(b.Context(), bm.loss, x, y); err != nil {
 								b.Fatal(err)
 							}
+							start := time.Now()
 							if err := opt.Step(b.Context()); err != nil {
 								b.Fatal(err)
 							}
 							opt.ZeroGrad()
+							if spent != nil {
+								spent["step"] += time.Since(start)
+							}
 						}
 						for range 3 {
 							step()
 						}
+						spent = map[string]time.Duration{}
+						defer train.SetPhases(func(phase string, rank int, d time.Duration) {
+							if rank >= 0 {
+								phase += strconv.Itoa(rank)
+							}
+							spent[phase] += d
+						})()
 						for b.Loop() {
 							step()
+						}
+						for phase, d := range spent {
+							b.ReportMetric(float64(d.Microseconds())/float64(b.N), phase+"-µs/op")
 						}
 						rate := float64(per*n*b.N) / b.Elapsed().Seconds()
 						b.ReportMetric(rate, "examples/s")
