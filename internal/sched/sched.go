@@ -366,6 +366,7 @@ func (m *pool) program(w *walker, targets, dsts []*graph.Node) (*program, error)
 	if err != nil {
 		return nil, err
 	}
+	compiled++
 	if cached {
 		m.programs.add(hash, w.key, prog)
 	}
