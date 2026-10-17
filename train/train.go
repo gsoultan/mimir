@@ -450,7 +450,11 @@ func (l *loop) step(ctx context.Context, model nn.Module, opt *optim.Optimizer, 
 	if l.scale != 0 {
 		opt.SetGradScale(l.scale)
 	}
-	if err := opt.Step(ctx); err != nil {
+	step := opt.Step
+	if l.dp != nil {
+		step = func(ctx context.Context) error { return l.dp.Step(ctx, opt) }
+	}
+	if err := step(ctx); err != nil {
 		return 0, false, err
 	}
 	opt.ZeroGrad()

@@ -325,3 +325,42 @@ func TestToBetweenDevicesOfAGroup(t *testing.T) {
 		})
 	}
 }
+
+func TestAllReduceGrads(t *testing.T) {
+	ctx := t.Context()
+	devs := tensor.CPUs(3)
+	g, err := tensor.NewGroup(devs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	params := make([][]*tensor.Param, len(devs))
+	for r, d := range devs {
+		w := tensor.NewParam(tensor.Randn(uint64(r+1), 4, 3).To(d))
+		params[r] = []*tensor.Param{w}
+		if r == 1 {
+			continue // rank 1 has no gradients
+		}
+		x := tensor.Full(tensor.Float32, float64(r+1), 2, 4).To(d)
+		if err := x.MatMul(w.Value()).Sum().Backward(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := g.AllReduceGrads(ctx, tensor.ReduceSum, params...); err != nil {
+		t.Fatal(err)
+	}
+	// d/dw of sum(x·w) is 2(r+1) for every element: 2 on rank 0, none on
+	// rank 1, 6 on rank 2.
+	for r := range devs {
+		gr := params[r][0].Grad()
+		if gr == nil {
+			t.Fatalf("rank %d has no gradient", r)
+		}
+		if !gr.Device().Equal(devs[r]) {
+			t.Errorf("rank %d's gradient on %v", r, gr.Device())
+		}
+		if v := data[float32](t, gr); v[0] != 8 || v[11] != 8 {
+			t.Errorf("rank %d's gradient %v, want 8s", r, v)
+		}
+	}
+}

@@ -64,6 +64,23 @@ func New(params []*tensor.Param, lr float64, rule Rule) *Optimizer {
 	return o
 }
 
+// Params returns the parameters the optimizer updates, in order.
+func (o *Optimizer) Params() []*tensor.Param { return slices.Clone(o.params) }
+
+// Over returns an optimizer that updates params with o's rule, learning
+// rate and gradient scale, and no state: one for a replica of o's
+// parameters, such as train.Parallel steps alongside o, each over its
+// own device's copies. params[i] stands for o's i-th parameter. Restore
+// gives it o's state.
+func (o *Optimizer) Over(params []*tensor.Param) *Optimizer {
+	c := New(params, o.lr, o.rule)
+	c.scale, c.err = o.scale, cmp.Or(c.err, o.err)
+	if len(params) != len(o.params) {
+		c.err = fmt.Errorf("optim: %d parameters for an optimizer of %d: %w", len(params), len(o.params), tensor.ErrShape)
+	}
+	return c
+}
+
 // LR returns the learning rate.
 func (o *Optimizer) LR() float64 { return o.lr }
 
