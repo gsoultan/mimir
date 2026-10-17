@@ -153,9 +153,9 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 		return 0, err
 	}
 	// Every share reaches its device before any device computes: a copy
-	// between devices goes through the host, which waits for the source
-	// device to finish what it was given, and so would wait for the
-	// replica on that device to run its whole step.
+	// from the host, or between devices that do not copy between
+	// themselves, waits for the devices to finish what they were given,
+	// and so would wait for the replicas on them to run their steps.
 	xs, ys := make([]*tensor.Tensor, n), make([]*tensor.Tensor, n)
 	moved := make([]*tensor.Tensor, 0, 2*n)
 	for r, d := range p.devs {

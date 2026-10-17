@@ -137,16 +137,77 @@ func Upload(ctx context.Context, be backend.Backend, dt backend.DType, data []by
 // one from be's pool, or else a new one from be.
 func uploadBuffer(be backend.Backend, dt backend.DType, n int) (backend.Buffer, error) {
 	mu.Lock()
-	p := poolOf(be)
-	key := poolKey{dt, n}
-	if bufs := p.free[key]; len(bufs) > 0 {
-		buf := bufs[len(bufs)-1].buf
-		p.free[key] = bufs[:len(bufs)-1]
-		mu.Unlock()
+	buf := freeBuffer(be, dt, n)
+	mu.Unlock()
+	if buf != nil {
 		return buf, nil
 	}
-	mu.Unlock()
 	return be.Alloc(dt, n)
+}
+
+// freeBuffer takes a free buffer of n elements of dt off be's pool, or
+// returns nil if it holds none. mu is held.
+func freeBuffer(be backend.Backend, dt backend.DType, n int) backend.Buffer {
+	p := poolOf(be)
+	key := poolKey{dt, n}
+	bufs := p.free[key]
+	if len(bufs) == 0 {
+		return nil
+	}
+	p.free[key] = bufs[:len(bufs)-1]
+	return bufs[len(bufs)-1].buf
+}
+
+// Copy realizes n on its device from, unless it is realized, and returns
+// a realized node on to holding its elements, which to copies from from
+// without the host (see backend.PeerCopier). The copy's buffer comes from
+// to's pool as an upload's does. keep is as for Download.
+func Copy(ctx context.Context, from backend.Backend, to backend.PeerCopier, n *graph.Node, keep func() []*graph.Node) (*graph.Node, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	if err := realize(ctx, from, []*graph.Node{n}, nil, keep); err != nil {
+		return nil, err
+	}
+	buf, v := n.Buf(), n.View
+	if !v.IsContiguous() || v.Offset != 0 || buf.Len() != n.Size() {
+		m := poolOf(from)
+		s := m.simulate()
+		s.take(n.DType, n.Size())
+		if err := m.reserve(s); err != nil {
+			return nil, err
+		}
+		tmp, err := runNew(ctx, m, &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: n.Shape, In: []backend.View{v}}, buf)
+		if err != nil {
+			return nil, err
+		}
+		// The source's later work, which may reuse tmp, waits for the
+		// copy.
+		defer m.release(tmp)
+		buf = tmp
+	}
+	dst := freeBuffer(to, n.DType, n.Size())
+	if dst == nil {
+		var err error
+		if dst, err = to.Alloc(n.DType, n.Size()); err != nil {
+			return nil, err
+		}
+	}
+	back := func() {
+		p := poolOf(to)
+		p.track(dst)
+		p.release(dst)
+	}
+	if err := to.CopyPeer(ctx, dst, from, buf); err != nil {
+		back()
+		return nil, err
+	}
+	node, err := graph.Load(to, dst, n.Shape)
+	if err != nil {
+		back()
+		return nil, err
+	}
+	node.Mem.Pooled = true
+	return node, nil
 }
 
 // giveBack returns buf, which uploadBuffer returned, to be's pool.

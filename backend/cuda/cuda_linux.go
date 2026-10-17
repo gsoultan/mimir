@@ -53,6 +53,10 @@ type Backend struct {
 	// groups counts the open NCCL communicators over the device, which
 	// make it asynchronous (see nccl_linux.go).
 	groups atomic.Int32
+
+	// peers holds the devices whose access to this device's memory pool
+	// CopyPeer has settled, granted or not (see peer_linux.go).
+	peers map[int32]bool
 }
 
 // buffer is device memory.

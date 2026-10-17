@@ -279,3 +279,49 @@ func TestReduceGradsAndBroadcastParams(t *testing.T) {
 		t.Errorf("gradient after broadcast: %v, want 7s", v)
 	}
 }
+
+// TestToBetweenDevicesOfAGroup copies tensors, whole and in part, between
+// the devices of every group case, which copy between themselves where
+// they can, and checks the values and that the copy waits for the work
+// that computes its source.
+func TestToBetweenDevicesOfAGroup(t *testing.T) {
+	for name, devs := range groupCases() {
+		if len(devs) < 2 {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			src, dst := devs[0], devs[len(devs)-1]
+			want := make([]float32, 6*5)
+			for i := range want {
+				want[i] = float32(i)
+			}
+			x := tensor.FromSlice(want, 6, 5).To(src)
+			for i := range 20 {
+				// Queued work on the source, then a copy of its result.
+				y := x.Mul(tensor.Scalar(float32(i))).To(dst)
+				if !y.Device().Equal(dst) {
+					t.Fatalf("copy on %v, want %v", y.Device(), dst)
+				}
+				got := data[float32](t, y)
+				for j, w := range want {
+					if got[j] != w*float32(i) {
+						t.Fatalf("step %d: element %d is %v, want %v", i, j, got[j], w*float32(i))
+					}
+				}
+			}
+			// Rows from the middle, and a transpose, which are views.
+			rows := data[float32](t, x.Shrink([][2]int{{2, 4}, {0, 5}}).To(dst))
+			if !slices.Equal(rows, want[10:20]) {
+				t.Errorf("rows 2 to 4: got %v, want %v", rows, want[10:20])
+			}
+			tr := data[float32](t, x.Transpose(0, 1).To(dst))
+			for i := range 5 {
+				for j := range 6 {
+					if tr[i*6+j] != want[j*5+i] {
+						t.Fatalf("transpose: element (%d, %d) is %v, want %v", i, j, tr[i*6+j], want[j*5+i])
+					}
+				}
+			}
+		})
+	}
+}
