@@ -134,6 +134,21 @@ type Asynchronous interface {
 	Asynchronous() bool
 }
 
+// PeerCopier is a Backend that copies buffers from other devices of its
+// kind without the host, as a GPU copies from another over NVLink or
+// PCIe. CopyPeer queues a copy of src, a buffer of from, into dst, a
+// buffer of the receiver of the same dtype and length: the copy runs
+// after the work submitted to either device before it, and work
+// submitted to either device after it runs after the copy, so src can
+// neither change nor be freed under it. Neither device waits on the host.
+// CopiesFrom reports whether CopyPeer copies from buffers of from; it is
+// false for the receiver itself.
+type PeerCopier interface {
+	Backend
+	CopiesFrom(from Backend) bool
+	CopyPeer(ctx context.Context, dst Buffer, from Backend, src Buffer) error
+}
+
 // CheckCollectives verifies cs against the contract of Communicator.Run
 // over a group of size ranks: one buffer per rank, of one dtype that
 // collectives take, with the lengths the kind requires. Backends can then

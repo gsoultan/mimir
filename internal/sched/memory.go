@@ -50,6 +50,8 @@ type pool struct {
 
 	programs cache // the programs of recent schedules (see cache.go)
 
+	loads map[poolKey]*loadOrder // the buffers uploads and copies took (see freeBuffer)
+
 	acct      sync.Mutex
 	allocated int64                         // bytes obtained from be whose buffers are alive
 	owned     map[weak.Pointer[byte]]*entry // the alive buffers obtained from be
@@ -67,6 +69,14 @@ func (k poolKey) bytes() int64 { return bufferBytes(k.dt, k.n) }
 func bufferBytes(dt backend.DType, n int) int64 {
 	size, _ := dt.Bytes(n)
 	return int64(size)
+}
+
+// loadOrder is the addresses of the buffers of one key that uploads and
+// copies took from the pool since its last schedule, at clock, in order,
+// and between the two schedules before.
+type loadOrder struct {
+	clock     int
+	cur, last []uintptr
 }
 
 type pooled struct {
@@ -88,7 +98,7 @@ var pools = map[backend.Backend]*pool{}
 func poolOf(be backend.Backend) *pool {
 	p := pools[be]
 	if p == nil {
-		p = &pool{be: be, free: map[poolKey][]pooled{}, owned: map[weak.Pointer[byte]]*entry{}}
+		p = &pool{be: be, free: map[poolKey][]pooled{}, loads: map[poolKey]*loadOrder{}, owned: map[weak.Pointer[byte]]*entry{}}
 		pools[be] = p
 	}
 	return p

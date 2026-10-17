@@ -29,6 +29,17 @@ func SetCaching(on bool) (was bool) {
 	return was
 }
 
+// compiled counts the programs compiled, cached or not, for tests.
+var compiled int
+
+// Compiled returns the number of programs compiled so far, for tests that
+// check a schedule replays its program.
+func Compiled() int {
+	mu.Lock()
+	defer mu.Unlock()
+	return compiled
+}
+
 // cache holds the programs of a pool.
 type cache struct {
 	byHash map[uint64][]*cached

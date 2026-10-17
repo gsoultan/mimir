@@ -285,6 +285,25 @@ const bucketBytes = 25 << 20
 // a backward pass computes them, each bucket's collectives queued as one
 // group.
 func (g *Group) ReduceGrads(ctx context.Context, op ReduceOp, root int, params ...[]*Param) error {
+	return g.reduceGrads(ctx, op, root, params)
+}
+
+// AllReduceGrads reduces the gradients of the parameters across the group
+// as ReduceGrads does, into the gradients of every rank: afterwards every
+// rank's gradients hold the same values, bit for bit, so that an
+// optimizer step on each rank computes the same parameters as on any
+// other (see train.Parallel.Step).
+func (g *Group) AllReduceGrads(ctx context.Context, op ReduceOp, params ...[]*Param) error {
+	return g.reduceGrads(ctx, op, -1, params)
+}
+
+// reduceGrads reduces the gradients of params into rank root's, or into
+// every rank's if root is -1.
+func (g *Group) reduceGrads(ctx context.Context, op ReduceOp, root int, params [][]*Param) error {
+	kind, all := backend.Reduce, root < 0
+	if all {
+		kind, root = backend.AllReduce, 0
+	}
 	values, err := g.checkParams(root, params)
 	if err != nil {
 		return err
@@ -335,7 +354,7 @@ func (g *Group) ReduceGrads(ctx context.Context, op ReduceOp, root int, params .
 					return err
 				}
 				ins[r][j] = gr.node
-				if r == root {
+				if all || r == root {
 					outs[r][j] = sched.Out{DType: like.node.DType, Shape: like.node.Shape, Over: j}
 				}
 			}
@@ -343,7 +362,7 @@ func (g *Group) ReduceGrads(ctx context.Context, op ReduceOp, root int, params .
 		nodes, err := sched.Collective(ctx, g.bes, ins, outs, lazy.values, func(in, out [][]backend.Buffer) error {
 			cs := make([]backend.Collective, len(bucket))
 			for j := range bucket {
-				c := backend.Collective{Kind: backend.Reduce, Reduce: op, Root: root, In: make([]backend.Buffer, n), Out: make([]backend.Buffer, n)}
+				c := backend.Collective{Kind: kind, Reduce: op, Root: root, In: make([]backend.Buffer, n), Out: make([]backend.Buffer, n)}
 				for r := range n {
 					c.In[r], c.Out[r] = in[r][j], out[r][j]
 				}
@@ -354,9 +373,14 @@ func (g *Group) ReduceGrads(ctx context.Context, op ReduceOp, root int, params .
 		if err != nil {
 			return err
 		}
-		for j, i := range bucket {
-			t := values[root][i].tape
-			t.grad, t.own = wrap(nodes[root][j], nil), true
+		for r := range n {
+			if !all && r != root {
+				continue
+			}
+			for j, i := range bucket {
+				t := values[r][i].tape
+				t.grad, t.own = wrap(nodes[r][j], nil), true
+			}
 		}
 		return nil
 	})

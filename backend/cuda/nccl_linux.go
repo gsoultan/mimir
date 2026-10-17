@@ -296,6 +296,16 @@ func (c *communicator) Run(ctx context.Context, cs []backend.Collective) error {
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	// A collective may write over memory that copies to other devices
+	// read.
+	for _, d := range byDevice {
+		if len(d.reads) > 0 {
+			cuCtxSetCurrent(d.ctx)
+			if err := d.settleAll(); err != nil {
+				return err
+			}
+		}
+	}
 	if err := checkNCCL(ncclGroupStart(), "group start"); err != nil {
 		return err
 	}

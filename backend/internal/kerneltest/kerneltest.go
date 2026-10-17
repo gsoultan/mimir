@@ -32,7 +32,8 @@ type Target interface {
 
 // Case is a kernel and its inputs, which are Host buffers. Tol is the
 // relative error allowed against the CPU backend for a float output of
-// any dtype; 0 requires identical bits.
+// any dtype; 0 requires identical bits, but for a NaN, which matches
+// any NaN.
 type Case struct {
 	Name string
 	K    backend.Kernel
@@ -98,7 +99,10 @@ func Check(t *testing.T, tg Target, c Case) {
 			if bytes.Equal(want[o][i*size:(i+1)*size], got[o][i*size:(i+1)*size]) {
 				continue
 			}
-			if dt.IsFloat() && c.Tol > 0 && (math.Abs(w-g) <= c.Tol*math.Max(1, math.Abs(w)) || math.IsNaN(w) && math.IsNaN(g)) {
+			// Arithmetic on a NaN may return any NaN: NVIDIA GPUs return
+			// their canonical NaN where the CPU keeps the input's sign
+			// and payload, so NaNs match whatever their bits.
+			if dt.IsFloat() && (math.IsNaN(w) && math.IsNaN(g) || c.Tol > 0 && math.Abs(w-g) <= c.Tol*math.Max(1, math.Abs(w))) {
 				continue
 			}
 			t.Fatalf("output %d element %d: got %v (%x), want %v (%x)", o, i, g, got[o][i*size:(i+1)*size], w, want[o][i*size:(i+1)*size])

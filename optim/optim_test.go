@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gsoultan/mimir/internal/goldentest"
+	"github.com/gsoultan/mimir/internal/sched"
 	"github.com/gsoultan/mimir/optim"
 	"github.com/gsoultan/mimir/tensor"
 )
@@ -271,5 +272,44 @@ func TestGradsFinite(t *testing.T) {
 			}
 			opt.ZeroGrad()
 		}
+	}
+}
+
+// TestStepsReplayTheirProgram checks that, once the optimizers' states
+// exist, every step schedules the same graph and so replays the program
+// compiled for the first, however many parameters and states there are.
+func TestStepsReplayTheirProgram(t *testing.T) {
+	for name, newOpt := range optimizers {
+		t.Run(name, func(t *testing.T) {
+			var ps []*tensor.Param
+			for i := range 24 {
+				ps = append(ps, tensor.NewParam(tensor.Full(tensor.Float32, float64(i), 3)))
+			}
+			opt := newOpt(ps)
+			step := func() {
+				t.Helper()
+				l := ps[0].Value().Mul(ps[0].Value()).Sum()
+				for _, p := range ps[1:] {
+					l = l.Add(p.Value().Mul(p.Value()).Sum())
+				}
+				if err := l.Backward(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if err := opt.Step(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				opt.ZeroGrad()
+			}
+			for range 3 {
+				step()
+			}
+			before := sched.Compiled()
+			for range 5 {
+				step()
+			}
+			if n := sched.Compiled() - before; n > 0 {
+				t.Errorf("5 steps compiled %d programs, want none", n)
+			}
+		})
 	}
 }

@@ -1,6 +1,7 @@
 package train_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -68,9 +69,9 @@ func closeValues(got, want [][]float32, tol float64) error {
 
 // TestDataParallelMatchesOneDevice trains the same model for a few steps
 // on one device over whole batches and on two and four devices that split
-// them, the batch of 10 unevenly over four, and checks that the losses and
-// parameters agree, and that the replicas hold the model's parameters bit
-// for bit.
+// them, the batch of 10 unevenly over four, stepping the optimizer itself
+// or through Parallel.Step, and checks that the losses and parameters
+// agree, and that the replicas hold the model's parameters bit for bit.
 func TestDataParallelMatchesOneDevice(t *testing.T) {
 	ctx := t.Context()
 	models := map[string]struct {
@@ -94,8 +95,16 @@ func TestDataParallelMatchesOneDevice(t *testing.T) {
 	const batch, steps = 10, 3
 	for mname, mc := range models {
 		for oname, newOpt := range opts {
-			for _, n := range []int{2, 4} {
-				t.Run(fmt.Sprintf("%s/%s/%d", mname, oname, n), func(t *testing.T) {
+			for _, tc := range []struct {
+				n     int
+				local bool // step through Parallel.Step
+			}{{2, false}, {4, false}, {2, true}, {4, true}} {
+				n := tc.n
+				name := fmt.Sprintf("%s/%s/%d", mname, oname, n)
+				if tc.local {
+					name += "/local"
+				}
+				t.Run(name, func(t *testing.T) {
 					shape := append([]int{batch}, mc.input...)
 					xs := make([]*tensor.Tensor, steps)
 					ys := make([]*tensor.Tensor, steps)
@@ -148,7 +157,16 @@ func TestDataParallelMatchesOneDevice(t *testing.T) {
 						if math.Abs(v-want[s]) > tol*max(1, math.Abs(want[s])) {
 							t.Errorf("step %d: loss %v, want %v", s, v, want[s])
 						}
-						if err := opt.Step(ctx); err != nil {
+						// The first Parallel.Step gives the replicas the
+						// optimizer's state, and the later ones step them.
+						if got, want := train.AllReduced(dp), tc.local && s > 0; got != want {
+							t.Errorf("step %d: gradients reduced into every replica: %v, want %v", s, got, want)
+						}
+						step := opt.Step
+						if tc.local {
+							step = func(ctx context.Context) error { return dp.Step(ctx, opt) }
+						}
+						if err := step(ctx); err != nil {
 							t.Fatal(err)
 						}
 						opt.ZeroGrad()
@@ -156,27 +174,40 @@ func TestDataParallelMatchesOneDevice(t *testing.T) {
 					if err := closeValues(paramValues(t, m), paramValues(t, ref), tol); err != nil {
 						t.Error(err)
 					}
+					if tc.local {
+						// The replicas stepped themselves to the model's
+						// values.
+						sameAsModel(t, m, dp)
+						return
+					}
 					// The next Backward hands the replicas the last step's
 					// values first.
 					if _, err := dp.Backward(ctx, loss.CrossEntropy, xs[0], ys[0]); err != nil {
 						t.Fatal(err)
 					}
 					opt.ZeroGrad()
-					values := paramValues(t, m)
-					for r, rep := range dp.Replicas()[1:] {
-						got := paramValues(t, rep)
-						for i := range values {
-							if !slices.Equal(got[i], values[i]) {
-								t.Errorf("replica %d differs from the model in parameter %d", r+1, i)
-							}
-						}
-						for _, p := range nn.Parameters(rep) {
-							if p.Grad() != nil {
-								t.Errorf("replica %d kept a gradient", r+1)
-							}
-						}
-					}
+					sameAsModel(t, m, dp)
 				})
+			}
+		}
+	}
+}
+
+// sameAsModel checks that dp's replicas hold the values of m's parameters
+// bit for bit, and no gradients.
+func sameAsModel(t *testing.T, m nn.Module, dp *train.Parallel) {
+	t.Helper()
+	values := paramValues(t, m)
+	for r, rep := range dp.Replicas()[1:] {
+		got := paramValues(t, rep)
+		for i := range values {
+			if !slices.Equal(got[i], values[i]) {
+				t.Errorf("replica %d differs from the model in parameter %d", r+1, i)
+			}
+		}
+		for _, p := range nn.Parameters(rep) {
+			if p.Grad() != nil {
+				t.Errorf("replica %d kept a gradient", r+1)
 			}
 		}
 	}
@@ -252,4 +283,62 @@ func TestParallelErrors(t *testing.T) {
 			t.Fatal("no gradient from a batch of one")
 		}
 	}
+}
+
+// TestParallelStepsAfterOtherSteps steps the optimizer through
+// Parallel.Step, then itself, then through Parallel.Step again, and
+// checks that training matches one device's and that the replicas step
+// themselves again once Parallel.Step has given them the optimizer's new
+// state.
+func TestParallelStepsAfterOtherSteps(t *testing.T) {
+	ctx := t.Context()
+	build := func() nn.Module {
+		return nn.NewSequential(nn.NewLinear(5, 8), nn.ReLU(), nn.NewLinear(8, 2))
+	}
+	x, y := tensor.Randn(1, 6, 5), tensor.Randn(2, 6, 2)
+	nn.ManualSeed(4)
+	ref := build()
+	refOpt := optim.Adam(nn.Parameters(ref), optim.LR(0.01))
+	devs, tol := parallelDevices(t, 3)
+	nn.ManualSeed(4)
+	m := build()
+	if err := nn.To(m, devs[0]); err != nil {
+		t.Fatal(err)
+	}
+	opt := optim.Adam(nn.Parameters(m), optim.LR(0.01))
+	dp, err := train.NewParallel(m, devs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dp.Close()
+	for s, local := range []bool{true, true, false, true, true, true} {
+		l := loss.MSE(ref.Forward(x), y)
+		if err := l.Backward(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := refOpt.Step(ctx); err != nil {
+			t.Fatal(err)
+		}
+		refOpt.ZeroGrad()
+		if _, err := dp.Backward(ctx, loss.MSE, x, y); err != nil {
+			t.Fatal(err)
+		}
+		// The replicas step themselves once a Parallel.Step has given
+		// them the optimizer's state, until it steps by itself.
+		if got, want := train.AllReduced(dp), s != 0 && s != 3; got != want {
+			t.Errorf("step %d: gradients reduced into every replica: %v, want %v", s, got, want)
+		}
+		step := opt.Step
+		if local {
+			step = func(ctx context.Context) error { return dp.Step(ctx, opt) }
+		}
+		if err := step(ctx); err != nil {
+			t.Fatal(err)
+		}
+		opt.ZeroGrad()
+	}
+	if err := closeValues(paramValues(t, m), paramValues(t, ref), tol); err != nil {
+		t.Error(err)
+	}
+	sameAsModel(t, m, dp)
 }
