@@ -59,16 +59,16 @@ func Checkpoint(f func(in ...*Tensor) *Tensor, in ...*Tensor) *Tensor {
 		return fail(err)
 	}
 	det := make([]*Tensor, len(in))
-	parents := make([]*tape, len(in))
 	for i, t := range in {
-		det[i], parents[i] = t.detached(), t.tape
+		det[i] = t.detached()
 	}
 	since := tapes.Load()
 	out := f(det...)
 	if err := firstErr(out); err != nil {
 		return fail(err)
 	}
-	captured, reads, effects := scan(out.tape, since)
+	c := &checkpointCall{f: f}
+	captured, effects := c.scan(out.tape, since)
 	if captured {
 		return fail(fmt.Errorf("tensor: checkpointed function reads a tracked tensor that is not an input or a leaf: %w", ErrCheckpoint))
 	}
@@ -76,14 +76,23 @@ func Checkpoint(f func(in ...*Tensor) *Tensor, in ...*Tensor) *Tensor {
 		return out
 	}
 	// The result's own tape, if f built one through parameters, goes: the
-	// recompute builds it again. Unlike track, the node is recorded even
+	// recompute builds it again. Unlike record, the node is recorded even
 	// when no input is tracked, for the parameters f reads. The checkpoint
 	// keeps what the dropped tape held that the recompute does not give
 	// back: the effects and the values of the parameters read.
-	vjp := func(g *Tensor) []*Tensor { return recompute(f, det, parents, reads, g) }
-	tp := newTape(out.node.Shape, parents, vjp)
-	tp.effects, tp.reads = effects, reads
+	tp := &tape{seq: tapes.Add(1), node: out.node, ins: slices.Clone(in), effects: effects, ckpt: c}
 	return &Tensor{node: out.node, tape: tp}
+}
+
+// checkpointCall is a call of Checkpoint: the function, which its rule
+// recomputes, the parameters it read and the tapes it reached besides
+// its inputs': leaves, which parameters are, and tensors standing for
+// the arguments of a transformation. A derivative of the result flows to
+// those as well as to the inputs.
+type checkpointCall struct {
+	f       func(in ...*Tensor) *Tensor
+	reads   []paramRead
+	reaches []*tape
 }
 
 // paramRead is a parameter that a checkpointed function read, and the
@@ -93,90 +102,113 @@ type paramRead struct {
 	node *graph.Node
 }
 
-// recompute is the gradient rule of a checkpoint of f over the detached
-// inputs det, whose tapes are parents and which read the parameters
-// reads: it runs f again on fresh leaves standing for the tracked inputs,
-// propagates g through the result into bwd and returns the gradients the
-// leaves received. The gradients of the other leaves f reads, its
-// parameters, stay in bwd for Backward to collect. The recompute's effects
-// are dropped: those of the call that the checkpoint carries are the ones
-// Backward computes. An error is left in bwd.
-func recompute(f func(in ...*Tensor) *Tensor, det []*Tensor, parents []*tape, reads []paramRead, g *Tensor) []*Tensor {
-	for _, r := range reads {
-		if r.p.Value().node != r.node {
-			bwd.fail(fmt.Errorf("tensor: backward: recompute of a checkpointed function: a parameter it read changed after the call: %w", ErrOverwritten))
-			return nil
-		}
-	}
-	leaves := make([]*Tensor, len(det))
-	for i, d := range det {
-		leaves[i] = d
-		if parents[i] != nil {
-			leaves[i] = d.RequiresGrad()
+// recompute is the gradient rule of the checkpoint c over the inputs ins,
+// in the reverse pass r: it runs the function again on tensors standing
+// for the tracked inputs, propagates g through the result and returns the
+// gradients that reach them, followed by those that reach c.reaches. The
+// recompute's effects are dropped: those of the call that the checkpoint
+// carries are the ones Backward computes.
+//
+// What stands for an input is a fresh leaf when the gradients are not to
+// be differentiated, and otherwise a tensor whose tape leads to the input
+// (see standIn), so that the gradients are functions of the inputs.
+func (c *checkpointCall) recompute(r *reverse, ins []*Tensor, g *Tensor) ([]*Tensor, error) {
+	for _, rd := range c.reads {
+		if rd.p.Value().node != rd.node {
+			return nil, fmt.Errorf("tensor: backward: recompute of a checkpointed function: a parameter it read changed after the call: %w", ErrOverwritten)
 		}
 	}
 	since := tapes.Load()
-	out := f(leaves...)
+	args := make([]*Tensor, len(ins))
+	var stops []*tape
+	for i, x := range ins {
+		switch {
+		case x.tape == nil:
+			args[i] = x
+		case r.create:
+			args[i] = standIn(x)
+		default:
+			args[i] = x.detached().RequiresGrad()
+		}
+		if x.tape != nil {
+			stops = append(stops, args[i].tape)
+		}
+	}
+	out := c.f(args...)
 	if err := firstErr(out); err != nil {
-		bwd.fail(fmt.Errorf("tensor: backward: recompute: %w", err))
-		return nil
+		return nil, fmt.Errorf("tensor: backward: recompute: %w", err)
 	}
 	if !slices.Equal(out.node.Shape, g.node.Shape) {
-		bwd.fail(fmt.Errorf("tensor: backward: recompute of shape %v, want %v: %w", out.node.Shape, g.node.Shape, ErrShape))
-		return nil
+		return nil, fmt.Errorf("tensor: backward: recompute of shape %v, want %v: %w", out.node.Shape, g.node.Shape, ErrShape)
 	}
-	if captured, _, _ := scan(out.tape, since); captured {
-		bwd.fail(fmt.Errorf("tensor: backward: recompute reads a tracked tensor that is not an input or a leaf: %w", ErrCheckpoint))
-		return nil
+	if captured, _ := new(checkpointCall).scan(out.tape, since); captured {
+		return nil, fmt.Errorf("tensor: backward: recompute reads a tracked tensor that is not an input or a leaf: %w", ErrCheckpoint)
 	}
-	if out.tape != nil {
-		if _, _, err := propagate(out.tape, g); err != nil {
-			bwd.fail(err)
-			return nil
+	gs := make([]*Tensor, len(ins)+len(c.reaches))
+	if out.tape == nil {
+		return gs, nil
+	}
+	at, _, _, err := r.propagate([]*tape{out.tape}, []*Tensor{g}, append(stops, c.reaches...))
+	if err != nil {
+		return nil, err
+	}
+	k := 0
+	for i, x := range ins {
+		if x.tape != nil {
+			gs[i] = at[k]
+			k++
 		}
 	}
-	gs := make([]*Tensor, len(leaves))
-	for i, l := range leaves {
-		if parents[i] != nil {
-			gs[i] = bwd.take(l.tape)
-		}
-	}
-	return gs
+	copy(gs[len(ins):], at[k:])
+	return gs, nil
 }
 
 // scan walks the tapes reachable from root, the tape of what a function
 // returned that ran when since tapes existed. It reports whether one that
-// is not a leaf was made by then: a tracked tensor that the function
-// captured, since those it computed itself came later and its inputs and
-// parameters are leaves. Otherwise it also returns the parameters the
-// function read, with their values now, those that checkpoints inside it
-// read, and the effects of the tapes, those of checkpoints inside it
-// included.
-func scan(root *tape, since uint64) (captured bool, reads []paramRead, effects []*Tensor) {
+// is not a leaf or a stand-in was made by then: a tracked tensor that the
+// function captured, since those it computed itself came later and its
+// inputs are leaves or stand-ins. Otherwise it adds to c the parameters
+// the function read, with their values now, and the leaves and stand-ins
+// it reached, those of checkpoints inside it included, and returns the
+// effects of the tapes, those of checkpoints inside it included.
+func (c *checkpointCall) scan(root *tape, since uint64) (captured bool, effects []*Tensor) {
 	if root == nil {
-		return false, nil, nil
+		return false, nil
 	}
+	gradMu.Lock()
+	defer gradMu.Unlock()
 	seen := map[*tape]bool{root: true}
+	reach := func(t *tape) {
+		if !slices.Contains(c.reaches, t) {
+			c.reaches = append(c.reaches, t)
+		}
+	}
 	for stack := []*tape{root}; len(stack) > 0; {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		switch {
-		case n.leaf:
+		case n.leaf || n.stand:
 			if n.param != nil {
-				reads = append(reads, paramRead{p: n.param, node: n.param.Value().node})
+				c.reads = append(c.reads, paramRead{p: n.param, node: n.param.Value().node})
 			}
+			reach(n)
 			continue
 		case n.seq <= since:
-			return true, nil, nil
+			return true, nil
 		}
-		reads = append(reads, n.reads...)
+		if n.ckpt != nil {
+			c.reads = append(c.reads, n.ckpt.reads...)
+			for _, t := range n.ckpt.reaches {
+				reach(t)
+			}
+		}
 		effects = append(effects, n.effects...)
-		for _, p := range n.parents {
-			if p != nil && !seen[p] {
+		for i := range n.ins {
+			if p, _ := n.dep(i); p != nil && !seen[p] {
 				seen[p] = true
 				stack = append(stack, p)
 			}
 		}
 	}
-	return false, reads, effects
+	return false, effects
 }

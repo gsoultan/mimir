@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
@@ -43,10 +44,16 @@ func (o ConvOptions) window(k int) graph.Window {
 }
 
 // windows returns the k×k sliding windows over the spatial dimensions of
-// an [N, C, H, W] tensor as [N, C, K, K, OH, OW], padding with pad.
+// an [N, C, H, W] tensor as [N, C, K, K, OH, OW], padding with pad. On a
+// device that runs convolution kernels they are always an unfold, which
+// the scheduler reads where the windows lie (see backend.Convolver),
+// even when they tile t and could be a view of it.
 func (t *Tensor) windows(k int, o ConvOptions, pad float64) *Tensor {
 	if err := t.checkWindows(k, o); err != nil {
 		return fail(err)
+	}
+	if _, ok := backendOf(t.node).(backend.Convolver); ok {
+		return t.unfoldPrim(o.window(k), pad)
 	}
 	return t.unfold(o.window(k), pad)
 }
@@ -80,28 +87,62 @@ func (t *Tensor) pool(k int, o ConvOptions, pad float64, reduce func(t *Tensor, 
 // unfold returns the sliding windows w over the trailing dimensions of t,
 // filling the padding with value: [B..., D...] becomes [B..., K..., O...].
 func (t *Tensor) unfold(w graph.Window, value float64) *Tensor {
+	if batchLevel(t) != 0 {
+		if tiles(w) {
+			return t.tilesUnfolded(w)
+		}
+		return t.unfoldPrim(w, value)
+	}
 	out := wrap(graph.Unfold(t.node, w, value))
 	if out.err == nil && tiles(w) {
-		// [B..., O0, K0, O1, K1, ...] -> [B..., K..., O...]
-		s := len(w.Kernel)
-		lead := len(t.node.Shape) - s
-		perm := make([]int, 0, lead+2*s)
-		for d := range lead {
-			perm = append(perm, d)
-		}
-		for d := range s {
-			perm = append(perm, lead+2*d+1)
-		}
-		for d := range s {
-			perm = append(perm, lead+2*d)
-		}
-		return t.tiles(w).permute(perm)
+		return t.tilesUnfolded(w)
 	}
+	return t.trackUnfold(out, w)
+}
+
+// tilesUnfolded returns the windows w of t, which tiles(w) accepts, as
+// unfold lays them out, as a view.
+func (t *Tensor) tilesUnfolded(w graph.Window) *Tensor {
+	// [B..., O0, K0, O1, K1, ...] -> [B..., K..., O...]
+	s := len(w.Kernel)
+	lead := len(t.node.Shape) - s
+	perm := make([]int, 0, lead+2*s)
+	for d := range lead {
+		perm = append(perm, d)
+	}
+	for d := range s {
+		perm = append(perm, lead+2*d+1)
+	}
+	for d := range s {
+		perm = append(perm, lead+2*d)
+	}
+	return t.tiles(w).permute(perm)
+}
+
+// unfoldPrim is the unfold primitive: the windows w of t, filled with
+// value in the padding, as one node, with the fold of its gradient as
+// t's.
+func (t *Tensor) unfoldPrim(w graph.Window, value float64) *Tensor {
+	if err := firstErr(t); err != nil {
+		return fail(err)
+	}
+	if l := batchLevel(t); l != 0 {
+		return t.trackUnfold(batchUnfold(l, t, w, value), w)
+	}
+	return t.trackUnfold(wrap(graph.Unfold(t.node, w, value)), w)
+}
+
+// trackUnfold returns out, the unfold of t into the windows w, with the
+// fold of its gradient as t's.
+func (t *Tensor) trackUnfold(out *Tensor, w graph.Window) *Tensor {
 	if !tracked(t) || out.err != nil {
 		return out
 	}
 	spatial := t.node.Shape[len(t.node.Shape)-len(w.Kernel):]
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.fold(spatial, w)) }, t)
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.fold(spatial, w)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].unfold(w, 0) },
+	}, t)
 }
 
 // tiles reports whether the valid windows w are apart, unpadded and
@@ -164,11 +205,22 @@ func whole(shape []int) [][2]int {
 // fold sums the windows w in t, shaped [B..., K..., O...], into a
 // [B..., spatial...] tensor: the adjoint of unfold.
 func (t *Tensor) fold(spatial []int, w graph.Window) *Tensor {
-	out := wrap(graph.Fold(t.node, spatial, w))
+	if err := firstErr(t); err != nil {
+		return fail(err)
+	}
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchFold(l, t, spatial, w)
+	} else {
+		out = wrap(graph.Fold(t.node, spatial, w))
+	}
 	if !tracked(t) || out.err != nil {
 		return out
 	}
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.unfold(w, 0)) }, t)
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.unfold(w, 0)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].fold(spatial, w) },
+	}, t)
 }
 
 // Conv2d returns the 2-D convolution (cross-correlation, like

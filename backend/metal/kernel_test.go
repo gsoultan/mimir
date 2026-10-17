@@ -59,3 +59,14 @@ func TestMovementKernels(t *testing.T) {
 }
 func TestWindowKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Window(t), targets(t, false)) }
 func TestMatMulKernels(t *testing.T) { kerneltest.Run(t, kerneltest.MatMul(t), targets(t, true)) }
+func TestScanKernels(t *testing.T)   { kerneltest.Run(t, kerneltest.Scan(t), targets(t, false)) }
+func TestQuantKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.Quant(t), targets(t, false)) }
+func TestAttentionKernels(t *testing.T) {
+	kerneltest.Run(t, kerneltest.Attention(t), targets(t, false))
+}
+func TestConvKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Conv(t), targets(t, false)) }
+func TestSortKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Sort(t), targets(t, false)) }
+func TestFFTKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.FFT(t), targets(t, false)) }
+func TestSegmentKernels(t *testing.T) {
+	kerneltest.Run(t, kerneltest.Segment(t), targets(t, false))
+}

@@ -16,6 +16,12 @@ import (
 // ResNet-18 on a batch of 16 ImageNet-sized images, a step of seconds,
 // which runs only when MIMIR_BENCH_RESNET=1. tools/bench times the same
 // steps in PyTorch.
+//
+// Each model trains on one batch over and over, and, in the upload and
+// donated sub-benchmarks, on a new batch every step, uploaded from host
+// memory as a dataset's batches are; donated hands each batch's memory
+// to its step (see tensor.Tensor.Donate). Each reports the page faults
+// of a step, where the platform counts them.
 func BenchmarkTrainStep(b *testing.B) {
 	for _, bm := range []struct {
 		name    string
@@ -28,33 +34,79 @@ func BenchmarkTrainStep(b *testing.B) {
 		{"cnn", mnistCNN, 128, []int{1, 28, 28}, 10},
 		{"resnet18", resnet18, 16, []int{3, 224, 224}, 1000},
 	} {
-		b.Run(bm.name, func(b *testing.B) {
-			if bm.name == "resnet18" && os.Getenv("MIMIR_BENCH_RESNET") != "1" {
-				b.Skip("set MIMIR_BENCH_RESNET=1 to run")
-			}
-			nn.ManualSeed(1)
-			m := bm.model()
-			opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-3))
-			x := tensor.Rand(1, append([]int{bm.batch}, bm.input...)...)
-			labels := make([]int32, bm.batch)
-			for i := range labels {
-				labels[i] = int32(i % bm.classes)
-			}
-			y := tensor.FromSlice(labels, bm.batch)
-			if err := tensor.Realize(b.Context(), x, y); err != nil {
-				b.Fatal(err)
-			}
-			for b.Loop() {
-				l := loss.CrossEntropy(m.Forward(x), y)
-				if err := l.Backward(b.Context()); err != nil {
-					b.Fatal(err)
+		for _, feed := range []string{"", "/upload", "/donated"} {
+			b.Run(bm.name+feed, func(b *testing.B) {
+				if bm.name == "resnet18" && os.Getenv("MIMIR_BENCH_RESNET") != "1" {
+					b.Skip("set MIMIR_BENCH_RESNET=1 to run")
 				}
-				if err := opt.Step(b.Context()); err != nil {
-					b.Fatal(err)
-				}
-				opt.ZeroGrad()
-			}
-		})
+				trainStep(b, bm.model, bm.batch, bm.input, bm.classes, feed)
+			})
+		}
+	}
+}
+
+// trainStep times the training step of BenchmarkTrainStep of the model
+// that model returns, on batches of the given size and examples of the
+// shape input, fed as feed says: one batch, or a new one every step,
+// uploaded or uploaded and donated.
+func trainStep(b *testing.B, model func() nn.Module, batch int, input []int, classes int, feed string) {
+	nn.ManualSeed(1)
+	m := model()
+	opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-3))
+	shape := append([]int{batch}, input...)
+	x := tensor.Rand(1, shape...)
+	labels := make([]int32, batch)
+	for i := range labels {
+		labels[i] = int32(i % classes)
+	}
+	y := tensor.FromSlice(labels, batch)
+	if err := tensor.Realize(b.Context(), x, y); err != nil {
+		b.Fatal(err)
+	}
+	// A few batches of host memory, which the upload feeds go through in
+	// turn.
+	var images [4][]float32
+	for i := range images {
+		var err error
+		if images[i], err = tensor.Rand(uint64(i+2), shape...).Data[float32](b.Context()); err != nil {
+			b.Fatal(err)
+		}
+	}
+	n := 0
+	next := func() (x, y *tensor.Tensor) {
+		n++
+		x, y = tensor.FromSlice(images[n%len(images)], shape...), tensor.FromSlice(labels, batch)
+		if feed == "/donated" {
+			x, y = x.Donate(), y.Donate()
+		}
+		return x, y
+	}
+	step := func() {
+		x, y := x, y
+		if feed != "" {
+			x, y = next()
+		}
+		l := loss.CrossEntropy(m.Forward(x), y)
+		if err := l.Backward(b.Context()); err != nil {
+			b.Fatal(err)
+		}
+		if err := opt.Step(b.Context()); err != nil {
+			b.Fatal(err)
+		}
+		opt.ZeroGrad()
+	}
+	// The first steps compile the GPU kernels, plan the schedules,
+	// create the optimizer's state and, on CUDA, capture the step's
+	// graph: work a training run does once, which is not timed.
+	for range 3 {
+		step()
+	}
+	faults, counted := pageFaults()
+	for b.Loop() {
+		step()
+	}
+	if after, _ := pageFaults(); counted {
+		b.ReportMetric(float64(after-faults)/float64(b.N), "faults/op")
 	}
 }
 

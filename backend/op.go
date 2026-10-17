@@ -25,7 +25,7 @@ const (
 	OpSin   // Float32 only
 	OpSqrt  // Float32 only
 	OpRecip // 1/x; Float32 only
-	OpCast  // convert to Kernel.DType
+	OpCast  // convert to Kernel.DType; a block-quantized input is dequantized
 
 	// Binary.
 	OpAdd
@@ -55,7 +55,9 @@ const (
 	// its output keeps with size 1.
 	OpMatMul
 
-	// Indexing along Attrs.Axis with Int32 indices.
+	// Indexing along Attrs.Axis with Int32 indices. A gather from a
+	// block-quantized In[0] dequantizes the elements it reads into a float
+	// output.
 	OpGather     // out[m] = In[0][m with m[axis] = In[1][m]]
 	OpScatterAdd // out = In[0]; out[m with m[axis] = In[1][m]] += In[2][m]
 
@@ -75,8 +77,163 @@ const (
 	// for chains of elementwise ops; it is not part of the public IR.
 	OpFused
 
+	// OpScan is the inclusive scan of In[0] along Attrs.Axis by
+	// Attrs.Combine: out[m] combines the elements In[0][m'] with m' = m
+	// outside axis and m'[axis] <= m[axis], in order along axis. Half
+	// elements are combined in float32 and rounded once, into an output
+	// of their dtype.
+	OpScan
+
+	// Joining. OpCat concatenates its inputs along Attrs.Axis, each after
+	// the ones before it, like torch.cat: they share the output's dtype,
+	// rank and every dimension but the axis. It takes at least one input
+	// and at most MaxCatInputs.
+	OpCat
+
+	// OpQMatMul multiplies by the transpose of a block-quantized matrix,
+	// like a linear layer: In[0] is Float32 [..., K], In[1] a
+	// block-quantized [N, K] read contiguously from a block boundary, and
+	// the Float32 output [..., N] holds x·Wᵀ. Backends may round x to the
+	// precision of the weights first, as the CPU backend rounds each block
+	// of a row of x to int8 with a float32 scale, so results differ from
+	// the product of the dequantized weights by about the weights'
+	// quantization error.
+	OpQMatMul
+
+	// Attention. Queries In[0] are [B..., H, Q, D], keys In[1] [B..., HK,
+	// K, D] and values In[2] [B..., HK, K, DV], where HK divides H and
+	// query head h reads key head h/(H/HK). See AttentionShape.
+	//
+	// OpAttention computes softmax(Attrs.Scale·q·kᵀ + mask)·v without
+	// materializing the scores, adding the optional mask In[3], shaped
+	// [B..., H, Q, K], and hiding key j from query i when Attrs.Causal is
+	// set and j > i + Attrs.CausalOffset. Its Float32 output holds the
+	// result, [B..., H, Q, DV], followed by the natural log of each
+	// softmax's denominator, [B..., H, Q], whose maximum term is factored
+	// out first: the logsumexp of the row's scores. A query that may
+	// attend to no key gets zeros and a logsumexp of -Inf.
+	OpAttention
+	// OpAttentionGrad computes the gradients of an OpAttention from its
+	// inputs, its result In[3] and logsumexp In[4] (views of its output),
+	// and the gradient of its result In[5], with the forward kernel's
+	// mask, if any, as In[6]. Its Float32 output holds the gradients of
+	// the queries, keys and values in turn, each shaped like its input.
+	OpAttentionGrad
+	// OpSliceScatter copies In[0] with the block Attrs.Ranges replaced
+	// by In[1], which has the block's shape.
+	OpSliceScatter
+
+	// Convolutions. The scheduler inserts them, in place of products
+	// of the windows of OpUnfold, for a backend that runs them (see
+	// Convolver); they are not part of the public IR. The windows never
+	// take a buffer: a kernel reads them from the image, an input X
+	// shaped [N, G*C, D...], as W[n, g, j, o] = X[n, g*C + c, i] with
+	// j = (c, k...) and o = (o...) in row-major order and i = o*stride -
+	// pad + k*dilation along each windowed dimension as for OpUnfold, or
+	// 0 in the padding: OpUnfold of X reshaped to [N, G, C*K, O]. Float32
+	// only.
+	OpConv       // In[0] [N, G, M, C*K] times W, In[1]'s windows: [N, G, M, O], with an epilogue as OpMatMul has
+	OpConvWeight // In[0] [N, G, M, O] times Wᵀ, In[1]'s windows, summed over the pairs (n, o): [S, G, M, C*K] (see ConvParts)
+	OpConvInput  // In[0] [N, G, C*K, M] times In[1] [N, G, M, O], folded as OpFold folds windows: [N, G*C, D...]
+
+	// OpArgsort holds Int32 positions along Attrs.Axis: element j along
+	// the axis is the position of the j-th element of the stable sort of
+	// In[0]'s line, ascending, or descending when Attrs.Descending is set.
+	// NaN sorts as the largest value and ties keep their order. The
+	// output has In[0]'s shape but along the axis, where it holds every
+	// position or, for a top-k, the first K, with K at most MaxTopK.
+	OpArgsort
+
+	// OpFFT is the discrete Fourier transform along Attrs.Axis of the
+	// complex Float32 In[0], [..., 2], whose last dimension holds the real
+	// and imaginary parts and is not the axis: out[k] = Σ x[j]·e^(-2πijk/n)
+	// over the n positions j, or e^(+2πijk/n) when Attrs.Inverse is set.
+	// Neither direction scales its result.
+	OpFFT
+
+	// Linear algebra on Float32 matrices: the last two dimensions of
+	// In[0], [B..., m, n], batched over the leading ones. Factorizations
+	// other than OpCholesky write a one-dimensional output that holds
+	// their parts in turn, each contiguous and shaped as FactorParts
+	// returns.
+	OpCholesky        // the lower factor L of a positive definite [B..., n, n], read from its lower triangle, with zeros above the diagonal; ErrSingular unless positive definite
+	OpTriangularSolve // X of A·X = B for a triangular In[0] [B..., n, n], read from its lower triangle or, with Attrs.Upper, its upper, with ones on the diagonal if Attrs.Unit, and In[1] [B..., n, k]; ErrSingular on a zero diagonal
+	OpLU              // P·A = L·U with partial pivoting: L and U packed in [B..., n, n] with L's unit diagonal implied, the permutation [B..., n], whose element i is the row of A that row i of P·A is, and its sign [B...]; a zero pivot is kept
+	OpQR              // A = Q·R from Householder reflections, with min(m, n) columns of Q and rows of R: Q [B..., m, k], R [B..., k, n]; R's diagonal has LAPACK's signs
+	OpSVD             // A = U·diag(S)·Vh with k = min(m, n) singular values in descending order: U [B..., m, k], S [B..., k], Vh [B..., k, n]
+	OpEigh            // A = V·diag(W)·Vᵀ for a symmetric [B..., n, n], read from its lower triangle: W [B..., n] in ascending order, V [B..., n, n]
+
+	// Special functions, unary and elementwise like OpExp2, on float types
+	// only. Each is a pole or a limit where its mathematical function has
+	// one, as in torch.special.
+	OpLog1p    // log(1 + x)
+	OpExpm1    // e^x - 1
+	OpErf      // the error function
+	OpErfinv   // the inverse of the error function on [-1, 1]: ±Inf at ±1, NaN outside
+	OpLgamma   // log|Γ(x)|: +Inf at the non-positive integers
+	OpDigamma  // ψ(x), the derivative of log Γ(x): -Inf at +0, +Inf at -0, NaN at the negative integers
+	OpTrigamma // ψ'(x), the derivative of ψ: +Inf at the non-positive integers
+
+	// Samplers whose elements each draw as many Philox4x32-10 blocks as
+	// their rejection loop needs, keyed by Attrs.Seed: element i draws
+	// blocks (i, j, 0, word) for j = 0, 1 and so on, where word tells the
+	// ops apart. They map a Float32 parameter In[0] to Float32 samples of
+	// its shape.
+	OpRandGamma   // Gamma(In[0], 1) by Marsaglia and Tsang's method, with Gamma(α+1)·U^(1/α) for α < 1; at least the smallest normal float32
+	OpRandPoisson // Poisson(In[0]) by multiplication of uniforms below 10 and Hörmann's PTRS above
+	// OpGammaGrad is the derivative of a sample In[1] of Gamma(In[0], 1)
+	// with respect to In[0] that keeps its CDF fixed, the implicit
+	// reparameterization gradient: -(∂P(α, x)/∂α) / p(x; α).
+	OpGammaGrad
+
+	// OpSegment combines rows of In[0], [R, D...], in segments, as the
+	// product of a sparse matrix in compressed rows: In[1], Int32 [S+1],
+	// holds the offsets of S segments into In[2], Int32 [J], which lists
+	// rows of In[0]. Row s of the output, [S, D...], combines the rows
+	// In[2][j] for j from In[1][s] up to In[1][s+1], in that order, by
+	// Attrs.Combine, CombineSum or CombineMax, and is zero for an empty
+	// segment. Offsets that fall or leave [0, J], and rows outside
+	// [0, R), fail with ErrIndex. Half rows are combined in float32 and
+	// rounded once.
+	OpSegment
+
 	numOps
 )
+
+// Combine is the function a scan combines elements with. Each is
+// associative, so a device may group the elements of a line as it likes,
+// and the last bits of a float scan can differ between devices.
+type Combine uint8
+
+// Scan combines.
+const (
+	CombineSum       Combine = iota + 1 // a + b; Int32 wraps
+	CombineMax                          // max(a, b), like OpMax: NaN propagates
+	CombineLogSumExp                    // log(exp(a) + exp(b)), without overflow; float types only
+)
+
+func (c Combine) String() string {
+	switch c {
+	case CombineSum:
+		return "sum"
+	case CombineMax:
+		return "max"
+	case CombineLogSumExp:
+		return "logsumexp"
+	default:
+		return fmt.Sprintf("Combine(%d)", uint8(c))
+	}
+}
+
+// MaxTopK is the most positions an OpArgsort keeps along its axis when
+// it keeps fewer than all, so that a GPU group can hold them while it
+// scans the rest of a line.
+const MaxTopK = 1024
+
+// MaxCatInputs is the most inputs an OpCat kernel takes, so that the
+// buffers of a GPU kernel fit its argument table. Longer joins are trees
+// of OpCat.
+const MaxCatInputs = 16
 
 var opNames = [numOps]string{
 	OpInvalid:     "invalid",
@@ -113,6 +270,38 @@ var opNames = [numOps]string{
 	OpFold:        "fold",
 	OpContiguous:  "contiguous",
 	OpFused:       "fused",
+	OpScan:        "scan",
+	OpCat:         "cat",
+	OpQMatMul:     "qmatmul",
+
+	OpAttention:     "attention",
+	OpAttentionGrad: "attention_grad",
+	OpSliceScatter:  "slice_scatter",
+
+	OpConv:       "conv",
+	OpConvWeight: "conv_weight",
+	OpConvInput:  "conv_input",
+
+	OpArgsort:         "argsort",
+	OpFFT:             "fft",
+	OpCholesky:        "cholesky",
+	OpTriangularSolve: "triangular_solve",
+	OpLU:              "lu",
+	OpQR:              "qr",
+	OpSVD:             "svd",
+	OpEigh:            "eigh",
+
+	OpLog1p:       "log1p",
+	OpExpm1:       "expm1",
+	OpErf:         "erf",
+	OpErfinv:      "erfinv",
+	OpLgamma:      "lgamma",
+	OpDigamma:     "digamma",
+	OpTrigamma:    "trigamma",
+	OpRandGamma:   "rand_gamma",
+	OpRandPoisson: "rand_poisson",
+	OpGammaGrad:   "gamma_grad",
+	OpSegment:     "segment",
 }
 
 func (o Op) String() string {
@@ -123,7 +312,11 @@ func (o Op) String() string {
 }
 
 // IsUnary reports whether o takes one input and applies elementwise.
-func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast }
+func (o Op) IsUnary() bool { return o >= OpNeg && o <= OpCast || o.IsSpecial() }
+
+// IsSpecial reports whether o is one of the special functions, unary ops
+// defined on float types only, from OpLog1p to OpTrigamma.
+func (o Op) IsSpecial() bool { return o >= OpLog1p && o <= OpTrigamma }
 
 // IsBinary reports whether o takes two same-shaped inputs elementwise.
 func (o Op) IsBinary() bool { return o >= OpAdd && o <= OpMod }

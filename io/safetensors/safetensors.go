@@ -18,6 +18,8 @@ import (
 	"math"
 	"runtime"
 	"slices"
+
+	"github.com/gsoultan/mimir/internal/filemap"
 )
 
 // ErrFormat reports a malformed file.
@@ -44,9 +46,8 @@ type Tensor struct {
 type File struct {
 	Metadata map[string]string
 	tensors  map[string]Tensor
-	mapping  *mapping        // the mapping the tensors alias, when Open made one
-	cleanup  runtime.Cleanup // lets go of the mapping if the File is garbage
-	closed   bool            // Close ran; guarded by mapping.mu
+	mapping  *filemap.Mapping // the mapping the tensors alias, when Open made one
+	cleanup  runtime.Cleanup  // lets go of the mapping if the File is garbage
 }
 
 type entry struct {

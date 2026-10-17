@@ -37,14 +37,21 @@ func TestParallelForCoversEveryIndexOnce(t *testing.T) {
 
 func TestParallelForReturnsErrorOfFirstFailedChunk(t *testing.T) {
 	b := &Backend{workers: 4}
+	var mu sync.Mutex
+	first := -1
 	err := b.parallelFor(t.Context(), 100, 1, func(lo, hi int) error {
-		if lo >= 50 {
-			return fmt.Errorf("chunk at %d", lo)
+		if lo < 50 {
+			return nil
 		}
-		return nil
+		mu.Lock()
+		defer mu.Unlock()
+		if first < 0 || lo < first {
+			first = lo
+		}
+		return fmt.Errorf("chunk at %d", lo)
 	})
-	if err == nil || err.Error() != "chunk at 50" {
-		t.Fatalf("got %v, want the error of the chunk at 50", err)
+	if want := fmt.Sprintf("chunk at %d", first); first < 0 || err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %q, the error of the first chunk that failed", err, want)
 	}
 }
 

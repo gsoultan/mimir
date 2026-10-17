@@ -10,12 +10,13 @@
 // a portable Go kernel.
 //
 // Buffers of a megabyte or more live outside the Go heap, in anonymous
-// mappings that Free returns to the operating system at once. A mapped
-// buffer that becomes garbage instead, as a dropped tensor's does, is
-// unmapped by a cleanup after the next collection, and since such buffers
-// barely grow the Go heap, Alloc runs a collection itself once enough
-// bytes have been mapped since the last (see Alloc). Smaller buffers live
-// on the heap. Wrap and WrapFunc make a buffer over memory the caller
+// mappings that Free returns at once to a bounded cache, from which
+// Alloc reuses them before it maps new memory (see mapcache.go). A
+// mapped buffer that becomes garbage instead, as a dropped tensor's
+// does, goes back by a cleanup after the next collection, and since such
+// buffers barely grow the Go heap, Alloc runs a collection itself once
+// enough bytes have been allocated off the heap since the last (see
+// Alloc). Smaller buffers live on the heap. Wrap and WrapFunc make a buffer over memory the caller
 // owns, such as a mapped file. Where the syscall package cannot map
 // memory, on Windows, Plan 9 and WebAssembly, every buffer Alloc makes
 // lives on the heap.
@@ -28,6 +29,7 @@ import (
 	"math"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
@@ -36,6 +38,9 @@ import (
 // Backend runs kernels on the host CPU. It is safe for concurrent use.
 type Backend struct {
 	workers int
+	// team runs the chunks of parallel loops, or is nil for the
+	// process-wide team (see team.go). A Stream has a team of its own.
+	team *team
 }
 
 // New returns a CPU backend that uses up to GOMAXPROCS goroutines per kernel.
@@ -94,39 +99,60 @@ var offHeapBytes atomic.Int64
 // heap: those Alloc mapped that are not freed yet.
 func OffHeapBytes() int64 { return offHeapBytes.Load() }
 
-// gcPaceMin is the fewest bytes Alloc maps between the collections it runs.
+// gcPaceMin is the fewest bytes Alloc allocates off the heap between the
+// collections it runs.
 const gcPaceMin = 256 << 20
 
 var (
-	mappedSinceGC atomic.Int64 // bytes mapped since Alloc last ran a collection
+	mappedSinceGC atomic.Int64 // bytes allocated off the heap since Alloc last ran a collection
 	collecting    atomic.Bool  // a collection that Alloc runs is under way
 )
 
-// paceGC counts size more bytes mapped and runs a collection once the
-// count since the last reaches the larger of gcPaceMin and half the bytes
-// mapped now, as GOGC=50 would for memory the collector cannot see. The
-// collection finds the mapped buffers that became garbage since, whose
-// cleanups unmap them. Without it they would wait for a collection that
-// the heap paces, which their few heap bytes may not bring for a long
-// time, and mapped memory would grow without bound. One goroutine runs
-// it while the others go on.
+// paceGC counts size more bytes allocated off the heap and runs a
+// collection once the count since the last reaches the larger of
+// gcPaceMin and half the bytes off the heap now, as GOGC=50 would for
+// memory the collector cannot see. The collection finds the mapped
+// buffers that became garbage since, whose cleanups give their mappings
+// back. Without it they would wait for a collection that the heap paces,
+// which their few heap bytes may not bring for a long time, and mapped
+// memory would grow without bound. One goroutine runs it while the
+// others go on.
+//
+// The cleanups that give the mappings back run after the collection, on
+// goroutines of their own, and where they fall behind, the bytes off the
+// heap grow, which puts the next collection off further. So the
+// goroutine that ran the collection waits, up to cleanupWait, for the
+// cleanup of an object the collection found, which runs among theirs.
 func paceGC(size int) {
 	if mappedSinceGC.Add(int64(size)) < max(gcPaceMin, offHeapBytes.Load()/2) || !collecting.CompareAndSwap(false, true) {
 		return
 	}
 	defer collecting.Store(false)
 	mappedSinceGC.Store(0)
+	done := make(chan struct{})
+	runtime.AddCleanup(new(sentinel), func(done chan struct{}) { close(done) }, done)
 	runtime.GC()
+	wait := time.NewTimer(cleanupWait)
+	defer wait.Stop()
+	select {
+	case <-done:
+	case <-wait.C:
+	}
 }
 
+// cleanupWait is the longest a collection that Alloc runs waits for the
+// cleanups the collection queued.
+const cleanupWait = time.Second
+
 // Alloc returns a zeroed buffer of n elements. A buffer of offHeapMin bytes
-// or more comes from an anonymous mapping on platforms that have them, and
-// a smaller one from the Go heap. Each time the bytes mapped since its last
-// collection reach the larger of 256 MiB and half of OffHeapBytes, Alloc
-// runs a garbage collection, so that mapped buffers that became garbage
-// are unmapped. A request larger than the runtime can
-// address, or than the operating system can map, is reported as
-// backend.ErrOutOfMemory.
+// or more comes from an anonymous mapping on platforms that have them,
+// one that a freed buffer left if there is one of its size class, and a
+// smaller one from the Go heap. Each time the bytes allocated off the
+// heap since its last collection reach the larger of 256 MiB and half of
+// OffHeapBytes, Alloc runs a garbage collection, so that the mappings of
+// buffers that became garbage are reused or unmapped. A request larger
+// than the runtime can address, or than the operating system can map, is
+// reported as backend.ErrOutOfMemory.
 func (*Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 	if n < 0 {
 		return nil, fmt.Errorf("cpu: alloc %d elements: %w", n, backend.ErrShape)
@@ -135,6 +161,8 @@ func (*Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 		return nil, fmt.Errorf("cpu: alloc %d x %s: %w", n, dt, backend.ErrOutOfMemory)
 	}
 	switch dt {
+	case backend.Q8_0, backend.Q4_K, backend.Q6_K:
+		return allocBlocks(dt, n)
 	case backend.Float32:
 		return alloc[float32](n)
 	case backend.Int32:
@@ -165,20 +193,24 @@ func alloc[T elem](n int) (buf backend.Buffer, err error) {
 	return &buffer[T]{data: make([]T, n)}, nil
 }
 
-// mapBuffer returns a buffer of n elements of T, size bytes in all, in a
-// zeroed anonymous mapping. Free returns the mapping to the operating
-// system, and so does the garbage collector if the buffer becomes
-// unreachable first, as a tensor's does when the tensor is dropped.
+// mapBuffer returns a buffer of n elements of T, size bytes in all, in
+// an anonymous mapping of its size class, cached or new, with the bytes
+// of the buffer zeroed. Free gives the mapping back to the cache, and so
+// does the garbage collector if the buffer becomes unreachable first, as
+// a tensor's does when the tensor is dropped.
 func mapBuffer[T elem](n, size int) (backend.Buffer, error) {
-	mem, unmap, err := mapAnon(size)
+	mem, unmap, reused, err := mappings.take(mapClass(size))
 	if err != nil {
 		return nil, fmt.Errorf("cpu: alloc %d x %s: %v: %w", n, dtypeOf[T](), err, backend.ErrOutOfMemory)
+	}
+	if reused {
+		clear(mem[:size])
 	}
 	offHeapBytes.Add(int64(size))
 	paceGC(size)
 	release := func() {
-		_ = unmap() // fails only for a range that is not mapped
 		offHeapBytes.Add(-int64(size))
+		mappings.put(mem, unmap)
 	}
 	b := &buffer[T]{data: unsafe.Slice((*T)(unsafe.Pointer(&mem[0])), n)}
 	cleanup := runtime.AddCleanup(b, func(release func()) { release() }, release)
@@ -189,8 +221,8 @@ func mapBuffer[T elem](n, size int) (backend.Buffer, error) {
 	return b, nil
 }
 
-// Free returns a buffer's memory to the operating system if Alloc mapped
-// it, runs the release of one that WrapFunc made, and does nothing
+// Free gives a buffer's mapping back for reuse if Alloc mapped it (see
+// mapcache.go), runs the release of one that WrapFunc made, and does nothing
 // otherwise: a heap buffer is reclaimed by the garbage collector, and the
 // memory of one that Wrap made is the caller's. The buffer
 // must not be used afterwards. The scheduler's pool frees a buffer only
@@ -221,7 +253,8 @@ var ErrUnaligned = errors.New("cpu: unaligned bytes")
 // of dt in the host's byte order. data must hold a whole number of
 // elements, or Wrap fails with backend.ErrShape, and must start at an
 // address that is a multiple of the element size, or it fails with
-// ErrUnaligned. The caller keeps data valid for as long as the buffer is
+// ErrUnaligned. A buffer of a block-quantized dtype holds whole blocks in
+// ggml's little-endian layout at any address. The caller keeps data valid for as long as the buffer is
 // in use. data may be a mapped file: a kernel that writes the buffer, as
 // an in-place update does, then writes the mapping. Free does nothing to
 // a wrapped buffer.
@@ -235,6 +268,9 @@ func Wrap(dt backend.DType, data []byte) (backend.Buffer, error) {
 // it unreachable, whichever comes first. A nil release makes it Wrap.
 // When WrapFunc fails, it does not run release.
 func WrapFunc(dt backend.DType, data []byte, release func()) (backend.Buffer, error) {
+	if dt.IsQuantized() {
+		return wrapBlocks(dt, data, release)
+	}
 	size := dt.Size()
 	if size == 0 {
 		return nil, fmt.Errorf("cpu: wrap %s: %w", dt, backend.ErrDType)
@@ -333,6 +369,8 @@ func bytesOf(b backend.Buffer) ([]byte, error) {
 		return asBytes(b.data), nil
 	case *buffer[f16]:
 		return asBytes(b.data), nil
+	case *blocks:
+		return b.data, nil
 	default:
 		return nil, fmt.Errorf("cpu: foreign buffer %T: %w", b, backend.ErrDType)
 	}

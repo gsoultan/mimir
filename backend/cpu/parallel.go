@@ -11,7 +11,11 @@ import (
 // parallelFor runs fn over [0, n) split into contiguous chunks of at least
 // grain elements, using up to b.workers goroutines. Chunks never overlap, so
 // fn may write its own range of an output without synchronization, and
-// their bounds depend only on n, grain and b.workers.
+// their bounds depend only on n, grain and b.workers. There are up to
+// chunksPerWorker chunks per worker, which the goroutines claim as they
+// become free: one that other processes on the machine leave less time,
+// or that drew slower chunks, then holds up the loop for one small chunk
+// instead of a whole share.
 //
 // It returns after every started chunk has finished. A panic in fn is
 // recovered and reported as backend.ErrInternal. Cancellation is checked
@@ -21,17 +25,22 @@ func (b *Backend) parallelFor(ctx context.Context, n, grain int, fn func(lo, hi 
 		return nil
 	}
 	grain = max(grain, 1)
-	chunks := min(b.workers, (n+grain-1)/grain)
-	if chunks <= 1 {
+	chunks := min(b.workers*chunksPerWorker, (n+grain-1)/grain)
+	if b.workers <= 1 || chunks <= 1 {
 		return runChunk(ctx, fn, 0, n)
 	}
 	size := (n + chunks - 1) / chunks
-	if t := defaultTeam(); t != nil && t.mu.TryLock() {
+	t := b.team
+	if t == nil {
+		t = defaultTeam()
+	}
+	if t != nil && t.mu.TryLock() {
 		defer t.mu.Unlock()
 		return t.run(ctx, n, size, fn)
 	}
 	// Another loop holds the team, so every processor is likely busy; let
-	// the runtime share them between the loops.
+	// the runtime share them between the loops, in one chunk per worker.
+	size = max(size, (n+b.workers-1)/b.workers)
 	errs := make([]error, (n+size-1)/size)
 	var wg sync.WaitGroup
 	for c := range errs {
@@ -47,6 +56,10 @@ func (b *Backend) parallelFor(ctx context.Context, n, grain int, fn func(lo, hi 
 	}
 	return nil
 }
+
+// chunksPerWorker is how many chunks per worker parallelFor splits a loop
+// into, at most.
+const chunksPerWorker = 4
 
 func runChunk(ctx context.Context, fn func(lo, hi int) error, lo, hi int) (err error) {
 	if err := ctx.Err(); err != nil {

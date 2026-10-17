@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/backend/cpu"
 	"github.com/gsoultan/mimir/backend/cuda"
 	"github.com/gsoultan/mimir/backend/metal"
+	"github.com/gsoultan/mimir/backend/rocm"
 	"github.com/gsoultan/mimir/internal/graph"
 	"github.com/gsoultan/mimir/internal/sched"
 )
@@ -37,7 +39,7 @@ var (
 	cpuBackend = cpu.New()
 
 	gpuOnce sync.Once
-	gpu     backend.Backend // the Metal backend, or nil
+	gpu     backend.Backend // the GPU backend, or nil
 	gpuErr  error
 )
 
@@ -45,30 +47,62 @@ var (
 func CPU() Device { return Device{cpuBackend} }
 
 // GPU returns the GPU, or an error saying why there is none that mimir can
-// use. mimir uses Metal on Apple silicon Macs and CUDA on NVIDIA GPUs
-// under Linux.
+// use. mimir uses Metal on Apple silicon Macs, CUDA on NVIDIA GPUs under
+// Linux and ROCm on AMD GPUs under Linux, in that order of preference:
+// a Linux machine with both NVIDIA and AMD GPUs uses CUDA unless
+// MIMIR_DEVICE is rocm.
 func GPU() (Device, error) {
-	gpuOnce.Do(func() {
-		m, metalErr := metal.New()
-		if metalErr == nil {
-			gpu = m
-			return
-		}
-		c, cudaErr := cuda.New()
-		if cudaErr == nil {
-			gpu = c
-			return
-		}
-		// Report the error of the GPU this platform could have.
-		gpuErr = cudaErr
-		if runtime.GOOS == "darwin" || !errors.Is(metalErr, metal.ErrUnavailable) {
-			gpuErr = metalErr
-		}
-	})
+	gpuOnce.Do(func() { gpu, gpuErr = openGPU(os.Getenv("MIMIR_DEVICE")) })
 	if gpu == nil {
 		return Device{}, fmt.Errorf("tensor: no GPU: %w", gpuErr)
 	}
 	return Device{gpu}, nil
+}
+
+// gpuKinds are the GPU backends, in order of preference.
+var gpuKinds = []gpuKind{
+	{"metal", func() (backend.Backend, error) { return opened(metal.New()) }},
+	{"cuda", func() (backend.Backend, error) { return opened(cuda.New()) }},
+	{"rocm", func() (backend.Backend, error) { return opened(rocm.New()) }},
+}
+
+// gpuKind is a GPU backend: its name and how to open its device.
+type gpuKind struct {
+	name string
+	open func() (backend.Backend, error)
+}
+
+// opened returns the backend b that a New returned, or err, as an
+// interface that is nil when b is.
+func opened[B backend.Backend](b B, err error) (backend.Backend, error) {
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// openGPU returns the first GPU backend that has a device, or only the
+// backend kind names if kind is metal, cuda or rocm. If there is none, it
+// reports why: the errors of the backend asked for, or else of the
+// backends this platform could have, Metal on a Mac and CUDA and ROCm
+// elsewhere.
+func openGPU(kind string) (backend.Backend, error) {
+	only := slices.ContainsFunc(gpuKinds, func(g gpuKind) bool { return g.name == kind })
+	mac := runtime.GOOS == "darwin"
+	var errs []error
+	for _, g := range gpuKinds {
+		if only && g.name != kind {
+			continue
+		}
+		be, err := g.open()
+		if err == nil {
+			return be, nil
+		}
+		if only || (g.name == "metal") == mac || g.name == "metal" && !errors.Is(err, metal.ErrUnavailable) {
+			errs = append(errs, err)
+		}
+	}
+	return nil, errors.Join(errs...)
 }
 
 // Auto returns the GPU if there is one, and otherwise the CPU.
@@ -98,7 +132,7 @@ func (d Device) backend() backend.Backend {
 	return d.be
 }
 
-// Name returns the device's kind: "cpu", "metal" or "cuda".
+// Name returns the device's kind: "cpu", "metal", "cuda" or "rocm".
 func (d Device) Name() string { return d.backend().Name() }
 
 // String returns the device's name and, for a GPU, its model, such as
@@ -126,7 +160,7 @@ func init() {
 	defaultDev = CPU()
 	switch name := os.Getenv("MIMIR_DEVICE"); name {
 	case "", "cpu":
-	case "gpu", "metal", "cuda":
+	case "gpu", "metal", "cuda", "rocm":
 		defaultDev, defaultErr = GPU()
 		if defaultErr == nil && name != "gpu" && defaultDev.Name() != name {
 			defaultDev, defaultErr = CPU(), fmt.Errorf("tensor: MIMIR_DEVICE=%s, but the GPU is %s", name, defaultDev)
@@ -134,7 +168,7 @@ func init() {
 	case "auto":
 		defaultDev = Auto()
 	default:
-		defaultErr = fmt.Errorf("tensor: MIMIR_DEVICE=%q, want cpu, gpu, metal, cuda or auto", name)
+		defaultErr = fmt.Errorf("tensor: MIMIR_DEVICE=%q, want cpu, gpu, metal, cuda, rocm or auto", name)
 	}
 }
 
@@ -147,7 +181,7 @@ func defaultDevice() Device {
 // DefaultDevice returns the device that FromSlice uploads to and that
 // computes tensors made of constants alone. It is the CPU unless
 // SetDefaultDevice or the MIMIR_DEVICE environment variable (cpu, gpu,
-// metal, cuda or auto) changes it.
+// metal, cuda, rocm or auto) changes it.
 func DefaultDevice() Device { return defaultDevice() }
 
 // SetDefaultDevice makes d the default device and returns the previous
@@ -168,7 +202,9 @@ func SetDefaultDevice(d Device) Device {
 // allocates or computes anything, instead of running out of memory
 // midway. The budget counts the memory of computed tensors on d, held by
 // them or kept by the device for reuse, until they are garbage collected;
-// tensors uploaded with FromSlice are not counted. train.MemoryBudget
+// tensors uploaded with FromSlice are not counted, unless they reuse
+// memory the device kept, as the next batch after a donated one does (see
+// Donate). train.MemoryBudget
 // trains within a budget by splitting batches that do not fit.
 func SetMemoryBudget(d Device, bytes int64) { sched.SetBudget(d.backend(), bytes) }
 
@@ -194,7 +230,8 @@ func (t *Tensor) Device() Device {
 
 // To returns t's values on d. If t is on d already, it returns t; otherwise
 // it computes t and copies its values, and gradients flow back through the
-// copy to t.
+// copy to t. A sharded tensor's shards are gathered, and To a mesh's
+// device shards t whole on every device of the mesh (see Shard).
 func (t *Tensor) To(d Device) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
@@ -203,14 +240,25 @@ func (t *Tensor) To(d Device) *Tensor {
 	if from == to {
 		return t
 	}
-	ctx := context.Background()
-	data := make([]byte, t.node.Size()*t.node.DType.Size())
-	if err := sched.Download(ctx, from, t.node, data); err != nil {
+	if md, ok := to.(*meshDevice); ok {
+		return Shard(t, md.mesh, nil)
+	}
+	src := Device{from}
+	toRule := rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.To(src)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].To(d) },
+	}
+	if s, ok := t.Sharding(); ok {
+		toRule.vjp = func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(Shard(g, s.Mesh, s.Spec)) }
+	}
+	if l := batchLevel(t); l != 0 {
+		return record(batchTo(l, t, d), toRule, t)
+	}
+	data, err := hostBytes(context.Background(), t.node)
+	if err != nil {
 		return fail(err)
 	}
-	out := upload(to, t.node.DType, data, t.node.Shape)
-	src := Device{from}
-	return track(out, func(g *Tensor) []*Tensor { return []*Tensor{g.To(src)} }, t)
+	return record(upload(to, t.node.DType, data, t.node.Shape), toRule, t)
 }
 
 // upload returns a tensor of shape holding data, as elements of dt, on be.
@@ -218,14 +266,5 @@ func upload(be backend.Backend, dt DType, data []byte, shape []int) *Tensor {
 	if defaultErr != nil {
 		return fail(defaultErr)
 	}
-	n, _ := backend.NumElements(shape)
-	buf, err := be.Alloc(dt, n)
-	if err != nil {
-		return fail(err)
-	}
-	if err := be.Upload(context.Background(), buf, data); err != nil {
-		be.Free(buf)
-		return fail(err)
-	}
-	return wrap(graph.Load(be, buf, shape))
+	return wrap(sched.Upload(context.Background(), be, dt, data, shape))
 }

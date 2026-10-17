@@ -12,10 +12,11 @@ import (
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/internal/diskcache"
 	"github.com/gsoultan/mimir/backend/internal/gen"
 )
 
-// Backend runs kernels on the first CUDA device. It is safe for concurrent
+// Backend runs kernels on one CUDA device. It is safe for concurrent
 // use.
 //
 // Run launches each kernel on the backend's stream and returns; the
@@ -28,13 +29,14 @@ type Backend struct {
 	stream uintptr
 	name   string
 	cc     int // compute capability, such as 86 for 8.6
+	sms    int // multiprocessors
 	pools  bool
 
 	// arch is the architecture NVRTC compiles for, and cubin whether it
 	// emits machine code for it rather than PTX the driver compiles.
 	arch  string
 	cubin bool
-	disk  *diskCache
+	disk  *diskcache.Cache
 
 	blas uintptr // cuBLAS handle
 	// blasMin is the work, in multiply-adds, from which float32 products
@@ -47,6 +49,10 @@ type Backend struct {
 	// writes through errDev.
 	errWord *uint32
 	errDev  uint64
+
+	// groups counts the open NCCL communicators over the device, which
+	// make it asynchronous (see nccl_linux.go).
+	groups atomic.Int32
 }
 
 // buffer is device memory.
@@ -60,11 +66,22 @@ type buffer struct {
 func (b *buffer) DType() backend.DType { return b.dt }
 func (b *buffer) Len() int             { return b.n }
 
+// size returns the buffer's size in bytes.
+func (b *buffer) size() int {
+	n, _ := b.dt.Bytes(b.n)
+	return n
+}
+
 var _ backend.Backend = (*Backend)(nil)
 
 // New returns a backend for the first CUDA device, or an error wrapping
 // ErrUnavailable if there is none or its libraries are missing.
-func New() (*Backend, error) {
+func New() (*Backend, error) { return NewDevice(0) }
+
+// NewDevice returns a backend for the CUDA device of the given ordinal,
+// counted from 0 as DeviceCount counts them. Each call returns a new
+// backend with a stream of its own; tensor.GPUs keeps one per device.
+func NewDevice(ordinal int) (*Backend, error) {
 	if err := loadDriver(); err != nil {
 		return nil, fmt.Errorf("cuda: %v: %w", err, ErrUnavailable)
 	}
@@ -75,13 +92,16 @@ func New() (*Backend, error) {
 	if count == 0 {
 		return nil, fmt.Errorf("cuda: no device: %w", ErrUnavailable)
 	}
+	if ordinal < 0 || ordinal >= int(count) {
+		return nil, fmt.Errorf("cuda: device %d of %d: %w", ordinal, count, ErrUnavailable)
+	}
 	for _, load := range []func() error{loadNVRTC, loadBLAS} {
 		if err := load(); err != nil {
 			return nil, fmt.Errorf("cuda: %v: %w", err, ErrUnavailable)
 		}
 	}
-	b := &Backend{funcs: map[string]uintptr{}, disk: openDiskCache()}
-	if r := cuDeviceGet(&b.dev, 0); r != cudaSuccess {
+	b := &Backend{funcs: map[string]uintptr{}, disk: diskcache.Open("cuda")}
+	if r := cuDeviceGet(&b.dev, int32(ordinal)); r != cudaSuccess {
 		return nil, check(r, "open device")
 	}
 	var name [256]byte
@@ -89,16 +109,16 @@ func New() (*Backend, error) {
 		return nil, check(r, "device name")
 	}
 	b.name = goString(&name[0])
-	var major, minor, pools int32
+	var major, minor, pools, sms int32
 	for _, a := range []struct {
 		v    *int32
 		attr int32
-	}{{&major, attrComputeMajor}, {&minor, attrComputeMinor}, {&pools, attrMemoryPools}} {
+	}{{&major, attrComputeMajor}, {&minor, attrComputeMinor}, {&pools, attrMemoryPools}, {&sms, attrMultiprocessors}} {
 		if r := cuDeviceGetAttribute(a.v, a.attr, b.dev); r != cudaSuccess {
 			return nil, check(r, "device attribute")
 		}
 	}
-	b.cc, b.pools = int(major)*10+int(minor), pools != 0
+	b.cc, b.pools, b.sms = int(major)*10+int(minor), pools != 0, int(sms)
 	if r := cuDevicePrimaryCtxRetain(&b.ctx, b.dev); r != cudaSuccess {
 		return nil, check(r, "retain context")
 	}
@@ -201,19 +221,23 @@ func (b *Backend) Alloc(dt backend.DType, n int) (backend.Buffer, error) {
 	if n < 0 || n > gen.MaxElems {
 		return nil, fmt.Errorf("cuda: alloc %d elements: %w", n, backend.ErrShape)
 	}
-	if dt.Size() == 0 {
+	if dt.BlockBytes() == 0 {
 		return nil, fmt.Errorf("cuda: alloc %s: %w", dt, backend.ErrDType)
 	}
-	size := uintptr(max(n*dt.Size(), 4))
+	size, ok := dt.Bytes(n)
+	if !ok {
+		return nil, fmt.Errorf("cuda: alloc %d elements of %s, in blocks of %d: %w", n, dt, dt.BlockSize(), backend.ErrShape)
+	}
+	bytes := uintptr(max(size, 4))
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.enter()()
 	var ptr uint64
 	var r result
 	if b.pools {
-		r = cuMemAllocAsync(&ptr, size, b.stream)
+		r = cuMemAllocAsync(&ptr, bytes, b.stream)
 	} else {
-		r = cuMemAlloc(&ptr, size)
+		r = cuMemAlloc(&ptr, bytes)
 	}
 	if r != cudaSuccess {
 		return nil, check(r, fmt.Sprintf("alloc %d x %s", n, dt))
@@ -262,8 +286,8 @@ func (b *Backend) Upload(ctx context.Context, dst backend.Buffer, src []byte) er
 	if err != nil {
 		return err
 	}
-	if len(src) != cb.n*cb.dt.Size() {
-		return fmt.Errorf("cuda: upload %d bytes into %d-byte buffer: %w", len(src), cb.n*cb.dt.Size(), backend.ErrShape)
+	if len(src) != cb.size() {
+		return fmt.Errorf("cuda: upload %d bytes into %d-byte buffer: %w", len(src), cb.size(), backend.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -287,8 +311,8 @@ func (b *Backend) Download(ctx context.Context, dst []byte, src backend.Buffer) 
 	if err != nil {
 		return err
 	}
-	if len(dst) != cb.n*cb.dt.Size() {
-		return fmt.Errorf("cuda: download %d-byte buffer into %d bytes: %w", cb.n*cb.dt.Size(), len(dst), backend.ErrShape)
+	if len(dst) != cb.size() {
+		return fmt.Errorf("cuda: download %d-byte buffer into %d bytes: %w", cb.size(), len(dst), backend.ErrShape)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -342,69 +366,95 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 	if err := backend.CheckRun(k, outs, ins); err != nil {
 		return fmt.Errorf("cuda: %w", err)
 	}
-	bufs := make([]*buffer, 0, len(outs)+len(ins))
+	ptrs := make([]uint64, 0, len(outs)+len(ins))
 	for _, buf := range slices.Concat(outs, ins) {
 		cb, err := b.own(buf)
 		if err != nil {
 			return err
 		}
-		bufs = append(bufs, cb)
+		ptrs = append(ptrs, cb.ptr)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	defer b.enter()()
+	var c call
+	if err := b.plan(&c, k, outs, ins); err != nil {
+		return err
+	}
+	return b.issue(&c, ptrs, nil)
+}
+
+// call is how the backend runs one kernel: a cuBLAS product, if gemm is
+// set, then the generated kernel l, if it is set, which is the product's
+// epilogue or the kernel itself.
+type call struct {
+	gemm *gen.ColumnMajor
+	l    *gen.Launch
+	fn   uintptr // the compiled kernel of l
+}
+
+// plan sets c to the call that runs k over outs and ins. b.mu is held
+// and the context is current.
+func (b *Backend) plan(c *call, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	*c = call{}
 	lens := make([]int, len(ins))
 	for i, buf := range ins {
 		lens[i] = buf.Len()
 	}
-	g, isGEMM := gen.PlanGEMM(k, lens)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	defer b.enter()()
-	if isGEMM && b.blasMin >= 0 && g.Batch*g.M*g.N*g.K >= b.blasMin {
-		var epilogue *gen.Launch
+	var err error
+	if g, isGEMM := gen.PlanGEMM(k, lens); isGEMM && b.blasMin >= 0 && g.Batch*g.M*g.N*g.K >= b.blasMin {
+		s := g.ColumnMajor()
+		c.gemm = &s
 		if k.Attrs.Program != nil {
-			var err error
-			if epilogue, err = gen.PlanEpilogue(gen.CUDA, k, outs, ins); err != nil {
-				return fmt.Errorf("cuda: %s: %w", k.Op, err)
-			}
+			c.l, err = gen.PlanEpilogue(gen.CUDA, k, outs, ins)
 		}
-		if err := b.sgemm(planSgemm(g), bufs); err != nil || epilogue == nil {
+	} else {
+		c.l, err = gen.Plan(gen.CUDA, k, outs, ins)
+	}
+	if err != nil {
+		return fmt.Errorf("cuda: %s: %w", k.Op, err)
+	}
+	if c.l != nil {
+		if c.fn, err = b.function(c.l.Src, c.l.Threads); err != nil {
+			return fmt.Errorf("cuda: %s: %w", k.Op, err)
+		}
+	}
+	return nil
+}
+
+// issue queues the call c over the device pointers ptrs of its outputs,
+// then its inputs, building the kernel's arguments in args, which may be
+// nil. b.mu is held and the context is current.
+func (b *Backend) issue(c *call, ptrs []uint64, args []unsafe.Pointer) error {
+	if c.gemm != nil {
+		if err := b.sgemm(*c.gemm, ptrs); err != nil {
 			return err
 		}
-		return b.launch(k, epilogue, bufs)
 	}
-	l, err := gen.Plan(gen.CUDA, k, outs, ins)
-	if err != nil {
-		return fmt.Errorf("cuda: %s: %w", k.Op, err)
-	}
-	if l == nil {
+	if c.l == nil {
 		return nil
 	}
-	return b.launch(k, l, bufs)
+	args = kernelArgs(args, ptrs, c.l, &b.errDev)
+	r := cuLaunchKernel(c.fn, uint32(c.l.Groups), 1, 1, uint32(c.l.Threads), 1, 1, 0, b.stream, &args[0], 0)
+	runtime.KeepAlive(ptrs)
+	runtime.KeepAlive(c)
+	return check(r, "launch")
 }
 
-// launch queues the launch l of k over bufs, the outputs then the
-// inputs. b.mu is held and the context is current.
-func (b *Backend) launch(k *backend.Kernel, l *gen.Launch, bufs []*buffer) error {
-	fn, err := b.function(l.Src, l.Threads)
-	if err != nil {
-		return fmt.Errorf("cuda: %s: %w", k.Op, err)
-	}
-	ptrs := make([]uint64, len(bufs))
-	args := make([]unsafe.Pointer, 0, len(bufs)+2)
-	for i, cb := range bufs {
-		ptrs[i] = cb.ptr
+// kernelArgs returns, in args, the arguments of a launch of l as the
+// driver takes them: the address of each buffer pointer, of the launch's
+// parameters and of the error word's pointer.
+func kernelArgs(args []unsafe.Pointer, ptrs []uint64, l *gen.Launch, errDev *uint64) []unsafe.Pointer {
+	args = args[:0]
+	for i := range ptrs {
 		args = append(args, unsafe.Pointer(&ptrs[i]))
 	}
-	args = append(args, unsafe.Pointer(&l.Params[0]), unsafe.Pointer(&b.errDev))
-	r := cuLaunchKernel(fn, uint32(l.Groups), 1, 1, uint32(l.Threads), 1, 1, 0, b.stream, &args[0], 0)
-	runtime.KeepAlive(args)
-	runtime.KeepAlive(ptrs)
-	runtime.KeepAlive(l)
-	return check(r, k.Op.String()+": launch")
+	return append(args, unsafe.Pointer(&l.Params[0]), unsafe.Pointer(errDev))
 }
 
-// sgemm queues the cuBLAS call s over bufs, the output then the inputs.
-// b.mu is held and the context is current.
-func (b *Backend) sgemm(s sgemm, bufs []*buffer) error {
+// sgemm queues the cuBLAS call s over the device pointers ptrs of the
+// output, then the inputs. b.mu is held and the context is current.
+func (b *Backend) sgemm(s gen.ColumnMajor, ptrs []uint64) error {
 	alpha, beta := float32(1), float32(0)
 	op := func(trans bool) int32 {
 		if trans {
@@ -412,11 +462,10 @@ func (b *Backend) sgemm(s sgemm, bufs []*buffer) error {
 		}
 		return blasOpN
 	}
-	at := func(o operand) uint64 { return bufs[1+o.in].ptr + 4*uint64(o.offset) }
-	st := cublasSgemmStridedBatched(b.blas, op(s.a.trans), op(s.b.trans), int32(s.m), int32(s.n), int32(s.k),
-		&alpha, at(s.a), int32(s.a.ld), int64(s.a.stride), at(s.b), int32(s.b.ld), int64(s.b.stride),
-		&beta, bufs[0].ptr, int32(s.ldc), int64(s.strideC), int32(s.batch))
-	runtime.KeepAlive(bufs)
+	at := func(o gen.Operand) uint64 { return ptrs[1+o.In] + 4*uint64(o.Offset) }
+	st := cublasSgemmStridedBatched(b.blas, op(s.A.Trans), op(s.B.Trans), int32(s.M), int32(s.N), int32(s.K),
+		&alpha, at(s.A), int32(s.A.LD), int64(s.A.Stride), at(s.B), int32(s.B.LD), int64(s.B.Stride),
+		&beta, ptrs[0], int32(s.LDC), int64(s.StrideC), int32(s.Batch))
 	if st != blasSuccess {
 		return fmt.Errorf("cuda: cuBLAS sgemm: status %d: %w", st, backend.ErrInternal)
 	}
@@ -457,15 +506,15 @@ func (b *Backend) function(src string, threads int) (uintptr, error) {
 // the disk cache if it has it.
 func (b *Backend) compile(src string) ([]byte, error) {
 	options := []string{b.arch, "--fmad=false"}
-	key := b.disk.key(compilerVersion(), options, src)
-	if image, ok := b.disk.get(key); ok {
+	key := b.disk.Key(compilerVersion(), options, src)
+	if image, ok := b.disk.Get(key); ok {
 		return image, nil
 	}
 	image, err := compileNVRTC(src, options, b.cubin)
 	if err != nil {
 		return nil, err
 	}
-	b.disk.put(key, image)
+	b.disk.Put(key, image)
 	return image, nil
 }
 

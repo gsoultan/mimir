@@ -13,6 +13,12 @@
 //	)
 //	logits := model.Forward(x)
 //
+// Transformers are built from MultiheadAttention, RMSNorm,
+// RotaryEmbedding and DecoderBlock, whose GPT-2 and Llama forms
+// NewGPT2Block and NewLlamaBlock return. Their attention runs as one fused
+// kernel (see tensor.ScaledDotProductAttention), and a KVCache lets a
+// decoder compute only the new positions at each step.
+//
 // New layers start in training mode; Eval switches dropout and batch
 // normalization to inference behavior and Train switches them back.
 // Weights are initialized like PyTorch's defaults from a seeded
@@ -67,7 +73,10 @@ func Parameters(m Module) []*tensor.Param {
 
 // NamedParams yields every parameter and buffer of m with its path, such
 // as "Layers.0.Weight". A parameter reachable by several paths is yielded
-// once, under the first.
+// once, under the first. A struct field tagged `nn:"-"` is skipped, and
+// one tagged `nn:"inline"` adds nothing to the paths below it, so the
+// parameters of an RNN, held in a map, are named by their keys alone, as
+// "weight_ih_l0".
 func NamedParams(m Module) iter.Seq2[string, *tensor.Param] {
 	return func(yield func(string, *tensor.Param) bool) {
 		w := walker{seen: map[unsafe.Pointer]bool{}}
@@ -122,10 +131,12 @@ var (
 // slices, arrays, maps and interfaces.
 type walker struct {
 	seen map[unsafe.Pointer]bool
+	all  bool // fn sees every pointer, not just parameters and trainers
 }
 
 // visit calls fn with each non-nil pointer that is a *tensor.Param or
-// implements trainer, and its path. It stops when fn returns false.
+// implements trainer, or with every one if w.all is set, and its path. It
+// stops when fn returns false.
 func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Value) bool) bool {
 	switch v.Kind() {
 	case reflect.Interface:
@@ -148,14 +159,15 @@ func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Val
 		if v.Type() == paramType {
 			return fn(path, v)
 		}
-		if v.Type().Implements(trainerType) && !fn(path, v) {
+		if (w.all || v.Type().Implements(trainerType)) && !fn(path, v) {
 			return false
 		}
 		return w.visit(v.Elem(), path, fn)
 	case reflect.Struct:
 		for i := range v.NumField() {
 			f := v.Field(i)
-			if v.Type().Field(i).Tag.Get("nn") == "-" {
+			tag := v.Type().Field(i).Tag.Get("nn")
+			if tag == "-" {
 				continue
 			}
 			if !f.CanInterface() {
@@ -164,11 +176,20 @@ func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Val
 				}
 				f = reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
 			}
-			if !w.visit(f, join(path, v.Type().Field(i).Name), fn) {
+			name := join(path, v.Type().Field(i).Name)
+			if tag == "inline" {
+				name = path
+			}
+			if !w.visit(f, name, fn) {
 				return false
 			}
 		}
 	case reflect.Slice, reflect.Array:
+		// Numbers hold no parameters, and a model may hold many, such as
+		// the edges of a graph.
+		if k := v.Type().Elem().Kind(); k <= reflect.Complex128 || k == reflect.String {
+			return true
+		}
 		for i := range v.Len() {
 			if !w.visit(v.Index(i), join(path, strconv.Itoa(i)), fn) {
 				return false
@@ -281,7 +302,10 @@ func Encode(ctx context.Context, t *tensor.Tensor) (safetensors.Tensor, error) {
 	case tensor.BFloat16, tensor.Float16:
 		return encodeHalf(ctx, t)
 	}
-	return safetensors.Tensor{}, t.Err()
+	if err := t.Err(); err != nil {
+		return safetensors.Tensor{}, err
+	}
+	return safetensors.Tensor{}, fmt.Errorf("nn: encode %s tensor: %w", t.DType(), tensor.ErrDType)
 }
 
 // Decode returns a safetensors tensor of dtype F32, I32, BF16 or F16 as a
@@ -342,6 +366,18 @@ type options struct {
 	eps      float64
 	momentum float64
 	seed     *uint64
+
+	// Recurrent layers.
+	layers        int
+	bidirectional bool
+	batchFirst    bool
+	layerDropout  float64
+	relu          bool
+	checkpoint    int
+
+	// Graph attention.
+	slope     float64
+	meanHeads bool
 }
 
 func resolve(opts []Option, base options) options {
@@ -378,6 +414,14 @@ func Momentum(m float64) Option { return func(o *options) { o.momentum = m } }
 // Seed initializes a layer's weights from seed instead of the next seed
 // after ManualSeed.
 func Seed(seed uint64) Option { return func(o *options) { o.seed = &seed } }
+
+// NegativeSlope sets the slope of the LeakyReLU that scores the edges of
+// a graph attention layer, 0.2 by default.
+func NegativeSlope(s float64) Option { return func(o *options) { o.slope = s } }
+
+// MeanHeads averages the heads of a graph attention layer rather than
+// concatenating them.
+func MeanHeads() Option { return func(o *options) { o.meanHeads = true } }
 
 func (o options) nextSeed() uint64 {
 	if o.seed != nil {

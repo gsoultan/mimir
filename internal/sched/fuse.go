@@ -27,7 +27,9 @@ import (
 // A transpose of a product that nothing else reads is computed as the
 // product of the transposed operands, (AB)ᵀ = BᵀAᵀ, so it is written in
 // the order it is read. Linear layers multiply by transposed weights, and
-// the weight gradients come out transposed back.
+// the weight gradients come out transposed back. So does a transpose of
+// a product summed over batch axes, through reshapes that drop the
+// summed axes: the gradient of a weight that a batch of inputs shares.
 //
 // A sum over batch axes of a product that nothing else reads runs as one
 // matmul kernel that adds the products of each output as it computes
@@ -62,7 +64,9 @@ type work struct {
 	prog   []backend.Instr // a fused program, or gemm's epilogue
 	gemm   *graph.Node     // a product its kernel computes, which prog, if any, reads as input 0
 	stores []store         // the targets prog also writes
-	swap   bool            // a transposed product, computed from deps transposed
+	swap   bool            // a transposed product, computed from deps transposed; of gemm if set, a summed product
+	src    []*graph.Node   // the node each instruction of prog computes
+	conv   *conv           // a convolution kernel that computes the product or fold
 }
 
 // store is a target that a fused kernel computes for its group and writes
@@ -87,10 +91,32 @@ func (w *work) nodes(n *graph.Node) []*graph.Node {
 // results of w.deps through views, with an output for each of w.nodes(n)
 // (see resultView); or nil, and the view of its input's buffer that holds
 // n, when n is a view that needs no kernel. It is the one decision that
-// step runs and forecast predicts.
+// compile makes for each step of the plan.
 func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, backend.View, error) {
+	if w.conv != nil {
+		if w.conv.parts > 1 {
+			return w.conv.sum(n, views[0]), backend.View{}, nil
+		}
+		return w.conv.kernel(n, w, views), backend.View{}, nil
+	}
 	if w.swap {
 		// (AB)ᵀ = BᵀAᵀ, from the operands B and A transposed.
+		if w.gemm != nil {
+			// Summed over the batch axes of the product, whose last two
+			// axes the transpose swaps.
+			r := len(w.gemm.Shape)
+			axes := make([]int, r)
+			for i := range axes {
+				axes[i] = i
+			}
+			axes[r-2], axes[r-1] = r-1, r-2
+			shape := slices.Clone(w.gemm.Shape)
+			shape[r-2], shape[r-1] = shape[r-1], shape[r-2]
+			k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: shape, In: []backend.View{
+				views[0].Permute(axes), views[1].Permute(axes),
+			}, Attrs: backend.Attrs{Axes: w.gemm.Attrs.Axes}}
+			return k, backend.View{}, nil
+		}
 		k := &backend.Kernel{Op: backend.OpMatMul, DType: n.DType, Shape: n.Shape, In: []backend.View{
 			views[0].Permute(n.Attrs.Axes), views[1].Permute(n.Attrs.Axes),
 		}}
@@ -128,6 +154,16 @@ func (w *work) kernel(n *graph.Node, views []backend.View) (*backend.Kernel, bac
 	return k, backend.View{}, nil
 }
 
+// parts returns the kernel that computes the parts of a weight gradient
+// that w splits, reading the results of w.deps through views, whose
+// output the kernel of n reads; or nil if w computes n in one kernel.
+func (w *work) parts(n *graph.Node, views []backend.View) *backend.Kernel {
+	if w.conv == nil || w.conv.parts <= 1 {
+		return nil
+	}
+	return w.conv.kernel(n, w, views)
+}
+
 // uses returns how many times the kernels of p read each node.
 func (p *plan) uses() map[*graph.Node]int {
 	uses := make(map[*graph.Node]int, len(p.order))
@@ -139,10 +175,10 @@ func (p *plan) uses() map[*graph.Node]int {
 	return uses
 }
 
-// newPlan plans the kernels for the unrealized nodes in order, which lists
-// every node before its consumers. over holds the storages that targets
-// may be written over; see candidates.
-func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph.Storage]bool) *plan {
+// newPlan plans the kernels that be runs for the unrealized nodes in
+// order, which lists every node before its consumers. over holds the
+// storages that targets may be written over; see candidates.
+func newPlan(be backend.Backend, order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph.Storage]bool) *plan {
 	users := make(map[*graph.Node][]*graph.Node, len(order))
 	for _, n := range order {
 		for i, in := range n.Inputs {
@@ -157,9 +193,10 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	}
 	// joins reports whether n could be computed inside its consumers'
 	// kernel: an unrealized elementwise node read by elementwise nodes
-	// only.
+	// only, other than a cast that dequantizes, whose kernel reads whole
+	// blocks, which programs do not load.
 	joins := func(n *graph.Node) bool {
-		return n.Op.IsElementwise() && !n.Realized() && len(users[n]) > 0 &&
+		return n.Op.IsElementwise() && !n.Realized() && len(users[n]) > 0 && !dequantizes(n) &&
 			!slices.ContainsFunc(users[n], func(u *graph.Node) bool { return !u.Op.IsElementwise() })
 	}
 	// A group stops growing at maxProgram instructions, counting each load
@@ -217,18 +254,23 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	// consumers' group computes and writes.
 	stored := func(n *graph.Node) bool { return member(n) && isTarget[n] }
 
-	p := &plan{work: make(map[*graph.Node]*work, len(order)), storer: map[*graph.Node]*graph.Node{}}
+	p := &plan{be: be, work: make(map[*graph.Node]*work, len(order)), storer: map[*graph.Node]*graph.Node{}}
 	for _, n := range order {
 		switch {
 		case member(n):
 		case summedProduct(n, private):
 			p.work[n] = &work{deps: factors(n), gemm: n}
+			p.convolve(n, p.work[n], private)
 		case transposes(n) && n.Inputs[0].Op == backend.OpMatMul && private(n.Inputs[0]):
 			mm := n.Inputs[0]
 			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true}
+		case transposedSum(n, private) != nil:
+			sum := transposedSum(n, private)
+			mm := sum.Inputs[0]
+			p.work[n] = &work{deps: []*graph.Node{mm.Inputs[1], mm.Inputs[0]}, swap: true, gemm: sum}
 		case n.Op.IsElementwise():
 			prog, nodes, ins := fuse(n, member)
-			w := &work{deps: ins, prog: prog}
+			w := &work{deps: ins, prog: prog, src: nodes}
 			for j, x := range nodes {
 				if x != n && stored(x) {
 					w.stores = append(w.stores, store{x, j})
@@ -243,7 +285,8 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			if w.stores == nil && !slices.ContainsFunc(ins, overwritable) {
 				for i, x := range ins {
 					if gemm := productOf(x, private); gemm != nil && gemm.DType == n.DType && n.DType == backend.Float32 {
-						w = epilogue(prog, ins, i, gemm)
+						w = epilogue(prog, nodes, ins, i, gemm)
+						p.convolve(n, w, private)
 						break
 					}
 				}
@@ -255,6 +298,15 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 			p.work[n] = w
 		default:
 			p.work[n] = &work{deps: n.Inputs}
+			if n.Op == backend.OpMatMul || n.Op == backend.OpFold {
+				w := &work{deps: slices.Clone(n.Inputs)}
+				if n.Op == backend.OpMatMul {
+					w.gemm = n
+				}
+				if p.convolve(n, w, private) {
+					p.work[n] = w
+				}
+			}
 		}
 	}
 	// Keep the kernels the targets need: a constant read only by programs
@@ -274,6 +326,11 @@ func newPlan(order []*graph.Node, isTarget map[*graph.Node]bool, over map[*graph
 	}
 	slices.Reverse(p.order)
 	return p
+}
+
+// dequantizes reports whether n is a cast of a block-quantized value.
+func dequantizes(n *graph.Node) bool {
+	return n.Op == backend.OpCast && n.Inputs[0].DType.IsQuantized()
 }
 
 // fuse returns the program that computes root with the members of its
@@ -305,12 +362,12 @@ func fuse(root *graph.Node, member func(*graph.Node) bool) (prog []backend.Instr
 	return prog, nodes, ins
 }
 
-// epilogue returns the work of a program over ins that runs as the
-// epilogue of gemm, whose product is ins[at]. The matmul reads its two
-// factors, and the program the product as input 0 and the other loads
-// after it.
-func epilogue(prog []backend.Instr, ins []*graph.Node, at int, gemm *graph.Node) *work {
-	w := &work{deps: factors(gemm), prog: slices.Clone(prog), gemm: gemm}
+// epilogue returns the work of a program over ins, whose instructions
+// compute nodes, that runs as the epilogue of gemm, whose product is
+// ins[at]. The matmul reads its two factors, and the program the product
+// as input 0 and the other loads after it.
+func epilogue(prog []backend.Instr, nodes, ins []*graph.Node, at int, gemm *graph.Node) *work {
+	w := &work{deps: factors(gemm), prog: slices.Clone(prog), gemm: gemm, src: nodes}
 	renumber := make([]int, len(ins))
 	for i, x := range ins {
 		if i == at {
@@ -347,6 +404,32 @@ func transposes(n *graph.Node) bool {
 		}
 	}
 	return true
+}
+
+// transposedSum returns the summed product whose transpose n is, if n
+// swaps the last two axes of a private summed product, directly or
+// through private reshapes that only add or drop leading axes of one
+// element, and nil otherwise.
+func transposedSum(n *graph.Node, private func(*graph.Node) bool) *graph.Node {
+	if !transposes(n) {
+		return nil
+	}
+	x := n.Inputs[0]
+	for x.Op == backend.OpReshape && private(x) && slices.Equal(trimOnes(x.Shape), trimOnes(x.Inputs[0].Shape)) {
+		x = x.Inputs[0]
+	}
+	if !summedProduct(x, private) || !private(x) {
+		return nil
+	}
+	return x
+}
+
+// trimOnes returns shape without its leading axes of one element.
+func trimOnes(shape []int) []int {
+	for len(shape) > 0 && shape[0] == 1 {
+		shape = shape[1:]
+	}
+	return shape
 }
 
 // summedProduct reports whether n sums a private matmul over batch axes
@@ -429,11 +512,21 @@ func viewOf(v backend.View, n *graph.Node) (backend.View, bool) {
 // constOf reports the value of n if every element of it is that constant:
 // an unrealized constant, seen through any views.
 func constOf(n *graph.Node) (float64, bool) {
+	c := constNode(n)
+	if c == nil {
+		return 0, false
+	}
+	return c.Attrs.Value, true
+}
+
+// constNode returns the unrealized constant that n is, seen through any
+// views, or nil.
+func constNode(n *graph.Node) *graph.Node {
 	for !n.Realized() && n.Op.IsView() {
 		n = n.Inputs[0]
 	}
 	if n.Realized() || n.Op != backend.OpConst {
-		return 0, false
+		return nil
 	}
-	return n.Attrs.Value, true
+	return n
 }

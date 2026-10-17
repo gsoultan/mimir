@@ -57,7 +57,7 @@ func refEvalExact(in backend.Instr, prog []backend.Instr, vals []refScalar, inpu
 	case backend.OpNeg:
 		return refScalar{-arg(0).f, -arg(0).i}
 	case backend.OpExp2:
-		return refScalar{f: float32(math.Exp2(float64(arg(0).f)))}
+		return refScalar{f: exp2Ref(arg(0).f)}
 	case backend.OpLog2:
 		return refScalar{f: float32(math.Log2(float64(arg(0).f)))}
 	case backend.OpSin:
@@ -162,7 +162,13 @@ func randomProgram(rng *rand.Rand, dtypes []backend.DType, n int, out backend.DT
 	return append(prog, backend.Instr{Op: backend.OpCast, DType: out, Args: []int{of(backend.Float32)}})
 }
 
+// TestFusedProgramsMatchReference runs random programs with each set of
+// vector routines, and none, which must compute the same bits.
 func TestFusedProgramsMatchReference(t *testing.T) {
+	withRoutines(t, testFusedPrograms)
+}
+
+func testFusedPrograms(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	// Shapes with short rows run in tiles that span rows.
 	shapes := [][]int{{7}, {3, 1100}, {2, 3, 5, 4}, {2500}, {37, 3, 20}, {2, 700, 3}}

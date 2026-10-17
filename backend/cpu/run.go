@@ -37,6 +37,12 @@ func (b *Backend) Run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buffer, ins []backend.Buffer) error {
 	out := outs[0]
 	switch {
+	case k.Op == backend.OpCast && ins[0].DType().IsQuantized():
+		return dequantize(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpGather && ins[0].DType().IsQuantized():
+		return gatherQuant(ctx, b, k, out, ins)
+	case k.Op == backend.OpQMatMul:
+		return runQMatMul(ctx, b, k, out, ins)
 	case k.Op == backend.OpFused:
 		return runProgram(ctx, b, k, k.Attrs.Program, k.Attrs.Stores, outs, ins)
 	case k.Op.RunsElementwise():
@@ -56,6 +62,31 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		}
 	case k.Op.IsReduce():
 		return runReduce(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpScan:
+		return runScan(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpAttention || k.Op == backend.OpAttentionGrad:
+		o, err := data[float32](out)
+		if err != nil {
+			return err
+		}
+		if k.Op == backend.OpAttention {
+			return attention(ctx, b, k, o, ins)
+		}
+		return attentionGrad(ctx, b, k, o, ins)
+	case k.Op == backend.OpConv || k.Op == backend.OpConvWeight || k.Op == backend.OpConvInput:
+		return runConv(ctx, b, k, outs, ins)
+
+	case k.Op == backend.OpArgsort:
+		return runArgsort(ctx, b, k, out, ins[0])
+	case k.Op == backend.OpFFT:
+		return runFFT(ctx, b, k, out, ins[0])
+	case k.Op >= backend.OpCholesky && k.Op <= backend.OpEigh:
+		return runLinalg(ctx, b, k, out, ins)
+
+	case k.Op == backend.OpRandGamma || k.Op == backend.OpRandPoisson || k.Op == backend.OpGammaGrad:
+		return runSample(ctx, b, k, out, ins)
+	case k.Op == backend.OpSegment:
+		return runSegment(ctx, b, k, out, ins)
 	}
 	switch k.DType {
 	case backend.Float32:
@@ -119,6 +150,10 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 		return unfold(ctx, b, k, out, in[0])
 	case op == backend.OpFold:
 		return fold(ctx, b, k, out, in[0])
+	case op == backend.OpCat:
+		return cat(ctx, b, k, out, in)
+	case op == backend.OpSliceScatter:
+		return sliceScatter(ctx, b, k, out, in[0], in[1], outBuf == ins[0])
 	default:
 		return fmt.Errorf("no cpu kernel: %w", backend.ErrInternal)
 	}

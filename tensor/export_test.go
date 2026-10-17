@@ -15,3 +15,6 @@ func Eager() bool { return eager }
 
 // DeviceOn returns a device that runs on be.
 func DeviceOn(be backend.Backend) Device { return Device{be} }
+
+// BackendOf returns the backend d runs on.
+func BackendOf(d Device) backend.Backend { return d.backend() }

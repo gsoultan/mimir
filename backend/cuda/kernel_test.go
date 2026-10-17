@@ -42,7 +42,7 @@ func targets(t *testing.T, products bool) map[string]kerneltest.Target {
 
 // emulatedSgemm computes the product g as the backend asks cuBLAS to.
 func emulatedSgemm(g gen.GEMM, x, y []float32) []float32 {
-	return cublas(planSgemm(g), [2][]float32{x, y})
+	return kerneltest.ColumnMajor(g.ColumnMajor(), [2][]float32{x, y})
 }
 
 func TestElementwiseKernels(t *testing.T) {
@@ -55,3 +55,14 @@ func TestMovementKernels(t *testing.T) {
 }
 func TestWindowKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Window(t), targets(t, false)) }
 func TestMatMulKernels(t *testing.T) { kerneltest.Run(t, kerneltest.MatMul(t), targets(t, true)) }
+func TestScanKernels(t *testing.T)   { kerneltest.Run(t, kerneltest.Scan(t), targets(t, false)) }
+func TestQuantKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.Quant(t), targets(t, false)) }
+func TestAttentionKernels(t *testing.T) {
+	kerneltest.Run(t, kerneltest.Attention(t), targets(t, false))
+}
+func TestConvKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Conv(t), targets(t, false)) }
+func TestSortKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Sort(t), targets(t, false)) }
+func TestFFTKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.FFT(t), targets(t, false)) }
+func TestSegmentKernels(t *testing.T) {
+	kerneltest.Run(t, kerneltest.Segment(t), targets(t, false))
+}

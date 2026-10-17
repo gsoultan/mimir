@@ -23,9 +23,10 @@ const (
 	cudaNoDevice    result = 100
 
 	// CUdevice_attribute values.
-	attrComputeMajor = 75
-	attrComputeMinor = 76
-	attrMemoryPools  = 115
+	attrMultiprocessors = 16
+	attrComputeMajor    = 75
+	attrComputeMinor    = 76
+	attrMemoryPools     = 115
 
 	// CUfunction_attribute values, numbered apart from the device's.
 	funcAttrMaxThreadsPerBlock = 0
@@ -39,6 +40,7 @@ const (
 var (
 	driverOnce sync.Once
 	driverErr  error
+	driverLib  uintptr
 
 	cuInit                    func(flags uint32) result
 	cuGetErrorName            func(r result, name **byte) result
@@ -74,6 +76,7 @@ func loadDriver() error {
 			driverErr = err
 			return
 		}
+		driverLib = lib
 		purego.RegisterLibFunc(&cuInit, lib, "cuInit")
 		purego.RegisterLibFunc(&cuGetErrorName, lib, "cuGetErrorName")
 		purego.RegisterLibFunc(&cuDeviceGetCount, lib, "cuDeviceGetCount")
@@ -103,6 +106,67 @@ func loadDriver() error {
 		}
 	})
 	return driverErr
+}
+
+// CUDA graph constants.
+const (
+	captureModeThreadLocal = 1 // CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+	captureStatusActive    = 1 // CU_STREAM_CAPTURE_STATUS_ACTIVE
+)
+
+// kernelNodeParams is a CUDA_KERNEL_NODE_PARAMS_v2.
+type kernelNodeParams struct {
+	fn                     uintptr
+	gridX, gridY, gridZ    uint32
+	blockX, blockY, blockZ uint32
+	_                      uint32 // sharedMemBytes
+	params                 *unsafe.Pointer
+	_                      uintptr    // extra
+	_                      [2]uintptr // kern, ctx
+}
+
+// Loaded functions of the driver's CUDA graph API, which a driver for
+// CUDA 12 has. Kernels launch one by one if any is missing.
+var (
+	graphOnce sync.Once
+	graphErr  error
+
+	cuStreamBeginCapture           func(s uintptr, mode int32) result
+	cuStreamEndCapture             func(s uintptr, graph *uintptr) result
+	cuStreamGetCaptureInfo         func(s uintptr, status *int32, id *uint64, graph *uintptr, deps **uintptr, n *uintptr) result
+	cuGraphInstantiate             func(exec *uintptr, graph uintptr, flags uint64) result
+	cuGraphExecKernelNodeSetParams func(exec, node uintptr, params *kernelNodeParams) result
+	cuGraphLaunch                  func(exec, s uintptr) result
+	cuGraphExecDestroy             func(exec uintptr) result
+	cuGraphDestroy                 func(graph uintptr) result
+)
+
+// loadGraphs loads the CUDA graph API once. loadDriver must have
+// succeeded.
+func loadGraphs() error {
+	graphOnce.Do(func() {
+		for _, f := range []struct {
+			fptr any
+			name string
+		}{
+			{&cuStreamBeginCapture, "cuStreamBeginCapture_v2"},
+			{&cuStreamEndCapture, "cuStreamEndCapture"},
+			{&cuStreamGetCaptureInfo, "cuStreamGetCaptureInfo_v2"},
+			{&cuGraphInstantiate, "cuGraphInstantiateWithFlags"},
+			{&cuGraphExecKernelNodeSetParams, "cuGraphExecKernelNodeSetParams_v2"},
+			{&cuGraphLaunch, "cuGraphLaunch"},
+			{&cuGraphExecDestroy, "cuGraphExecDestroy"},
+			{&cuGraphDestroy, "cuGraphDestroy"},
+		} {
+			sym, err := purego.Dlsym(driverLib, f.name)
+			if err != nil {
+				graphErr = err
+				return
+			}
+			purego.RegisterFunc(f.fptr, sym)
+		}
+	})
+	return graphErr
 }
 
 // errName returns the name of a driver result, such as

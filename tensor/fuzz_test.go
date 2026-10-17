@@ -13,6 +13,7 @@ import (
 func FuzzOps(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13})
 	f.Add([]byte{3, 200, 7, 7, 1, 0, 255, 9, 2, 2})
+	f.Add([]byte{17, 1, 18, 255, 14, 2, 17, 0, 18, 3})
 	f.Fuzz(func(t *testing.T, ops []byte) {
 		if len(ops) > 64 {
 			return
@@ -27,7 +28,7 @@ func FuzzOps(f *testing.F) {
 		dtypes := []tensor.DType{tensor.Float32, tensor.Int32, tensor.BFloat16, tensor.Float16}
 		for i, op := range ops {
 			a, b := arg(i+1), arg(i+2)
-			switch op % 17 {
+			switch op % 19 {
 			case 0:
 				x = x.Reshape(a, -1)
 			case 1:
@@ -70,6 +71,11 @@ func FuzzOps(f *testing.F) {
 				x = x.Mul(tensor.Ones(tensor.BFloat16, a, b)).Sigmoid()
 			case 16:
 				x = x.MatMul(tensor.Ones(tensor.Float16, max(a, 0), max(b, 0)))
+			case 17:
+				x = x.CumSum(a).LogCumSumExp(b)
+			case 18:
+				v, i := x.CumMax(a)
+				x = v.Add(i.Cast(v.DType()))
 			}
 			if x.Size() > 1<<16 {
 				return

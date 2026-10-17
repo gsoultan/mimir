@@ -1,6 +1,6 @@
 // Package gen generates the source of the kernels GPU backends run: one
 // kernel per Backend.Run, in the C++ dialect of the device, Metal Shading
-// Language or CUDA C++.
+// Language, CUDA C++ or HIP C++.
 //
 // The source depends on the structure of a kernel: its op, dtypes, the
 // rank of its coalesced shape, which inputs are read contiguously and
@@ -12,6 +12,9 @@
 // where a group of GroupSize threads computes one. Threads visit the
 // inputs an element sums in the same order as the CPU backend, so sums
 // that one thread computes match it bit for bit.
+//
+// Block-quantized elements are bytes, uchar, in a buffer, which kernels
+// dequantize as they read them; see quant.go.
 //
 // Half elements, BFloat16 and Float16, are ushort in a buffer. Kernels
 // convert them to float as they load them, compute in float and round to
@@ -31,8 +34,8 @@ import (
 	"github.com/gsoultan/mimir/backend"
 )
 
-// GroupSize is the number of threads in a group: a Metal threadgroup or a
-// CUDA block.
+// GroupSize is the number of threads in a group: a Metal threadgroup, or a
+// CUDA or HIP block.
 const GroupSize = 256
 
 // Bits a kernel ORs into its error word.
@@ -50,6 +53,41 @@ type Launch struct {
 	Threads  int
 	Params   []int32
 	Barriers bool // threads of a group synchronize
+
+	args []argParam // the parameters that hold the kernel's arguments
+}
+
+// argParam is parameter param, which holds argument arg of the kernel
+// (see backend.Kernel.AppendArgs): a constant of dtype dt, or, for the
+// seed, its low or high word.
+type argParam struct {
+	param, arg int
+	dt         backend.DType
+	high       bool
+}
+
+// SetArgs writes the arguments args of a kernel (see
+// backend.Kernel.AppendArgs) into the parameters of l, which Plan or
+// PlanEpilogue returned for a kernel that differs from it in its
+// arguments at most. Kernels that differ only in their arguments share
+// their source, so l then runs the other kernel: a backend that keeps a
+// planned launch need not plan it again, which costs far more, when an
+// optimizer's constants change from one step to the next.
+func (l *Launch) SetArgs(args []uint64) {
+	for _, a := range l.args {
+		var v int32
+		switch {
+		case a.arg >= len(args):
+			continue
+		case a.dt == backend.Invalid && a.high:
+			v = int32(uint32(args[a.arg] >> 32))
+		case a.dt == backend.Invalid:
+			v = int32(uint32(args[a.arg]))
+		default:
+			v = constantParam(math.Float64frombits(args[a.arg]), a.dt)
+		}
+		l.Params[a.param] = v
+	}
 }
 
 // MaxElems bounds the elements of a buffer and the offsets kernels
@@ -58,14 +96,16 @@ const MaxElems = math.MaxInt32
 
 // gen builds the source of one kernel.
 type gen struct {
-	d      *Dialect
-	k      *backend.Kernel
-	outs   []backend.DType
-	ins    []backend.DType
-	body   strings.Builder
-	params []int32
-	vars   int
-	err    error
+	d       *Dialect
+	k       *backend.Kernel
+	outs    []backend.DType
+	ins     []backend.DType
+	body    strings.Builder
+	helpers string // functions the body calls, beyond the prelude's
+	params  []int32
+	args    []argParam
+	vars    int
+	err     error
 }
 
 func newGen(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) *gen {
@@ -113,10 +153,11 @@ func (g *gen) finish(groups int, barriers bool) (*Launch, error) {
 	}
 	var s strings.Builder
 	s.WriteString(g.d.prelude)
+	s.WriteString(g.helpers)
 	g.d.signature(&s, g.outs, g.ins, len(g.params))
 	s.WriteString(g.body.String())
 	s.WriteString("}\n")
-	return &Launch{Src: s.String(), Groups: groups, Threads: GroupSize, Params: g.params, Barriers: barriers}, nil
+	return &Launch{Src: s.String(), Groups: groups, Threads: GroupSize, Params: g.params, Barriers: barriers, args: g.args}, nil
 }
 
 // typeName returns the type kernels compute values of dt in: float for
@@ -130,6 +171,9 @@ func typeName(dt backend.DType) string {
 
 // elemName returns the type of the elements of a buffer of dt.
 func elemName(dt backend.DType) string {
+	if dt.IsQuantized() {
+		return "uchar"
+	}
 	if dt.Size() == 2 {
 		return "ushort"
 	}
@@ -174,10 +218,29 @@ func round(dt backend.DType, x string) string {
 // an optimizer's update at each step, share one compiled pipeline. The
 // value of a half type is a float, to round when stored.
 func (g *gen) constant(v float64, dt backend.DType) string {
+	p := g.param(int(constantParam(v, dt)))
 	if dt.IsFloat() {
-		return fmt.Sprintf("fbits(%s)", g.param(int(int32(math.Float32bits(float32(v))))))
+		return fmt.Sprintf("fbits(%s)", p)
 	}
-	return g.param(int(int32(v)))
+	return p
+}
+
+// constantParam returns the parameter that holds the constant v of type
+// dt: its float32 bits, or the integer.
+func constantParam(v float64, dt backend.DType) int32 {
+	if dt.IsFloat() {
+		return int32(math.Float32bits(float32(v)))
+	}
+	return int32(v)
+}
+
+// arg returns the expression of the constant v of type dt, argument a of
+// the kernel (see backend.Kernel.AppendArgs), as constant does, and
+// records its parameter for Launch.SetArgs.
+func (g *gen) arg(a int, v float64, dt backend.DType) string {
+	e := g.constant(v, dt)
+	g.args = append(g.args, argParam{param: len(g.params) - 1, arg: a, dt: dt})
+	return e
 }
 
 // literal returns an exact expression for v converted to dt, as the CPU
@@ -254,8 +317,12 @@ func (g *gen) index(lin string, shape []int) []string {
 // program emits the instructions of an elementwise program and returns the
 // variable holding each value. input returns the expression of the
 // element of input a, which a load converts to a value.
+//
+// The constants of prog, which is the kernel's program when it has any,
+// are its arguments from the third on, in order.
 func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 	vals := make([]string, len(prog))
+	consts := 0
 	for j, in := range prog {
 		t := typeName(in.DType)
 		arg := func(i int) string { return vals[in.Args[i]] }
@@ -264,7 +331,8 @@ func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 		case backend.OpLoad:
 			e = load(in.DType, input(in.Args[0]))
 		case backend.OpConst:
-			e = g.constant(in.Value, in.DType)
+			e = g.arg(2+consts, in.Value, in.DType)
+			consts++
 		case backend.OpNeg:
 			e = "-" + arg(0)
 		case backend.OpExp2:
@@ -293,6 +361,8 @@ func (g *gen) program(prog []backend.Instr, input func(a int) string) []string {
 			e = fmt.Sprintf("md(%s, %s, err)", arg(0), arg(1))
 		case backend.OpWhere:
 			e = fmt.Sprintf("%s != 0 ? %s : %s", arg(0), arg(1), arg(2))
+		case backend.OpLog1p, backend.OpExpm1, backend.OpErf, backend.OpErfinv, backend.OpLgamma, backend.OpDigamma, backend.OpTrigamma:
+			e = g.special(op, arg(0))
 		default:
 			g.err = fmt.Errorf("instruction %d: %s is not elementwise: %w", j, op, backend.ErrInternal)
 			e = "0"
@@ -362,6 +432,9 @@ func checkProgram(prog []backend.Instr, stores []int, out backend.DType, ins []b
 				return backend.ErrDType
 			}
 		}
+		if in.Op.IsSpecial() && !in.DType.IsFloat() {
+			return backend.ErrDType
+		}
 	}
 	return nil
 }
@@ -375,6 +448,9 @@ func indexable(n int, ins []backend.Buffer) error {
 	for _, b := range ins {
 		if b.Len() > MaxElems {
 			return fmt.Errorf("input of %d elements exceeds the %d a GPU kernel indexes: %w", b.Len(), MaxElems, backend.ErrShape)
+		}
+		if size, ok := b.DType().Bytes(b.Len()); b.DType().IsQuantized() && (!ok || size > MaxElems) {
+			return fmt.Errorf("%s input of %d elements exceeds the %d bytes a GPU kernel indexes: %w", b.DType(), b.Len(), MaxElems, backend.ErrShape)
 		}
 	}
 	return nil
@@ -391,8 +467,14 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return nil, nil
 	}
 	g := newGen(d, k, outs, ins)
+	if k.Op == backend.OpQMatMul {
+		return g.qmatmul(n)
+	}
 	g.line("if (gid >= uint(%s)) return;", g.param(n))
 	g.line("int i = int(gid);")
+	if dequantizes(k, g.ins) {
+		return g.dequantize(n)
+	}
 	switch op := k.Op; {
 	case op == backend.OpFused:
 		return g.elementwise(n, k.Attrs.Program, k.Attrs.Stores)
@@ -408,7 +490,7 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		}
 		return g.elementwise(n, prog, nil)
 	case op == backend.OpConst:
-		g.line("o0[i] = %s;", store(k.DType, g.constant(k.Attrs.Value, k.DType)))
+		g.line("o0[i] = %s;", store(k.DType, g.arg(0, k.Attrs.Value, k.DType)))
 		return g.perElement(n)
 	case op == backend.OpRandUniform || op == backend.OpRandNormal:
 		return g.random(n)
@@ -426,6 +508,31 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 		return g.fold(n)
 	case op == backend.OpMatMul:
 		return g.matmul(n)
+	case op == backend.OpScan:
+		return planScan(d, k, outs, ins, n)
+	case op == backend.OpCat:
+		return g.cat(n)
+
+	case op == backend.OpAttention:
+		return planAttention(d, k, outs, ins)
+	case op == backend.OpAttentionGrad:
+		return planAttentionGrad(d, k, outs, ins)
+	case op == backend.OpSliceScatter:
+		return planSliceScatter(d, k, outs, ins, n)
+	case op == backend.OpConv:
+		return planConv(d, k, outs, ins)
+	case op == backend.OpConvWeight:
+		return planConvWeight(d, k, outs, ins)
+	case op == backend.OpConvInput:
+		return planConvInput(d, k, outs, ins)
+
+	case op == backend.OpArgsort:
+		return planArgsort(d, k, outs, ins, n)
+	case op == backend.OpFFT:
+		return planFFT(d, k, outs, ins, n)
+
+	case op == backend.OpSegment:
+		return g.segment(n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
@@ -459,7 +566,10 @@ func (g *gen) random(n int) (*Launch, error) {
 	}
 	seed := g.k.Attrs.Seed
 	g.line("uint w0 = uint(i / 4), w1 = 0u, w2 = 0u, w3 = 0u;")
-	g.line("uint key0 = uint(%s), key1 = uint(%s);", g.param(int(int32(uint32(seed)))), g.param(int(int32(uint32(seed>>32)))))
+	key0 := g.param(int(int32(uint32(seed))))
+	key1 := g.param(int(int32(uint32(seed >> 32))))
+	g.args = append(g.args, argParam{param: len(g.params) - 2, arg: 1}, argParam{param: len(g.params) - 1, arg: 1, high: true})
+	g.line("uint key0 = uint(%s), key1 = uint(%s);", key0, key1)
 	g.line("for (int round = 0; round < 10; round++) {")
 	g.line("\tif (round > 0) { key0 += 0x9E3779B9u; key1 += 0xBB67AE85u; }")
 	g.line("\tuint hi0 = mulhi(0xD2511F53u, w0), lo0 = 0xD2511F53u * w0;")
@@ -545,11 +655,24 @@ func planReduce(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int
 		g.line("%s %s part[%d];", d.shared, t, GroupSize)
 		g.line("part[tid] = acc;")
 		g.line("%s;", d.sync)
-		g.line("for (uint s = %d; s > 0; s >>= 1) {", GroupSize/2)
+		if d.wave == 0 {
+			g.line("for (uint s = %d; s > 0; s >>= 1) {", GroupSize/2)
+			g.line("\tif (tid < s) part[tid] = %s;", reduceStep(k.Op, "part[tid]", "part[tid + s]"))
+			g.line("\t%s;", d.sync)
+			g.line("}")
+			g.line("if (tid == 0) o0[i] = part[0];")
+			return g.finish(n, true)
+		}
+		// The same steps, the last within the first wavefront.
+		g.line("for (uint s = %d; s >= %du; s >>= 1) {", GroupSize/2, d.wave)
 		g.line("\tif (tid < s) part[tid] = %s;", reduceStep(k.Op, "part[tid]", "part[tid + s]"))
 		g.line("\t%s;", d.sync)
 		g.line("}")
-		g.line("if (tid == 0) o0[i] = part[0];")
+		g.line("if (tid < %du) {", d.wave)
+		g.line("\t%s v = part[tid];", t)
+		g.line("\tfor (uint s = %d; s > 0; s >>= 1) v = %s;", d.wave/2, reduceStep(k.Op, "v", fmt.Sprintf("__shfl_down(v, s, %d)", d.wave)))
+		g.line("\tif (tid == 0) o0[i] = v;")
+		g.line("}")
 		return g.finish(n, true)
 	}
 	g.line("if (gid >= uint(%s)) return;", g.param(n))
@@ -587,7 +710,7 @@ func (g *gen) pad(n int) (*Launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", s, s, g.param(v.Shape[d]))
 		g.line("off += %s * %s;", s, g.param(v.Strides[d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.constant(g.k.Attrs.Value, g.k.DType)))
+	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.arg(0, g.k.Attrs.Value, g.k.DType)))
 	return g.perElement(n)
 }
 
@@ -608,7 +731,16 @@ func (g *gen) gather(n int) (*Launch, error) {
 	g.line("\to0[i] = 0;")
 	g.line("\treturn;")
 	g.line("}")
-	g.line("o0[i] = i0[%s + j * %s];", offs[1], g.param(vs.Strides[axis]))
+	at := fmt.Sprintf("%s + j * %s", offs[1], g.param(vs.Strides[axis]))
+	if dt := g.ins[0]; dt.IsQuantized() {
+		if g.k.DType != backend.Float32 {
+			return nil, fmt.Errorf("gather of %s into %s: %w", dt, g.k.DType, backend.ErrInternal)
+		}
+		g.helpers = quantHelpers(g.d, dt)
+		g.line("o0[i] = dq_%s(i0, %s);", quantName(dt), at)
+		return g.perElement(n)
+	}
+	g.line("o0[i] = i0[%s];", at)
 	return g.perElement(n)
 }
 
@@ -616,13 +748,18 @@ func (g *gen) gather(n int) (*Launch, error) {
 // out[m with m[axis] = idx[m]]. Each output element adds the updates that
 // land on it in the order of their position along axis, as the CPU
 // backend does, and the threads at position 0 along axis check the
-// indices of their column.
+// indices of their column. More than ScatterLines updates of 32-bit
+// elements per line run a thread per line instead (see scatterAddLines).
 func (g *gen) scatterAdd(n int) (*Launch, error) {
 	axis := g.k.Attrs.Axis
 	vd, vi, vu := g.k.In[0], g.k.In[1], g.k.In[2]
 	r := len(g.k.Shape)
 	if g.ins[1] != backend.Int32 || axis < 0 || axis >= r || len(vd.Shape) != r || len(vi.Shape) != r || !slices.Equal(vi.Shape, vu.Shape) {
 		return nil, fmt.Errorf("scatter add along axis %d: %w", axis, backend.ErrInternal)
+	}
+	if vi.Shape[axis] > ScatterLines && g.k.DType.Size() == 4 {
+		lines := &gen{d: g.d, k: g.k, outs: g.outs, ins: g.ins}
+		return lines.scatterAddLines(n)
 	}
 	coords := g.index("i", g.k.Shape)
 	g.line("int dst = %s;", g.param(vd.Offset))
@@ -691,7 +828,7 @@ func (g *gen) unfold(n int) (*Launch, error) {
 		g.line("inside = inside && %s >= 0 && %s < %s;", x, x, g.param(v.Shape[lead+d]))
 		g.line("off += %s * %s;", x, g.param(v.Strides[lead+d]))
 	}
-	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.constant(a.Value, g.k.DType)))
+	g.line("o0[i] = inside ? i0[off] : %s;", store(g.k.DType, g.arg(0, a.Value, g.k.DType)))
 	return g.perElement(n)
 }
 
@@ -795,43 +932,14 @@ func (g *gen) matmul(n int) (*Launch, error) {
 	return g.epilogue(n, "acc")
 }
 
-// epilogue writes the product acc, after the epilogue program of the
-// product g.k if it has one. The epilogue reads the product as input 0 and
-// inputs 2 on as inputs 1 on, through views of a shape that lists the
-// output's elements in row-major order.
+// epilogue writes the product acc into element i, after the epilogue
+// program of the product g.k if it has one (see epilogueViews).
 func (g *gen) epilogue(n int, acc string) (*Launch, error) {
-	k := g.k
-	if k.Attrs.Program == nil {
-		g.line("o0[i] = %s;", acc)
-		return g.perElement(n)
-	}
-	// The epilogue's inputs: the product, then ins[2:].
-	shape := k.Shape
-	if len(k.In) > 2 {
-		shape = k.In[2].Shape
-	}
-	views := k.In[2:]
-	for _, v := range views {
-		if !slices.Equal(v.Shape, shape) {
-			return nil, fmt.Errorf("epilogue inputs of shapes %v and %v: %w", shape, v.Shape, backend.ErrInternal)
-		}
-	}
-	if e, _ := backend.NumElements(shape); e != n {
-		return nil, fmt.Errorf("epilogue of shape %v for %d elements: %w", shape, n, backend.ErrInternal)
-	}
-	types := append([]backend.DType{k.DType}, g.ins[2:]...)
-	if err := checkProgram(k.Attrs.Program, nil, k.DType, types); err != nil {
+	ep, err := g.epilogueViews()
+	if err != nil {
 		return nil, err
 	}
-	cshape, cviews := backend.Coalesce(shape, views)
-	offs := g.offsets("i", cshape, cviews)
-	vals := g.program(k.Attrs.Program, func(a int) string {
-		if a == 0 {
-			return acc
-		}
-		return fmt.Sprintf("i%d[%s]", a+1, offs[a-1])
-	})
-	g.line("o0[i] = %s;", vals[len(vals)-1])
+	g.store(ep, "i", acc)
 	return g.perElement(n)
 }
 
@@ -842,4 +950,53 @@ func Numbered(src string) string {
 		fmt.Fprintf(&b, "%4d %s\n", i+1, l)
 	}
 	return b.String()
+}
+
+// cat copies each output element from the input whose range along the
+// axis holds it: input j covers the positions after those of inputs 0 to
+// j-1. Elements move as they are, half ones included.
+func (g *gen) cat(n int) (*Launch, error) {
+	axis, r := g.k.Attrs.Axis, len(g.k.Shape)
+	if len(g.k.In) == 0 || len(g.k.In) > backend.MaxCatInputs || axis < 0 || axis >= r {
+		return nil, fmt.Errorf("cat of %d inputs along axis %d of %v: %w", len(g.k.In), axis, g.k.Shape, backend.ErrInternal)
+	}
+	at := 0
+	for j, v := range g.k.In {
+		if len(v.Shape) != r || g.ins[j] != g.k.DType {
+			return nil, fmt.Errorf("cat input %s%v for output %s%v: %w", g.ins[j], v.Shape, g.k.DType, g.k.Shape, backend.ErrInternal)
+		}
+		for d, s := range v.Shape {
+			if d != axis && s != g.k.Shape[d] {
+				return nil, fmt.Errorf("cat input %v for output %v: %w", v.Shape, g.k.Shape, backend.ErrInternal)
+			}
+		}
+		at += v.Shape[axis]
+	}
+	if at != g.k.Shape[axis] {
+		return nil, fmt.Errorf("cat inputs of %d along axis %d for output %v: %w", at, axis, g.k.Shape, backend.ErrInternal)
+	}
+	coords := g.index("i", g.k.Shape)
+	at = 0
+	for j, v := range g.k.In {
+		size := v.Shape[axis]
+		if size == 0 {
+			continue
+		}
+		g.line("if (%s < %s) {", coords[axis], g.param(at+size))
+		g.line("\tint off = %s;", g.param(v.Offset))
+		for d, c := range coords {
+			if v.Strides[d] == 0 {
+				continue
+			}
+			if d == axis {
+				c = fmt.Sprintf("(%s - %s)", c, g.param(at))
+			}
+			g.line("\toff += %s * %s;", c, g.param(v.Strides[d]))
+		}
+		g.line("\to0[i] = i%d[off];", j)
+		g.line("\treturn;")
+		g.line("}")
+		at += size
+	}
+	return g.perElement(n)
 }

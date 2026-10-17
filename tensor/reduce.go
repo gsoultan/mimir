@@ -65,18 +65,54 @@ func (t *Tensor) reduce(op backend.Op, axes []int) *Tensor {
 	if len(axes) == 0 {
 		return t
 	}
-	out := wrap(graph.Reduce(op, t.node, axes))
-	if !tracked(t) || out.err != nil {
-		return out
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchReduce(l, op, t, axes)
+	} else {
+		out = wrap(graph.Reduce(op, t.node, axes))
 	}
-	x, y, shape := t.detached(), out.detached(), t.node.Shape
 	if op == backend.OpReduceSum {
-		return track(out, func(g *Tensor) []*Tensor { return grads(g.expand(shape)) }, t)
+		return record(out, sumRule(), t)
 	}
-	return track(out, func(g *Tensor) []*Tensor {
-		hit := x.Equal(y)
-		return grads(hit.Mul(g.Div(hit.reduce(backend.OpReduceSum, axes))))
-	}, t)
+	return record(out, maxReduceRule(), t)
+}
+
+// reducedAxes returns the axes that a keep-dims reduction of in into out
+// reduced, but for those of length 1, whose reduction changes nothing.
+func reducedAxes(in, out *Tensor) []int {
+	var axes []int
+	for i, d := range in.node.Shape {
+		if d != out.node.Shape[i] {
+			axes = append(axes, i)
+		}
+	}
+	return axes
+}
+
+// sumRule is the rule of a sum.
+func sumRule() rule {
+	return rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor { return grads(g.expand(in[0].node.Shape)) },
+		jvp: func(t, in []*Tensor, out *Tensor) *Tensor {
+			return t[0].reduce(backend.OpReduceSum, reducedAxes(in[0], out))
+		},
+	}
+}
+
+// maxReduceRule is the rule of a maximum, whose derivative is shared
+// evenly between tied elements.
+func maxReduceRule() rule {
+	return rule{
+		vjp: func(g *Tensor, in []*Tensor, out *Tensor) []*Tensor {
+			hit := in[0].Equal(out)
+			return grads(hit.Mul(g.Div(hit.reduce(backend.OpReduceSum, reducedAxes(in[0], out)))))
+		},
+		jvp: func(t, in []*Tensor, out *Tensor) *Tensor {
+			axes := reducedAxes(in[0], out)
+			hit := in[0].Equal(out)
+			return hit.Mul(t[0]).reduce(backend.OpReduceSum, axes).Div(hit.reduce(backend.OpReduceSum, axes))
+		},
+	}
 }
 
 // dropAxes removes the size-1 axes left by a keep-dims reduction.
@@ -163,7 +199,7 @@ func (t *Tensor) LogSoftmax(axis int) *Tensor {
 // overflow. The result of softmax does not depend on the shift, so no
 // gradient flows through the maximum.
 func (t *Tensor) shiftedByMax(axis int) *Tensor {
-	m, _ := t.detached().reduceKeep(backend.OpReduceMax, []int{axis})
+	m, _ := t.stopGradient().reduceKeep(backend.OpReduceMax, []int{axis})
 	return t.Sub(m)
 }
 
@@ -187,6 +223,8 @@ func (t *Tensor) Argmax(axis int) *Tensor {
 	n := x.node.Shape[a]
 	shape := slices.Repeat([]int{1}, len(x.node.Shape))
 	shape[a] = n
-	pos := Arange[int32](0, int32(n), 1).reshape(shape)
+	// The positions come from a scan of ones, which, unlike a tensor of
+	// data, belongs to no device, so t may be on any.
+	pos := Ones(Int32, shape...).cumsum(a).Sub(Scalar[int32](1))
 	return Where(hit, pos, Scalar(int32(n))).Min(a)
 }

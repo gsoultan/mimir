@@ -193,7 +193,7 @@ func (t *Tensor) MatMul(u *Tensor) *Tensor {
 	y = y.broadcastTo(slices.Concat(batch, y.node.Shape[ry-2:]))
 	out := product(x, y)
 	if out.err != nil {
-		return fail(fmt.Errorf("tensor: matmul %v and %v: %w", t.node.Shape, u.node.Shape, ErrShape))
+		return fail(fmt.Errorf("tensor: matmul %v and %v: %w", t.node.Shape, u.node.Shape, out.err))
 	}
 	if !vecX && !vecY {
 		return out
@@ -233,11 +233,32 @@ func matmulPrim(x, y *Tensor) *Tensor {
 	if err := firstErr(x, y); err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.MatMul(x.node, y.node))
-	a, b := x.detached(), y.detached()
-	return track(out, func(g *Tensor) []*Tensor {
-		return grads(g.MatMul(b.Transpose(-1, -2)), a.Transpose(-1, -2).MatMul(g))
-	}, x, y)
+	var out *Tensor
+	if l := batchLevel(x, y); l != 0 {
+		out = batchMatMul(l, x, y)
+	} else {
+		out = wrap(graph.MatMul(x.node, y.node))
+	}
+	return record(out, matmulRule(), x, y)
+}
+
+// matmulRule is the rule of the product of matrices.
+func matmulRule() rule {
+	return rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor {
+			return grads(g.MatMul(in[1].Transpose(-1, -2)), in[0].Transpose(-1, -2).MatMul(g))
+		},
+		jvp: func(t, in []*Tensor, _ *Tensor) *Tensor {
+			var a, b *Tensor
+			if t[0] != nil {
+				a = t[0].MatMul(in[1])
+			}
+			if t[1] != nil {
+				b = in[0].MatMul(t[1])
+			}
+			return addGrad(a, b)
+		},
+	}
 }
 
 // Gather reads t along axis at the Int32 positions in idx, like
@@ -251,11 +272,21 @@ func (t *Tensor) Gather(axis int, idx *Tensor) *Tensor {
 	if err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.Gather(t.node, idx.node, a))
-	i, shape := idx.detached(), t.node.Shape
-	return track(out, func(g *Tensor) []*Tensor {
-		return grads(Zeros(g.node.DType, shape...).ScatterAdd(a, i, g), nil)
-	}, t, idx)
+	var out *Tensor
+	if l := batchLevel(t, idx); l != 0 {
+		out = batchGather(l, t, a, idx)
+	} else {
+		out = wrap(graph.Gather(t.node, idx.node, a))
+	}
+	if !tracked(t) || out.err != nil {
+		return out
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor {
+			return grads(Zeros(g.node.DType, in[0].node.Shape...).ScatterAdd(a, in[1], g), nil)
+		},
+		jvp: func(t, in []*Tensor, _ *Tensor) *Tensor { return t[0].Gather(a, in[1]) },
+	}, t, idx.detached())
 }
 
 // ScatterAdd returns a copy of t with src added at the Int32 positions in
@@ -271,9 +302,31 @@ func (t *Tensor) ScatterAdd(axis int, idx, src *Tensor) *Tensor {
 		return fail(err)
 	}
 	x, s := promote(t, src)
-	out := wrap(graph.ScatterAdd(x.node, idx.node, s.node, a))
-	i := idx.detached()
-	return track(out, func(g *Tensor) []*Tensor { return grads(g, nil, g.Gather(a, i)) }, x, idx, s)
+	if err := firstErr(x, s); err != nil {
+		return fail(err)
+	}
+	var out *Tensor
+	if l := batchLevel(x, idx, s); l != 0 {
+		out = batchScatterAdd(l, x, a, idx, s)
+	} else {
+		out = wrap(graph.ScatterAdd(x.node, idx.node, s.node, a))
+	}
+	if !tracked(x, s) || out.err != nil {
+		return out
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor { return grads(g, nil, g.Gather(a, in[1])) },
+		jvp: func(t, in []*Tensor, out *Tensor) *Tensor {
+			if t[2] == nil {
+				return t[0]
+			}
+			base := t[0]
+			if base == nil {
+				base = Zeros(t[2].node.DType, out.node.Shape...)
+			}
+			return base.ScatterAdd(a, in[1], t[2])
+		},
+	}, x, idx.detached(), s)
 }
 
 // The movement primitives below take validated arguments and record their
@@ -286,9 +339,22 @@ func (t *Tensor) reshape(shape []int) *Tensor {
 	if slices.Equal(shape, t.node.Shape) {
 		return t
 	}
-	from := t.node.Shape
-	out := wrap(graph.Reshape(t.node, shape))
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.reshape(from)) }, t)
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchReshape(l, t, shape)
+	} else {
+		out = wrap(graph.Reshape(t.node, shape))
+	}
+	return record(out, reshapeRule(), t)
+}
+
+// reshapeRule reshapes each derivative to the shape of what it is the
+// derivative of.
+func reshapeRule() rule {
+	return rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor { return grads(g.reshape(in[0].node.Shape)) },
+		jvp: func(t, _ []*Tensor, out *Tensor) *Tensor { return t[0].reshape(out.node.Shape) },
+	}
 }
 
 // expand broadcasts size-1 dimensions to shape, which has t's rank.
@@ -300,24 +366,41 @@ func (t *Tensor) expand(shape []int) *Tensor {
 	if slices.Equal(shape, t.node.Shape) {
 		return t
 	}
-	out := wrap(graph.Expand(t.node, shape))
-	if !tracked(t) || out.err != nil {
-		return out
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchExpand(l, t, shape)
+	} else {
+		out = wrap(graph.Expand(t.node, shape))
 	}
-	var axes []int
-	for i, d := range t.node.Shape {
-		if d == 1 && shape[i] != 1 {
-			axes = append(axes, i)
-		}
+	return record(out, expandRule(), t)
+}
+
+// expandRule sums the gradient over the broadcast dimensions.
+func expandRule() rule {
+	return rule{
+		vjp: func(g *Tensor, in []*Tensor, out *Tensor) []*Tensor {
+			var axes []int
+			for i, d := range in[0].node.Shape {
+				if d == 1 && out.node.Shape[i] != 1 {
+					axes = append(axes, i)
+				}
+			}
+			return grads(g.reduce(backend.OpReduceSum, axes))
+		},
+		jvp: func(t, _ []*Tensor, out *Tensor) *Tensor { return t[0].expand(out.node.Shape) },
 	}
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.reduce(backend.OpReduceSum, axes)) }, t)
 }
 
 func (t *Tensor) permute(perm []int) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.Permute(t.node, perm))
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchPermute(l, t, perm)
+	} else {
+		out = wrap(graph.Permute(t.node, perm))
+	}
 	if !tracked(t) || out.err != nil {
 		return out
 	}
@@ -325,14 +408,22 @@ func (t *Tensor) permute(perm []int) *Tensor {
 	for i, p := range perm {
 		inv[p] = i
 	}
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.permute(inv)) }, t)
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.permute(inv)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].permute(perm) },
+	}, t)
 }
 
 func (t *Tensor) pad(pads [][2]int, value float64) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.Pad(t.node, pads, value))
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchPad(l, t, pads, value)
+	} else {
+		out = wrap(graph.Pad(t.node, pads, value))
+	}
 	if !tracked(t) || out.err != nil {
 		return out
 	}
@@ -340,14 +431,22 @@ func (t *Tensor) pad(pads [][2]int, value float64) *Tensor {
 	for i, p := range pads {
 		keep[i] = [2]int{p[0], p[0] + t.node.Shape[i]}
 	}
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.shrink(keep)) }, t)
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.shrink(keep)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].pad(pads, 0) },
+	}, t)
 }
 
 func (t *Tensor) shrink(ranges [][2]int) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.Shrink(t.node, ranges))
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchShrink(l, t, ranges)
+	} else {
+		out = wrap(graph.Shrink(t.node, ranges))
+	}
 	if !tracked(t) || out.err != nil {
 		return out
 	}
@@ -355,15 +454,29 @@ func (t *Tensor) shrink(ranges [][2]int) *Tensor {
 	for i, r := range ranges {
 		pads[i] = [2]int{r[0], t.node.Shape[i] - r[1]}
 	}
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.pad(pads, 0)) }, t)
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.pad(pads, 0)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].shrink(ranges) },
+	}, t)
 }
 
 func (t *Tensor) flip(axes []int) *Tensor {
 	if err := firstErr(t); err != nil {
 		return fail(err)
 	}
-	out := wrap(graph.Flip(t.node, axes))
-	return track(out, func(g *Tensor) []*Tensor { return grads(g.flip(axes)) }, t)
+	var out *Tensor
+	if l := batchLevel(t); l != 0 {
+		out = batchFlip(l, t, axes)
+	} else {
+		out = wrap(graph.Flip(t.node, axes))
+	}
+	if !tracked(t) || out.err != nil {
+		return out
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.flip(axes)) },
+		jvp: func(t, _ []*Tensor, _ *Tensor) *Tensor { return t[0].flip(axes) },
+	}, t)
 }
 
 // Flatten merges dimensions start through end, inclusive, into one, like
@@ -398,31 +511,192 @@ func Cat(axis int, ts ...*Tensor) *Tensor {
 	if err != nil {
 		return fail(err)
 	}
-	total := 0
 	for _, t := range ts {
 		s := t.node.Shape
 		if len(s) != len(first.Shape) || t.node.DType != first.DType ||
 			!slices.Equal(s[:a], first.Shape[:a]) || !slices.Equal(s[a+1:], first.Shape[a+1:]) {
 			return fail(fmt.Errorf("tensor: cat %s%v and %s%v along %d: %w", first.DType, first.Shape, t.node.DType, s, a, ErrShape))
 		}
-		total += s[a]
 	}
-	// Each part is padded to the full length and the parts are added, so
-	// every gradient is a slice of the result's.
+	return cat(a, ts)
+}
+
+// cat joins tensors that fit along axis a. A kernel joins at most
+// backend.MaxCatInputs, so more are joined in groups, and the groups
+// joined in turn: every element is copied once per level, and a level
+// joins MaxCatInputs times as many as the one before.
+func cat(a int, ts []*Tensor) *Tensor {
+	for len(ts) > backend.MaxCatInputs {
+		groups := (len(ts) + backend.MaxCatInputs - 1) / backend.MaxCatInputs
+		joined := make([]*Tensor, 0, groups)
+		for part := range slices.Chunk(ts, (len(ts)+groups-1)/groups) {
+			joined = append(joined, catPrim(a, part))
+		}
+		ts = joined
+	}
+	return catPrim(a, ts)
+}
+
+// catPrim is the join primitive: each input's gradient is a view of the
+// result's.
+func catPrim(a int, ts []*Tensor) *Tensor {
+	if err := firstErr(ts...); err != nil {
+		return fail(err)
+	}
+	if len(ts) == 1 {
+		return ts[0]
+	}
 	var out *Tensor
+	if l := batchLevel(ts...); l != 0 {
+		out = batchCat(l, a, ts)
+	} else {
+		nodes := make([]*graph.Node, len(ts))
+		for i, t := range ts {
+			nodes[i] = t.node
+		}
+		out = wrap(graph.Cat(nodes, a))
+	}
+	if !tracked(ts...) || out.err != nil {
+		return out
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, in []*Tensor, out *Tensor) []*Tensor {
+			gs := make([]*Tensor, len(in))
+			at := 0
+			for i, x := range in {
+				n := x.node.Shape[a]
+				gs[i] = g.shrink(rangeAxis(out.node.Shape, a, at, at+n))
+				at += n
+			}
+			return gs
+		},
+		jvp: func(t, in []*Tensor, _ *Tensor) *Tensor {
+			parts := make([]*Tensor, len(in))
+			for i, x := range in {
+				if parts[i] = t[i]; parts[i] == nil {
+					parts[i] = Zeros(x.node.DType, x.node.Shape...)
+				}
+			}
+			return cat(a, parts)
+		},
+	}, ts...)
+}
+
+// Split cuts t along axis into parts of the given sizes, which must add up
+// to its length there, like torch.split with a list of sizes. The parts
+// are views of t. Backward joins their gradients into t's with one copy,
+// where Shrink would pad each part's gradient to t's shape and add them.
+func (t *Tensor) Split(axis int, sizes ...int) []*Tensor {
+	failed := func(err error) []*Tensor {
+		parts := make([]*Tensor, len(sizes))
+		for i := range parts {
+			parts[i] = fail(err)
+		}
+		return parts
+	}
+	if err := firstErr(t); err != nil {
+		return failed(err)
+	}
+	a, err := normAxis(axis, len(t.node.Shape))
+	if err != nil {
+		return failed(err)
+	}
+	total := 0
+	for _, n := range sizes {
+		if n < 0 {
+			total = -1
+			break
+		}
+		total += n
+	}
+	if total != t.node.Shape[a] {
+		return failed(fmt.Errorf("tensor: split %v into %v along %d: %w", t.node.Shape, sizes, a, ErrShape))
+	}
+	return t.split(a, sizes)
+}
+
+// split cuts t along the axis a into parts of the given sizes, which add
+// up to its length there, like torch.split. The parts are views of t.
+// Backward joins their gradients into t's with one Cat, where the
+// gradient of each view on its own would be padded to t's shape: a loop
+// over the parts would pay for that once per part.
+func (t *Tensor) split(a int, sizes []int) []*Tensor {
+	parts := make([]*Tensor, len(sizes))
+	if err := firstErr(t); err != nil {
+		for i := range parts {
+			parts[i] = fail(err)
+		}
+		return parts
+	}
+	x := t.detached()
+	var s *splitting
+	if t.tape != nil {
+		s = &splitting{axis: a, shapes: make([][]int, len(sizes))}
+	}
 	at := 0
-	for _, t := range ts {
-		pads := make([][2]int, len(first.Shape))
-		pads[a] = [2]int{at, total - at - t.node.Shape[a]}
-		at += t.node.Shape[a]
-		p := t.pad(pads, 0)
-		if out == nil {
-			out = p
-		} else {
-			out = out.Add(p)
+	for i, n := range sizes {
+		p := x.shrink(rangeAxis(t.node.Shape, a, at, at+n))
+		at += n
+		if s != nil && p.err == nil {
+			s.shapes[i] = p.node.Shape
+			p = &Tensor{node: p.node, tape: &tape{seq: tapes.Add(1), node: p.node, ins: []*Tensor{t}, part: &part{of: s, i: i}}}
+		}
+		parts[i] = p
+	}
+	return parts
+}
+
+// splitting is a tensor split into parts of shapes along axis.
+type splitting struct {
+	axis   int
+	shapes [][]int
+}
+
+// part is part i of a splitting.
+type part struct {
+	of *splitting
+	i  int
+}
+
+// ranges returns the shrink ranges that keep the part of the split
+// tensor, of shape whole.
+func (p *part) ranges(whole []int) [][2]int {
+	lo := 0
+	for _, s := range p.of.shapes[:p.i] {
+		lo += s[p.of.axis]
+	}
+	return rangeAxis(whole, p.of.axis, lo, lo+p.of.shapes[p.i][p.of.axis])
+}
+
+// joining collects the gradients of the parts of a splitting during
+// propagate: grads[i] is part i's, or nil if it received none.
+type joining struct {
+	of    *splitting
+	grads []*Tensor
+}
+
+// join returns the gradient of the split tensor: the parts' gradients
+// joined, with zeros for the parts that received none. Gradients of
+// different float dtypes join in Float32.
+func (j *joining) join() *Tensor {
+	var dt DType
+	for _, g := range j.grads {
+		switch {
+		case g == nil:
+		case dt == backend.Invalid:
+			dt = g.node.DType
+		case dt != g.node.DType:
+			dt = Float32
 		}
 	}
-	return out
+	parts := make([]*Tensor, len(j.grads))
+	for i, g := range j.grads {
+		if g == nil {
+			g = Zeros(dt, j.of.shapes[i]...)
+		}
+		parts[i] = g.Cast(dt)
+	}
+	return cat(j.of.axis, parts)
 }
 
 // Stack joins tensors of one shape along a new axis, like torch.stack.
@@ -491,6 +765,43 @@ func (t *Tensor) Unfold(axis, size, step int) *Tensor {
 		perm = append(perm, d)
 	}
 	return w.permute(append(perm, a))
+}
+
+// SliceScatter returns a copy of t with the block ranges, half-open in
+// each dimension like Shrink's, replaced by src, which has the block's
+// shape and t's dtype, like torch.slice_scatter. Computed over t's memory
+// with RealizeInto, it writes the block alone and leaves the rest of t in
+// place, so a cache can grow a few rows at a time without copying what it
+// holds. t's gradient is the result's with the block zeroed, and src's
+// the block of it.
+func (t *Tensor) SliceScatter(src *Tensor, ranges [][2]int) *Tensor {
+	if err := firstErr(t, src); err != nil {
+		return fail(err)
+	}
+	var out *Tensor
+	if l := batchLevel(t, src); l != 0 {
+		out = batchSliceScatter(l, t, src, ranges)
+	} else {
+		out = wrap(graph.SliceScatter(t.node, src.node, ranges))
+	}
+	if !tracked(t, src) || out.err != nil {
+		return out
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor {
+			return grads(g.SliceScatter(Zeros(g.node.DType, in[1].node.Shape...), ranges), g.shrink(ranges))
+		},
+		jvp: func(t, in []*Tensor, out *Tensor) *Tensor {
+			base, src := t[0], t[1]
+			if base == nil {
+				base = Zeros(src.node.DType, out.node.Shape...)
+			}
+			if src == nil {
+				src = Zeros(base.node.DType, in[1].node.Shape...)
+			}
+			return base.SliceScatter(src, ranges)
+		},
+	}, t, src)
 }
 
 // padAxis returns pads for a rank-r tensor that pad only axis.

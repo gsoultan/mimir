@@ -10,8 +10,9 @@
 //	err := train.Fit(ctx, model, opt, trainSet, train.Loss(loss.CrossEntropy))
 //
 // On Apple silicon Macs the GPU runs through Metal, and on Linux machines
-// with an NVIDIA GPU through CUDA. Set MIMIR_DEVICE to cpu, gpu or auto to
-// choose the default device for tensors that FromSlice creates.
+// with an NVIDIA GPU through CUDA, or with an AMD GPU through ROCm. Set
+// MIMIR_DEVICE to cpu, gpu or auto to choose the default device for
+// tensors that FromSlice creates, or to cuda or rocm to choose the GPU.
 package mimir
 
 import "github.com/gsoultan/mimir/tensor"

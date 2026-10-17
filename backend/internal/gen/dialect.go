@@ -20,6 +20,7 @@ import (
 //	md(a, b, err)   the truncated remainder; int division by zero reports
 //	bf2f(h), h2f(h) the float of the bfloat16 or binary16 element h
 //	f2bf(f), f2h(f) the nearest bfloat16 or binary16 element, ties to even
+//	lse(a, b)       log(exp(a) + exp(b)) of floats, without overflow
 //
 // and declares the variables gid, the thread's index in the launch, tid,
 // its index in its group, and bid, its group's index. The half
@@ -33,19 +34,30 @@ type Dialect struct {
 	// param is the format of the expression reading parameter %d.
 	param string
 	// shared declares a variable its group shares, and sync waits for
-	// every thread of the group to reach it.
-	shared, sync string
+	// every thread of the group to reach it. syncDevice also makes the
+	// group's writes to device memory visible to the group.
+	shared, sync, syncDevice string
 	// signature writes the kernel's declaration and opening brace.
 	signature func(s *strings.Builder, outs, ins []backend.DType, params int)
+	// decl declares a helper function, and global qualifies the type a
+	// pointer to a buffer's elements points to.
+	decl, global string
+	// wave is the number of threads that run in lockstep and exchange
+	// values with shuffles, or 0 if kernels may not use shuffles: the
+	// threads of a group then exchange values through shared memory.
+	wave int
 }
 
 // Metal is Metal Shading Language. A kernel takes its outputs, inputs,
 // parameters and error word as buffers 0, 1 and so on, in that order.
 var Metal = &Dialect{
-	Name:   "metal",
-	param:  "p[%d]",
-	shared: "threadgroup",
-	sync:   "threadgroup_barrier(mem_flags::mem_threadgroup)",
+	Name:       "metal",
+	param:      "p[%d]",
+	shared:     "threadgroup",
+	sync:       "threadgroup_barrier(mem_flags::mem_threadgroup)",
+	syncDevice: "threadgroup_barrier(mem_flags::mem_device)",
+	decl:       "static inline",
+	global:     "device ",
 	prelude: `#include <metal_stdlib>
 using namespace metal;
 
@@ -71,7 +83,7 @@ static inline int md(int a, int b, device atomic_uint* err) {
 	return b == -1 ? 0 : a % b;
 }
 static inline float md(float a, float b, device atomic_uint* err) { return fmod(a, b); }
-` + halfPrelude("static inline"),
+` + halfPrelude("static inline") + lsePrelude("static inline"),
 	signature: func(s *strings.Builder, outs, ins []backend.DType, params int) {
 		var args []string
 		for i, dt := range outs {
@@ -96,12 +108,21 @@ static inline float md(float a, float b, device atomic_uint* err) { return fmod(
 // struct Params of one int array, and the error word as a pointer, in
 // that order.
 var CUDA = &Dialect{
-	Name:   "cuda",
-	param:  "p.v[%d]",
-	shared: "__shared__",
-	sync:   "__syncthreads()",
-	prelude: `typedef unsigned int uint;
+	Name:       "cuda",
+	param:      "p.v[%d]",
+	shared:     "__shared__",
+	sync:       "__syncthreads()",
+	syncDevice: "__syncthreads()",
+	decl:       "static __device__ inline",
+	prelude:    cudaPrelude,
+	signature:  cudaSignature(""),
+}
+
+// cudaPrelude is the prelude of the CUDA dialect, which HIP compiles
+// too.
+var cudaPrelude = `typedef unsigned int uint;
 typedef unsigned short ushort;
+typedef unsigned char uchar;
 
 static __device__ inline float fbits(int b) { return __int_as_float(b); }
 static __device__ inline float fbits(uint b) { return __uint_as_float(b); }
@@ -124,8 +145,12 @@ static __device__ inline int md(int a, int b, uint* err) {
 	return b == -1 ? 0 : a % b;
 }
 static __device__ inline float md(float a, float b, uint* err) { return fmodf(a, b); }
-` + halfPrelude("static __device__ inline"),
-	signature: func(s *strings.Builder, outs, ins []backend.DType, params int) {
+` + halfPrelude("static __device__ inline") + lsePrelude("static __device__ inline")
+
+// cudaSignature returns the signature writer of the CUDA dialect, which
+// declares the kernel with the attributes attrs, if any.
+func cudaSignature(attrs string) func(s *strings.Builder, outs, ins []backend.DType, params int) {
+	return func(s *strings.Builder, outs, ins []backend.DType, params int) {
 		fmt.Fprintf(s, "struct Params { int v[%d]; };\n\n", params)
 		var args []string
 		for i, dt := range outs {
@@ -135,9 +160,51 @@ static __device__ inline float md(float a, float b, uint* err) { return fmodf(a,
 			args = append(args, fmt.Sprintf("const %s* i%d", elemName(dt), i))
 		}
 		args = append(args, "Params p", "uint* err")
-		fmt.Fprintf(s, "extern \"C\" __global__ void k(%s) {\n", strings.Join(args, ", "))
+		fmt.Fprintf(s, "extern \"C\" __global__ void %sk(%s) {\n", attrs, strings.Join(args, ", "))
 		s.WriteString("\tuint gid = blockIdx.x * blockDim.x + threadIdx.x, tid = threadIdx.x, bid = blockIdx.x;\n")
-	},
+	}
+}
+
+// HIP64 and HIP32 are HIP C++ as hiprtc compiles it for AMD devices
+// whose wavefronts run 64 threads, as CDNA's do (gfx90a, gfx942), or 32,
+// as RDNA's do (gfx1100). HIP compiles the CUDA dialect's kernels as they
+// are, and kernels take their arguments as CUDA's do. The HIP dialects
+// differ in two ways. Kernels declare that they run GroupSize threads a
+// group, which the compiler otherwise assumes may be 1024, so that it
+// allots each thread the registers of the smaller group. And the threads
+// of a wavefront exchange values with shuffles where the CUDA dialect
+// goes through shared memory and synchronizes the group: in the last
+// steps of a group's reduction and the 32-thread sums of quantized
+// products. The shuffles pair the threads that the shared-memory steps
+// pair, so the dialects sum in the same order and agree bit for bit.
+var (
+	HIP64 = hipDialect(64)
+	HIP32 = hipDialect(32)
+)
+
+// HIP returns the HIP dialect for wavefronts of wave threads, or nil if
+// there is none: wave must be 32 or 64.
+func HIP(wave int) *Dialect {
+	switch wave {
+	case 64:
+		return HIP64
+	case 32:
+		return HIP32
+	}
+	return nil
+}
+
+// Wave returns the number of threads of a wavefront whose threads
+// exchange values with shuffles, or 0 if the dialect's kernels exchange
+// values through shared memory alone.
+func (d *Dialect) Wave() int { return d.wave }
+
+func hipDialect(wave int) *Dialect {
+	d := *CUDA
+	d.Name = fmt.Sprintf("hip%d", wave)
+	d.signature = cudaSignature(fmt.Sprintf("__launch_bounds__(%d) ", GroupSize))
+	d.wave = wave
+	return &d
 }
 
 // halfPrelude returns the conversions between float and the half
