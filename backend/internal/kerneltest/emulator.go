@@ -88,6 +88,37 @@ inline float sinpif(float x) { return float(std::sin(3.14159265358979323846 * x)
 using std::exp2; using std::fma; using std::log; using std::log2; using std::sin; using std::sqrt;
 `
 
+// hipShim stands in for the declarations hiprtc provides: CUDA's, and
+// __shfl_down, which reads the value of the thread delta places along in
+// the thread's segment of width threads, or its own past the segment's
+// end. The threads of a segment exchange values through a buffer that
+// they wait for at a barrier of their own, so a segment's threads must
+// all shuffle, as on a device.
+const hipShim = cudaShim + `#define __launch_bounds__(n)
+#include <map>
+#include <memory>
+#include <mutex>
+inline std::mutex shfl_mu;
+inline std::map<std::pair<int, unsigned>, std::unique_ptr<std::barrier<>>> shfl_bars;
+inline uint64_t shfl_buf[1024];
+template <class T> T __shfl_down(T v, unsigned delta, int width) {
+	unsigned t = threadIdx.x, lane = t % unsigned(width);
+	std::barrier<>* bar;
+	{
+		std::lock_guard<std::mutex> l(shfl_mu);
+		auto& b = shfl_bars[{width, t / unsigned(width)}];
+		if (!b) b = std::make_unique<std::barrier<>>(width);
+		bar = b.get();
+	}
+	std::memcpy(&shfl_buf[t], &v, sizeof v);
+	bar->arrive_and_wait();
+	T r = v;
+	if (lane + delta < unsigned(width)) std::memcpy(&r, &shfl_buf[t + delta], sizeof r);
+	bar->arrive_and_wait();
+	return r;
+}
+`
+
 // driver runs a kernel over buffers it reads from the file named by its
 // first argument and writes them back to the file named by its second.
 // SETUP declares what CALL, which runs thread t of group g, needs.
@@ -156,18 +187,22 @@ var emulations = map[*gen.Dialect]emulation{
 			).Replace(driver)
 		},
 	},
-	gen.CUDA: {
-		shim:   cudaShim,
-		header: "cuda_shim.h",
-		source: func(src string, args []string) string {
-			return "#include <cuda_shim.h>\n" + src + strings.NewReplacer(
-				"SETUP", "Params pp;\n\tstd::memcpy(pp.v, p.data(), sizeof pp.v);\n\tunsigned err = 0;",
-				"CALL", fmt.Sprintf("blockIdx.x = g; threadIdx.x = t; blockDim.x = threads; k(%s, pp, &err)", strings.Join(args, ", ")),
-				"BARRIER", "group_barrier",
-				"ERR", "err",
-			).Replace(driver)
-		},
-	},
+	gen.CUDA:  {shim: cudaShim, header: "cuda_shim.h", source: cudaSource("cuda_shim.h")},
+	gen.HIP64: {shim: hipShim, header: "hip_shim.h", source: cudaSource("hip_shim.h")},
+	gen.HIP32: {shim: hipShim, header: "hip_shim.h", source: cudaSource("hip_shim.h")},
+}
+
+// cudaSource returns how the emulator builds the kernels of the CUDA
+// dialect, or of HIP's, against the shim header.
+func cudaSource(header string) func(src string, args []string) string {
+	return func(src string, args []string) string {
+		return "#include <" + header + ">\n" + src + strings.NewReplacer(
+			"SETUP", "Params pp;\n\tstd::memcpy(pp.v, p.data(), sizeof pp.v);\n\tunsigned err = 0;",
+			"CALL", fmt.Sprintf("blockIdx.x = g; threadIdx.x = t; blockDim.x = threads; k(%s, pp, &err)", strings.Join(args, ", ")),
+			"BARRIER", "group_barrier",
+			"ERR", "err",
+		).Replace(driver)
+	}
 }
 
 // Emulator compiles and runs kernels of one dialect on the CPU.

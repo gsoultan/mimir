@@ -177,6 +177,12 @@ func (g *gen) qmatmul(n int) (*Launch, error) {
 	g.line("for (int s = live ? lane : %s; s < %s; s += 32) {", g.param(kk/32), g.param(kk/32))
 	g.line("\tacc = dot32_%s(w, s, i0, %s + s * 32 * sx, sx, acc);", name, ox)
 	g.line("}")
+	if g.d.wave >= 32 {
+		// The same steps, within the 32 threads' wavefront.
+		g.line("for (int st = 16; st > 0; st >>= 1) acc = acc + __shfl_down(acc, st, 32);")
+		g.line("if (live && lane == 0) o0[o] = acc;")
+		return g.finish((n+qmatmulRows-1)/qmatmulRows, true)
+	}
 	g.line("%s float part[%d];", g.d.shared, GroupSize)
 	g.line("part[tid] = acc;")
 	g.line("%s;", g.d.sync)
