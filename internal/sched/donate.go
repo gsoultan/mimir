@@ -145,17 +145,49 @@ func uploadBuffer(be backend.Backend, dt backend.DType, n int) (backend.Buffer, 
 	return be.Alloc(dt, n)
 }
 
+// maxLoads bounds the loads of one size whose order freeBuffer keeps
+// between two schedules, as loads that no schedule follows would keep
+// adding to it.
+const maxLoads = 64
+
 // freeBuffer takes a free buffer of n elements of dt off be's pool, or
 // returns nil if it holds none. mu is held.
+//
+// The uploads and copies between two schedules take the buffers that
+// those of the same sizes took between the last two, in the same order,
+// when the pool holds them: a loop that uploads a batch's inputs and
+// targets of one size every step then puts each in the same buffer every
+// step, not in the one the other had, and a backend can keep what it
+// derived from the step's buffers, such as a CUDA graph whose products
+// read the inputs.
 func freeBuffer(be backend.Backend, dt backend.DType, n int) backend.Buffer {
 	p := poolOf(be)
 	key := poolKey{dt, n}
-	bufs := p.free[key]
-	if len(bufs) == 0 {
+	if len(p.free[key]) == 0 {
 		return nil
 	}
-	p.free[key] = bufs[:len(bufs)-1]
-	return bufs[len(bufs)-1].buf
+	o := p.loads[key]
+	if o == nil {
+		o = &loadOrder{clock: p.clock}
+		p.loads[key] = o
+	}
+	if o.clock != p.clock {
+		// A schedule ran since the last load: this one starts the order
+		// anew, and the last order is the one to follow.
+		if len(o.cur) > 0 {
+			o.last, o.cur = o.cur, o.last[:0]
+		}
+		o.clock = p.clock
+	}
+	var at uintptr
+	if i := len(o.cur); i < len(o.last) {
+		at = o.last[i]
+	}
+	buf, _, _ := p.take(key, at, false) // the pool holds one: take cannot fail
+	if len(o.cur) < maxLoads {
+		o.cur = append(o.cur, uintptr(addressOf(buf)))
+	}
+	return buf
 }
 
 // Copy realizes n on its device from, unless it is realized, and returns

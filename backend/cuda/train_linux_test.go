@@ -17,12 +17,22 @@ import (
 // CUDA graphs on and checks that its steps launch as graphs, captured
 // while the first steps settle the buffers of the optimizer's state and
 // hardly ever after, and compute what the steps launched one by one
-// compute.
+// compute: over one batch, and over a batch uploaded and donated every
+// step, as Fit's are, whose inputs the first product reads from wherever
+// the upload put them.
 func TestTrainingStepsRunAsCUDAGraphs(t *testing.T) {
 	dev, err := tensor.GPU()
 	if err != nil || dev.Name() != "cuda" {
 		t.Skip("no CUDA device")
 	}
+	for _, fresh := range []bool{false, true} {
+		t.Run(map[bool]string{false: "one batch", true: "uploaded batches"}[fresh], func(t *testing.T) {
+			testTrainingStepsRunAsCUDAGraphs(t, dev, fresh)
+		})
+	}
+}
+
+func testTrainingStepsRunAsCUDAGraphs(t *testing.T, dev tensor.Device, fresh bool) {
 	// The first half of the steps settle; the second half must launch as
 	// graphs without capturing them again.
 	const steps = 24
@@ -44,11 +54,15 @@ func TestTrainingStepsRunAsCUDAGraphs(t *testing.T) {
 		for i := range labels {
 			labels[i] = int32(i % 10)
 		}
-		x, y := tensor.Rand(1, 32, 1, 28, 28).To(dev), tensor.FromSlice(labels, 32).To(dev)
+		pixels := tensor.Rand(1, 32, 1, 28, 28).To(tensor.CPU()) // uploaded from the host
+		x, y := pixels.To(dev), tensor.FromSlice(labels, 32).To(dev)
 		if err := tensor.Realize(t.Context(), x, y); err != nil {
 			t.Fatal(err)
 		}
 		for range steps {
+			if fresh {
+				x, y = pixels.To(dev).Donate(), tensor.FromSlice(labels, 32).To(dev).Donate()
+			}
 			before := counts()
 			l := loss.CrossEntropy(m.Forward(x), y)
 			if err := l.Backward(t.Context()); err != nil {
