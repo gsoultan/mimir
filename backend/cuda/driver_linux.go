@@ -66,6 +66,26 @@ var (
 	cuMemHostGetDevicePointer func(p *uint64, host unsafe.Pointer, flags uint32) result
 	cuDeviceGetDefaultMemPool func(pool *uintptr, dev int32) result
 	cuMemPoolSetAttribute     func(pool uintptr, attr int32, value unsafe.Pointer) result
+	cuMemcpyPeerAsync         func(dst uint64, dstCtx uintptr, src uint64, srcCtx uintptr, n uintptr, stream uintptr) result
+	cuEventCreate             func(ev *uintptr, flags uint32) result
+	cuEventRecord             func(ev, stream uintptr) result
+	cuEventDestroy            func(ev uintptr) result
+	cuStreamWaitEvent         func(stream, ev uintptr, flags uint32) result
+	cuDeviceCanAccessPeer     func(can *int32, dev, peer int32) result
+	cuMemPoolSetAccess        func(pool uintptr, desc *memAccessDesc, n uintptr) result
+)
+
+// memAccessDesc is a CUmemAccessDesc: a device and the access it gets.
+type memAccessDesc struct {
+	locationType int32 // CU_MEM_LOCATION_TYPE_DEVICE
+	device       int32
+	flags        int32 // CU_MEM_ACCESS_FLAGS_PROT_*
+}
+
+// Memory access constants.
+const (
+	memLocationDevice  = 1 // CU_MEM_LOCATION_TYPE_DEVICE
+	memAccessReadWrite = 3 // CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 )
 
 // loadDriver loads libcuda and initializes it once.
@@ -101,6 +121,13 @@ func loadDriver() error {
 		purego.RegisterLibFunc(&cuMemHostGetDevicePointer, lib, "cuMemHostGetDevicePointer_v2")
 		purego.RegisterLibFunc(&cuDeviceGetDefaultMemPool, lib, "cuDeviceGetDefaultMemPool")
 		purego.RegisterLibFunc(&cuMemPoolSetAttribute, lib, "cuMemPoolSetAttribute")
+		purego.RegisterLibFunc(&cuMemcpyPeerAsync, lib, "cuMemcpyPeerAsync")
+		purego.RegisterLibFunc(&cuEventCreate, lib, "cuEventCreate")
+		purego.RegisterLibFunc(&cuEventRecord, lib, "cuEventRecord")
+		purego.RegisterLibFunc(&cuEventDestroy, lib, "cuEventDestroy_v2")
+		purego.RegisterLibFunc(&cuStreamWaitEvent, lib, "cuStreamWaitEvent")
+		purego.RegisterLibFunc(&cuDeviceCanAccessPeer, lib, "cuDeviceCanAccessPeer")
+		purego.RegisterLibFunc(&cuMemPoolSetAccess, lib, "cuMemPoolSetAccess")
 		if r := cuInit(0); r != cudaSuccess {
 			driverErr = fmt.Errorf("cuInit: %s", errName(r))
 		}
