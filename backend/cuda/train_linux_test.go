@@ -14,16 +14,24 @@ import (
 )
 
 // TestTrainingStepsRunAsCUDAGraphs trains a small network on the GPU with
-// CUDA graphs on and checks that its steps launch as graphs, captured a
-// few times rather than at every step, and compute what the steps
-// launched one by one compute.
+// CUDA graphs on and checks that its steps launch as graphs, captured
+// while the first steps settle the buffers of the optimizer's state and
+// hardly ever after, and compute what the steps launched one by one
+// compute.
 func TestTrainingStepsRunAsCUDAGraphs(t *testing.T) {
 	dev, err := tensor.GPU()
 	if err != nil || dev.Name() != "cuda" {
 		t.Skip("no CUDA device")
 	}
-	const steps = 12
-	train := func(graphs bool) []float32 {
+	// The first half of the steps settle; the second half must launch as
+	// graphs without capturing them again.
+	const steps = 24
+	type count struct{ graphs, captures, rejects int64 }
+	counts := func() count {
+		g, _, c := cuda.GraphLaunches()
+		return count{g, c, cuda.GraphRejects()}
+	}
+	train := func(graphs bool) (losses []float32, perStep []count) {
 		t.Helper()
 		defer cuda.SetGraphs(graphs)()
 		nn.ManualSeed(1)
@@ -40,8 +48,8 @@ func TestTrainingStepsRunAsCUDAGraphs(t *testing.T) {
 		if err := tensor.Realize(t.Context(), x, y); err != nil {
 			t.Fatal(err)
 		}
-		var losses []float32
 		for range steps {
+			before := counts()
 			l := loss.CrossEntropy(m.Forward(x), y)
 			if err := l.Backward(t.Context()); err != nil {
 				t.Fatal(err)
@@ -55,23 +63,29 @@ func TestTrainingStepsRunAsCUDAGraphs(t *testing.T) {
 				t.Fatal(err)
 			}
 			opt.ZeroGrad()
+			after := counts()
+			perStep = append(perStep, count{after.graphs - before.graphs, after.captures - before.captures, after.rejects - before.rejects})
 		}
-		return losses
+		return losses, perStep
 	}
-	direct := train(false)
-	graphs0, _, captures0 := cuda.GraphLaunches()
-	withGraphs := train(true)
-	graphs, _, captures := cuda.GraphLaunches()
-	graphs, captures = graphs-graphs0, captures-captures0
-	t.Logf("%d steps: %d batches launched as graphs, %d graphs captured", steps, graphs, captures)
-	// Each step runs a batch for the forward and backward passes and one
-	// for the update, which differ in the first steps, while the
-	// optimizer's state is new.
-	if graphs < steps {
-		t.Errorf("%d batches launched as graphs in %d steps, want at least %d", graphs, steps, steps)
+	direct, _ := train(false)
+	withGraphs, perStep := train(true)
+	var settle, steady count
+	for i, c := range perStep {
+		half := &settle
+		if i >= steps/2 {
+			half = &steady
+		}
+		half.graphs += c.graphs
+		half.captures += c.captures
+		half.rejects += c.rejects
 	}
-	if captures > 8 {
-		t.Errorf("%d graphs captured in %d steps: the steps capture their graphs again", captures, steps)
+	t.Logf("per step (graphs launched, captured, updates rejected): %v", perStep)
+	if steady.graphs < steps/2 {
+		t.Errorf("%d batches launched as graphs in the last %d steps, want at least %d", steady.graphs, steps/2, steps/2)
+	}
+	if steady.captures > 2 {
+		t.Errorf("%d graphs captured in the last %d steps: the steps capture their graphs again", steady.captures, steps/2)
 	}
 	for i := range steps {
 		if d := math.Abs(float64(withGraphs[i] - direct[i])); d > 1e-5*math.Abs(float64(direct[i])) {

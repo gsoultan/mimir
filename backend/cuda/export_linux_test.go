@@ -19,3 +19,7 @@ func GraphLaunches() (graphs, direct, captures int64) {
 // GraphUpdates returns the number of kernel nodes updated in executable
 // graphs so far.
 func GraphUpdates() int64 { return graphCounts.updates.Load() }
+
+// GraphRejects returns the number of kernel node updates an executable
+// graph rejected, each of which captured the graph anew.
+func GraphRejects() int64 { return graphCounts.rejected.Load() }
