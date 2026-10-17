@@ -94,7 +94,10 @@ func (s *sim) take(dt backend.DType, n int) {
 func (p *pool) reserve(s *sim) error {
 	if p.budget > 0 && p.held()+s.extra > p.budget {
 		spares, n := p.room(s)
-		if n < 0 {
+		for range collectTries {
+			if n >= 0 {
+				break
+			}
 			p.collect()
 			spares, n = p.room(s)
 		}
@@ -128,6 +131,14 @@ func (p *pool) room(s *sim) ([]spare, int) {
 	}
 	return spares, n
 }
+
+// collectTries is how many collections reserve runs before it refuses.
+// A collection can miss a dropped result whose address a goroutine
+// stopped between two instructions still holds in a register, which the
+// collector then scans conservatively, as a spinning CPU helper's may
+// after the kernel that wrote the result. The next collection stops it
+// elsewhere.
+const collectTries = 3
 
 // collect runs the garbage collector and takes the buffers it reclaimed
 // off the account at once, rather than when their cleanups run, which
