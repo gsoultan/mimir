@@ -131,10 +131,12 @@ var (
 // slices, arrays, maps and interfaces.
 type walker struct {
 	seen map[unsafe.Pointer]bool
+	all  bool // fn sees every pointer, not just parameters and trainers
 }
 
 // visit calls fn with each non-nil pointer that is a *tensor.Param or
-// implements trainer, and its path. It stops when fn returns false.
+// implements trainer, or with every one if w.all is set, and its path. It
+// stops when fn returns false.
 func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Value) bool) bool {
 	switch v.Kind() {
 	case reflect.Interface:
@@ -157,7 +159,7 @@ func (w *walker) visit(v reflect.Value, path string, fn func(string, reflect.Val
 		if v.Type() == paramType {
 			return fn(path, v)
 		}
-		if v.Type().Implements(trainerType) && !fn(path, v) {
+		if (w.all || v.Type().Implements(trainerType)) && !fn(path, v) {
 			return false
 		}
 		return w.visit(v.Elem(), path, fn)
