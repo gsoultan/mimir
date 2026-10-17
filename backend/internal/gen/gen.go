@@ -1,6 +1,6 @@
 // Package gen generates the source of the kernels GPU backends run: one
 // kernel per Backend.Run, in the C++ dialect of the device, Metal Shading
-// Language or CUDA C++.
+// Language, CUDA C++ or HIP C++.
 //
 // The source depends on the structure of a kernel: its op, dtypes, the
 // rank of its coalesced shape, which inputs are read contiguously and
@@ -34,8 +34,8 @@ import (
 	"github.com/gsoultan/mimir/backend"
 )
 
-// GroupSize is the number of threads in a group: a Metal threadgroup or a
-// CUDA block.
+// GroupSize is the number of threads in a group: a Metal threadgroup, or a
+// CUDA or HIP block.
 const GroupSize = 256
 
 // Bits a kernel ORs into its error word.
@@ -655,11 +655,24 @@ func planReduce(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int
 		g.line("%s %s part[%d];", d.shared, t, GroupSize)
 		g.line("part[tid] = acc;")
 		g.line("%s;", d.sync)
-		g.line("for (uint s = %d; s > 0; s >>= 1) {", GroupSize/2)
+		if d.wave == 0 {
+			g.line("for (uint s = %d; s > 0; s >>= 1) {", GroupSize/2)
+			g.line("\tif (tid < s) part[tid] = %s;", reduceStep(k.Op, "part[tid]", "part[tid + s]"))
+			g.line("\t%s;", d.sync)
+			g.line("}")
+			g.line("if (tid == 0) o0[i] = part[0];")
+			return g.finish(n, true)
+		}
+		// The same steps, the last within the first wavefront.
+		g.line("for (uint s = %d; s >= %du; s >>= 1) {", GroupSize/2, d.wave)
 		g.line("\tif (tid < s) part[tid] = %s;", reduceStep(k.Op, "part[tid]", "part[tid + s]"))
 		g.line("\t%s;", d.sync)
 		g.line("}")
-		g.line("if (tid == 0) o0[i] = part[0];")
+		g.line("if (tid < %du) {", d.wave)
+		g.line("\t%s v = part[tid];", t)
+		g.line("\tfor (uint s = %d; s > 0; s >>= 1) v = %s;", d.wave/2, reduceStep(k.Op, "v", fmt.Sprintf("__shfl_down(v, s, %d)", d.wave)))
+		g.line("\tif (tid == 0) o0[i] = v;")
+		g.line("}")
 		return g.finish(n, true)
 	}
 	g.line("if (gid >= uint(%s)) return;", g.param(n))

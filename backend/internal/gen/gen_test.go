@@ -17,7 +17,7 @@ import (
 // dialect on the CPU and compare them with the CPU backend. The GPU
 // backends run the same cases on their devices.
 
-var dialects = []*gen.Dialect{gen.Metal, gen.CUDA}
+var dialects = []*gen.Dialect{gen.Metal, gen.CUDA, gen.HIP64, gen.HIP32}
 
 func TestMain(m *testing.M) {
 	code := m.Run()
