@@ -95,7 +95,7 @@ func (g *graphHandles) live() bool { return g != nil && g.exec != 0 }
 
 // graphCounts counts what batches did with CUDA graphs, for tests.
 var graphCounts struct {
-	captures, launches, direct atomic.Int64
+	captures, launches, direct, updates atomic.Int64
 }
 
 // RunBatch queues the kernels of bt on the stream, as one CUDA graph when
@@ -231,6 +231,7 @@ func (b *Backend) graph(st *batchState) error {
 			}
 			r := cuGraphExecKernelNodeSetParams(st.graph.exec, c.node, &params)
 			runtime.KeepAlive(c)
+			graphCounts.updates.Add(1)
 			if r != cudaSuccess {
 				updated = false
 				break

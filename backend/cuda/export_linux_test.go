@@ -15,3 +15,7 @@ func SetGraphs(on bool) (restore func()) {
 func GraphLaunches() (graphs, direct, captures int64) {
 	return graphCounts.launches.Load(), graphCounts.direct.Load(), graphCounts.captures.Load()
 }
+
+// GraphUpdates returns the number of kernel nodes updated in executable
+// graphs so far.
+func GraphUpdates() int64 { return graphCounts.updates.Load() }

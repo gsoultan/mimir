@@ -79,3 +79,60 @@ func TestTrainingStepsRunAsCUDAGraphs(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkTrainingStepGraphs times the training step of
+// BenchmarkStepOverhead's MLP on the GPU, with CUDA graphs off and on,
+// and reports per step what its batches did with graphs: those launched
+// as graphs and one call at a time, the graphs captured and the kernel
+// nodes updated in them. A step that launches its batches as graphs but
+// captures them again, or updates most of their nodes, pays more on the
+// host than launching the calls one by one.
+func BenchmarkTrainingStepGraphs(b *testing.B) {
+	dev, err := tensor.GPU()
+	if err != nil || dev.Name() != "cuda" {
+		b.Skip("no CUDA device")
+	}
+	for _, graphs := range []bool{false, true} {
+		b.Run(map[bool]string{false: "direct", true: "graphs"}[graphs], func(b *testing.B) {
+			defer cuda.SetGraphs(graphs)()
+			nn.ManualSeed(1)
+			m := nn.NewSequential(nn.Flatten(), nn.NewLinear(28*28, 256), nn.ReLU(), nn.NewLinear(256, 10))
+			if err := nn.To(m, dev); err != nil {
+				b.Fatal(err)
+			}
+			opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-3))
+			labels := make([]int32, 128)
+			for i := range labels {
+				labels[i] = int32(i % 10)
+			}
+			x, y := tensor.Rand(1, 128, 1, 28, 28).To(dev), tensor.FromSlice(labels, 128).To(dev)
+			if err := tensor.Realize(b.Context(), x, y); err != nil {
+				b.Fatal(err)
+			}
+			step := func() {
+				l := loss.CrossEntropy(m.Forward(x), y)
+				if err := l.Backward(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+				if err := opt.Step(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+				opt.ZeroGrad()
+			}
+			for range 5 {
+				step()
+			}
+			launched, direct, captures := cuda.GraphLaunches()
+			updates := cuda.GraphUpdates()
+			for b.Loop() {
+				step()
+			}
+			l2, d2, c2 := cuda.GraphLaunches()
+			n := float64(b.N)
+			b.ReportMetric(float64(l2-launched)/n, "graphs/op")
+			b.ReportMetric(float64(d2-direct)/n, "direct/op")
+			b.ReportMetric(float64(c2-captures)/n, "captures/op")
+			b.ReportMetric(float64(cuda.GraphUpdates()-updates)/n, "node-updates/op")
+		})
+	}
+}
