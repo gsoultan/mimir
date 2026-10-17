@@ -78,6 +78,8 @@ type config struct {
 	onEpoch   []func(Epoch) error
 	onBatch   []func(Batch) error
 	parallel  []tensor.Device // the devices of DataParallel, or nil
+	mesh      *tensor.Mesh    // the mesh of Sharded, or nil
+	shardRule nn.ShardRule
 	configErr error
 }
 
@@ -238,8 +240,16 @@ func Fit(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dat
 		return fmt.Errorf("%w: %d epochs", ErrConfig, c.epochs)
 	case c.parallel != nil && (c.micro != 0 || c.budget != 0):
 		return fmt.Errorf("%w: DataParallel with MicroBatch or MemoryBudget", ErrConfig)
+	case c.mesh != nil && (c.parallel != nil || c.micro != 0 || c.budget != 0 || c.ckptDir != ""):
+		return fmt.Errorf("%w: Sharded with DataParallel, MicroBatch, MemoryBudget or Checkpoint", ErrConfig)
 	}
 	l := &loop{c: &c, dev: deviceOf(model), chunk: c.micro, scale: c.scale}
+	if c.mesh != nil {
+		if err := nn.Shard(model, c.mesh, c.shardRule); err != nil {
+			return err
+		}
+		l.dev = c.mesh.Device()
+	}
 	if c.parallel != nil {
 		if !l.dev.Equal(c.parallel[0]) {
 			if err := nn.To(model, c.parallel[0]); err != nil {
@@ -376,6 +386,9 @@ func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer,
 func (l *loop) batch(t *tensor.Tensor) *tensor.Tensor {
 	if l.dp != nil {
 		return t // Parallel copies each device's share
+	}
+	if l.c.mesh != nil {
+		return l.shard(t)
 	}
 	moved := t.To(l.dev)
 	if moved == t || l.chunk != 0 || l.c.budget != 0 {
