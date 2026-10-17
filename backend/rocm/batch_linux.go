@@ -41,7 +41,7 @@ import (
 // capture, instantiation or an update fail, the batch's calls launch one
 // by one, or are captured anew.
 //
-// Graphs are off by default, as on CUDA, until an AMD GPU shows them
+// Graphs are off by default, unlike on CUDA, until an AMD GPU shows them
 // faster than launching the calls one by one.
 
 // graphsOn turns HIP graphs on.
