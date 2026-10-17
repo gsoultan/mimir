@@ -27,7 +27,10 @@ import (
 // batches leaves it waiting on the host rather than computing. Each also
 // reports the host's time per step in each phase of Parallel.Backward,
 // those of one device numbered with its rank, and in the optimizer's
-// step: a phase that waits for a device shows that device's work.
+// step: a phase that waits for a device shows that device's work. With
+// MIMIR_DP_WAITS=1 the step also waits for the devices after each phase
+// and reports the waits, named gpu-..., though they stop the devices from
+// overlapping one phase with the next.
 //
 // Each reports examples per second, the speedup over one device and the
 // efficiency, the speedup divided by the devices: 1 when n devices
@@ -118,6 +121,9 @@ func BenchmarkDataParallel(b *testing.B) {
 							}
 							spent[phase] += d
 						})()
+						if os.Getenv("MIMIR_DP_WAITS") == "1" {
+							defer train.SetWaitPhases(true)()
+						}
 						for b.Loop() {
 							step()
 						}
