@@ -171,8 +171,10 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		}
 		updates = append(updates, update{i, v, s})
 		targets, dsts = append(targets, v), append(dsts, cur)
-		for name, t := range s {
-			targets, dsts = append(targets, t), append(dsts, o.states[i][name])
+		// In the order of their names, not the map's, so that each step
+		// schedules the same graph and replays its program.
+		for _, name := range slices.Sorted(maps.Keys(s)) {
+			targets, dsts = append(targets, s[name]), append(dsts, o.states[i][name])
 		}
 	}
 	if err := tensor.RealizeInto(ctx, dsts, targets); err != nil {
