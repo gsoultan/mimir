@@ -7,6 +7,8 @@
 set -eu
 nvidia-smi -L || true
 gpus=$(nvidia-smi -L | grep -c '^GPU')
+go test -count=1 -v -run 'CopyPeer|NCCL' ./backend/cuda
+MIMIR_DEVICE=gpu go test -count=1 -run 'Group|ReduceGrads|Replicate|Parallel|BetweenDevices' ./tensor ./nn ./train
 for graphs in 1 0; do
 	echo "## MIMIR_CUDA_GRAPHS=$graphs"
 	MIMIR_CUDA_GRAPHS=$graphs MIMIR_DEVICE=gpu MIMIR_DP_WAITS=1 go test -run '^$' -count 1 -benchtime 3s \
