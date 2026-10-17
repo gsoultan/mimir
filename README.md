@@ -213,11 +213,11 @@ repeats, replays the planned kernels into the same buffers, passing changed
 constants and random seeds as kernel arguments, without building, sorting
 or planning anything or allocating, and gives each kernel the buffers it
 had in the last run. On Metal the replayed kernels are encoded into one
-command buffer. On CUDA they launch one by one by default;
-`MIMIR_CUDA_GRAPHS=1` runs a step's kernels and cuBLAS calls as one CUDA
+command buffer. On CUDA a step's kernels and cuBLAS calls run as one CUDA
 graph, captured once a run has repeated the last one's products and
-updated in place when only arguments change, and `MIMIR_ROCM_GRAPHS=1` does
-the same with HIP graphs on ROCm. On the GPUs, convolutions run
+updated in place when only arguments change (`MIMIR_CUDA_GRAPHS=0` launches
+them one by one instead); `MIMIR_ROCM_GRAPHS=1` does the same with HIP
+graphs on ROCm, where they stay off until an AMD GPU measures them. On the GPUs, convolutions run
 as tiled implicit-GEMM kernels that read their windows from the image
 where they lie, for the forward pass and both gradients; the CPU
 multiplies unfolded windows with its GEMM microkernels. On CUDA and ROCm, a

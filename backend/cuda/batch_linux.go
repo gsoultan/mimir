@@ -22,8 +22,8 @@ import (
 // gen.Launch.SetArgs), and it plans a kernel again only when its buffers
 // change shape.
 //
-// With MIMIR_CUDA_GRAPHS=1, a batch whose runs repeat launches as one
-// CUDA graph: the backend captures the calls on its stream once,
+// A batch whose runs repeat launches as one CUDA graph, unless
+// MIMIR_CUDA_GRAPHS=0: the backend captures the calls on its stream once,
 // instantiates the graph, and from then on launches it as a whole, after
 // updating the kernel nodes whose parameters or buffers changed in the
 // executable graph. A cuBLAS call cannot be updated so: cuBLAS chooses
@@ -40,14 +40,13 @@ import (
 // its graph is captured once. When the driver lacks the graph API, or
 // capture or instantiation fail, the batch's calls launch one by one.
 //
-// Graphs are off by default until a GPU shows them faster than launching
-// the calls one by one. On the T4 of the first measurements, training
-// steps launched as graphs were slower, because every step captured and
-// instantiated its graph again when its products moved, which they no
-// longer do.
+// On a T4, a training step of BenchmarkTrainingStepGraphs captures its
+// graphs once and then updates about 7 kernel nodes a step, and steps
+// launched as graphs are up to 10% faster than launched call by call, and
+// never slower.
 
 // graphsOn turns CUDA graphs on.
-var graphsOn = os.Getenv("MIMIR_CUDA_GRAPHS") == "1"
+var graphsOn = os.Getenv("MIMIR_CUDA_GRAPHS") != "0"
 
 // graphsReady loads the CUDA graph API, or reports why it cannot.
 var graphsReady = loadGraphs
