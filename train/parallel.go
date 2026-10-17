@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
@@ -131,9 +132,11 @@ func (p *Parallel) current() []*tensor.Tensor {
 // A batch smaller than the number of devices leaves some devices idle.
 // x and y may live on any device; each device's share is copied to it.
 func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.Tensor) (float64, error) {
+	mark := phaseTimer()
 	if err := p.broadcast(ctx); err != nil {
 		return 0, err
 	}
+	mark("broadcast", -1)
 	if err := x.Err(); err != nil {
 		return 0, err
 	}
@@ -166,6 +169,7 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 	if err := tensor.Realize(ctx, moved...); err != nil {
 		return 0, err
 	}
+	mark("share", -1)
 	losses := make([]*tensor.Tensor, 0, n)
 	for r := range p.devs {
 		lo, hi := rows*r/n, rows*(r+1)/n
@@ -176,12 +180,14 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 		if hi-lo != rows {
 			l = l.Mul(tensor.Scalar(float32(hi-lo) / float32(rows)))
 		}
+		mark("forward", r)
 		// On the devices of a group the backward pass is queued, and the
 		// next device's starts while this one's runs.
 		if err := l.Backward(ctx); err != nil {
 			p.discard()
 			return 0, err
 		}
+		mark("backward", r)
 		losses = append(losses, l)
 	}
 	err := p.group.ReduceGrads(ctx, tensor.ReduceSum, 0, p.trained...)
@@ -189,6 +195,7 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 	if err != nil {
 		return 0, err
 	}
+	mark("reduce", -1)
 	var sum float64
 	for _, l := range losses {
 		v, err := l.Item[float32](ctx) // computed by Backward
@@ -197,7 +204,29 @@ func (p *Parallel) Backward(ctx context.Context, lossFn loss.Func, x, y *tensor.
 		}
 		sum += float64(v)
 	}
+	mark("losses", -1)
 	return sum, nil
+}
+
+// phases, when a test sets it, receives the host's time in each phase of
+// Parallel.Backward: the phase's name, the rank it ran for or -1, and its
+// duration.
+var phases func(phase string, rank int, d time.Duration)
+
+// phaseTimer returns a function that reports to phases the time since
+// its last call, or since phaseTimer's, and does nothing when phases is
+// nil.
+func phaseTimer() func(phase string, rank int) {
+	report := phases
+	if report == nil {
+		return func(string, int) {}
+	}
+	last := time.Now()
+	return func(phase string, rank int) {
+		now := time.Now()
+		report(phase, rank, now.Sub(last))
+		last = now
+	}
 }
 
 // broadcast gives the replicas the model's parameter values, unless they
