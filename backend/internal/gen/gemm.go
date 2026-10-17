@@ -185,6 +185,58 @@ func (mat Matrix) At(b, i, j int) int {
 	return mat.Offset + b*mat.Stride + i*mat.LD + j
 }
 
+// ColumnMajor is a call of a column-major BLAS's strided batched SGEMM,
+// such as cublasSgemmStridedBatched or hipblasSgemmStridedBatched: Batch
+// products of an M × K and a K × N matrix, each read in column-major
+// order and transposed if the operand says, into M × N column-major
+// results LDC elements per column and StrideC elements apart.
+//
+// Such a library reads matrices in column-major order, which is
+// row-major order transposed, so a backend computes the transpose of the
+// row-major result C = A·B as Cᵀ = Bᵀ·Aᵀ: the library's first operand is
+// the product's right one, input 1, and its second the left one, input 0.
+type ColumnMajor struct {
+	M, N, K      int
+	A, B         Operand
+	LDC, StrideC int
+	Batch        int
+}
+
+// Operand is how a column-major BLAS reads one operand: the matrices of
+// input In, column-major with LD elements per column and Stride elements
+// apart, from element Offset, transposed if Trans is set.
+type Operand struct {
+	In                 int
+	Offset, LD, Stride int
+	Trans              bool
+}
+
+// ColumnMajor returns the column-major BLAS call that computes g.
+func (g GEMM) ColumnMajor() ColumnMajor {
+	// A row-major matrix stored with LD elements per row is, read in
+	// column-major order with LD elements per column, its transpose. So
+	// the right operand as stored is Bᵀ, which the library reads as it
+	// is, unless the operand is stored transposed: then it is B, and the
+	// library transposes it. Likewise the left one.
+	return ColumnMajor{
+		M: g.N, N: g.M, K: g.K,
+		A:       Operand{In: 1, Offset: g.B.Offset, LD: g.B.LD, Stride: g.B.Stride, Trans: g.B.Trans},
+		B:       Operand{In: 0, Offset: g.A.Offset, LD: g.A.LD, Stride: g.A.Stride, Trans: g.A.Trans},
+		LDC:     g.N,
+		StrideC: g.ResultSize,
+		Batch:   g.Batch,
+	}
+}
+
+// At returns the element of the buffer that holds element (i, j) of
+// matrix b of the operand o stands for, as the library reads it.
+func (o Operand) At(b, i, j int) int {
+	if o.Trans {
+		i, j = j, i
+	}
+	return o.Offset + b*o.Stride + j*o.LD + i
+}
+
 // PlanEpilogue returns the kernel, in dialect d, that applies the epilogue
 // program of the product k to its result, already in outs[0], in place.
 func PlanEpilogue(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, error) {

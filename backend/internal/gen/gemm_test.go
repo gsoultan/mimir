@@ -175,3 +175,48 @@ func TestGEMMFoldsSumsIntoTheInnerDimension(t *testing.T) {
 		}
 	}
 }
+
+// TestColumnMajorComputesTheProduct checks, for every way the kernel tests
+// read operands, that the column-major BLAS call planned for a product
+// computes what the product's own plan does.
+func TestColumnMajorComputesTheProduct(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 12))
+	f := backend.Float32
+	planned := 0
+	for _, s := range []struct {
+		batch   []int
+		m, k, n int
+	}{
+		{nil, 5, 7, 3},
+		{nil, 1, 7, 3},
+		{nil, 5, 1, 3},
+		{nil, 5, 7, 1},
+		{[]int{2}, 4, 6, 5},
+		{[]int{3, 2}, 4, 6, 5},
+	} {
+		xs := slices.Concat(s.batch, []int{s.m, s.k})
+		ys := slices.Concat(s.batch, []int{s.k, s.n})
+		out := slices.Concat(s.batch, []int{s.m, s.n})
+		for xn, x := range kerneltest.Views(xs) {
+			for yn, y := range kerneltest.Views(ys) {
+				name := fmt.Sprintf("%v x %v/%s/%s", xs, ys, xn, yn)
+				k := &backend.Kernel{Op: backend.OpMatMul, DType: f, Shape: out, In: []backend.View{x.V, y.V}}
+				g, ok := gen.PlanGEMM(k, []int{x.N, y.N})
+				if !ok {
+					continue
+				}
+				planned++
+				xv := kerneltest.Floats(t, kerneltest.HostBuffer(t, rng, f, x.N, 0, 0))
+				yv := kerneltest.Floats(t, kerneltest.HostBuffer(t, rng, f, y.N, 0, 0))
+				want := kerneltest.GEMM(g, xv, yv)
+				got := kerneltest.ColumnMajor(g.ColumnMajor(), [2][]float32{xv, yv})
+				if !slices.Equal(got, want) {
+					t.Errorf("%s: the column-major call computes %v, want %v", name, got, want)
+				}
+			}
+		}
+	}
+	if planned < 20 {
+		t.Errorf("only %d products planned", planned)
+	}
+}

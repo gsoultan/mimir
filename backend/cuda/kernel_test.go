@@ -42,7 +42,7 @@ func targets(t *testing.T, products bool) map[string]kerneltest.Target {
 
 // emulatedSgemm computes the product g as the backend asks cuBLAS to.
 func emulatedSgemm(g gen.GEMM, x, y []float32) []float32 {
-	return cublas(planSgemm(g), [2][]float32{x, y})
+	return kerneltest.ColumnMajor(g.ColumnMajor(), [2][]float32{x, y})
 }
 
 func TestElementwiseKernels(t *testing.T) {

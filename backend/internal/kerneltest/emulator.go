@@ -364,6 +364,25 @@ func (e EmulatedGEMM) Run(t *testing.T, k *backend.Kernel, outs, ins []backend.B
 	return e.Exec(t, l, outs, ins)
 }
 
+// ColumnMajor computes the call s as a column-major BLAS does, over the
+// operand buffers ins: for each batch, the column-major result
+// C = op(A)·op(B).
+func ColumnMajor(s gen.ColumnMajor, ins [2][]float32) []float32 {
+	c := make([]float32, s.Batch*s.StrideC)
+	for b := range s.Batch {
+		for i := range s.M {
+			for j := range s.N {
+				var acc float32
+				for p := range s.K {
+					acc += ins[s.A.In][s.A.At(b, i, p)] * ins[s.B.In][s.B.At(b, p, j)]
+				}
+				c[b*s.StrideC+j*s.LDC+i] = acc
+			}
+		}
+	}
+	return c
+}
+
 // GEMM returns the result of g over the operand buffers x and y, reading
 // them where g says.
 func GEMM(g gen.GEMM, x, y []float32) []float32 {

@@ -1,6 +1,8 @@
-//go:build linux && (amd64 || arm64) && !nocuda
-
-package cuda
+// Package diskcache keeps the kernels a GPU backend compiles between
+// runs, so that a program's second run compiles nothing. Entries live
+// under MIMIR_CACHE_DIR or the user's cache directory, in a directory per
+// backend, and a run that cannot write there compiles everything again.
+package diskcache
 
 import (
 	"crypto/sha256"
@@ -9,17 +11,15 @@ import (
 	"path/filepath"
 )
 
-// diskCache keeps compiled kernels between runs, so that a program's
-// second run compiles nothing. It lives under MIMIR_CACHE_DIR or the
-// user's cache directory, and a run that cannot write there compiles
-// everything again.
-type diskCache struct {
+// Cache is one backend's directory of compiled kernels. A nil Cache holds
+// nothing and stores nothing.
+type Cache struct {
 	dir string
 }
 
-// openDiskCache returns the cache, or nil if there is no directory for
-// it.
-func openDiskCache() *diskCache {
+// Open returns the cache of the backend name, such as "cuda", or nil if
+// there is no directory for it.
+func Open(name string) *Cache {
 	dir := os.Getenv("MIMIR_CACHE_DIR")
 	if dir == "" {
 		base, err := os.UserCacheDir()
@@ -28,16 +28,16 @@ func openDiskCache() *diskCache {
 		}
 		dir = filepath.Join(base, "mimir")
 	}
-	dir = filepath.Join(dir, "cuda")
+	dir = filepath.Join(dir, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil
 	}
-	return &diskCache{dir: dir}
+	return &Cache{dir: dir}
 }
 
-// key returns the name of the entry compiled from src with the given
+// Key returns the name of the entry compiled from src with the given
 // compiler and options.
-func (*diskCache) key(compiler string, options []string, src string) string {
+func (*Cache) Key(compiler string, options []string, src string) string {
 	h := sha256.New()
 	h.Write([]byte(compiler))
 	for _, o := range options {
@@ -49,8 +49,8 @@ func (*diskCache) key(compiler string, options []string, src string) string {
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
-// get returns the entry key, if there is one.
-func (c *diskCache) get(key string) ([]byte, bool) {
+// Get returns the entry key, if there is one.
+func (c *Cache) Get(key string) ([]byte, bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -58,10 +58,10 @@ func (c *diskCache) get(key string) ([]byte, bool) {
 	return data, err == nil && len(data) > 0
 }
 
-// put stores data as the entry key. Another process storing the same
+// Put stores data as the entry key. Another process storing the same
 // entry at the same time is harmless: whichever rename lands last wins,
 // and both wrote the same bytes.
-func (c *diskCache) put(key string, data []byte) {
+func (c *Cache) Put(key string, data []byte) {
 	if c == nil {
 		return
 	}
