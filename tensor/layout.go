@@ -1,10 +1,9 @@
 package tensor
 
 import (
-	"fmt"
 	"runtime"
 	"slices"
-	"strings"
+	"strconv"
 	"sync"
 	"weak"
 
@@ -119,21 +118,39 @@ func (l layout) equal(o layout) bool {
 
 // key returns a string that equal layouts share.
 func (l layout) key() string {
-	var b strings.Builder
-	l.write(&b)
-	return b.String()
+	return string(l.appendKey(make([]byte, 0, 32)))
 }
 
-func (l layout) write(b *strings.Builder) {
+func (l layout) appendKey(b []byte) []byte {
 	for _, d := range l.dims {
-		fmt.Fprintf(b, "%d%v,", d.axis, d.sec)
+		b = strconv.AppendInt(b, int64(d.axis), 10)
+		b = appendInts(b, d.sec)
+		b = append(b, ',')
 	}
-	fmt.Fprintf(b, "p%d%v", l.partial, l.max)
+	b = append(b, 'p')
+	b = strconv.AppendUint(b, uint64(l.partial), 10)
+	b = strconv.AppendBool(b, l.max)
 	for _, p := range l.packed {
-		fmt.Fprintf(b, "[%d%v:", p.off, p.shape)
-		p.lay.write(b)
-		b.WriteByte(']')
+		b = append(b, '[')
+		b = strconv.AppendInt(b, int64(p.off), 10)
+		b = appendInts(b, p.shape)
+		b = append(b, ':')
+		b = p.lay.appendKey(b)
+		b = append(b, ']')
 	}
+	return b
+}
+
+// appendInts appends xs as fmt's %v prints a slice.
+func appendInts(b []byte, xs []int) []byte {
+	b = append(b, '[')
+	for i, x := range xs {
+		if i > 0 {
+			b = append(b, ' ')
+		}
+		b = strconv.AppendInt(b, int64(x), 10)
+	}
+	return append(b, ']')
 }
 
 // local returns the length of a rank's block of an axis of length n.
@@ -188,6 +205,11 @@ func (c *constraintSet) remove(k weak.Pointer[graph.Node]) {
 }
 
 func (c *constraintSet) get(n *graph.Node) (layout, bool) {
+	// constrain makes every node it constrains a reshape, and weak.Make
+	// is costly enough not to call for the others.
+	if n.Op != backend.OpReshape {
+		return layout{}, false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	l, ok := c.m[weak.Make(n)]

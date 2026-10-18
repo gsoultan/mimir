@@ -339,8 +339,11 @@ func (p *plan) build(byDepth [][]*graph.Node, extra func(k int) []convReq, last 
 		var expands []convReq
 		seen := map[convKey]bool{}
 		for _, r := range reqs {
+			if !p.needsCollective(r.n, r.lay) {
+				continue
+			}
 			key := convKey{r.n, r.lay.key()}
-			if seen[key] || !p.needsCollective(r.n, r.lay) {
+			if seen[key] {
 				continue
 			}
 			if _, ok := p.convs[key]; ok {
@@ -455,6 +458,9 @@ func (p *plan) valueOf(n *graph.Node) (*value, error) {
 // input returns the shards of n laid out as l: built by a collective
 // already, or converted on each device now.
 func (p *plan) input(n *graph.Node, l layout) (*value, error) {
+	if v := p.nodes[n].val; v != nil && v.lay.equal(l) {
+		return v, nil
+	}
 	key := convKey{n, l.key()}
 	if v, ok := p.convs[key]; ok {
 		return v, nil
