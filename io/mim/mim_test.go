@@ -15,7 +15,7 @@ import (
 )
 
 // The files in testdata come from the repository of the format,
-// github.com/gsoultan/mim: models exported from PyTorch and converted from
+// github.com/gsoultan/mimir-model: models exported from PyTorch and converted from
 // ONNX, with the outputs PyTorch and onnxruntime computed, and a tiny
 // Q4_K_M Llama converted from GGUF, with the logits of a float64 forward
 // pass.
