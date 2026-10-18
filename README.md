@@ -471,7 +471,7 @@ once with `mim-import`, which copies its weights byte for byte and keeps
 its hyperparameters and vocabulary in the file's metadata:
 
 ```sh
-go run github.com/gsoultan/mim/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K_M.gguf
+go run github.com/gsoultan/mimir-model/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K_M.gguf
 go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.mim -prompt "The capital of France is" -n 64 -temperature 0
 ```
 
@@ -552,7 +552,7 @@ go run ./examples/rl/ppo
 
 ## Mimir Model files
 
-Mimir Model (`.mim`, [github.com/gsoultan/mim](https://github.com/gsoultan/mim))
+Mimir Model (`.mim`, [github.com/gsoultan/mimir-model](https://github.com/gsoultan/mimir-model))
 is mimir's model format: one file holds a model's weights, which may be
 block-quantized, its graph in the format's 33 primitives and calls of its
 standard library (`linear.v1`, `attention.v2`, `rope.v1`, ...), and typed

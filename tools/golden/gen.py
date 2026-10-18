@@ -877,7 +877,7 @@ def evaluate(oracle, inputs, np_fn, torch_fn):
 
 
 # Mimir Model (.mim) container, spec/container.md and spec/metadata.md of
-# github.com/gsoultan/mim: the subset the goldens need, which is plain
+# github.com/gsoultan/mimir-model: the subset the goldens need, which is plain
 # tensors in the weights section and string metadata.
 
 MIM_DTYPES = {np.dtype(F32): 1, np.dtype(np.uint8): 6, np.dtype(I32): 9}  # spec/dtypes.md
