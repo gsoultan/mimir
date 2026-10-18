@@ -56,10 +56,12 @@ type cached struct {
 	used uint64 // the clock when it last ran
 }
 
-// lookup returns the program of key, or nil.
+// lookup returns a program of key that no running schedule runs, or
+// nil. Schedules of the same key that run at once each compile their own
+// program, which the cache then holds alongside the first.
 func (c *cache) lookup(hash uint64, key []uint64) *program {
 	for _, e := range c.byHash[hash] {
-		if slices.Equal(e.key, key) {
+		if !e.prog.busy && slices.Equal(e.key, key) {
 			c.clock++
 			e.used = c.clock
 			c.hits++

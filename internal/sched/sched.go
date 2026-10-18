@@ -22,17 +22,73 @@ import (
 	"github.com/gsoultan/mimir/internal/graph"
 )
 
-// mu serializes Realize and Download. Realizing writes results into nodes
-// that other graphs may share, so concurrent schedules could race on them.
-// Kernels themselves still use every core.
+// mu guards the state of graphs, of the pools and of the cache: every
+// field of a node or storage that a schedule reads or writes. A schedule
+// holds it while it walks its graph, plans and binds its program, and
+// while it assigns the results, but not while its kernels run, so that
+// graphs that share no memory compute at once (see claims below).
+//
+// Lock order: mu is taken after the locks of package tensor and those of
+// the keep functions that the callers pass in, which run under it. The
+// pool's acct is taken under mu or alone.
 var mu sync.Mutex
+
+// While a schedule's kernels run without mu, it claims the storages they
+// read and write: Storage.Readers and Storage.Writers count the running
+// schedules that do. A schedule whose leaves include a storage that one
+// writes, or that would write a storage that one reads or writes, does
+// not start: it gives mu up until a running schedule ends (idle) and
+// begins again from its walk, since the graph may have changed. A
+// schedule takes its claims at once, all of them, under mu, and holds
+// nothing while it waits, so schedules cannot deadlock; one never waits
+// for another while it holds claims.
+//
+// The pooled buffers a running schedule took, and those it gave back
+// during its bookkeeping but whose last readers have not run, are off the
+// free lists until it ends (see program.hide), and its program and walker
+// are its own, so nothing else a running schedule touches is shared.
+//
+// Operations that are not worth running concurrently, those of several
+// devices and collectives among them, wait for every running schedule to
+// end and keep mu throughout (see lockAll), as every operation did before.
+
+// running counts the schedules and downloads running without mu.
+var running int
+
+// idle is signalled, with mu, each time one of them ends.
+var idle = sync.Cond{L: &mu}
+
+// errBusy reports a schedule that cannot start while others run, as
+// claims describes. It never reaches callers outside the package: the
+// operation waits and begins again.
+var errBusy = errors.New("sched: memory in use by a running schedule")
+
+// lockAll takes mu once no schedule runs without it, for operations that
+// keep mu while their kernels run.
+func lockAll() {
+	mu.Lock()
+	for running > 0 {
+		idle.Wait()
+	}
+}
+
+// retry calls f, with mu held, until it does not report errBusy, waiting
+// for a running schedule to end each time it does.
+func retry(f func() error) error {
+	for {
+		if err := f(); !errors.Is(err, errBusy) {
+			return err
+		}
+		idle.Wait()
+	}
+}
 
 // Realize computes every target on be. On success each target holds its
 // result and has dropped its inputs; on error no node is changed.
 func Realize(ctx context.Context, be backend.Backend, targets ...*graph.Node) error {
 	mu.Lock()
 	defer mu.Unlock()
-	return realize(ctx, be, targets, nil, nil)
+	return retry(func() error { return realize(ctx, be, targets, nil, nil, true) })
 }
 
 // RealizeInto computes every target on be like Realize, but writes
@@ -67,8 +123,14 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	targets, dsts = protect(ctx, be, targets, dsts, keep)
-	return realize(ctx, be, targets, dsts, keep)
+	var computed []*graph.Node
+	return retry(func() error {
+		ts, ds, err := protect(ctx, be, targets, dsts, keep, &computed)
+		if err != nil {
+			return err
+		}
+		return realize(ctx, be, ts, ds, keep, true)
+	})
 }
 
 // RealizeEach realizes targets[i] on bes[i], writing them over dsts[i],
@@ -103,7 +165,7 @@ func realizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 			}
 		}
 	}
-	mu.Lock()
+	lockAll()
 	defer mu.Unlock()
 	ts, ds := slices.Clone(targets), make([][]*graph.Node, len(bes))
 	keeps := make([]func() []*graph.Node, len(bes))
@@ -138,7 +200,8 @@ func realizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 			// which a replay would not.
 			traces[i] = nil
 		}
-		ts[i], ds[i] = protect(ctx, be, ts[i], ds[i], keeps[i])
+		// No schedule runs, so none is busy.
+		ts[i], ds[i], _ = protect(ctx, be, ts[i], ds[i], keeps[i], new([]*graph.Node))
 	}
 	errs := make([]error, len(bes))
 	var wg sync.WaitGroup
@@ -146,7 +209,7 @@ func realizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 		if len(ts[i]) == 0 {
 			continue
 		}
-		wg.Go(func() { errs[i] = schedule(ctx, be, ts[i], ds[i], keeps[i], true, traces[i]) })
+		wg.Go(func() { errs[i] = schedule(ctx, be, ts[i], ds[i], keeps[i], true, false, traces[i]) })
 	}
 	wg.Wait()
 	return errors.Join(errs...)
@@ -154,31 +217,48 @@ func realizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 
 // protect computes, in schedules of their own, the nodes that keep lists
 // that read the memory of a destination in dsts, as RealizeInto
-// documents, and returns the targets and destinations with those it
-// computed added. mu is held.
-func protect(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) ([]*graph.Node, []*graph.Node) {
+// documents, adds them to computed, and returns the targets and
+// destinations with those of computed that are valid added. mu is held,
+// and those schedules keep it, so that the targets' schedule follows them
+// before any other. It returns errBusy if a running schedule keeps them
+// from starting; the caller then waits and calls it again with the same
+// computed, since the nodes it computed are no longer endangered but must
+// still join the targets.
+func protect(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, computed *[]*graph.Node) ([]*graph.Node, []*graph.Node, error) {
 	if keep != nil {
 		if k := endangered(keep(), targets, dsts); len(k) > 0 {
 			// The errors are their readers' to see, when they read them.
 			// They take no donated memory that the targets read.
 			read := func() []*graph.Node { return targets }
-			if realize(ctx, be, k, nil, read) != nil {
+			if err := realize(ctx, be, k, nil, read, false); errors.Is(err, errBusy) {
+				return nil, nil, err
+			} else if err != nil {
 				for _, n := range k {
-					_ = realize(ctx, be, []*graph.Node{n}, nil, read)
+					// One at a time, a node may wait for the memory it
+					// reads after others are computed: waiting gives mu
+					// up, but the nodes computed stay in computed.
+					_ = retry(func() error { return realize(ctx, be, []*graph.Node{n}, nil, read, false) })
 				}
 			}
-			// Those computed join the targets, which costs no kernels: one
-			// that is a view of a destination then keeps that memory from
-			// being written over or made stale, as a target would.
-			targets, dsts = slices.Clip(targets), slices.Clip(dsts)
 			for _, n := range k {
 				if n.Realized() {
-					targets, dsts = append(targets, n), append(dsts, nil)
+					*computed = append(*computed, n)
 				}
 			}
 		}
 	}
-	return targets, dsts
+	// Those computed join the targets, which costs no kernels: one that is
+	// a view of a destination then keeps that memory from being written
+	// over or made stale, as a target would.
+	if len(*computed) > 0 {
+		targets, dsts = slices.Clip(targets), slices.Clip(dsts)
+		for _, n := range *computed {
+			if !n.Stale() {
+				targets, dsts = append(targets, n), append(dsts, nil)
+			}
+		}
+	}
+	return targets, dsts, nil
 }
 
 // A node's state says what it is computed from.
@@ -329,6 +409,7 @@ func keptMemory(keep []*graph.Node) map[*graph.Storage]bool {
 func Release(n *graph.Node, keep func() []*graph.Node) {
 	mu.Lock()
 	defer mu.Unlock()
+	waitUnclaimed(n)
 	if !n.Realized() || n.Stale() || n.Mem.Refs != 1 {
 		return
 	}
@@ -340,6 +421,15 @@ func Release(n *graph.Node, keep func() []*graph.Node) {
 	p := poolOf(n.Mem.Dev)
 	p.track(n.Buf())
 	p.release(n.Buf())
+}
+
+// waitUnclaimed waits, with mu held, until no running schedule reads or
+// writes the memory of n, if n is realized, so that it can be given away
+// or made stale.
+func waitUnclaimed(n *graph.Node) {
+	for n.Realized() && (n.Mem.Readers > 0 || n.Mem.Writers > 0) {
+		idle.Wait()
+	}
 }
 
 // Realized reports whether n holds its result. Unlike n.Realized, it is
@@ -365,32 +455,69 @@ func Device(n *graph.Node) backend.Backend {
 // Download realizes n on be, unless it is realized, and copies its
 // elements into dst as row-major bytes. len(dst) must equal the tensor's
 // size in bytes. keep, if not nil, lists nodes whose memory the schedule
-// must not take, as for RealizeInto.
+// must not take, as for RealizeInto. The copy runs without mu, as kernels
+// do.
 func Download(ctx context.Context, be backend.Backend, n *graph.Node, dst []byte, keep func() []*graph.Node) error {
 	mu.Lock()
 	defer mu.Unlock()
-	if err := realize(ctx, be, []*graph.Node{n}, nil, keep); err != nil {
-		return err
-	}
-	return download(ctx, n, dst)
+	return retry(func() error {
+		if err := realize(ctx, be, []*graph.Node{n}, nil, keep, true); err != nil {
+			return err
+		}
+		return download(ctx, n, dst, true)
+	})
 }
 
-// download copies the elements of the realized node n into dst.
-func download(ctx context.Context, n *graph.Node, dst []byte) error {
-	be := n.Mem.Dev
+// download copies the elements of the realized node n into dst. mu is
+// held; if unlock is set it is given up while the copy runs, with n's
+// memory claimed for reading, and download returns errBusy if a running
+// schedule writes that memory.
+func download(ctx context.Context, n *graph.Node, dst []byte, unlock bool) (err error) {
+	if n.Stale() {
+		return stale(n)
+	}
+	mem := n.Mem
+	if unlock && mem.Writers > 0 {
+		return errBusy
+	}
+	be := mem.Dev
 	buf, v := n.Buf(), n.View
+	var (
+		m   *pool
+		tmp backend.Buffer
+		k   *backend.Kernel
+	)
 	if !v.IsContiguous() || v.Offset != 0 || buf.Len() != n.Size() {
-		m := poolOf(be)
+		m = poolOf(be)
 		s := m.simulate()
 		s.take(n.DType, n.Size())
 		if err := m.reserve(s); err != nil {
+			if unlock && running > 0 {
+				return errBusy
+			}
 			return err
 		}
-		tmp, err := runNew(ctx, m, &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: n.Shape, In: []backend.View{v}}, buf)
-		if err != nil {
+		k = &backend.Kernel{Op: backend.OpContiguous, DType: n.DType, Shape: n.Shape, In: []backend.View{v}}
+		if tmp, err = m.alloc(n.DType, n.Size()); err != nil {
 			return err
 		}
 		defer m.release(tmp)
+	}
+	if unlock {
+		mem.Readers++
+		running++
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			mem.Readers--
+			running--
+			idle.Broadcast()
+		}()
+	}
+	if tmp != nil {
+		if err := be.Run(ctx, k, []backend.Buffer{tmp}, []backend.Buffer{buf}); err != nil {
+			return err
+		}
 		buf = tmp
 	}
 	return be.Download(ctx, dst, buf)
@@ -403,21 +530,24 @@ type result struct {
 }
 
 // realize computes targets on be, writing them over dsts, as
-// RealizeInto documents. mu is held.
-func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
-	return schedule(ctx, be, targets, dsts, keep, false, nil)
+// RealizeInto documents. mu is held; if unlock is set, it is given up
+// while the kernels run (see claims), and realize returns errBusy, having
+// changed nothing, if running schedules keep it from starting.
+func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, unlock bool) error {
+	return schedule(ctx, be, targets, dsts, keep, false, unlock, nil)
 }
 
 // schedule is realize, which if local is set runs while the schedules of
 // other devices do (see RealizeEach), and therefore fails rather than
 // copy an input from another device; mu is then held by the caller of
-// the goroutines that run them. It calls trace, if not nil, with the
-// schedule's trace (see RealizeEachTraced) unless a target is realized.
-func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, local bool, trace func(*Trace, []*graph.Node, []*graph.Node)) (err error) {
+// the goroutines that run them, and unlock must not be set. It calls
+// trace, if not nil, with the schedule's trace (see RealizeEachTraced)
+// unless a target is realized.
+func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, local, unlock bool, trace func(*Trace, []*graph.Node, []*graph.Node)) (err error) {
 	generation.Add(1)
 	m := poolOf(be)
-	w := &m.walker
-	defer w.forget()
+	w := m.takeWalker()
+	defer m.giveWalker(w)
 	if err := w.run(be, targets, dsts); err != nil {
 		return err
 	}
@@ -429,6 +559,11 @@ func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.No
 		}
 	}
 	w.withhold(keep, targets)
+	// Nothing has changed yet, so a schedule that must wait for others
+	// can begin again.
+	if w.contended(dsts) {
+		return errBusy
+	}
 	if trace != nil && slices.ContainsFunc(targets, (*graph.Node).Realized) {
 		// The key names a realized target by the leaf it is, which a
 		// replay would have to find.
@@ -441,15 +576,19 @@ func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.No
 		consume(targets, dsts)
 		return nil
 	}
-	defer m.tick()
 	// A backend may run kernels after Run returns and report their errors
 	// at Sync, so the schedule waits for them before it changes any node.
 	// On error it still waits, so that the errors of kernels already
-	// queued are not reported by a later schedule.
+	// queued are not reported by a later schedule. A schedule that waits
+	// for others to end has not begun.
 	defer func() {
+		if errors.Is(err, errBusy) {
+			return
+		}
 		if err != nil {
 			_ = be.Sync(context.WithoutCancel(ctx))
 		}
+		m.tick()
 	}()
 	prog, err := m.program(w, targets, dsts)
 	if err != nil {
@@ -461,9 +600,14 @@ func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.No
 	// The schedule is refused before it allocates anything if it would
 	// not fit in the budget.
 	if err := prog.reserve(m); err != nil {
+		// Memory that running schedules hold may be back in the pool
+		// once they end.
+		if unlock && running > 0 && errors.Is(err, backend.ErrMemoryBudget) {
+			return errBusy
+		}
 		return err
 	}
-	return prog.run(ctx, m, w, targets, dsts)
+	return prog.run(ctx, m, w, targets, dsts, unlock)
 }
 
 // program returns the program that computes targets, which w has walked,

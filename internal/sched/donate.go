@@ -195,9 +195,9 @@ func freeBuffer(be backend.Backend, dt backend.DType, n int) backend.Buffer {
 // without the host (see backend.PeerCopier). The copy's buffer comes from
 // to's pool as an upload's does. keep is as for Download.
 func Copy(ctx context.Context, from backend.Backend, to backend.PeerCopier, n *graph.Node, keep func() []*graph.Node) (*graph.Node, error) {
-	mu.Lock()
+	lockAll()
 	defer mu.Unlock()
-	if err := realize(ctx, from, []*graph.Node{n}, nil, keep); err != nil {
+	if err := realize(ctx, from, []*graph.Node{n}, nil, keep, false); err != nil {
 		return nil, err
 	}
 	buf, v := n.Buf(), n.View

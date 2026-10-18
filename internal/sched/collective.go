@@ -33,7 +33,7 @@ func Collective(ctx context.Context, bes []backend.Backend, ins [][]*graph.Node,
 	if len(ins) != len(bes) || len(outs) != len(bes) {
 		return nil, fmt.Errorf("sched: collective over %d devices of %d inputs and %d outputs: %w", len(bes), len(ins), len(outs), backend.ErrInternal)
 	}
-	mu.Lock()
+	lockAll()
 	defer mu.Unlock()
 	for r, be := range bes {
 		var todo []*graph.Node
@@ -49,7 +49,7 @@ func Collective(ctx context.Context, bes []backend.Backend, ins [][]*graph.Node,
 			}
 		}
 		if len(todo) > 0 {
-			if err := realize(ctx, be, todo, nil, keep); err != nil {
+			if err := realize(ctx, be, todo, nil, keep, false); err != nil {
 				return nil, err
 			}
 		}
