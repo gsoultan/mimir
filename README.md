@@ -322,15 +322,17 @@ err = train.Fit(ctx, model, opt, trainSet,
 `Fit` moves the model to the first device, replicates it onto the others
 with `nn.Replicate`, and splits each batch between them along its first
 axis. Each replica computes the loss and gradients of its share, the
-gradients are all-reduced into every replica, weighted by each share's
-part of the batch, and every device steps its own copy of the parameters
-with the optimizer, so every replica holds the same values bit for bit
-without copying them from the first device. Evaluation and checkpoints
+gradients are reduced into the first device's model, weighted by each
+share's part of the batch, the optimizer steps once there, and the
+replicas take the new parameters and buffers before the next batch, so
+every replica holds the same values bit for bit. Evaluation and checkpoints
 use the model on the first device. `train.NewParallel` does the same in a
 loop you write: its `Backward` takes a batch and leaves the whole batch's
 gradients on the model, as PyTorch's `DistributedDataParallel` does within
-one process, and its `Step` steps the optimizer on every device. Two and
-four CPU devices match one device over the whole batch. `DataParallel` does not combine with `MicroBatch` or `MemoryBudget`.
+one process. Its `Step` instead all-reduces the gradients and steps every
+replica on its own device, which saves copying the new values but costs
+the host a step per device. Two and four CPU devices match one device
+over the whole batch. `DataParallel` does not combine with `MicroBatch` or `MemoryBudget`.
 
 Underneath, `tensor.NewGroup` connects devices of one kind, the CPU
 devices or CUDA GPUs, like a group of NCCL ranks in one process. Its
