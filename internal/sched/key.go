@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"reflect"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
@@ -30,7 +31,7 @@ import (
 
 // walks counts the walks, so that a node marked by an earlier walk reads
 // as unmarked.
-var walks uint64
+var walks atomic.Uint64
 
 // walker walks the graph of one schedule. Its slices are reused from walk
 // to walk, so that a schedule replayed from the cache allocates nothing
@@ -55,8 +56,6 @@ type frame struct {
 	n    *graph.Node
 	next int
 }
-
-var walker0 walker
 
 // Key words start with a tag that says what follows.
 const (
@@ -103,8 +102,7 @@ func (w *walker) pushInts(s []int) {
 // target. It returns ErrOverwritten if a node it needs is stale. It
 // walks iteratively, so deep graphs cannot overflow the stack.
 func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
-	walks++
-	w.walk, w.be = walks, be
+	w.walk, w.be = walks.Add(1), be
 	w.gifts = w.gifts[:0]
 	w.order, w.leaves, w.mems = w.order[:0], w.leaves[:0], 0
 	w.key = w.key[:0]

@@ -48,7 +48,8 @@ type pool struct {
 	// prediction was exact.
 	obtained, predicted int64
 
-	programs cache // the programs of recent schedules (see cache.go)
+	programs cache  // the programs of recent schedules (see cache.go)
+	walker   walker // walks the graphs of the schedules on be
 
 	loads map[poolKey]*loadOrder // the buffers uploads and copies took (see freeBuffer)
 

@@ -11,10 +11,12 @@ package sched
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
@@ -65,6 +67,83 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	targets, dsts = protect(ctx, be, targets, dsts, keep)
+	return realize(ctx, be, targets, dsts, keep)
+}
+
+// RealizeEach realizes targets[i] on bes[i], writing them over dsts[i],
+// as RealizeInto does for each i, with dsts nil or dsts[i] nil for no
+// destinations. The schedules of the devices run at once, each on its
+// own goroutine, so that walking one device's graph and launching its
+// kernels overlaps the others': the schedules of a sharded computation
+// then start on every device together rather than one after another.
+//
+// The devices must differ, and each graph must read only nodes on its
+// own device or computed from constants: a schedule that would copy an
+// input from another device fails with backend.ErrDevice. Nor may the
+// graphs share an unrealized node. keep is as for RealizeInto; each
+// device's schedule spares only the nodes that keep lists on that
+// device. It returns the errors of the schedules that failed, joined;
+// the others' targets are computed.
+func RealizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*graph.Node, keep func() []*graph.Node) error {
+	if len(targets) != len(bes) || dsts != nil && len(dsts) != len(bes) {
+		return fmt.Errorf("sched: %d target lists and %d destination lists for %d devices: %w", len(targets), len(dsts), len(bes), backend.ErrInternal)
+	}
+	for i, ts := range targets {
+		if dsts != nil && dsts[i] != nil && len(dsts[i]) != len(ts) {
+			return fmt.Errorf("sched: %d destinations for %d targets: %w", len(dsts[i]), len(ts), backend.ErrInternal)
+		}
+		for _, be := range bes[:i] {
+			if be == bes[i] {
+				return fmt.Errorf("sched: two schedules at once on %s: %w", be.Name(), backend.ErrInternal)
+			}
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	ts, ds := slices.Clone(targets), make([][]*graph.Node, len(bes))
+	keeps := make([]func() []*graph.Node, len(bes))
+	var kept []*graph.Node
+	if keep != nil {
+		kept = keep()
+	}
+	for i, be := range bes {
+		poolOf(be) // created now: the schedules only read the map of pools
+		if dsts != nil {
+			ds[i] = dsts[i]
+		}
+		if keep == nil {
+			continue
+		}
+		// A node on another device reads none of be's memory, as a
+		// schedule here reads none of another's, and its graph is the
+		// other schedule's to change.
+		var mine []*graph.Node
+		for _, k := range kept {
+			if !k.Realized() && k.Dev == be {
+				mine = append(mine, k)
+			}
+		}
+		keeps[i] = func() []*graph.Node { return mine }
+		ts[i], ds[i] = protect(ctx, be, ts[i], ds[i], keeps[i])
+	}
+	errs := make([]error, len(bes))
+	var wg sync.WaitGroup
+	for i, be := range bes {
+		if len(ts[i]) == 0 {
+			continue
+		}
+		wg.Go(func() { errs[i] = realizeLocal(ctx, be, ts[i], ds[i], keeps[i]) })
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// protect computes, in schedules of their own, the nodes that keep lists
+// that read the memory of a destination in dsts, as RealizeInto
+// documents, and returns the targets and destinations with those it
+// computed added. mu is held.
+func protect(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) ([]*graph.Node, []*graph.Node) {
 	if keep != nil {
 		if k := endangered(keep(), targets, dsts); len(k) > 0 {
 			// The errors are their readers' to see, when they read them.
@@ -86,7 +165,7 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 			}
 		}
 	}
-	return realize(ctx, be, targets, dsts, keep)
+	return targets, dsts
 }
 
 // A node's state says what it is computed from.
@@ -181,7 +260,7 @@ func endangered(keep, targets, dsts []*graph.Node) []*graph.Node {
 // generation counts the schedules, which change what nodes are realized
 // or stale. A release does not count: it makes stale only memory that no
 // kept node reads.
-var generation uint64
+var generation atomic.Uint64
 
 // kept caches keptMemory's answer for a generation and set of nodes.
 var kept struct {
@@ -199,7 +278,7 @@ func keptMemory(keep []*graph.Node) map[*graph.Storage]bool {
 	for _, k := range keep {
 		nodes[k] = true
 	}
-	if kept.mems != nil && kept.generation == generation && maps.Equal(kept.nodes, nodes) {
+	if kept.mems != nil && kept.generation == generation.Load() && maps.Equal(kept.nodes, nodes) {
 		return kept.mems
 	}
 	classify := classifier(nil, nil)
@@ -224,7 +303,7 @@ func keptMemory(keep []*graph.Node) map[*graph.Storage]bool {
 			}
 		}
 	}
-	kept.generation, kept.nodes, kept.mems = generation, nodes, mems
+	kept.generation, kept.nodes, kept.mems = generation.Load(), nodes, mems
 	return mems
 }
 
@@ -310,19 +389,40 @@ type result struct {
 	mem  *graph.Storage
 }
 
-func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) (err error) {
-	generation++
-	w := &walker0
+// realize computes targets on be, writing them over dsts, as
+// RealizeInto documents. mu is held.
+func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
+	return schedule(ctx, be, targets, dsts, keep, false)
+}
+
+// realizeLocal is realize for a schedule that runs while those of other
+// devices do (see RealizeEach), which therefore fails rather than copy
+// an input from another device. mu is held by the caller of the
+// goroutines that run them.
+func realizeLocal(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
+	return schedule(ctx, be, targets, dsts, keep, true)
+}
+
+func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, local bool) (err error) {
+	generation.Add(1)
+	m := poolOf(be)
+	w := &m.walker
 	defer w.forget()
 	if err := w.run(be, targets, dsts); err != nil {
 		return err
+	}
+	if local {
+		for _, n := range w.leaves {
+			if n.Mem.Dev != be {
+				return fmt.Errorf("sched: a schedule on %s reads a tensor on %s while that device runs its own: %w", be.Name(), n.Mem.Dev.Name(), backend.ErrDevice)
+			}
+		}
 	}
 	w.withhold(keep, targets)
 	if len(w.order) == 0 {
 		consume(targets, dsts)
 		return nil
 	}
-	m := poolOf(be)
 	defer m.tick()
 	// A backend may run kernels after Run returns and report their errors
 	// at Sync, so the schedule waits for them before it changes any node.
@@ -366,7 +466,7 @@ func (m *pool) program(w *walker, targets, dsts []*graph.Node) (*program, error)
 	if err != nil {
 		return nil, err
 	}
-	compiled++
+	compiled.Add(1)
 	if cached {
 		m.programs.add(hash, w.key, prog)
 	}
@@ -387,17 +487,17 @@ func assign(t *graph.Node, r result) {
 // may hold a newer value. It marks the storages it has seen, as a walk
 // does, so that it allocates nothing.
 func consume(targets, dsts []*graph.Node) {
-	walks++
+	walk := walks.Add(1)
 	for _, t := range targets {
 		if t.Mem != nil {
-			t.Mem.Mark.Walk = walks
+			t.Mem.Mark.Walk = walk
 		}
 	}
 	for _, d := range dsts {
-		if d != nil && d.Realized() && !d.Stale() && d.Mem.Mark.Walk != walks {
+		if d != nil && d.Realized() && !d.Stale() && d.Mem.Mark.Walk != walk {
 			d.Mem.Version++
 			d.Mem.Refs = 0
-			d.Mem.Mark.Walk = walks
+			d.Mem.Mark.Walk = walk
 		}
 	}
 }
