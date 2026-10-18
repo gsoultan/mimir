@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gsoultan/mimir/backend"
+	"github.com/gsoultan/mimir/backend/cpu"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -89,5 +90,21 @@ func TestTraceReportsFailedResults(t *testing.T) {
 	f := func(x ...*tensor.Tensor) []*tensor.Tensor { return []*tensor.Tensor{x[0].MatMul(x[0])} }
 	if _, err := tensor.Trace(f, []*tensor.Tensor{tensor.Zeros(tensor.Float32, 2, 3)}, nil); err == nil {
 		t.Fatal("trace of a product of mismatched shapes succeeded")
+	}
+}
+
+// TestTraceOnAnotherDevice traces a function that moves what it computes
+// from the arguments, as a factorization does to run on the CPU.
+func TestTraceOnAnotherDevice(t *testing.T) {
+	other := tensor.DeviceOn(cpu.New())
+	f := func(x ...*tensor.Tensor) []*tensor.Tensor {
+		return []*tensor.Tensor{x[0].MatMul(x[0].Transpose(0, 1)).Cholesky()}
+	}
+	tg, err := tensor.Trace(f, []*tensor.Tensor{tensor.Zeros(tensor.Float32, 2, 2).To(other)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := tg.Nodes[tg.Outputs[0]]; out.Op != backend.OpCholesky || tg.Nodes[out.Inputs[0]].Op != backend.OpMatMul {
+		t.Errorf("result: %+v", out)
 	}
 }

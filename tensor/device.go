@@ -243,6 +243,11 @@ func (t *Tensor) To(d Device) *Tensor {
 	if md, ok := to.(*meshDevice); ok {
 		return Shard(t, md.mesh, nil)
 	}
+	if dependsOnTraced(t.node) {
+		// An argument of a running Trace has no values to move. The trace
+		// records the operations, which no device runs.
+		return t
+	}
 	src := Device{from}
 	toRule := rule{
 		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.To(src)) },

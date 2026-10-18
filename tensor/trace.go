@@ -3,6 +3,7 @@ package tensor
 import (
 	"fmt"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/gsoultan/mimir/backend"
@@ -14,6 +15,35 @@ import (
 // operations are lazy in eager mode too: eager mode would compute the
 // operations on the arguments, which have no values.
 var tracing atomic.Int32
+
+// tracedArgs holds the nodes that stand for the arguments of the running
+// calls of Trace.
+var tracedArgs sync.Map
+
+// dependsOnTraced reports whether n is computed from an argument of a
+// running Trace, which has no values.
+func dependsOnTraced(n *graph.Node) bool {
+	if tracing.Load() == 0 {
+		return false
+	}
+	seen := map[*graph.Node]bool{}
+	stack := []*graph.Node{n}
+	for len(stack) > 0 {
+		m := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[m] {
+			continue
+		}
+		seen[m] = true
+		if _, ok := tracedArgs.Load(m); ok {
+			return true
+		}
+		if !sched.Realized(m) {
+			stack = append(stack, m.Inputs...)
+		}
+	}
+	return false
+}
 
 // TracedGraph is the graph of primitive operations that a function
 // computes, as Trace records it, for exporters that translate it into
@@ -54,7 +84,8 @@ type TracedNode struct {
 // f must not read the values of its arguments, as Data, Item, Realize and
 // Backward do: they have none, and doing so fails. The operations f
 // builds are lazy even in eager mode, which would compute them as f
-// builds them.
+// builds them, and To leaves a tensor computed from the arguments where
+// it is, since the trace records no devices.
 func Trace(f func(x ...*Tensor) []*Tensor, args []*Tensor, names map[string]*Tensor) (*TracedGraph, error) {
 	if err := firstErr(args...); err != nil {
 		return nil, err
@@ -67,8 +98,16 @@ func Trace(f func(x ...*Tensor) []*Tensor, args []*Tensor, names map[string]*Ten
 		argOf[n] = i
 	}
 	ys := func() []*Tensor {
+		for n := range argOf {
+			tracedArgs.Store(n, struct{}{})
+		}
 		tracing.Add(1)
-		defer tracing.Add(-1)
+		defer func() {
+			tracing.Add(-1)
+			for n := range argOf {
+				tracedArgs.Delete(n)
+			}
+		}()
 		return f(stand...)
 	}()
 	if err := firstErr(ys...); err != nil {
