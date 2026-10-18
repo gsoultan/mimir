@@ -310,6 +310,13 @@ func (g *Group) reduceGrads(ctx context.Context, op ReduceOp, root int, params [
 	}
 	gradMu.Lock()
 	defer gradMu.Unlock()
+	// The gradients are read and replaced once no Backward holds any of
+	// them.
+	for slices.ContainsFunc(values, func(vs []*Tensor) bool {
+		return slices.ContainsFunc(vs, func(v *Tensor) bool { return v.tape != nil && v.tape.busy })
+	}) {
+		gradIdle.Wait()
+	}
 	n := len(g.bes)
 	var idx []int
 	for i := len(params[root]) - 1; i >= 0; i-- {
