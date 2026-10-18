@@ -7,8 +7,13 @@
                backward and AdamW (BenchmarkDecoderBlockStep in package nn)
     decode     a decoding step of one token with 512 positions in the cache
                at Llama 3.2 1B shapes (BenchmarkDecode in package nn)
+    lstm       a 2-layer LSTM of 256 hidden units over 128 steps of 32
+               sequences of 64 features: forward, forward and backward, and
+               a training step with AdamW (BenchmarkLSTM in package nn)
 
-    python3 attention.py attention|block|decode [threads]
+    python3 attention.py attention|block|decode|lstm [threads] [device]
+
+device is cpu (the default) or cuda; on cuda each time waits for the GPU.
 """
 import math
 import sys
@@ -20,15 +25,24 @@ import torch.nn.functional as F
 
 torch.manual_seed(1)
 torch.set_num_threads(int(sys.argv[2]) if len(sys.argv) > 2 else 4)
+device = torch.device(sys.argv[3] if len(sys.argv) > 3 else "cpu")
+torch.set_default_device(device)
+
+
+def sync():
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
 
 def timed(name, f, warm, steps):
     for _ in range(warm):
         f()
+    sync()
     times = []
     for _ in range(steps):
         t = time.perf_counter()
         f()
+        sync()
         times.append(time.perf_counter() - t)
     times.sort()
     print(f"{name}: best {times[0] * 1e3:.2f} ms, median {times[len(times) // 2] * 1e3:.2f} ms")
@@ -128,4 +142,28 @@ def decode():
     timed("decode block", lambda: model.decode(x, cache_k, cache_v, past), 3, 20)
 
 
-{"attention": attention, "block": block, "decode": decode}[sys.argv[1]]()
+def lstm():
+    steps, batch, inp, hidden = 128, 32, 64, 256
+    model = nn.LSTM(inp, hidden, num_layers=2)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x, y = torch.randn(steps, batch, inp), torch.randn(steps, batch, hidden)
+
+    def forward():
+        with torch.no_grad():
+            model(x)
+
+    def backward():
+        F.mse_loss(model(x)[0], y).backward()
+        model.zero_grad()
+
+    def train():
+        F.mse_loss(model(x)[0], y).backward()
+        opt.step()
+        opt.zero_grad()
+
+    timed("lstm forward", forward, 3, 10)
+    timed("lstm backward", backward, 3, 10)
+    timed("lstm train", train, 3, 10)
+
+
+{"attention": attention, "block": block, "decode": decode, "lstm": lstm}[sys.argv[1]]()
