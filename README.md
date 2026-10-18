@@ -821,7 +821,7 @@ from the `pytorch-triton-rocm` wheel.
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
 | M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
 | M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ONNX import, ROCm through HIP, hiprtc and hipBLAS (done; ROCm pending validation on AMD hardware) |
-| M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism (in progress: built and tested on CPU devices, awaiting multi-GPU runs and the 8-GPU gate of 85% scaling efficiency) |
+| M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism, passing the 8-GPU gate of 85% scaling efficiency on H100s (done) |
 
 ## License
 
