@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	mimfile "github.com/gsoultan/mim"
-	"github.com/gsoultan/mim/interp"
-	"github.com/gsoultan/mim/ref"
+	mimfile "github.com/gsoultan/mimir-model"
+	"github.com/gsoultan/mimir-model/interp"
+	"github.com/gsoultan/mimir-model/ref"
 
 	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tensor"
