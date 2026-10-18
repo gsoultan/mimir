@@ -10,7 +10,7 @@ import (
 )
 
 // Linear applies y = x Wᵀ + b over the last dimension, like
-// torch.nn.Linear. For inference with weights quantized as a GGUF file
+// torch.nn.Linear. For inference with weights quantized as a Mimir Model file
 // holds them, Weight may be a buffer (tensor.NewBuffer) of a
 // block-quantized dtype, which the product reads without dequantizing
 // (see tensor.Tensor.MatMulT).

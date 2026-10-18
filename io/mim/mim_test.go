@@ -1,7 +1,6 @@
 package mim_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -11,9 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	mimfile "github.com/gsoultan/mim"
-	"github.com/gsoultan/mim/importer"
-
 	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tensor"
 )
@@ -21,7 +17,8 @@ import (
 // The files in testdata come from the repository of the format,
 // github.com/gsoultan/mim: models exported from PyTorch and converted from
 // ONNX, with the outputs PyTorch and onnxruntime computed, and a tiny
-// Q4_K_M Llama in GGUF with the logits of a float64 forward pass.
+// Q4_K_M Llama converted from GGUF, with the logits of a float64 forward
+// pass.
 
 type array struct {
 	DType string `json:"dtype"`
@@ -158,30 +155,13 @@ func TestONNXConversion(t *testing.T) {
 	check(t, m, e.Runs, e.Tolerance)
 }
 
-// llama converts the GGUF Llama in testdata with a graph, as mim-import
-// -graph does.
-func llama(t *testing.T, o importer.LlamaOptions) *mim.Model {
+// llama opens the tiny Llama in testdata, which mim-import -graph
+// converted from GGUF with a context of 64 and the options name names:
+// "exact" with a float32 cache, "f16-cache" with a float16 one, and "a8"
+// with a float16 cache and activations rounded to 8 bits.
+func llama(t *testing.T, name string) *mim.Model {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("testdata", "llama", "tiny-q4km.gguf"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	src, err := importer.ParseGGUF(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := importer.BuildLlama(src, o); err != nil {
-		t.Fatal(err)
-	}
-	w := mimfile.NewWriter()
-	if err := src.AddTo(w); err != nil {
-		t.Fatal(err)
-	}
-	var buf bytes.Buffer
-	if _, err := w.WriteTo(&buf); err != nil {
-		t.Fatal(err)
-	}
-	m, err := mim.Parse(buf.Bytes())
+	m, err := mim.Open(filepath.Join("testdata", "llama", "tiny-q4km-"+name+".mim"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +187,6 @@ func TestQuantizedLlama(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name string
-		o    importer.LlamaOptions
 		// tol bounds the logits' difference from the oracle's, relative
 		// to the largest; abs, if set, bounds it instead.
 		tol, abs float64
@@ -215,15 +194,15 @@ func TestQuantizedLlama(t *testing.T) {
 		// The weights decoded, products in float32 and a float32 cache:
 		// as close to the float64 oracle as float32 allows, and so
 		// choosing the same tokens.
-		{name: "exact", o: importer.LlamaOptions{Context: 64, Cache: mimfile.F32}, tol: 2e-5},
-		{name: "f16-cache", o: importer.LlamaOptions{Context: 64, Cache: mimfile.F16}, tol: 1e-3},
+		{name: "exact", tol: 2e-5},
+		{name: "f16-cache", tol: 1e-3},
 		// Activations rounded to 8 bits, as llama.cpp does: about as far
 		// from the oracle as llama.cpp, which can choose another token
 		// where two are close, so the steps take the oracle's tokens.
-		{name: "a8", o: importer.LlamaOptions{Context: 64, A8: true, Cache: mimfile.F16}, abs: 1.5 * e.LlamaCpp},
+		{name: "a8", abs: 1.5 * e.LlamaCpp},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := llama(t, tc.o)
+			m := llama(t, tc.name)
 			defer m.Close()
 			ctx := context.Background()
 			step := func(ids []int32, pos int) []float32 {

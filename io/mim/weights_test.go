@@ -3,6 +3,9 @@ package mim_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -308,5 +311,73 @@ func TestSaveRejectsWhatItCannotWrite(t *testing.T) {
 	failed := tensor.FromSlice([]float32{1, 2}, 2).Reshape(3)
 	if err := mim.WriteTensors(t.Context(), &buf, map[string]*tensor.Tensor{"x": failed}, nil); err == nil {
 		t.Error("a failed tensor saved")
+	}
+}
+
+// benchTensors returns n Float32 tensors of size elements each, computed.
+func benchTensors(b *testing.B, n, size int) map[string]*tensor.Tensor {
+	b.Helper()
+	ts := map[string]*tensor.Tensor{}
+	for i := range n {
+		ts[fmt.Sprintf("layers.%d.weight", i)] = tensor.Randn(uint64(i), size)
+	}
+	all := slices.Collect(maps.Values(ts))
+	if err := tensor.Realize(b.Context(), all...); err != nil {
+		b.Fatal(err)
+	}
+	return ts
+}
+
+var benchShapes = []struct {
+	name    string
+	n, size int
+}{{"4x16MiB", 4, 4 << 20}, {"20000x1KiB", 20000, 256}}
+
+func BenchmarkWriteTensors(b *testing.B) {
+	for _, s := range benchShapes {
+		b.Run(s.name, func(b *testing.B) {
+			ts := benchTensors(b, s.n, s.size)
+			b.SetBytes(int64(4 * s.n * s.size))
+			for b.Loop() {
+				if err := mim.WriteTensors(b.Context(), io.Discard, ts, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkOpenAndRead(b *testing.B) {
+	for _, s := range benchShapes {
+		b.Run(s.name, func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "model.mim")
+			out, err := os.Create(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := mim.WriteTensors(b.Context(), out, benchTensors(b, s.n, s.size), nil); err != nil {
+				b.Fatal(err)
+			}
+			out.Close()
+			b.SetBytes(int64(4 * s.n * s.size))
+			for b.Loop() {
+				f, err := mim.Open(path)
+				if err != nil {
+					b.Fatal(err)
+				}
+				var sums []*tensor.Tensor
+				for _, name := range f.Names() {
+					t, err := f.Tensor(name)
+					if err != nil {
+						b.Fatal(err)
+					}
+					sums = append(sums, t.Sum())
+				}
+				f.Close()
+				if err := tensor.Realize(b.Context(), sums...); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

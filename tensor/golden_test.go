@@ -144,7 +144,7 @@ func TestGolden(t *testing.T) {
 				t.Fatal(err)
 			}
 			switch c.Want.DType {
-			case "F32":
+			case "f32":
 				got, err := out.Data[float32](t.Context())
 				if err != nil {
 					t.Fatal(err)

@@ -13,7 +13,7 @@ import (
 )
 
 // TestQuantizedLinearAndEmbedding checks layers whose weights are
-// quantized buffers, as a model read from a GGUF file holds them: they
+// quantized buffers, as a model read from a Mimir Model file holds them: they
 // compute what the same layers with the dequantized weights compute, up to
 // the CPU's rounding of activations to int8, gradients reach the inputs and
 // the bias, and Save refuses the quantized weights.

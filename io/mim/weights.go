@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"slices"
+	"unicode/utf8"
 
 	mimfile "github.com/gsoultan/mim"
 
@@ -23,6 +24,11 @@ type SaveOptions struct {
 	// resuming training needs besides the weights, such as the optimizer
 	// state, which it names among the tensors.
 	Training *mimfile.Training
+	// Hash writes the SHA-256 hash of every section, which a reader may
+	// check (see mimfile.File.VerifyHashes), at the cost of reading every
+	// tensor twice: once for the hash, which comes first in the file, and
+	// once to write it.
+	Hash bool
 }
 
 // Save writes every parameter and buffer of m to w as a file of weights
@@ -37,8 +43,13 @@ func Save(ctx context.Context, w io.Writer, m nn.Module, opts *SaveOptions) erro
 
 // WriteTensors computes ts, together, and writes them to w by name as a
 // file of weights alone. Tensors of dtypes Float32, Float16, BFloat16,
-// Int32 and the block types are written as they are.
+// Int32 and the block types are written as they are. Each tensor's bytes
+// are copied from its device as they are written, so writing takes the
+// memory of the largest tensor, not of all of them.
 func WriteTensors(ctx context.Context, w io.Writer, ts map[string]*tensor.Tensor, opts *SaveOptions) error {
+	if opts == nil {
+		opts = &SaveOptions{}
+	}
 	names := slices.Sorted(maps.Keys(ts))
 	all := make([]*tensor.Tensor, len(names))
 	for i, name := range names {
@@ -47,14 +58,13 @@ func WriteTensors(ctx context.Context, w io.Writer, ts map[string]*tensor.Tensor
 	if err := tensor.Realize(ctx, all...); err != nil {
 		return fmt.Errorf("mim: save: %w", err)
 	}
-	fw := mimfile.NewWriter()
+	fts := make([]fileTensor, len(names))
 	for i, name := range names {
+		if name == "" || len(name) > mimfile.MaxNameLength || !utf8.ValidString(name) {
+			return fmt.Errorf("mim: save: tensor name %q: %w", name, ErrFormat)
+		}
 		t := all[i]
 		dt, err := mimDType(t.DType())
-		if err != nil {
-			return fmt.Errorf("mim: save %s: %w", name, err)
-		}
-		b, err := t.Bytes(ctx)
 		if err != nil {
 			return fmt.Errorf("mim: save %s: %w", name, err)
 		}
@@ -62,29 +72,31 @@ func WriteTensors(ctx context.Context, w io.Writer, ts map[string]*tensor.Tensor
 		for j, d := range t.Shape() {
 			shape[j] = uint64(d)
 		}
-		if err := fw.AddTensor(name, dt, shape, b); err != nil {
+		if len(shape) > mimfile.MaxRank {
+			return fmt.Errorf("mim: save %s: rank %d: %w", name, len(shape), tensor.ErrShape)
+		}
+		n, err := mimfile.ByteSize(dt, shape)
+		if err != nil {
 			return fmt.Errorf("mim: save %s: %w", name, err)
 		}
+		fts[i] = fileTensor{name: name, t: t, dtype: dt, shape: shape, length: n}
 	}
-	if opts != nil && len(opts.Metadata) > 0 {
+	var sections []fileSection
+	if len(opts.Metadata) > 0 {
 		md, err := opts.Metadata.Encode()
 		if err != nil {
 			return fmt.Errorf("mim: save metadata: %w", err)
 		}
-		if err := fw.AddSection(mimfile.SectionMetadata, false, md); err != nil {
-			return fmt.Errorf("mim: save metadata: %w", err)
-		}
+		sections = append(sections, fileSection{mimfile.SectionMetadata, md})
 	}
-	if opts != nil && opts.Training != nil {
+	if opts.Training != nil {
 		tr, err := opts.Training.Encode()
 		if err != nil {
 			return fmt.Errorf("mim: save training state: %w", err)
 		}
-		if err := fw.AddSection(mimfile.SectionTraining, false, tr); err != nil {
-			return fmt.Errorf("mim: save training state: %w", err)
-		}
+		sections = append(sections, fileSection{mimfile.SectionTraining, tr})
 	}
-	if _, err := fw.WriteTo(w); err != nil {
+	if err := writeFile(ctx, w, fts, sections, opts.Hash); err != nil {
 		return fmt.Errorf("mim: save: %w", err)
 	}
 	return nil
