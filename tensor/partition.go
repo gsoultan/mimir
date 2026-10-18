@@ -2,8 +2,10 @@ package tensor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
@@ -29,6 +31,7 @@ type plan struct {
 	order []*graph.Node // the nodes to compute, each after its inputs
 	convs map[convKey]*value
 	temps []*graph.Node // shards realized on the way, which go back to their pools at the end
+	cuts  []*value      // the values convert left to cut, until lowerAll cuts them
 }
 
 // pnode is what a plan knows of a node of the graph.
@@ -49,6 +52,10 @@ type value struct {
 	lay    layout
 	shape  []int
 	dt     DType
+	// cutOf, if not nil, is the value whose blocks this one's shards cut
+	// out, which a depth's lowering cuts on each device as it reaches
+	// them (see lowerAll); a nil shard is yet to be cut.
+	cutOf *value
 }
 
 type convKey struct {
@@ -380,10 +387,8 @@ func (p *plan) build(byDepth [][]*graph.Node, extra func(k int) []convReq, last 
 			}
 		}
 		if k < len(byDepth) {
-			for _, n := range byDepth[k] {
-				if err := p.lower(n); err != nil {
-					return err
-				}
+			if err := p.lowerAll(byDepth[k]); err != nil {
+				return err
 			}
 		}
 	}
@@ -458,6 +463,13 @@ func (p *plan) valueOf(n *graph.Node) (*value, error) {
 // input returns the shards of n laid out as l: built by a collective
 // already, or converted on each device now.
 func (p *plan) input(n *graph.Node, l layout) (*value, error) {
+	return p.convert(n, l, false)
+}
+
+// convert is input, which leaves the cutting of blocks to each device's
+// lowering if later is set, returning a value whose shards are cut from
+// another's as shard asks for them.
+func (p *plan) convert(n *graph.Node, l layout, later bool) (*value, error) {
 	if v := p.nodes[n].val; v != nil && v.lay.equal(l) {
 		return v, nil
 	}
@@ -484,6 +496,12 @@ func (p *plan) input(n *graph.Node, l layout) (*value, error) {
 				return nil, err
 			}
 		}
+	} else if later {
+		if err := p.cuttable(v, l); err != nil {
+			return nil, err
+		}
+		out = &value{shards: make([]*graph.Node, len(p.m.devs)), lay: l, shape: v.shape, dt: v.dt, cutOf: v}
+		p.cuts = append(p.cuts, out)
 	} else if out, err = p.cut(v, l); err != nil {
 		return nil, err
 	}
@@ -491,35 +509,97 @@ func (p *plan) input(n *graph.Node, l layout) (*value, error) {
 	return out, nil
 }
 
-// lower builds the shards of n from its inputs' shards.
-func (p *plan) lower(n *graph.Node) error {
-	pn := p.nodes[n]
-	ins := make([]*value, len(pn.ins))
-	for i, x := range pn.ins {
-		v, err := p.input(x, pn.req[i])
-		if err != nil {
-			return err
-		}
-		ins[i] = v
+// lowerAll builds the shards of the nodes ns, each after its inputs,
+// from their inputs' shards. It first gives each node, and each input it
+// reads converted, a value whose shards are to be built; then each
+// device builds its shards of them all, on a goroutine of its own, so
+// that the devices' graphs are built at once.
+func (p *plan) lowerAll(ns []*graph.Node) error {
+	type step struct {
+		n   *graph.Node
+		ins []*value
+		val *value
 	}
-	if _, ok := constraints.get(n); ok && len(ins) == 1 {
-		pn.val = ins[0]
+	steps := make([]step, 0, len(ns))
+	for _, n := range ns {
+		pn := p.nodes[n]
+		ins := make([]*value, len(pn.ins))
+		for i, x := range pn.ins {
+			v, err := p.convert(x, pn.req[i], true)
+			if err != nil {
+				return err
+			}
+			ins[i] = v
+		}
+		if _, ok := constraints.get(n); ok && len(ins) == 1 {
+			pn.val = ins[0]
+			continue
+		}
+		pn.val = &value{shards: make([]*graph.Node, len(p.m.devs)), lay: pn.lay, shape: n.Shape, dt: n.DType}
+		steps = append(steps, step{n, ins, pn.val})
+	}
+	// Every cut is made, including those that no node of ns reads but a
+	// later depth or a target does.
+	cuts := p.cuts
+	p.cuts = nil
+	defer func() {
+		for _, v := range cuts {
+			v.cutOf = nil
+		}
+	}()
+	build := func(r int) error {
+		var locals []*graph.Node
+		for _, s := range steps {
+			locals = locals[:0]
+			for _, x := range s.ins {
+				b, err := p.shard(x, r)
+				if err != nil {
+					return err
+				}
+				locals = append(locals, b)
+			}
+			b, err := p.local(s.n, locals, s.ins, s.val.lay)
+			if err != nil {
+				return fmt.Errorf("tensor: sharded %s: %w", s.n.Op, err)
+			}
+			s.val.shards[r] = b
+		}
+		for _, v := range cuts {
+			if _, err := p.shard(v, r); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
-	v := &value{shards: make([]*graph.Node, len(p.m.devs)), lay: pn.lay, shape: n.Shape, dt: n.DType}
-	locals := make([]*graph.Node, len(ins))
-	for r := range v.shards {
-		for i, x := range ins {
-			locals[i] = x.shards[r]
-		}
-		s, err := p.local(n, locals, ins, pn.lay)
-		if err != nil {
-			return fmt.Errorf("tensor: sharded %s: %w", n.Op, err)
-		}
-		v.shards[r] = s
+	if len(p.m.devs) == 1 {
+		return build(0)
 	}
-	pn.val = v
-	return nil
+	errs := make([]error, len(p.m.devs))
+	var wg sync.WaitGroup
+	for r := range p.m.devs {
+		wg.Go(func() { errs[r] = build(r) })
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// shard returns device r's shard of v, cutting it out of the shard it is
+// cut from first if v is a cut whose shard is yet to be built. Only the
+// goroutine that builds device r's shards calls it with r.
+func (p *plan) shard(v *value, r int) (*graph.Node, error) {
+	if s := v.shards[r]; s != nil || v.cutOf == nil {
+		return s, nil
+	}
+	from, err := p.shard(v.cutOf, r)
+	if err != nil {
+		return nil, err
+	}
+	s, err := p.cutShard(from, v.cutOf.lay, v.lay, v.shape, r)
+	if err != nil {
+		return nil, err
+	}
+	v.shards[r] = s
+	return s, nil
 }
 
 // local builds one device's block of n, laid out as l, from its blocks
