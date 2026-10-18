@@ -1,6 +1,7 @@
 package tensor
 
 import (
+	"context"
 	"fmt"
 	"slices"
 
@@ -135,6 +136,9 @@ func (p *plan) realizeLive(k int) error {
 			seen[s] = true
 			live[r] = append(live[r], s)
 		}
+	}
+	if p.rec != nil {
+		p.rec.realize(live)
 	}
 	err := sched.RealizeEach(p.ctx, p.m.bes, live, nil, lazy.values)
 	for _, ns := range live {
@@ -406,42 +410,26 @@ func (p *plan) run(jobs []*job) ([]*value, error) {
 	}
 	ins := make([][]*graph.Node, len(m.devs))
 	outs := make([][]sched.Out, len(m.devs))
-	for _, i := range coll {
+	descs := make([]collDesc, len(coll))
+	for at, i := range coll {
 		j := jobs[i]
 		for r := range ins {
 			ins[r] = append(ins[r], j.in[r])
 			outs[r] = append(outs[r], sched.Out{DType: j.dt, Shape: j.out, Over: -1})
 		}
+		descs[at] = collDesc{kind: j.kind, op: j.op, groups: groups[i], dt: j.dt, elems: prod(j.in[0].Shape)}
 	}
-	nodes, err := sched.Collective(p.ctx, m.bes, ins, outs, lazy.values, func(in, out [][]backend.Buffer) error {
-		var comms []backend.Communicator
-		byComm := map[backend.Communicator][]backend.Collective{}
-		for at, i := range coll {
-			j := jobs[i]
-			for _, g := range groups[i] {
-				c := backend.Collective{Kind: j.kind, Reduce: j.op, In: make([]backend.Buffer, len(g.ranks)), Out: make([]backend.Buffer, len(g.ranks))}
-				for q, r := range g.ranks {
-					c.In[q], c.Out[q] = in[r][at], out[r][at]
-				}
-				if _, ok := byComm[g.comm]; !ok {
-					comms = append(comms, g.comm)
-				}
-				byComm[g.comm] = append(byComm[g.comm], c)
-			}
-		}
-		for _, c := range comms {
-			if err := c.Run(p.ctx, byComm[c]); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	if p.rec != nil {
+		p.rec.collective(ins, outs, descs)
+	}
+	nodes, err := m.collect(p.ctx, ins, outs, descs)
 	if err != nil {
 		return nil, err
 	}
+	if p.rec != nil {
+		p.rec.produced(nodes)
+	}
 	for at, i := range coll {
-		j := jobs[i]
-		m.count(j.kind, j.dt, prod(j.in[0].Shape), len(m.devs))
 		out := make([]*graph.Node, len(m.devs))
 		for r := range out {
 			out[r] = nodes[r][at]
@@ -454,6 +442,53 @@ func (p *plan) run(jobs []*job) ([]*value, error) {
 		vals[i] = v
 	}
 	return vals, nil
+}
+
+// collDesc is one collective of a group that collect runs: its kind and
+// reduction, the groups of ranks it connects, and, for the mesh's
+// traffic, the dtype and number of elements of each rank's input.
+type collDesc struct {
+	kind   backend.CollectiveKind
+	op     backend.Reduction
+	groups []meshGroup
+	dt     DType
+	elems  int
+}
+
+// collect computes the inputs ins[r] on each device r and runs the
+// collectives descs over them as one group, the at-th of each device's
+// inputs and outputs, outs[r][at], being those of descs[at]. It returns
+// each device's outputs.
+func (m *Mesh) collect(ctx context.Context, ins [][]*graph.Node, outs [][]sched.Out, descs []collDesc) ([][]*graph.Node, error) {
+	nodes, err := sched.Collective(ctx, m.bes, ins, outs, lazy.values, func(in, out [][]backend.Buffer) error {
+		var comms []backend.Communicator
+		byComm := map[backend.Communicator][]backend.Collective{}
+		for at, d := range descs {
+			for _, g := range d.groups {
+				c := backend.Collective{Kind: d.kind, Reduce: d.op, In: make([]backend.Buffer, len(g.ranks)), Out: make([]backend.Buffer, len(g.ranks))}
+				for q, r := range g.ranks {
+					c.In[q], c.Out[q] = in[r][at], out[r][at]
+				}
+				if _, ok := byComm[g.comm]; !ok {
+					comms = append(comms, g.comm)
+				}
+				byComm[g.comm] = append(byComm[g.comm], c)
+			}
+		}
+		for _, c := range comms {
+			if err := c.Run(ctx, byComm[c]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range descs {
+		m.count(d.kind, d.dt, d.elems, len(m.devs))
+	}
+	return nodes, nil
 }
 
 // join joins the whole parts of a packed value, each flattened, into the

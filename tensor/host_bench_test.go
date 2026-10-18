@@ -2,6 +2,7 @@ package tensor_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/gsoultan/mimir/backend"
@@ -12,8 +13,9 @@ import (
 )
 
 // idle is a backend whose kernels do nothing, so that a benchmark on it
-// times the host's work alone.
-type idle struct{}
+// times the host's work alone. Its field keeps two from sharing an
+// address, which a zero-size type would let them do.
+type idle struct{ _ byte }
 
 type idleBuffer struct {
 	dt backend.DType
@@ -34,6 +36,17 @@ func (idle) Run(context.Context, *backend.Kernel, []backend.Buffer, []backend.Bu
 	return nil
 }
 func (idle) Sync(context.Context) error { return nil }
+func (idle) Asynchronous() bool         { return true }
+func (idle) Group(devs []backend.Backend) (backend.Communicator, error) {
+	return &idleGroup{devs: devs}, nil
+}
+
+// idleGroup is a group of idle devices, whose collectives do nothing.
+type idleGroup struct{ devs []backend.Backend }
+
+func (g *idleGroup) Backends() []backend.Backend                   { return g.devs }
+func (*idleGroup) Run(context.Context, []backend.Collective) error { return nil }
+func (*idleGroup) Close() error                                    { return nil }
 
 // BenchmarkHostStep times the host's work in a training step of a GPT-2
 // block and of four, on a device whose kernels do nothing, without a
@@ -46,10 +59,11 @@ func BenchmarkHostStep(b *testing.B) {
 		name   string
 		blocks int
 	}{{"gpt2", 1}, {"transformer", 4}} {
-		for _, sharded := range []bool{false, true} {
+		for _, n := range []int{0, 1, 2, 4, 8} {
+			sharded := n > 0
 			name := bm.name + "/n=1"
 			if sharded {
-				name = bm.name + "/mesh=1"
+				name = fmt.Sprintf("%s/mesh=%d", bm.name, n)
 			}
 			b.Run(name, func(b *testing.B) {
 				dev := tensor.DeviceOn(&idle{})
@@ -59,9 +73,14 @@ func BenchmarkHostStep(b *testing.B) {
 					blocks[i] = nn.NewGPT2Block(256, 8)
 				}
 				m := nn.NewSequential(blocks...)
-				x, y := tensor.Randn(1, 8, 64, 256), tensor.Randn(2, 8, 64, 256)
+				batch := 8 * max(n, 1)
+				x, y := tensor.Randn(1, batch, 64, 256), tensor.Randn(2, batch, 64, 256)
 				if sharded {
-					mesh, err := tensor.NewMesh([]int{1}, []string{"data"}, dev)
+					devs := make([]tensor.Device, n)
+					for i := range devs {
+						devs[i] = tensor.DeviceOn(&idle{})
+					}
+					mesh, err := tensor.NewMesh([]int{n}, []string{"data"}, devs...)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -96,6 +115,7 @@ func BenchmarkHostStep(b *testing.B) {
 				for b.Loop() {
 					step()
 				}
+
 			})
 		}
 	}
