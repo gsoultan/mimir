@@ -244,9 +244,7 @@ func (t *Tensor) To(d Device) *Tensor {
 		return Shard(t, md.mesh, nil)
 	}
 	if dependsOnTraced(t.node) {
-		// An argument of a running Trace has no values to move. The trace
-		// records the operations, which no device runs.
-		return t
+		return movedInTrace(t.node, to)
 	}
 	src := Device{from}
 	toRule := rule{

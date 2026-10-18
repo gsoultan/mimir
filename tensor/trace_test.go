@@ -104,7 +104,30 @@ func TestTraceOnAnotherDevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out := tg.Nodes[tg.Outputs[0]]; out.Op != backend.OpCholesky || tg.Nodes[out.Inputs[0]].Op != backend.OpMatMul {
-		t.Errorf("result: %+v", out)
+	// The input moves to the CPU, and the result back, as reshapes.
+	var ops []backend.Op
+	for n := tg.Nodes[tg.Outputs[0]]; len(n.Inputs) > 0; n = tg.Nodes[n.Inputs[0]] {
+		ops = append(ops, n.Op)
+	}
+	if want := []backend.Op{backend.OpReshape, backend.OpCholesky, backend.OpReshape, backend.OpMatMul}; !slices.Equal(ops, want) {
+		t.Errorf("result computed by %v, want %v", ops, want)
+	}
+}
+
+// TestTraceMovesToTheTensorsItMeets traces a function that moves what it
+// computes from an argument to the device of a parameter.
+func TestTraceMovesToTheTensorsItMeets(t *testing.T) {
+	other := tensor.DeviceOn(cpu.New())
+	w := tensor.FromSlice([]float32{1, 2, 3}, 3).To(tensor.CPU())
+	f := func(x ...*tensor.Tensor) []*tensor.Tensor {
+		return []*tensor.Tensor{x[0].Add(x[0]).To(tensor.CPU()).Mul(w)}
+	}
+	tg, err := tensor.Trace(f, []*tensor.Tensor{tensor.Zeros(tensor.Float32, 3).To(other)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mul := tg.Nodes[tg.Outputs[0]]
+	if move := tg.Nodes[mul.Inputs[0]]; mul.Op != backend.OpMul || move.Op != backend.OpReshape || tg.Nodes[move.Inputs[0]].Op != backend.OpAdd {
+		t.Errorf("result %+v of %+v", mul, move)
 	}
 }
