@@ -1,10 +1,15 @@
-# Code tools
+# mimir
+
+Pure-Go machine learning framework (no cgo, no Python at runtime). Run
+`go vet ./...` and `go test ./...` before pushing.
+
+## Code tools
 
 Two code-navigation tools are set up for Claude Code sessions in this repo.
 Use graphify to find your way around and Serena to read and change code by
 symbol.
 
-## graphify
+### graphify
 
 graphify builds a knowledge graph of the code in graphify-out/ (god nodes,
 communities, cross-file relationships). The SessionStart hook rebuilds it, so
@@ -14,8 +19,11 @@ it is not committed.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST only, no API cost).
 - The full skill is in .claude/skills/graphify/ (`/graphify`).
+- The graphify MCP server in .mcp.json serves the same graph as native tools
+  (`query_graph`, `shortest_path`, `god_nodes`); it starts once
+  graphify-out/graph.json exists.
 
-## Serena
+### Serena
 
 Serena is an MCP server (.mcp.json) that gives language-server tools: symbol
 overviews, find symbol, find references, and symbol-level edits. Its own
@@ -23,7 +31,7 @@ instructions arrive with the server. Once graphify has pointed you at the
 right file or symbol, read and edit it with Serena's symbolic tools rather
 than whole-file reads. Project settings are in .serena/project.yml.
 
-## Running these locally
+### Running these locally
 
 Cloud sessions install everything in .claude/hooks/session-start.sh. On your
 own machine, install once:

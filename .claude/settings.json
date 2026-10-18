@@ -1,5 +1,5 @@
 {
-  "enabledMcpjsonServers": ["serena"],
+  "enabledMcpjsonServers": ["serena", "graphify"],
   "hooks": {
     "SessionStart": [
       {
