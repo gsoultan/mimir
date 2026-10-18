@@ -45,6 +45,13 @@ func dependsOnTraced(n *graph.Node) bool {
 	return false
 }
 
+// movedInTrace returns n, which is computed from an argument of a running
+// Trace and so has no values to copy, on be: an identity reshape held by
+// be, which the trace records and no device runs.
+func movedInTrace(n *graph.Node, be backend.Backend) *Tensor {
+	return &Tensor{node: &graph.Node{Op: backend.OpReshape, DType: n.DType, Shape: slices.Clone(n.Shape), Inputs: []*graph.Node{n}, Dev: be}}
+}
+
 // TracedGraph is the graph of primitive operations that a function
 // computes, as Trace records it, for exporters that translate it into
 // another format.
@@ -84,8 +91,8 @@ type TracedNode struct {
 // f must not read the values of its arguments, as Data, Item, Realize and
 // Backward do: they have none, and doing so fails. The operations f
 // builds are lazy even in eager mode, which would compute them as f
-// builds them, and To leaves a tensor computed from the arguments where
-// it is, since the trace records no devices.
+// builds them, and To of a tensor computed from the arguments moves no
+// values: the trace records it as an identity reshape.
 func Trace(f func(x ...*Tensor) []*Tensor, args []*Tensor, names map[string]*Tensor) (*TracedGraph, error) {
 	if err := firstErr(args...); err != nil {
 		return nil, err

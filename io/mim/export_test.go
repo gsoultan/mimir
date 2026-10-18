@@ -133,7 +133,7 @@ func TestExportQuantizedLinear(t *testing.T) {
 		t.Run(dt.String(), func(t *testing.T) {
 			raw := quanttest.Random(rand.New(rand.NewPCG(10, uint64(dt))), dt, 4*256)
 			// FromBytes keeps the blocks on the CPU; on the input's device,
-			// the module and the file run the same kernel.
+			// the default one, the module and the file run the same kernel.
 			w := tensor.FromBytes(dt, raw, 4, 256).To(tensor.DefaultDevice())
 			l := &nn.Linear{Weight: tensor.NewBuffer(w)}
 			x := randn(11, 3, 256)
@@ -251,7 +251,7 @@ func TestExportRejectsWhatTheFormatCannotExpress(t *testing.T) {
 
 func TestExportQuantizedEmbedding(t *testing.T) {
 	raw := quanttest.Random(rand.New(rand.NewPCG(26, 27)), tensor.Q8_0, 10*32)
-	e := &nn.Embedding{Weight: tensor.NewBuffer(tensor.FromBytes(tensor.Q8_0, raw, 10, 32))}
+	e := &nn.Embedding{Weight: tensor.NewBuffer(tensor.FromBytes(tensor.Q8_0, raw, 10, 32).To(tensor.DefaultDevice()))}
 	roundTrip(t, e, tensor.FromSlice([]int32{3, 9, 0}, 3), 0, 0)
 }
 
