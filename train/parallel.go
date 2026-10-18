@@ -16,10 +16,9 @@ import (
 
 // DataParallel trains on every device of devs at once: Fit moves the
 // model to devs[0], replicates it onto the others, and splits each batch
-// between them along its first axis (see Parallel). Every device steps
-// its own copy of the parameters with the optimizer, on gradients reduced
-// into all of them (see Parallel.Step), so every replica holds the same
-// values, bit for bit.
+// between them along its first axis (see Parallel). The optimizer steps
+// the model on devs[0], and the replicas take its new parameters before
+// the next batch, so every replica holds the same values, bit for bit.
 // Evaluation and checkpoints use the model on devs[0].
 //
 // The devices are those of tensor.GPUs or tensor.CPUs, of one kind.
@@ -40,9 +39,9 @@ func DataParallel(devs ...tensor.Device) Option {
 // them. Each replica computes the loss and gradients of its share, and
 // the gradients are summed into the model's, weighted by each share's
 // part of the batch, so the model's gradients are those of the whole
-// batch's mean loss. Step the optimizer over the model's parameters with
-// Step, which steps the replicas alongside, rather than on the model's
-// device alone:
+// batch's mean loss. Step the optimizer over the model's parameters as
+// with one device; the replicas take the new values at the next Backward
+// (or see Step):
 //
 //	dp, err := train.NewParallel(model, tensor.GPUs()...)
 //	if err != nil { ... }
@@ -51,7 +50,7 @@ func DataParallel(devs ...tensor.Device) Option {
 //		...
 //		l, err := dp.Backward(ctx, loss.CrossEntropy, batch.X, batch.Y)
 //		if err != nil { ... }
-//		if err := dp.Step(ctx, opt); err != nil { ... }
+//		if err := opt.Step(ctx); err != nil { ... }
 //		opt.ZeroGrad()
 //	}
 //
@@ -335,8 +334,16 @@ func (p *Parallel) broadcast(ctx context.Context) error {
 // so that the replicas need not take the model's new values at the next
 // Backward. Every replica computes the same step from the same values
 // and gradients, so the replicas still hold the model's values, bit for
-// bit. Stepping opt itself works too, but then the next Backward copies
+// bit. Stepping opt itself works too, and then the next Backward copies
 // every new value from the model's device to the others.
+//
+// Which is faster depends on the devices. Step trades the copy of the
+// new values for an all-reduce in place of a reduction, which moves as
+// many bytes, and for the host's work of one step per device, which it
+// queues one after another. On 4 T4 GPUs, which NCCL connects through
+// host memory, the all-reduce takes less GPU time than the reduction and
+// the copy together, but a GPT-2 block's step takes 8% longer than with
+// opt.Step: the host's extra work outweighs it. Fit steps opt.
 //
 // The first Step, and a Step after anything else stepped opt or set its
 // state or the model's parameters, steps opt alone and gives the

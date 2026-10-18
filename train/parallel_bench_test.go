@@ -31,8 +31,8 @@ import (
 // MIMIR_DP_WAITS=1 the step also waits for the devices after each phase,
 // the optimizer's step included, and reports the waits, named gpu-...,
 // though they stop the devices from overlapping one phase with the next.
-// The optimizer steps every replica through Parallel.Step, or the model
-// alone with MIMIR_DP_STEP=model, for the replicas to take its values.
+// The optimizer steps the model, for the replicas to take its values, or
+// every replica through Parallel.Step with MIMIR_DP_STEP=local.
 //
 // Each reports examples per second, the speedup over one device and the
 // efficiency, the speedup divided by the devices: 1 when n devices
@@ -101,9 +101,9 @@ func BenchmarkDataParallel(b *testing.B) {
 						}
 						var spent map[string]time.Duration // host time per phase
 						waits := false                     // MIMIR_DP_WAITS=1, from the first timed step
-						optStep := func() error { return dp.Step(b.Context(), opt) }
-						if os.Getenv("MIMIR_DP_STEP") == "model" {
-							optStep = func() error { return opt.Step(b.Context()) }
+						optStep := func() error { return opt.Step(b.Context()) }
+						if os.Getenv("MIMIR_DP_STEP") == "local" {
+							optStep = func() error { return dp.Step(b.Context(), opt) }
 						}
 						step := func() {
 							if _, err := dp.Backward(b.Context(), bm.loss, x, y); err != nil {
