@@ -1,6 +1,7 @@
 package tensor
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"unsafe"
@@ -78,6 +79,22 @@ func FromBytesFunc(dt DType, data []byte, release func(), shape ...int) *Tensor 
 	}
 	defer done() // upload copies data
 	return upload(cpuBackend, dt, hostOrder(bb, data), shape)
+}
+
+// Bytes computes t and returns its elements as FromBytes reads them:
+// little-endian, and for a block-quantized dtype in its blocks.
+func (t *Tensor) Bytes(ctx context.Context) ([]byte, error) {
+	if err := firstErr(t); err != nil {
+		return nil, err
+	}
+	if err := computable(t); err != nil {
+		return nil, err
+	}
+	data, err := hostBytes(ctx, t.node)
+	if err != nil || t.node.DType.IsQuantized() {
+		return data, err
+	}
+	return hostOrder(t.node.DType.BlockBytes(), data), nil
 }
 
 // aligned reports whether data starts at a multiple of size bytes.

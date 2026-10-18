@@ -170,7 +170,7 @@ func wrap(n *graph.Node, err error) *Tensor {
 			return fail(fmt.Errorf("tensor: %s inside VMap has no batching rule: %w", n.Op, ErrNotBatchable))
 		}
 	}
-	if eager {
+	if eager && tracing.Load() == 0 {
 		if err := realizeOn(context.Background(), backendOf(n), []*graph.Node{n}, nil); err != nil {
 			return fail(err)
 		}

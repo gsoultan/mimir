@@ -615,6 +615,27 @@ primitive against the format's reference interpreter. Bitwise operations
 on integers, `bitcast`, `f64` and composites mimir does not know are an
 `*mim.UnsupportedError` that names them.
 
+`mim.Export` writes a mimir model to a `.mim` file. It traces the model's
+`Forward` once on an input of the given shape (see `tensor.Trace`) and
+writes the operations it records as the format's primitives and calls,
+with the parameters as weights named by their paths, block-quantized
+weights kept as they are, and fixed shapes:
+
+```go
+nn.Eval(model) // dropout draws no random numbers
+f, err := os.Create("model.mim")
+if err != nil {
+	return err
+}
+defer f.Close()
+err = mim.Export(ctx, f, model, tensor.Zeros(tensor.Float32, 1, 3, 32, 32), nil)
+```
+
+`mim.ExportFunc` does the same for a function of several tensors with
+several results. The tests export MLPs, CNNs, embeddings, norms, GPT-2
+and Llama blocks, encoder layers and quantized linear layers, and run
+the files with mimir and with the format's reference interpreter.
+
 ## Requirements
 
 Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
@@ -685,7 +706,7 @@ read.
 | Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
 | Distributions (`distributions`) | `Normal`, `MultivariateNormal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet`, `Poisson`; `Sample`, `RSample`, `LogProb`, `Entropy`, `Mean`, `Variance`, `KL` |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
-| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22); Mimir Model (`.mim`) read and run |
+| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22); Mimir Model (`.mim`) read, run and export |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -723,7 +744,7 @@ io/safetensors/      safetensors reader, writer and file mapping
 io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
 io/gguf/             GGUF reader and writer
 io/onnx/             ONNX model reader and interpreter
-io/mim/              Mimir Model (.mim) runner
+io/mim/              Mimir Model (.mim) runner and exporter
 examples/mnist/      trains an MLP or CNN on MNIST
 examples/gpt2/       trains a GPT-2 on a text file and samples from it
 examples/llama/      runs Llama-architecture GGUF models

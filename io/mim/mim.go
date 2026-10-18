@@ -35,6 +35,10 @@
 // decoded to Float32 when the model is opened. A model that uses f64, a
 // bitwise operation on integers or a composite mimir does not know is
 // reported by Open as an *UnsupportedError naming it.
+//
+// Export writes a mimir model as a .mim file, and ExportFunc a function of
+// tensors: they trace it once (see tensor.Trace) and write the operations
+// it records, with the tensors it reads as weights and constants.
 package mim
 
 import (
