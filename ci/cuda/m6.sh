@@ -27,7 +27,7 @@ fi
 
 echo "## PyTorch $torch"
 for w in attention block decode lstm; do
-	PYTHONPATH=$site python3 tools/bench/attention.py "$w" 4 cuda | tee -a "$out/torch.txt"
+	PYTHONPATH=$site python3 -W ignore tools/bench/attention.py "$w" 4 cuda | tee -a "$out/torch.txt"
 done
 
 echo "## mimir"
@@ -35,9 +35,9 @@ bench() {
 	MIMIR_DEVICE=gpu MIMIR_CUDA_GRAPHS=1 go test -p 1 -run '^$' -count "$count" "$@" | tee -a "$out/mimir.txt"
 }
 bench -bench '^BenchmarkAttention$/^fused$' -benchtime 10x ./tensor
-bench -bench '^BenchmarkDecoderBlockStep$/^seq[0-9]+$/^$' -benchtime 10x ./nn
+bench -bench '^BenchmarkDecoderBlockStep$/^seq[0-9]+$' -benchtime 10x ./nn
 bench -bench '^BenchmarkDecode$' -benchtime 20x ./nn
-bench -bench '^BenchmarkLSTM$/^(forward|backward|train)$/^$' -benchtime 10x ./nn
+bench -bench '^BenchmarkLSTM$/^(forward|backward|train)$' -benchtime 10x ./nn
 
 echo "## M6 speed gates (mimir's time over PyTorch's, at most $gate)"
 awk -v gate="$gate" '
