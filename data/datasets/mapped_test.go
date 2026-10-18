@@ -114,10 +114,13 @@ func TestMappedRejectsBadFiles(t *testing.T) {
 	if _, err := Mapped(path, "x", "short"); !errors.Is(err, tensor.ErrShape) {
 		t.Errorf("2 targets for 3 inputs: %v, want ErrShape", err)
 	}
-	if err := os.WriteFile(path, []byte("not a Mimir Model file"), 0o644); err != nil {
+	// A new file: the tensors that the failed calls made may still hold
+	// the mapping of the first, which Windows does not let a write change.
+	corrupt := filepath.Join(dir, "corrupt.mim")
+	if err := os.WriteFile(corrupt, []byte("not a Mimir Model file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Mapped(path, "x", "y"); !errors.Is(err, mim.ErrFormat) {
+	if _, err := Mapped(corrupt, "x", "y"); !errors.Is(err, mim.ErrFormat) {
 		t.Errorf("corrupt file: %v, want mim.ErrFormat", err)
 	}
 }
