@@ -32,8 +32,13 @@ go test -count=1 -v -run 'NCCL' ./backend/cuda
 # their products on 2×2 meshes) on the GPUs against one device, and the
 # collectives each strategy issues.
 MIMIR_DEVICE=gpu go test -count=1 -v -run 'Sharded' ./train
-# The per-op rules on the CPU devices, for the race detector.
-go test -count=1 -race -run 'Shard|Mesh' ./tensor ./train
+# The per-op rules on the CPU devices, for the race detector, which needs
+# cgo and so a C compiler.
+if [ "$(go env CGO_ENABLED)" = 1 ]; then
+	go test -count=1 -race -run 'Shard|Mesh' ./tensor ./train
+else
+	echo "no C compiler: the race detector's run is skipped"
+fi
 echo "## scaling"
 out=$(mktemp)
 MIMIR_DEVICE=gpu go test -p 1 -run '^$' -count "$count" -bench '^BenchmarkSharded$' -benchtime "$benchtime" -timeout 60m ./train | tee "$out"
