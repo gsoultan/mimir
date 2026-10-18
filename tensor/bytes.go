@@ -18,7 +18,7 @@ import (
 var hostIsLittleEndian = binary.NativeEndian.Uint32([]byte{1, 2, 3, 4}) == binary.LittleEndian.Uint32([]byte{1, 2, 3, 4})
 
 // FromBytes returns a tensor on the CPU whose elements of dt are the
-// little-endian bytes of data, as a safetensors file stores them. With no
+// little-endian bytes of data, as a Mimir Model file stores them. With no
 // shape it is one-dimensional; otherwise the shape must hold exactly the
 // elements of data: len(data)/dt.Size() of them, or for a block-quantized
 // dt the elements of len(data)/dt.BlockBytes() blocks, which fill whole
@@ -40,7 +40,7 @@ func FromBytes(dt DType, data []byte, shape ...int) *Tensor {
 
 // FromBytesFunc is FromBytes for bytes that the tensor holds until it no
 // longer reads them, such as a mapped file whose owner counts its
-// readers, as safetensors.File.Hold does: release runs once, after the
+// readers, as io/mim's models do: release runs once, after the
 // tensor's memory, which every view and every tensor that took it over
 // share, becomes garbage or is freed. When the tensor holds a copy, or
 // FromBytesFunc fails, release runs before it returns. A nil release
@@ -95,6 +95,28 @@ func (t *Tensor) Bytes(ctx context.Context) ([]byte, error) {
 		return data, err
 	}
 	return hostOrder(t.node.DType.BlockBytes(), data), nil
+}
+
+// ReadBytes computes t and copies its elements into dst as Bytes returns
+// them. dst must hold exactly t's bytes. It allocates nothing, so a loop
+// that reads many tensors, as a file writer does, can reuse one buffer.
+func (t *Tensor) ReadBytes(ctx context.Context, dst []byte) error {
+	if err := firstErr(t); err != nil {
+		return err
+	}
+	if err := computable(t); err != nil {
+		return err
+	}
+	if size, ok := t.node.DType.Bytes(t.node.Size()); !ok || size != len(dst) {
+		return fmt.Errorf("tensor: read %d bytes of a %s tensor of shape %v: %w", len(dst), t.node.DType, t.node.Shape, ErrShape)
+	}
+	if err := download(ctx, t.node, dst); err != nil {
+		return err
+	}
+	if !hostIsLittleEndian && !t.node.DType.IsQuantized() {
+		copy(dst, hostOrder(t.node.DType.BlockBytes(), dst))
+	}
+	return nil
 }
 
 // aligned reports whether data starts at a multiple of size bytes.

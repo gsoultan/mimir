@@ -4,25 +4,20 @@ import (
 	"os"
 	"testing"
 
-	"github.com/gsoultan/mimir/io/gguf"
 	"github.com/gsoultan/mimir/tensor"
 )
 
-// BenchmarkLlama times the model at MIMIR_LLAMA_MODEL, a GGUF file, or
-// the tiny testdata/bpe.gguf: a batched pass over a prompt of 64 tokens
+// BenchmarkLlama times the model at MIMIR_LLAMA_MODEL, a .mim file, or
+// the tiny testdata/bpe.mim: a batched pass over a prompt of 64 tokens
 // to the last token's logits, and a decoding step with 64 positions in
 // the caches, as llama-bench's pp64 and tg tests time llama.cpp.
 func BenchmarkLlama(b *testing.B) {
 	path := os.Getenv("MIMIR_LLAMA_MODEL")
 	if path == "" {
-		path = "testdata/bpe.gguf"
+		path = "testdata/bpe.mim"
 	}
-	f, err := gguf.Open(path)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	m, err := Load(f, tensor.CPU())
+	f, md := openFile(b, path)
+	m, err := Load(f, md, tensor.CPU())
 	if err != nil {
 		b.Fatal(err)
 	}

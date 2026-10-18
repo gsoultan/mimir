@@ -2,7 +2,9 @@
 """Generate golden test data for mimir.
 
 Every case draws its inputs from a seeded NumPy generator, computes the
-expected results with an oracle, and stores both in safetensors files:
+expected results with an oracle, and stores both as the tensors of Mimir
+Model (.mim) files, written by the small writer below (numpy and the
+standard library only):
 
     <case>/in0, <case>/in1, ...  inputs, in argument order
     <case>/out                   expected output
@@ -11,26 +13,34 @@ expected results with an oracle, and stores both in safetensors files:
     <case>/<name>                any other expected result, such as a
                                  layer's running statistics
 
+Tensors are f32 or i32, except the raw blocks of quantized weights, which
+are u8. Each file's metadata section records the oracle, the seed and the
+library versions as strings.
+
 Files:
-    ops.safetensors     tensor operations (package tensor)
-    grads.safetensors   gradients of tensor operations (package tensor)
-    nn.safetensors      layers and losses with their gradients (packages nn, nn/loss)
-    optim.safetensors   optimizer steps and learning-rate schedules (package optim)
-    scan.safetensors    running sums, maxima and log-sum-exps (package tensor)
-    rnn.safetensors     recurrent layers with their gradients (package nn)
-    quant.safetensors   block-quantized weights as ggml lays them out, U8
-                        blocks, dequantized and multiplied (package tensor)
-    attention.safetensors  attention, transformer layers and blocks with their
-                        gradients (package nn)
-    linalg.safetensors  sorts, top-k, Fourier transforms and linear algebra with
-                        their gradients (package tensor)
-    transforms.safetensors  Hessian-vector and Jacobian-vector products,
-                        Jacobians, Hessians and per-example gradients
-                        (package tensor)
-    distributions.safetensors  log densities, entropies, KL divergences and
-                        moments of probability distributions, and special
-                        functions, with their gradients (packages
-                        distributions and tensor)
+    ops.mim            tensor operations (package tensor)
+    grads.mim          gradients of tensor operations (package tensor)
+    nn.mim             layers and losses with their gradients (packages nn,
+                       nn/loss)
+    optim.mim          optimizer steps and learning-rate schedules (package
+                       optim)
+    scan.mim           running sums, maxima and log-sum-exps (package tensor)
+    rnn.mim            recurrent layers with their gradients (package nn)
+    quant.mim          block-quantized weights as ggml lays them out, u8
+                       blocks, dequantized and multiplied (package tensor)
+    attention.mim      attention, transformer layers and blocks with their
+                       gradients (package nn)
+    linalg.mim         sorts, top-k, Fourier transforms and linear algebra
+                       with their gradients (package tensor)
+    transforms.mim     Hessian-vector and Jacobian-vector products,
+                       Jacobians, Hessians and per-example gradients
+                       (package tensor)
+    distributions.mim  log densities, entropies, KL divergences and moments
+                       of probability distributions, and special functions,
+                       with their gradients (packages distributions and
+                       tensor)
+    gnn.mim            graph aggregations and GCN, GraphSAGE and GAT layers
+                       with their gradients (package nn)
 
 Oracles:
     torch  PyTorch on CPU, the reference mimir aims to match: float32 for
@@ -48,7 +58,7 @@ Usage:
 """
 
 import argparse
-import json
+import hashlib
 import math
 import os
 import struct
@@ -639,7 +649,7 @@ def optim_tensors(oracle, rng):
 
 
 # ---------------------------------------------------------------------------
-# Recurrent layers (rnn.safetensors). The inputs of a case are x, the
+# Recurrent layers (rnn.mim). The inputs of a case are x, the
 # initial states (h0, and c0 for an LSTM) and the parameters in the order
 # of torch's named_parameters. out joins the flattened output, h_n and, for
 # an LSTM, c_n, so the gradients cover all three; they are also stored on
@@ -866,23 +876,71 @@ def evaluate(oracle, inputs, np_fn, torch_fn):
     return out.astype(F32) if out.dtype == np.float64 else out
 
 
-def write_safetensors(path, tensors, metadata):
-    header = {"__metadata__": metadata}
-    blobs, offset = [], 0
-    for name in sorted(tensors):
+# Mimir Model (.mim) container, spec/container.md and spec/metadata.md of
+# github.com/gsoultan/mim: the subset the goldens need, which is plain
+# tensors in the weights section and string metadata.
+
+MIM_DTYPES = {np.dtype(F32): 1, np.dtype(np.uint8): 6, np.dtype(I32): 9}  # spec/dtypes.md
+MIM_DATA_ALIGNMENT = 4096  # the smallest the container allows
+
+
+def align(n, a):
+    return -(-n // a) * a
+
+
+def mim_metadata(metadata):
+    """A metadata section holding string values."""
+    entries, pool = b"", b""
+    for key in sorted(metadata, key=str.encode):
+        k, v = key.encode(), metadata[key].encode()
+        # key offset, key length, type 5 (string), reserved, byte count,
+        # pool offset, reserved
+        entries += struct.pack("<IIB3xIQ8x", len(pool), len(k), 5, len(v), len(pool) + len(k))
+        pool += k + v
+    return b"MIMM" + struct.pack("<IQ", len(metadata), len(pool)) + entries + pool
+
+
+def write_mim(path, tensors, metadata):
+    names = sorted(tensors, key=str.encode)  # the tensor table is in bytewise name order
+    blobs, rows, pool, end = [], [], b"", 0
+    for name in names:
         a = np.asarray(tensors[name], order="C")  # ascontiguousarray would make 0-d arrays 1-d
-        dtype = {np.dtype(F32): "F32", np.dtype(I32): "I32", np.dtype(np.uint8): "U8"}[a.dtype]
         data = a.astype(a.dtype.newbyteorder("<")).tobytes()
-        header[name] = {"dtype": dtype, "shape": list(a.shape), "data_offsets": [offset, offset + len(data)]}
-        blobs.append(data)
-        offset += len(data)
-    h = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
-    h += b" " * (-len(h) % 8)  # align the data section to 8 bytes
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(h)))
-        f.write(h)
-        for data in blobs:
-            f.write(data)
+        # Tensors are packed canonically in table order: each at the next
+        # multiple of 64 bytes, or of 4 KiB from 1 MiB on.
+        offset = align(end, 4096 if len(data) >= 1 << 20 else 64)
+        blobs.append((offset, data))
+        n = name.encode()
+        dims = list(a.shape) + [0] * (8 - a.ndim)
+        rows.append(struct.pack("<IIIB3x8QQQ", len(pool), len(n), MIM_DTYPES[a.dtype], a.ndim, *dims, offset, len(data)))
+        pool += n
+        end = offset + len(data)
+    weights = bytearray(end)
+    for offset, data in blobs:
+        weights[offset : offset + len(data)] = data
+    meta = mim_metadata(metadata)
+
+    # Preamble, index, metadata section, weights section.
+    index_len = 16 + 64 * 2 + 96 * len(rows) + len(pool)
+    meta_off = align(64 + index_len, 64)
+    data_off = align(meta_off + len(meta), MIM_DATA_ALIGNMENT)
+    file_len = data_off + len(weights)
+
+    def section(kind, flags, offset, data):
+        # kind, flags, offset, length, SHA-256, reserved, hash
+        return struct.pack("<IIQQB7x", kind, flags, offset, len(data), 1) + hashlib.sha256(data).digest()
+
+    head = b"MIM\0" + struct.pack("<HHIIQQQQQ8x", 0, 2, 0x0A0B0C0D, MIM_DATA_ALIGNMENT, 64, index_len, data_off, len(weights), file_len)
+    head += struct.pack("<IIQ", 2, len(rows), len(pool))
+    head += section(1, 1, data_off, weights)  # weights, required
+    head += section(2, 0, meta_off, meta)
+    head += b"".join(rows) + pool
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(head.ljust(meta_off, b"\0"))
+        f.write(meta.ljust(data_off - meta_off, b"\0"))
+        f.write(weights)
+    os.replace(tmp, path)
 
 
 def widen(inputs):
@@ -936,7 +994,7 @@ def evaluate_grad(oracle, inputs, diff, np_fn, torch_fn, gout_rng):
 
 
 # ---------------------------------------------------------------------------
-# Attention and transformer layers (attention.safetensors, package nn).
+# Attention and transformer layers (attention.mim, package nn).
 
 def np_sdpa(q, k, v, mask=None, causal=False, offset=0, scale=None):
     """Attention over [..., H, Q, D] queries and [..., HK, K, D] keys, with
@@ -1193,7 +1251,7 @@ def attention_cases(rng):
 
 
 # ---------------------------------------------------------------------------
-# Sorts, top-k, Fourier transforms and linear algebra (linalg.safetensors,
+# Sorts, top-k, Fourier transforms and linear algebra (linalg.mim,
 # package tensor). Complex tensors are real ones with a last dimension of 2,
 # as torch.view_as_real shows them. Functions of eigenvectors and singular
 # vectors use their squares, which do not depend on their signs, and inputs
@@ -1323,7 +1381,7 @@ def linalg_cases(rng):
 
 
 # ---------------------------------------------------------------------------
-# Function transformations (transforms.safetensors, package tensor). Each
+# Function transformations (transforms.mim, package tensor). Each
 # case is a function of its inputs and a kind of derivative with respect
 # to the inputs listed in diff:
 #
@@ -1501,7 +1559,7 @@ def evaluate_transform(oracle, kind, inputs, diff, np_fn, torch_fn, vec_rng):
 
 
 # ---------------------------------------------------------------------------
-# Probability distributions and special functions (distributions.safetensors,
+# Probability distributions and special functions (distributions.mim,
 # packages distributions and tensor). The NumPy oracle writes out each
 # formula in float64; torch uses torch.distributions. Cases named special_*
 # are the special functions of package tensor.
@@ -1744,7 +1802,7 @@ def distribution_cases(rng):
 
 
 # ---------------------------------------------------------------------------
-# Graph neural networks (gnn.safetensors, package nn): aggregation of edge
+# Graph neural networks (gnn.mim, package nn): aggregation of edge
 # features into nodes, the edge softmax, and the GCN, GraphSAGE and GAT
 # layers of PyTorch Geometric, written out from their definitions. Edges
 # run from edge_index[0] to edge_index[1].
@@ -2030,8 +2088,8 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     for file, tensors in files.items():
-        path = os.path.join(args.out, file + ".safetensors")
-        write_safetensors(path, tensors, metadata)
+        path = os.path.join(args.out, file + ".mim")
+        write_mim(path, tensors, metadata)
         print(f"wrote {len(tensors)} tensors to {path} (oracle {args.oracle})")
 
 

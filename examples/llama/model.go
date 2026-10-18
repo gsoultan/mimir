@@ -4,18 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"slices"
 
-	"github.com/gsoultan/mimir/io/gguf"
+	mimfile "github.com/gsoultan/mim"
+
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/tensor"
 )
 
-// Config holds a Llama model's hyperparameters, as the metadata of a GGUF
-// file names them under the architecture's prefix: "llama.block_count"
-// and so on.
+// Config holds a Llama model's hyperparameters, as the metadata of a
+// Mimir Model file converted from GGUF names them under the
+// architecture's prefix: "llama.block_count" and so on.
 type Config struct {
 	Vocab     int
 	Context   int // positions the model was trained on
@@ -38,32 +39,56 @@ const (
 	maxDim    = 1 << 20
 )
 
-// readConfig reads the hyperparameters of a model of architecture arch.
-func readConfig(f *gguf.File, arch string) (Config, error) {
+// metaInt returns md[key] as an integer, which the metadata holds as an
+// int64 or a uint64, and whether it is one.
+func metaInt(md mimfile.Metadata, key string) (int64, bool) {
+	switch v := md[key].(type) {
+	case int64:
+		return v, true
+	case uint64:
+		return int64(v), v <= math.MaxInt64
+	}
+	return 0, false
+}
+
+// metaFloat returns md[key] as a number, and whether it is one.
+func metaFloat(md mimfile.Metadata, key string) (float64, bool) {
+	if x, ok := md[key].(float64); ok {
+		return x, true
+	}
+	n, ok := metaInt(md, key)
+	return float64(n), ok
+}
+
+// readConfig reads the hyperparameters of a model of architecture arch
+// from its metadata md.
+func readConfig(md mimfile.Metadata, arch string) (Config, error) {
 	var errs []error
 	integer := func(key string, def int, required bool) int {
-		v, ok := f.Metadata(arch + "." + key)
+		key = arch + "." + key
+		v, ok := md[key]
 		if !ok {
 			if required {
-				errs = append(errs, fmt.Errorf("no %s.%s", arch, key))
+				errs = append(errs, fmt.Errorf("no %s", key))
 			}
 			return def
 		}
-		n, ok := v.Int()
+		n, ok := metaInt(md, key)
 		if !ok || n <= 0 || n > maxDim {
-			errs = append(errs, fmt.Errorf("%s.%s = %v", arch, key, v))
+			errs = append(errs, fmt.Errorf("%s = %v", key, v))
 			return def
 		}
 		return int(n)
 	}
 	float := func(key string, def float64) float64 {
-		v, ok := f.Metadata(arch + "." + key)
+		key = arch + "." + key
+		v, ok := md[key]
 		if !ok {
 			return def
 		}
-		x, ok := v.Float()
+		x, ok := metaFloat(md, key)
 		if !ok || !(x > 0) || math.IsInf(x, 0) {
-			errs = append(errs, fmt.Errorf("%s.%s = %v", arch, key, v))
+			errs = append(errs, fmt.Errorf("%s = %v", key, v))
 			return def
 		}
 		return x
@@ -82,8 +107,8 @@ func readConfig(f *gguf.File, arch string) (Config, error) {
 	c.RopeDim = integer("rope.dimension_count", c.HeadDim, false)
 	c.RopeScale = 1
 	scaling := "none"
-	if v, ok := f.Metadata(arch + ".rope.scaling.type"); ok {
-		scaling, _ = v.Text()
+	if v, ok := md[arch+".rope.scaling.type"]; ok {
+		scaling, _ = v.(string)
 	}
 	switch scaling {
 	case "none":
@@ -126,18 +151,24 @@ type Model struct {
 	Rope   *nn.RotaryEmbedding
 }
 
-// Load reads the model in f to dev. Its weights keep the file's types,
-// quantized or not; on the CPU they read the file's mapping in place.
-func Load(f *gguf.File, dev tensor.Device) (*Model, error) {
-	if arch := f.Architecture(); arch != "llama" {
+// Load reads the model in f, whose metadata is md, to dev. Its weights
+// keep the file's types, quantized or not; on the CPU they read the
+// file's mapping in place.
+func Load(f *mim.Model, md mimfile.Metadata, dev tensor.Device) (*Model, error) {
+	if arch, _ := md["general.architecture"].(string); arch != "llama" {
 		return nil, fmt.Errorf("llama: architecture %q, want llama: %w", arch, errors.ErrUnsupported)
 	}
-	c, err := readConfig(f, "llama")
+	c, err := readConfig(md, "llama")
 	if err != nil {
 		return nil, err
 	}
+	names := f.Names() // sorted
+	has := func(name string) bool {
+		_, ok := slices.BinarySearch(names, name)
+		return ok
+	}
 	load := func(name string, shape ...int) (*tensor.Tensor, error) {
-		w, err := f.Load(name)
+		w, err := f.Tensor(name)
 		if err != nil {
 			return nil, fmt.Errorf("llama: %w", err)
 		}
@@ -162,11 +193,14 @@ func Load(f *gguf.File, dev tensor.Device) (*Model, error) {
 		return &nn.RMSNorm{Weight: w, Eps: c.Eps}, err
 	}
 
-	emb, ok := f.Tensor("token_embd.weight")
-	if !ok || len(emb.Shape) != 2 {
-		return nil, fmt.Errorf("llama: token_embd.weight: %w", fs.ErrNotExist)
+	emb, err := f.Tensor("token_embd.weight")
+	if err != nil {
+		return nil, fmt.Errorf("llama: %w", err)
 	}
-	c.Vocab = emb.Shape[0]
+	if emb.Rank() != 2 {
+		return nil, fmt.Errorf("llama: token_embd.weight of shape %v: %w", emb.Shape(), tensor.ErrShape)
+	}
+	c.Vocab = emb.Shape()[0]
 	m := &Model{Config: c}
 	var errs []error
 	keep := func(err error) { errs = append(errs, err) }
@@ -175,7 +209,7 @@ func Load(f *gguf.File, dev tensor.Device) (*Model, error) {
 	m.Embed = &nn.Embedding{Weight: embed}
 	m.Norm, err = norm("output_norm.weight")
 	keep(err)
-	if _, ok := f.Tensor("output.weight"); ok {
+	if has("output.weight") {
 		m.Output, err = linear("output.weight", c.Vocab, c.Embed)
 		keep(err)
 	} else {
@@ -201,7 +235,7 @@ func Load(f *gguf.File, dev tensor.Device) (*Model, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	if m.Rope, err = rope(f, c); err != nil {
+	if m.Rope, err = rope(f, has("rope_freqs.weight"), c); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -210,12 +244,13 @@ func Load(f *gguf.File, dev tensor.Device) (*Model, error) {
 // rope returns the rotary embedding of c. llama.cpp rotates the "llama"
 // architecture's interleaved pairs of features, which its converter
 // permutes Hugging Face's weights for. Llama 3.1 and later store a
-// divisor of each pair's frequency in rope_freqs.weight.
-func rope(f *gguf.File, c Config) (*nn.RotaryEmbedding, error) {
+// divisor of each pair's frequency in rope_freqs.weight, which f holds if
+// freqs is set.
+func rope(f *mim.Model, freqs bool, c Config) (*nn.RotaryEmbedding, error) {
 	r := &nn.RotaryEmbedding{Dim: c.RopeDim, Base: c.RopeBase, Interleaved: true}
 	var factors []float32
-	if _, ok := f.Tensor("rope_freqs.weight"); ok {
-		w, err := f.Load("rope_freqs.weight")
+	if freqs {
+		w, err := f.Tensor("rope_freqs.weight")
 		if err != nil {
 			return nil, fmt.Errorf("llama: %w", err)
 		}
