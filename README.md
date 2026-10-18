@@ -812,6 +812,14 @@ ci/cuda/modal_test.py --script ci/cuda/perf.sh` on Modal). The CUDA
 kernels are also compiled with the real NVRTC on every change, which
 needs no GPU.
 
+`ci/cuda/m6.sh` holds the speed gates of M6. It times PyTorch on the same
+GPU doing the work of mimir's transformer and recurrent benchmarks: causal
+attention and a training step of a block at GPT-2 small shapes, a decoding
+step at Llama 3.2 1B shapes and a 2-layer LSTM. It fails when mimir, with
+CUDA graphs on, takes more than 1.25 times PyTorch's time on any of them
+(`modal run ci/cuda/modal_test.py --script ci/cuda/m6.sh`; `GATE` sets the
+bar).
+
 The multi-GPU tests run on demand, on paid Modal hosts with several GPUs,
 not on every change. `ci/cuda/parallel.sh` runs NCCL's collectives,
 replicas and data-parallel training on every GPU against one device, and
@@ -856,7 +864,7 @@ from the `pytorch-triton-rocm` wheel.
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
 | M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
 | M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ROCm through HIP, hiprtc and hipBLAS (done; ROCm pending validation on AMD hardware) |
-| M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism (in progress: built and tested on CPU devices, awaiting multi-GPU runs and the 8-GPU gate of 85% scaling efficiency) |
+| M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism, passing the 8-GPU gate of 85% scaling efficiency on H100s (done) |
 
 ## License
 
