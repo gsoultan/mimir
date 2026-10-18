@@ -1,6 +1,6 @@
 // Package mim loads models in the Mimir Model format (.mim) and runs them
 // with mimir tensors, on any device. The format is specified, and read,
-// by github.com/gsoultan/mim: a file holds a model's weights, its graph
+// by github.com/gsoultan/mimir-model: a file holds a model's weights, its graph
 // written in 33 primitive operations and calls of a standard library of
 // composites, and typed metadata, such as a tokenizer.
 //
@@ -62,7 +62,7 @@ import (
 	"strings"
 	"sync"
 
-	mimfile "github.com/gsoultan/mim"
+	mimfile "github.com/gsoultan/mimir-model"
 
 	"github.com/gsoultan/mimir/internal/filemap"
 	"github.com/gsoultan/mimir/tensor"

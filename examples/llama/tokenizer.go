@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	mimfile "github.com/gsoultan/mim"
+	mimfile "github.com/gsoultan/mimir-model"
 )
 
 // Token types, as tokenizer.ggml.token_type stores them.

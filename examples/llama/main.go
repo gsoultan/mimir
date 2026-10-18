@@ -4,7 +4,7 @@
 // keeps its weights byte for byte and its hyperparameters and vocabulary
 // in the file's metadata:
 //
-//	go run github.com/gsoultan/mim/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K_M.gguf
+//	go run github.com/gsoultan/mimir-model/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K_M.gguf
 //	go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.mim -prompt "The capital of France is"
 //
 // It builds the model from the file's metadata, keeps the weights in the
