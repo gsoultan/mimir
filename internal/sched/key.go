@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"reflect"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/gsoultan/mimir/backend"
@@ -30,7 +31,7 @@ import (
 
 // walks counts the walks, so that a node marked by an earlier walk reads
 // as unmarked.
-var walks uint64
+var walks atomic.Uint64
 
 // walker walks the graph of one schedule. Its slices are reused from walk
 // to walk, so that a schedule replayed from the cache allocates nothing
@@ -43,6 +44,9 @@ type walker struct {
 	mems   int32         // storages numbered
 	key    []uint64
 	stack  []frame
+	leafAt []int32 // where each leaf's words start in key
+	body   int     // the leaves met before the targets
+	tailAt int     // where the targets start in key
 
 	gifts []gift // the donated leaves whose memory the schedule takes
 }
@@ -55,8 +59,6 @@ type frame struct {
 	n    *graph.Node
 	next int
 }
-
-var walker0 walker
 
 // Key words start with a tag that says what follows.
 const (
@@ -103,11 +105,10 @@ func (w *walker) pushInts(s []int) {
 // target. It returns ErrOverwritten if a node it needs is stale. It
 // walks iteratively, so deep graphs cannot overflow the stack.
 func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
-	walks++
-	w.walk, w.be = walks, be
+	w.walk, w.be = walks.Add(1), be
 	w.gifts = w.gifts[:0]
 	w.order, w.leaves, w.mems = w.order[:0], w.leaves[:0], 0
-	w.key = w.key[:0]
+	w.key, w.leafAt = w.key[:0], w.leafAt[:0]
 	for _, t := range targets {
 		if t.Stale() {
 			return stale(t)
@@ -138,6 +139,7 @@ func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
 			w.stack = w.stack[:len(w.stack)-1]
 		}
 	}
+	w.body, w.tailAt = len(w.leaves), len(w.key)
 	w.push(tagTargets<<56 | uint64(len(targets)))
 	for _, t := range targets {
 		w.push(w.ref(t))
@@ -213,6 +215,7 @@ func (w *walker) node(n *graph.Node) {
 // schedule may take its memory (see donate.go), and which other leaves
 // share its storage.
 func (w *walker) leaf(n *graph.Node) {
+	w.leafAt = append(w.leafAt, int32(len(w.key)))
 	n.Mark = graph.Mark{Walk: w.walk, Num: int32(len(w.leaves))}
 	w.leaves = append(w.leaves, n)
 	m := n.Mem
@@ -334,7 +337,14 @@ func encoderOf(t reflect.Type, skip map[string]bool) (encoder, error) {
 		if len(fields) > 64 {
 			return nil, fmt.Errorf("sched: no key for %s: %d fields", t, len(fields))
 		}
+		size := t.Size()
 		return func(w *walker, p unsafe.Pointer) {
+			// Most nodes' attributes are all zero bytes, which says every
+			// field is zero at a glance, without asking each.
+			if allZero(unsafe.Slice((*byte)(p), size)) {
+				w.push(0)
+				return
+			}
 			at := len(w.key)
 			w.push(0)
 			var present uint64
@@ -348,6 +358,30 @@ func encoderOf(t reflect.Type, skip map[string]bool) (encoder, error) {
 		}, nil
 	}
 	return nil, fmt.Errorf("sched: no key for %s", t)
+}
+
+// allZero reports whether every byte of b is zero, reading four words at
+// a time.
+func allZero(b []byte) bool {
+	for len(b) >= 32 {
+		p := unsafe.Pointer(&b[0])
+		if *(*uint64)(p)|*(*uint64)(unsafe.Add(p, 8))|*(*uint64)(unsafe.Add(p, 16))|*(*uint64)(unsafe.Add(p, 24)) != 0 {
+			return false
+		}
+		b = b[32:]
+	}
+	for len(b) >= 8 {
+		if *(*uint64)(unsafe.Pointer(&b[0])) != 0 {
+			return false
+		}
+		b = b[8:]
+	}
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // zeroOf returns a function that reports whether the value of type t at
@@ -379,3 +413,19 @@ type sliceHeader struct {
 	data     unsafe.Pointer
 	len, cap int
 }
+
+// AppendAttrs appends to key the words that a schedule's key holds of
+// a: those of every field but the ones a program takes as arguments,
+// Value and Seed. It reports false, appending nothing, if the schedule
+// cache is off for want of an encoding of Attrs.
+func AppendAttrs(key []uint64, a *backend.Attrs) ([]uint64, bool) {
+	if keyAttrs == nil {
+		return key, false
+	}
+	w := walker{key: key}
+	keyAttrs(&w, unsafe.Pointer(a))
+	return w.key, true
+}
+
+// HashKey returns a hash of key, as the schedule cache hashes its keys.
+func HashKey(key []uint64) uint64 { return hashKey(key) }

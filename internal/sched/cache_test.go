@@ -489,17 +489,18 @@ func BenchmarkSchedule(b *testing.B) {
 	m := newMLP(b, be, 8, 32, 32)
 	m.train(b, be, 0.1)
 	targets, dsts := m.step(0.1)
+	var w0 walker
 	b.Run("walk", func(b *testing.B) {
 		for b.Loop() {
-			if err := walker0.run(be, targets, dsts); err != nil {
+			if err := w0.run(be, targets, dsts); err != nil {
 				b.Fatal(err)
 			}
 		}
-		b.ReportMetric(float64(len(walker0.order)), "nodes")
-		walker0.forget()
+		b.ReportMetric(float64(len(w0.order)), "nodes")
+		w0.forget()
 	})
 	b.Run("plan", func(b *testing.B) {
-		w := &walker0
+		w := &w0
 		if err := w.run(be, targets, dsts); err != nil {
 			b.Fatal(err)
 		}

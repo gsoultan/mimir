@@ -3,8 +3,10 @@ package train_test
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
@@ -20,6 +22,17 @@ import (
 // images per device, and a GPT-2 block of 256 features and 4 heads on 8
 // sequences of 64 per device. The devices are GPUs under MIMIR_DEVICE=gpu,
 // and otherwise the devices of tensor.CPUs, which share the host's cores.
+// On GPUs, the sub-benchmarks named x8 repeat them with 8 times the
+// examples per device, which tells whether a GPU's share of the small
+// batches leaves it waiting on the host rather than computing. Each also
+// reports the host's time per step in each phase of Parallel.Backward,
+// those of one device numbered with its rank, and in the optimizer's
+// step: a phase that waits for a device shows that device's work. With
+// MIMIR_DP_WAITS=1 the step also waits for the devices after each phase,
+// the optimizer's step included, and reports the waits, named gpu-...,
+// though they stop the devices from overlapping one phase with the next.
+// The optimizer steps the model, for the replicas to take its values, or
+// every replica through Parallel.Step with MIMIR_DP_STEP=local.
 //
 // Each reports examples per second, the speedup over one device and the
 // efficiency, the speedup divided by the devices: 1 when n devices
@@ -46,68 +59,114 @@ func BenchmarkDataParallel(b *testing.B) {
 			return tensor.Randn(1, n, 64, 256), tensor.Randn(2, n, 64, 256)
 		}, loss.MSE},
 	} {
-		per := map[string]int{"cnn": 64, "gpt2": 8}[bm.name]
-		var single float64         // examples per second on one device
-		whole := map[int]float64{} // on the CPU, of the batch of n devices
-		for _, n := range []int{1, 2, 4} {
-			for _, onCPU := range []bool{true, false} {
-				name := fmt.Sprintf("%s/%d", bm.name, n)
-				if onCPU {
-					if n == 1 || os.Getenv("MIMIR_DEVICE") == "gpu" {
-						continue
+		scales := []int{1}
+		if os.Getenv("MIMIR_DEVICE") == "gpu" {
+			scales = append(scales, 8)
+		}
+		for _, scale := range scales {
+			per := scale * map[string]int{"cnn": 64, "gpt2": 8}[bm.name]
+			var single float64         // examples per second on one device
+			whole := map[int]float64{} // on the CPU, of the batch of n devices
+			for _, n := range []int{1, 2, 4} {
+				for _, onCPU := range []bool{true, false} {
+					name := fmt.Sprintf("%s/%d", bm.name, n)
+					if scale > 1 {
+						name = fmt.Sprintf("%s/x%d/%d", bm.name, scale, n)
 					}
-					name += "/cpu"
+					if onCPU {
+						if n == 1 || os.Getenv("MIMIR_DEVICE") == "gpu" {
+							continue
+						}
+						name += "/cpu"
+					}
+					b.Run(name, func(b *testing.B) {
+						devs := []tensor.Device{tensor.CPU()}
+						if !onCPU {
+							devs = benchDevices(b, n)
+						}
+						nn.ManualSeed(1)
+						m := bm.model()
+						if err := nn.To(m, devs[0]); err != nil {
+							b.Fatal(err)
+						}
+						opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-4))
+						dp, err := train.NewParallel(m, devs...)
+						if err != nil {
+							b.Fatal(err)
+						}
+						defer dp.Close()
+						x, y := bm.batch(per * n)
+						if err := tensor.Realize(b.Context(), x, y); err != nil {
+							b.Fatal(err)
+						}
+						var spent map[string]time.Duration // host time per phase
+						waits := false                     // MIMIR_DP_WAITS=1, from the first timed step
+						optStep := func() error { return opt.Step(b.Context()) }
+						if os.Getenv("MIMIR_DP_STEP") == "local" {
+							optStep = func() error { return dp.Step(b.Context(), opt) }
+						}
+						step := func() {
+							if _, err := dp.Backward(b.Context(), bm.loss, x, y); err != nil {
+								b.Fatal(err)
+							}
+							start := time.Now()
+							if err := optStep(); err != nil {
+								b.Fatal(err)
+							}
+							opt.ZeroGrad()
+							if spent != nil {
+								spent["step"] += time.Since(start)
+							}
+							if waits {
+								// The step has run once the last replica's
+								// first parameter, or the model's when the
+								// replicas take its values at the next
+								// Backward, is computed.
+								start := time.Now()
+								reps := dp.Replicas()
+								prm := nn.Parameters(reps[len(reps)-1])[0]
+								if _, err := prm.Value().Reshape(-1).Sum().Item[float32](b.Context()); err != nil {
+									b.Fatal(err)
+								}
+								spent["gpu-step"] += time.Since(start)
+							}
+						}
+						for range 3 {
+							step()
+						}
+						spent = map[string]time.Duration{}
+						defer train.SetPhases(func(phase string, rank int, d time.Duration) {
+							if rank >= 0 {
+								phase += strconv.Itoa(rank)
+							}
+							spent[phase] += d
+						})()
+						if os.Getenv("MIMIR_DP_WAITS") == "1" {
+							defer train.SetWaitPhases(true)()
+							waits = true
+						}
+						for b.Loop() {
+							step()
+						}
+						for phase, d := range spent {
+							b.ReportMetric(float64(d.Microseconds())/float64(b.N), phase+"-µs/op")
+						}
+						rate := float64(per*n*b.N) / b.Elapsed().Seconds()
+						b.ReportMetric(rate, "examples/s")
+						switch {
+						case onCPU:
+							whole[n] = rate
+						case n == 1:
+							single = rate
+						case single > 0:
+							b.ReportMetric(rate/single, "speedup")
+							b.ReportMetric(rate/single/float64(n), "efficiency")
+							if whole[n] > 0 {
+								b.ReportMetric(rate/whole[n], "over-cpu")
+							}
+						}
+					})
 				}
-				b.Run(name, func(b *testing.B) {
-					devs := []tensor.Device{tensor.CPU()}
-					if !onCPU {
-						devs = benchDevices(b, n)
-					}
-					nn.ManualSeed(1)
-					m := bm.model()
-					if err := nn.To(m, devs[0]); err != nil {
-						b.Fatal(err)
-					}
-					opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-4))
-					dp, err := train.NewParallel(m, devs...)
-					if err != nil {
-						b.Fatal(err)
-					}
-					defer dp.Close()
-					x, y := bm.batch(per * n)
-					if err := tensor.Realize(b.Context(), x, y); err != nil {
-						b.Fatal(err)
-					}
-					step := func() {
-						if _, err := dp.Backward(b.Context(), bm.loss, x, y); err != nil {
-							b.Fatal(err)
-						}
-						if err := opt.Step(b.Context()); err != nil {
-							b.Fatal(err)
-						}
-						opt.ZeroGrad()
-					}
-					for range 3 {
-						step()
-					}
-					for b.Loop() {
-						step()
-					}
-					rate := float64(per*n*b.N) / b.Elapsed().Seconds()
-					b.ReportMetric(rate, "examples/s")
-					switch {
-					case onCPU:
-						whole[n] = rate
-					case n == 1:
-						single = rate
-					case single > 0:
-						b.ReportMetric(rate/single, "speedup")
-						b.ReportMetric(rate/single/float64(n), "efficiency")
-						if whole[n] > 0 {
-							b.ReportMetric(rate/whole[n], "over-cpu")
-						}
-					}
-				})
 			}
 		}
 	}

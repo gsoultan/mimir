@@ -35,6 +35,7 @@ var (
 	_ backend.Batcher      = (*Stream)(nil)
 	_ backend.Asynchronous = (*Stream)(nil)
 	_ backend.Grouper      = (*Stream)(nil)
+	_ backend.PeerCopier   = (*Stream)(nil)
 )
 
 // NewStream returns a Stream whose kernels use up to workers goroutines,
@@ -210,4 +211,48 @@ func (s *Stream) wait() error {
 	err := s.err
 	s.err = nil
 	return err
+}
+
+// peerMu queues the two halves of every copy between Streams together,
+// so that the copies stand in the same order on every queue and none
+// waits on a copy queued after it.
+var peerMu sync.Mutex
+
+// CopiesFrom reports whether from is another Stream.
+func (s *Stream) CopiesFrom(from backend.Backend) bool {
+	f, ok := from.(*Stream)
+	return ok && f != s
+}
+
+// CopyPeer queues a copy of src, a buffer of the Stream from, into dst
+// (see backend.PeerCopier): from's queue holds at the copy until it has
+// run, and s's runs it once from's queue reaches it.
+func (s *Stream) CopyPeer(ctx context.Context, dst backend.Buffer, from backend.Backend, src backend.Buffer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !s.CopiesFrom(from) {
+		return fmt.Errorf("cpu: copy from a %s device: %w", from.Name(), backend.ErrDevice)
+	}
+	if dst.DType() != src.DType() || dst.Len() != src.Len() {
+		return fmt.Errorf("cpu: copy %d x %s into %d x %s: %w", src.Len(), src.DType(), dst.Len(), dst.DType(), backend.ErrShape)
+	}
+	k := &backend.Kernel{Op: backend.OpContiguous, DType: dst.DType(), Shape: []int{dst.Len()}, In: []backend.View{backend.Contiguous([]int{src.Len()})}}
+	if err := backend.CheckRun(k, []backend.Buffer{dst}, []backend.Buffer{src}); err != nil {
+		return fmt.Errorf("cpu: %w", err)
+	}
+	reached, copied := make(chan struct{}), make(chan struct{})
+	peerMu.Lock()
+	defer peerMu.Unlock()
+	from.(*Stream).queue(func() error {
+		close(reached)
+		<-copied
+		return nil
+	})
+	s.queue(func() error {
+		defer close(copied)
+		<-reached
+		return s.be.Run(context.Background(), k, []backend.Buffer{dst}, []backend.Buffer{src})
+	})
+	return nil
 }

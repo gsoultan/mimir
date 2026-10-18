@@ -53,6 +53,12 @@ type Node struct {
 	// Mark is the scheduler's scratch space, which it uses under its lock
 	// while it walks a graph.
 	Mark Mark
+	// Plan is the scratch space of the partitioner of sharded graphs
+	// (see package tensor), which it uses under its own lock.
+	Plan Mark
+	// Constraint is what a sharding constraint demands of the node, which
+	// package tensor sets and reads, or nil.
+	Constraint any
 }
 
 // Mark numbers a node or storage within one walk of the scheduler over a

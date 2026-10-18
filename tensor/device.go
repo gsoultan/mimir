@@ -254,6 +254,11 @@ func (t *Tensor) To(d Device) *Tensor {
 	if l := batchLevel(t); l != 0 {
 		return record(batchTo(l, t, d), toRule, t)
 	}
+	if pc, ok := to.(backend.PeerCopier); ok && pc.CopiesFrom(from) && meshOf(t.node) == nil && !t.node.DType.IsQuantized() {
+		// The devices copy between themselves, and the host waits for
+		// neither.
+		return record(wrap(sched.Copy(context.Background(), from, pc, t.node, lazy.values)), toRule, t)
+	}
 	data, err := hostBytes(context.Background(), t.node)
 	if err != nil {
 		return fail(err)

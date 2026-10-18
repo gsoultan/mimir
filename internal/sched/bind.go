@@ -39,10 +39,10 @@ func Invalidate(n *graph.Node) {
 }
 
 // Inputs returns the inputs of n, which Bind and the scheduler drop once
-// n is realized, safely while other goroutines realize graphs that n is
-// part of.
-func Inputs(n *graph.Node) []*graph.Node {
+// n is realized, and whether n is realized, safely while other goroutines
+// realize graphs that n is part of.
+func Inputs(n *graph.Node) ([]*graph.Node, bool) {
 	mu.Lock()
 	defer mu.Unlock()
-	return n.Inputs
+	return n.Inputs, n.Realized()
 }

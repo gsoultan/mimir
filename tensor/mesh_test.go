@@ -414,3 +414,20 @@ func TestMeshErrors(t *testing.T) {
 		t.Errorf("sum on a closed mesh: %v, want ErrDevice", err)
 	}
 }
+
+func TestShardedStepsReuseTheirAnalysis(t *testing.T) {
+	m := meshes(t)["2x2"]
+	w := tensor.Shard(tensor.Randn(1, 8, 8), m, tensor.P("", "model"))
+	for step := range 4 {
+		x := tensor.Shard(tensor.Randn(uint64(2+step), 4, 8), m, tensor.P("data"))
+		// A scalar that changes every step, as a learning rate may, keeps
+		// the graph's analysis.
+		y := x.MatMul(w).ReLU().Mul(tensor.Scalar(float32(step + 1))).Sum()
+		if _, err := y.Item[float32](t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := tensor.PlanHits(m); got < 3 {
+		t.Errorf("the steps found %d analyses in the cache, want at least 3", got)
+	}
+}

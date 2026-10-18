@@ -54,7 +54,7 @@ func Collective(ctx context.Context, bes []backend.Backend, ins [][]*graph.Node,
 			}
 		}
 	}
-	generation++
+	generation.Add(1)
 	var kept map[*graph.Storage]bool
 	if keep != nil {
 		kept = keptMemory(keep())

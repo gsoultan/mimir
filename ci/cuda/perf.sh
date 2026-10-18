@@ -23,6 +23,9 @@ bench() {
 # The products, on cuBLAS and on the generated kernel, which no graph
 # runs.
 bench 0 ./backend/cuda '^BenchmarkMatMul$'
+# What a training step's batches do with graphs, which the benchmark
+# turns off and on itself.
+bench 0 ./backend/cuda '^BenchmarkTrainingStepGraphs$' -benchtime 3s
 
 for graphs in 0 1; do
 	# Whole training steps, whose launches graphs replay.

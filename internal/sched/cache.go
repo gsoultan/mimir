@@ -1,6 +1,9 @@
 package sched
 
-import "slices"
+import (
+	"slices"
+	"sync/atomic"
+)
 
 // Each pool caches the programs of its recent schedules by key (see
 // key.go), so that a schedule of a graph it has seen, such as every
@@ -27,6 +30,15 @@ func SetCaching(on bool) (was bool) {
 	defer mu.Unlock()
 	was, caching = caching, on
 	return was
+}
+
+// compiled counts the programs compiled, cached or not, for tests.
+var compiled atomic.Int64
+
+// Compiled returns the number of programs compiled so far, for tests that
+// check a schedule replays its program.
+func Compiled() int {
+	return int(compiled.Load())
 }
 
 // cache holds the programs of a pool.
