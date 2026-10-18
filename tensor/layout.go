@@ -1,12 +1,8 @@
 package tensor
 
 import (
-	"fmt"
-	"runtime"
 	"slices"
-	"strings"
-	"sync"
-	"weak"
+	"strconv"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
@@ -119,21 +115,39 @@ func (l layout) equal(o layout) bool {
 
 // key returns a string that equal layouts share.
 func (l layout) key() string {
-	var b strings.Builder
-	l.write(&b)
-	return b.String()
+	return string(l.appendKey(make([]byte, 0, 32)))
 }
 
-func (l layout) write(b *strings.Builder) {
+func (l layout) appendKey(b []byte) []byte {
 	for _, d := range l.dims {
-		fmt.Fprintf(b, "%d%v,", d.axis, d.sec)
+		b = strconv.AppendInt(b, int64(d.axis), 10)
+		b = appendInts(b, d.sec)
+		b = append(b, ',')
 	}
-	fmt.Fprintf(b, "p%d%v", l.partial, l.max)
+	b = append(b, 'p')
+	b = strconv.AppendUint(b, uint64(l.partial), 10)
+	b = strconv.AppendBool(b, l.max)
 	for _, p := range l.packed {
-		fmt.Fprintf(b, "[%d%v:", p.off, p.shape)
-		p.lay.write(b)
-		b.WriteByte(']')
+		b = append(b, '[')
+		b = strconv.AppendInt(b, int64(p.off), 10)
+		b = appendInts(b, p.shape)
+		b = append(b, ':')
+		b = p.lay.appendKey(b)
+		b = append(b, ']')
 	}
+	return b
+}
+
+// appendInts appends xs as fmt's %v prints a slice.
+func appendInts(b []byte, xs []int) []byte {
+	b = append(b, '[')
+	for i, x := range xs {
+		if i > 0 {
+			b = append(b, ' ')
+		}
+		b = strconv.AppendInt(b, int64(x), 10)
+	}
+	return append(b, ']')
 }
 
 // local returns the length of a rank's block of an axis of length n.
@@ -161,37 +175,14 @@ func (m *Mesh) localShape(shape []int, l layout) []int {
 	return out
 }
 
-// constraints holds the layouts that WithSharding demands of its nodes,
-// which they keep as long as they live.
-var constraints constraintSet
-
-type constraintSet struct {
-	mu sync.Mutex
-	m  map[weak.Pointer[graph.Node]]layout
-}
-
-func (c *constraintSet) add(n *graph.Node, l layout) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = map[weak.Pointer[graph.Node]]layout{}
+// constraint returns the layout that WithSharding demands of n, if it
+// demands one.
+func constraint(n *graph.Node) (layout, bool) {
+	l, ok := n.Constraint.(*layout)
+	if !ok {
+		return layout{}, false
 	}
-	k := weak.Make(n)
-	c.m[k] = l
-	runtime.AddCleanup(n, c.remove, k)
-}
-
-func (c *constraintSet) remove(k weak.Pointer[graph.Node]) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.m, k)
-}
-
-func (c *constraintSet) get(n *graph.Node) (layout, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	l, ok := c.m[weak.Make(n)]
-	return l, ok
+	return *l, true
 }
 
 // isZero reports whether n is computed from a constant zero by movement
@@ -222,7 +213,7 @@ func isZero(n *graph.Node) bool {
 // inputs laid out as in, and the layout each input must take first. The
 // inputs are converted where they differ.
 func (m *Mesh) rule(n *graph.Node, in []layout) (layout, []layout) {
-	if l, ok := constraints.get(n); ok {
+	if l, ok := constraint(n); ok {
 		return l, []layout{l}
 	}
 	ins := n.Inputs

@@ -213,11 +213,11 @@ repeats, replays the planned kernels into the same buffers, passing changed
 constants and random seeds as kernel arguments, without building, sorting
 or planning anything or allocating, and gives each kernel the buffers it
 had in the last run. On Metal the replayed kernels are encoded into one
-command buffer. On CUDA they launch one by one by default;
-`MIMIR_CUDA_GRAPHS=1` runs a step's kernels and cuBLAS calls as one CUDA
+command buffer. On CUDA a step's kernels and cuBLAS calls run as one CUDA
 graph, captured once a run has repeated the last one's products and
-updated in place when only arguments change, and `MIMIR_ROCM_GRAPHS=1` does
-the same with HIP graphs on ROCm. On the GPUs, convolutions run
+updated in place when only arguments change (`MIMIR_CUDA_GRAPHS=0` launches
+them one by one instead); `MIMIR_ROCM_GRAPHS=1` does the same with HIP
+graphs on ROCm, where they stay off until an AMD GPU measures them. On the GPUs, convolutions run
 as tiled implicit-GEMM kernels that read their windows from the image
 where they lie, for the forward pass and both gradients; the CPU
 multiplies unfolded windows with its GEMM microkernels. On CUDA and ROCm, a
@@ -329,14 +329,16 @@ every replica holds the same values bit for bit. Evaluation and checkpoints
 use the model on the first device. `train.NewParallel` does the same in a
 loop you write: its `Backward` takes a batch and leaves the whole batch's
 gradients on the model, as PyTorch's `DistributedDataParallel` does within
-one process. Two and four CPU devices match one device over the whole
-batch. `DataParallel` does not combine with `MicroBatch` or `MemoryBudget`.
+one process. Its `Step` instead all-reduces the gradients and steps every
+replica on its own device, which saves copying the new values but costs
+the host a step per device. Two and four CPU devices match one device
+over the whole batch. `DataParallel` does not combine with `MicroBatch` or `MemoryBudget`.
 
 Underneath, `tensor.NewGroup` connects devices of one kind, the CPU
 devices or CUDA GPUs, like a group of NCCL ranks in one process. Its
 `AllReduce`, `Broadcast`, `AllGather` and `ReduceScatter` take one tensor
 per device and return realized tensors on every device, and
-`ReduceGrads` and `BroadcastParams` work on parameters in place, in
+`ReduceGrads`, `AllReduceGrads` and `BroadcastParams` work on parameters in place, in
 buckets of about 25 MiB as `DistributedDataParallel` does. CUDA devices
 communicate through NCCL, which needs `libnccl.so.2`, and CPU devices
 through host memory. The devices of a group run asynchronously: the host

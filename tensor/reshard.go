@@ -1,6 +1,7 @@
 package tensor
 
 import (
+	"context"
 	"fmt"
 	"slices"
 
@@ -124,7 +125,7 @@ func (p *plan) realizeLive(k int) error {
 	live := make([][]*graph.Node, len(p.m.devs))
 	seen := map[*graph.Node]bool{}
 	for _, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		if pn.val == nil || pn.depth >= k || pn.last < k {
 			continue
 		}
@@ -136,16 +137,15 @@ func (p *plan) realizeLive(k int) error {
 			live[r] = append(live[r], s)
 		}
 	}
-	for r, ns := range live {
-		if len(ns) == 0 {
-			continue
+	err := p.schedule(live, nil, false)
+	for _, ns := range live {
+		for _, n := range ns {
+			if sched.Realized(n) {
+				p.temps = append(p.temps, n)
+			}
 		}
-		if err := sched.RealizeInto(p.ctx, p.m.bes[r], ns, nil, lazy.values); err != nil {
-			return err
-		}
-		p.temps = append(p.temps, ns...)
 	}
-	return nil
+	return err
 }
 
 // next returns the next collective that converting v to the layout to
@@ -407,42 +407,26 @@ func (p *plan) run(jobs []*job) ([]*value, error) {
 	}
 	ins := make([][]*graph.Node, len(m.devs))
 	outs := make([][]sched.Out, len(m.devs))
-	for _, i := range coll {
+	descs := make([]collDesc, len(coll))
+	for at, i := range coll {
 		j := jobs[i]
 		for r := range ins {
 			ins[r] = append(ins[r], j.in[r])
 			outs[r] = append(outs[r], sched.Out{DType: j.dt, Shape: j.out, Over: -1})
 		}
+		descs[at] = collDesc{kind: j.kind, op: j.op, groups: groups[i], dt: j.dt, elems: prod(j.in[0].Shape)}
 	}
-	nodes, err := sched.Collective(p.ctx, m.bes, ins, outs, lazy.values, func(in, out [][]backend.Buffer) error {
-		var comms []backend.Communicator
-		byComm := map[backend.Communicator][]backend.Collective{}
-		for at, i := range coll {
-			j := jobs[i]
-			for _, g := range groups[i] {
-				c := backend.Collective{Kind: j.kind, Reduce: j.op, In: make([]backend.Buffer, len(g.ranks)), Out: make([]backend.Buffer, len(g.ranks))}
-				for q, r := range g.ranks {
-					c.In[q], c.Out[q] = in[r][at], out[r][at]
-				}
-				if _, ok := byComm[g.comm]; !ok {
-					comms = append(comms, g.comm)
-				}
-				byComm[g.comm] = append(byComm[g.comm], c)
-			}
-		}
-		for _, c := range comms {
-			if err := c.Run(p.ctx, byComm[c]); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	if p.rec != nil {
+		p.rec.collective(ins, outs, descs)
+	}
+	nodes, err := m.collect(p.ctx, ins, outs, descs)
 	if err != nil {
 		return nil, err
 	}
+	if p.rec != nil {
+		p.rec.produced(nodes)
+	}
 	for at, i := range coll {
-		j := jobs[i]
-		m.count(j.kind, j.dt, prod(j.in[0].Shape), len(m.devs))
 		out := make([]*graph.Node, len(m.devs))
 		for r := range out {
 			out[r] = nodes[r][at]
@@ -455,6 +439,53 @@ func (p *plan) run(jobs []*job) ([]*value, error) {
 		vals[i] = v
 	}
 	return vals, nil
+}
+
+// collDesc is one collective of a group that collect runs: its kind and
+// reduction, the groups of ranks it connects, and, for the mesh's
+// traffic, the dtype and number of elements of each rank's input.
+type collDesc struct {
+	kind   backend.CollectiveKind
+	op     backend.Reduction
+	groups []meshGroup
+	dt     DType
+	elems  int
+}
+
+// collect computes the inputs ins[r] on each device r and runs the
+// collectives descs over them as one group, the at-th of each device's
+// inputs and outputs, outs[r][at], being those of descs[at]. It returns
+// each device's outputs.
+func (m *Mesh) collect(ctx context.Context, ins [][]*graph.Node, outs [][]sched.Out, descs []collDesc) ([][]*graph.Node, error) {
+	nodes, err := sched.Collective(ctx, m.bes, ins, outs, lazy.values, func(in, out [][]backend.Buffer) error {
+		var comms []backend.Communicator
+		byComm := map[backend.Communicator][]backend.Collective{}
+		for at, d := range descs {
+			for _, g := range d.groups {
+				c := backend.Collective{Kind: d.kind, Reduce: d.op, In: make([]backend.Buffer, len(g.ranks)), Out: make([]backend.Buffer, len(g.ranks))}
+				for q, r := range g.ranks {
+					c.In[q], c.Out[q] = in[r][at], out[r][at]
+				}
+				if _, ok := byComm[g.comm]; !ok {
+					comms = append(comms, g.comm)
+				}
+				byComm[g.comm] = append(byComm[g.comm], c)
+			}
+		}
+		for _, c := range comms {
+			if err := c.Run(ctx, byComm[c]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range descs {
+		m.count(d.kind, d.dt, d.elems, len(m.devs))
+	}
+	return nodes, nil
 }
 
 // join joins the whole parts of a packed value, each flattened, into the
@@ -498,37 +529,55 @@ func (p *plan) cut(v *value, l layout) (*value, error) {
 	if v.lay.equal(l) {
 		return v, nil
 	}
-	if v.lay.packed != nil || l.packed != nil || needsCollective(v.lay, l) || l.partial&^v.lay.partial != 0 {
-		return nil, fmt.Errorf("tensor: convert a sharded tensor from %s to %s on each device: %w", v.lay.key(), l.key(), ErrInternal)
+	if err := p.cuttable(v, l); err != nil {
+		return nil, err
 	}
-	m := p.m
-	shards := slices.Clone(v.shards)
-	for d, t := range l.dims {
-		if v.lay.dims[d].equal(t) {
-			continue
-		}
-		k := m.shape[t.axis]
-		for r, x := range shards {
-			c := m.coord(r, int(t.axis))
-			var parts []*graph.Node
-			at := 0
-			for _, n := range t.sections(v.shape[d]) {
-				b := n / k
-				y, err := graph.Shrink(x, rangeAxis(x.Shape, d, at+c*b, at+(c+1)*b))
-				if err != nil {
-					return nil, err
-				}
-				parts = append(parts, y)
-				at += n
-			}
-			y, err := catAll(parts, d)
-			if err != nil {
-				return nil, err
-			}
-			shards[r] = y
+	shards := make([]*graph.Node, len(v.shards))
+	for r, x := range v.shards {
+		var err error
+		if shards[r], err = p.cutShard(x, v.lay, l, v.shape, r); err != nil {
+			return nil, err
 		}
 	}
 	return v.with(shards, l), nil
+}
+
+// cuttable returns an error unless cut can convert v to l.
+func (p *plan) cuttable(v *value, l layout) error {
+	if v.lay.packed != nil || l.packed != nil || needsCollective(v.lay, l) || l.partial&^v.lay.partial != 0 {
+		return fmt.Errorf("tensor: convert a sharded tensor from %s to %s on each device: %w", v.lay.key(), l.key(), ErrInternal)
+	}
+	return nil
+}
+
+// cutShard cuts device r's block of a tensor of shape laid out as to out
+// of x, its block laid out as from, which cuttable allows.
+func (p *plan) cutShard(x *graph.Node, from, to layout, shape []int, r int) (*graph.Node, error) {
+	m := p.m
+	for d, t := range to.dims {
+		if from.dims[d].equal(t) {
+			continue
+		}
+		k := m.shape[t.axis]
+		c := m.coord(r, int(t.axis))
+		var parts []*graph.Node
+		at := 0
+		for _, n := range t.sections(shape[d]) {
+			b := n / k
+			y, err := graph.Shrink(x, rangeAxis(x.Shape, d, at+c*b, at+(c+1)*b))
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, y)
+			at += n
+		}
+		y, err := catAll(parts, d)
+		if err != nil {
+			return nil, err
+		}
+		x = y
+	}
+	return x, nil
 }
 
 // catAll joins xs along axis, in Cats of at most backend.MaxCatInputs

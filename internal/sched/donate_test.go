@@ -16,12 +16,19 @@ import (
 func uploaded(t *testing.T, be backend.Backend, shape []int, seed uint64) (*graph.Node, []float32) {
 	t.Helper()
 	vals := floats(t, be, realized(t, be, shape, seed))
-	n, err := Upload(t.Context(), be, backend.Float32, bytesOf(vals), shape)
+	return upload(t, be, bytesOf(vals), shape...), vals
+}
+
+// upload returns a donated node of shape holding data, as an upload of a
+// batch is.
+func upload(t *testing.T, be backend.Backend, data []byte, shape ...int) *graph.Node {
+	t.Helper()
+	n, err := Upload(t.Context(), be, backend.Float32, data, shape)
 	if err != nil {
 		t.Fatal(err)
 	}
 	Donate(n)
-	return n, vals
+	return n
 }
 
 func bytesOf(f []float32) []byte {
@@ -213,5 +220,36 @@ func TestReplaysTakeDonatedLeavesAndPlannedOnesDoNot(t *testing.T) {
 	}
 	if replays != 2 {
 		t.Errorf("%d replays, want 2", replays)
+	}
+}
+
+func TestUploadsTakeTheBuffersTheyTookLastStep(t *testing.T) {
+	be := cpu.New()
+	const n = 16
+	w := realized(t, be, []int{n, n}, 3)
+	batch := bytesOf(make([]float32, n*n))
+	var last [2]backend.Buffer
+	before := poolOf(be).obtained
+	for step := range 6 {
+		// A batch's inputs and targets of one size, uploaded and donated
+		// every step as Fit's are.
+		x, y := upload(t, be, batch, n, n), upload(t, be, batch, n, n)
+		bufs := [2]backend.Buffer{x.Buf(), y.Buf()}
+		d := must(graph.Binary(backend.OpAdd, must(graph.MatMul(x, w)), y))
+		loss := must(graph.Reduce(backend.OpReduceSum, d, []int{0, 1}))
+		if err := Realize(t.Context(), be, loss); err != nil {
+			t.Fatal(err)
+		}
+		if step >= 2 && bufs != last {
+			t.Errorf("step %d: the inputs and targets took buffers %p and %p, last step's %p and %p", step, bufs[0], bufs[1], last[0], last[1])
+		}
+		if step == 2 {
+			before = poolOf(be).obtained
+		}
+		last = bufs
+	}
+	// Each step obtains the memory of the loss it returns, and no more.
+	if got, want := poolOf(be).obtained-before, int64(3*4); got != want {
+		t.Errorf("the last 3 steps obtained %d bytes from the backend, want %d", got, want)
 	}
 }

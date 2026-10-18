@@ -22,8 +22,8 @@ import (
 // gen.Launch.SetArgs), and it plans a kernel again only when its buffers
 // change shape.
 //
-// With MIMIR_CUDA_GRAPHS=1, a batch whose runs repeat launches as one
-// CUDA graph: the backend captures the calls on its stream once,
+// A batch whose runs repeat launches as one CUDA graph, unless
+// MIMIR_CUDA_GRAPHS=0: the backend captures the calls on its stream once,
 // instantiates the graph, and from then on launches it as a whole, after
 // updating the kernel nodes whose parameters or buffers changed in the
 // executable graph. A cuBLAS call cannot be updated so: cuBLAS chooses
@@ -40,14 +40,13 @@ import (
 // its graph is captured once. When the driver lacks the graph API, or
 // capture or instantiation fail, the batch's calls launch one by one.
 //
-// Graphs are off by default until a GPU shows them faster than launching
-// the calls one by one. On the T4 of the first measurements, training
-// steps launched as graphs were slower, because every step captured and
-// instantiated its graph again when its products moved, which they no
-// longer do.
+// On a T4, a training step of BenchmarkTrainingStepGraphs captures its
+// graphs once and then updates about 7 kernel nodes a step, and steps
+// launched as graphs are up to 10% faster than launched call by call, and
+// never slower.
 
 // graphsOn turns CUDA graphs on.
-var graphsOn = os.Getenv("MIMIR_CUDA_GRAPHS") == "1"
+var graphsOn = os.Getenv("MIMIR_CUDA_GRAPHS") != "0"
 
 // graphsReady loads the CUDA graph API, or reports why it cannot.
 var graphsReady = loadGraphs
@@ -95,7 +94,7 @@ func (g *graphHandles) live() bool { return g != nil && g.exec != 0 }
 
 // graphCounts counts what batches did with CUDA graphs, for tests.
 var graphCounts struct {
-	captures, launches, direct atomic.Int64
+	captures, launches, direct, updates, rejected atomic.Int64
 }
 
 // RunBatch queues the kernels of bt on the stream, as one CUDA graph when
@@ -146,11 +145,16 @@ func (b *Backend) RunBatch(ctx context.Context, bt *backend.Batch) error {
 		}
 		c.args = append(c.args[:0], st.scratch...)
 		j := 0
-		for _, bufs := range [2][]backend.Buffer{outs, ins} {
+		for side, bufs := range [2][]backend.Buffer{outs, ins} {
 			for _, buf := range bufs {
 				cb, err := b.own(buf)
 				if err != nil {
 					return err
+				}
+				if side == 0 && len(b.reads) > 0 {
+					if err := b.settle(cb.ptr); err != nil {
+						return err
+					}
 				}
 				if c.ptrs[j] != cb.ptr {
 					c.ptrs[j], c.dirty = cb.ptr, true
@@ -231,7 +235,9 @@ func (b *Backend) graph(st *batchState) error {
 			}
 			r := cuGraphExecKernelNodeSetParams(st.graph.exec, c.node, &params)
 			runtime.KeepAlive(c)
+			graphCounts.updates.Add(1)
 			if r != cudaSuccess {
+				graphCounts.rejected.Add(1)
 				updated = false
 				break
 			}
