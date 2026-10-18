@@ -86,6 +86,10 @@ func RealizeInto(ctx context.Context, be backend.Backend, targets, dsts []*graph
 // device. It returns the errors of the schedules that failed, joined;
 // the others' targets are computed.
 func RealizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*graph.Node, keep func() []*graph.Node) error {
+	return realizeEach(ctx, bes, targets, dsts, keep, nil)
+}
+
+func realizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*graph.Node, keep func() []*graph.Node, trace func(r int, t *Trace, order, leaves []*graph.Node)) error {
 	if len(targets) != len(bes) || dsts != nil && len(dsts) != len(bes) {
 		return fmt.Errorf("sched: %d target lists and %d destination lists for %d devices: %w", len(targets), len(dsts), len(bes), backend.ErrInternal)
 	}
@@ -103,6 +107,7 @@ func RealizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 	defer mu.Unlock()
 	ts, ds := slices.Clone(targets), make([][]*graph.Node, len(bes))
 	keeps := make([]func() []*graph.Node, len(bes))
+	traces := make([]func(*Trace, []*graph.Node, []*graph.Node), len(bes))
 	var kept []*graph.Node
 	if keep != nil {
 		kept = keep()
@@ -111,6 +116,9 @@ func RealizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 		poolOf(be) // created now: the schedules only read the map of pools
 		if dsts != nil {
 			ds[i] = dsts[i]
+		}
+		if trace != nil {
+			traces[i] = func(t *Trace, order, leaves []*graph.Node) { trace(i, t, order, leaves) }
 		}
 		if keep == nil {
 			continue
@@ -125,6 +133,11 @@ func RealizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 			}
 		}
 		keeps[i] = func() []*graph.Node { return mine }
+		if len(mine) > 0 {
+			// The schedule may compute some of mine first (see protect),
+			// which a replay would not.
+			traces[i] = nil
+		}
 		ts[i], ds[i] = protect(ctx, be, ts[i], ds[i], keeps[i])
 	}
 	errs := make([]error, len(bes))
@@ -133,7 +146,7 @@ func RealizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 		if len(ts[i]) == 0 {
 			continue
 		}
-		wg.Go(func() { errs[i] = realizeLocal(ctx, be, ts[i], ds[i], keeps[i]) })
+		wg.Go(func() { errs[i] = schedule(ctx, be, ts[i], ds[i], keeps[i], true, traces[i]) })
 	}
 	wg.Wait()
 	return errors.Join(errs...)
@@ -392,18 +405,15 @@ type result struct {
 // realize computes targets on be, writing them over dsts, as
 // RealizeInto documents. mu is held.
 func realize(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
-	return schedule(ctx, be, targets, dsts, keep, false)
+	return schedule(ctx, be, targets, dsts, keep, false, nil)
 }
 
-// realizeLocal is realize for a schedule that runs while those of other
-// devices do (see RealizeEach), which therefore fails rather than copy
-// an input from another device. mu is held by the caller of the
-// goroutines that run them.
-func realizeLocal(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node) error {
-	return schedule(ctx, be, targets, dsts, keep, true)
-}
-
-func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, local bool) (err error) {
+// schedule is realize, which if local is set runs while the schedules of
+// other devices do (see RealizeEach), and therefore fails rather than
+// copy an input from another device; mu is then held by the caller of
+// the goroutines that run them. It calls trace, if not nil, with the
+// schedule's trace (see RealizeEachTraced) unless a target is realized.
+func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.Node, keep func() []*graph.Node, local bool, trace func(*Trace, []*graph.Node, []*graph.Node)) (err error) {
 	generation.Add(1)
 	m := poolOf(be)
 	w := &m.walker
@@ -419,7 +429,15 @@ func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.No
 		}
 	}
 	w.withhold(keep, targets)
+	if trace != nil && slices.ContainsFunc(targets, (*graph.Node).Realized) {
+		// The key names a realized target by the leaf it is, which a
+		// replay would have to find.
+		trace = nil
+	}
 	if len(w.order) == 0 {
+		if trace != nil {
+			trace(w.tracing(nil, len(targets)), w.order, w.leaves)
+		}
 		consume(targets, dsts)
 		return nil
 	}
@@ -436,6 +454,9 @@ func schedule(ctx context.Context, be backend.Backend, targets, dsts []*graph.No
 	prog, err := m.program(w, targets, dsts)
 	if err != nil {
 		return err
+	}
+	if trace != nil {
+		trace(w.tracing(prog, len(targets)), w.order, w.leaves)
 	}
 	// The schedule is refused before it allocates anything if it would
 	// not fit in the budget.

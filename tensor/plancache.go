@@ -32,6 +32,7 @@ type planCache struct {
 	hits    int // for tests
 	misses  int
 	replays int
+	missed  int // traced device schedules of replays that computed their graphs
 }
 
 // analysis is what analyze gave the nodes of a graph, by their place in

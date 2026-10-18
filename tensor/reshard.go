@@ -137,10 +137,7 @@ func (p *plan) realizeLive(k int) error {
 			live[r] = append(live[r], s)
 		}
 	}
-	if p.rec != nil {
-		p.rec.realize(live)
-	}
-	err := sched.RealizeEach(p.ctx, p.m.bes, live, nil, lazy.values)
+	err := p.schedule(live, nil, false)
 	for _, ns := range live {
 		for _, n := range ns {
 			if sched.Realized(n) {

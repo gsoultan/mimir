@@ -2,7 +2,6 @@ package tensor
 
 import (
 	"slices"
-	"sync"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
@@ -13,13 +12,15 @@ import (
 // lowering a graph whose analysis the mesh has cached (see plancache.go)
 // gives each device a graph of the same structure, read from the new
 // shards of the same leaves, and runs the same collectives. So the first
-// run of a graph records a script of what it did: each device's nodes, in
-// the order it built them, and the schedules, collectives and uploads it
-// ran between them. Later runs of a graph of the same key, with the same
-// targets and destinations, replay the script: they build each device's
-// nodes straight from it, without the layouts, conversions and checks of
-// lowering, and run what it ran. The scheduler still walks each device's
-// graph and finds its program by its key, as it does on a single device.
+// run of a graph records a script of what it did: each device's nodes,
+// and the schedules, collectives and uploads it ran. Later runs of a
+// graph of the same key, with the same targets and destinations, replay
+// the script. A schedule replays the program the scheduler compiled for
+// it (see sched.ReplayEach), which reads the leaves and writes the
+// targets alone, so only the nodes that hold its targets are built; the
+// scheduler checks that the leaves and destinations would have found the
+// same program, and a device whose do not computes the graph the script
+// builds for it, as the run did.
 //
 // A lowered node takes its constant or seed, which the key leaves out,
 // from the node of the graph that it lowers. A run that builds a node
@@ -27,8 +28,10 @@ import (
 // tensor that it cannot name by the graph's leaves or what the run
 // itself computed, is not recorded, and runs of its graph lower anew.
 
-// replays turns the replay of recorded runs on and off, for tests.
-var replays = true
+// replays turns the replay of recorded runs on and off, and
+// replayPrograms that of the schedules' programs, without which a replay
+// computes the graphs the script builds, for tests.
+var replays, replayPrograms = true, true
 
 // script is the record of a plan's run.
 type script struct {
@@ -37,12 +40,8 @@ type script struct {
 	want  []layout // the layout of each target's result
 	over  []bool   // whether each target is written over a destination
 
-	slots  [][]slot  // each device's nodes, in the order the run built or got them
-	built  []int     // how many of each device's slots are nodes the run built
-	owned  []int     // how many of those are allocated alone (see slot.own)
-	inputs []int     // how many inputs each device's nodes read in all
-	events []event   // what the run ran, in order
-	final  [][]int32 // each device's slots of the targets' shards
+	slots  [][]slot // each device's nodes, in the order the run built or got them
+	events []*event // what the run ran, in order
 }
 
 type slotKind uint8
@@ -65,9 +64,6 @@ type slot struct {
 	dev   backend.Backend
 	ins   []int32
 	src   int32
-	// own marks a node that is the shard of a target, which outlives
-	// the run, and so is not allocated with the others.
-	own bool
 	// The leaf's number, or the event and the place among its outputs.
 	from, at int32
 }
@@ -75,20 +71,26 @@ type slot struct {
 type eventKind uint8
 
 const (
-	eventRealize    eventKind = iota // a schedule on each device (realizeLive)
+	eventSchedule   eventKind = iota // a schedule on each device (plan.schedule)
 	eventCollective                  // a group of collectives (collect)
 	eventUpload                      // a leaf copied to every device (valueOf)
 )
 
-// event is a schedule, collective or upload of the run, which reads the
-// slots of each device that come before mark[r].
+// event is a schedule, collective or upload of the run.
 type event struct {
 	kind  eventKind
-	mark  []int
 	nodes [][]int32 // the targets of the schedules, or the collectives' inputs, by slot; -1 for none
-	outs  [][]sched.Out
-	descs []collDesc
-	leaf  int // the leaf uploaded
+	final bool      // whether the schedules compute the shards of the run's targets
+	// The schedules' traces, the slots of their leaves, and the sources
+	// of the constants and seeds of their programs (see slot.src), by
+	// device; a device without a trace computes its graph.
+	traces []*sched.Trace
+	leaves [][]int32
+	args   [][]int32
+	argBuf [][]*graph.Node // scratch for the arguments of a replay
+	outs   [][]sched.Out
+	descs  []collDesc
+	leaf   int // the leaf uploaded
 }
 
 // recorder records a plan's run in a script.
@@ -102,9 +104,13 @@ type recorder struct {
 // ambiguous is the source of a node that lowers two nodes of the graph.
 const ambiguous = -2
 
-// scripted returns the script of p's graph if the mesh has one that fits the
-// run's targets and their destinations. Otherwise it starts recording the
-// run if the graph has an analysis and no script yet.
+// zeroArg is the node whose constant and seed a program reads for a node
+// of no source, whose are zero.
+var zeroArg = &graph.Node{}
+
+// scripted returns the script of p's graph if the mesh has one that fits
+// the run's targets and their destinations. Otherwise it starts
+// recording the run if the graph has an analysis and no script yet.
 func (p *plan) scripted(roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node) *script {
 	a := p.an
 	if a == nil || !replays {
@@ -139,14 +145,11 @@ func (t *script) fits(p *plan, roots []*graph.Node, want []layout, todo []int, d
 func (p *plan) startRecording(roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node) {
 	nd := len(p.m.devs)
 	t := &script{
-		todo:   slices.Clone(todo),
-		want:   slices.Clone(want),
-		roots:  make([]int, len(roots)),
-		over:   make([]bool, len(roots)),
-		slots:  make([][]slot, nd),
-		built:  make([]int, nd),
-		owned:  make([]int, nd),
-		inputs: make([]int, nd),
+		todo:  slices.Clone(todo),
+		want:  slices.Clone(want),
+		roots: make([]int, len(roots)),
+		over:  make([]bool, len(roots)),
+		slots: make([][]slot, nd),
 	}
 	rc := &recorder{t: t, known: make([]map[*graph.Node]int32, nd), sources: make([]map[*graph.Node]int32, nd)}
 	for r := range nd {
@@ -261,9 +264,7 @@ func (rc *recorder) slot(r int, x *graph.Node) int32 {
 			for i, in := range n.Inputs {
 				s.ins[i] = rc.known[r][in]
 			}
-			rc.t.inputs[r] += len(n.Inputs)
 		}
-		rc.t.built[r]++
 		rc.define(r, n, s)
 	}
 	return rc.known[r][x]
@@ -281,23 +282,56 @@ func (rc *recorder) slots(nodes [][]*graph.Node) [][]int32 {
 	return out
 }
 
-func (rc *recorder) event(e event) {
-	e.mark = make([]int, len(rc.t.slots))
-	for r := range rc.t.slots {
-		e.mark[r] = len(rc.t.slots[r])
-	}
+func (rc *recorder) event(e *event) *event {
 	rc.t.events = append(rc.t.events, e)
+	return e
 }
 
-// realize records schedules that compute the nodes live of each device.
-func (rc *recorder) realize(live [][]*graph.Node) {
-	rc.event(event{kind: eventRealize, nodes: rc.slots(live)})
+// realize records schedules that compute the nodes of each device, the
+// shards of the run's targets if final is set, and returns their event,
+// for traced to fill in.
+func (rc *recorder) realize(nodes [][]*graph.Node, final bool) *event {
+	nd := len(nodes)
+	return rc.event(&event{
+		kind: eventSchedule, nodes: rc.slots(nodes), final: final,
+		traces: make([]*sched.Trace, nd), leaves: make([][]int32, nd), args: make([][]int32, nd), argBuf: make([][]*graph.Node, nd),
+	})
+}
+
+// traced records the trace of the schedule of ev on device r, which
+// computes order, from leaves. It runs on the device's goroutine.
+func (rc *recorder) traced(ev *event, r int, t *sched.Trace, order, leaves []*graph.Node) {
+	known, slots := rc.known[r], rc.t.slots[r]
+	ls := make([]int32, t.Leaves())
+	for i := range ls {
+		s, ok := known[leaves[i]]
+		if !ok {
+			return
+		}
+		ls[i] = s
+	}
+	var args []int32
+	if as := t.Args(); len(as) > 0 {
+		args = make([]int32, as[len(as)-1]+1)
+		for i := range args {
+			args[i] = -1
+		}
+		for _, a := range as {
+			s, ok := known[order[a]]
+			if !ok || slots[s].kind != slotNode {
+				return
+			}
+			args[a] = slots[s].src
+		}
+		ev.argBuf[r] = make([]*graph.Node, len(args))
+	}
+	ev.traces[r], ev.leaves[r], ev.args[r] = t, ls, args
 }
 
 // collective records collectives over ins, as collect runs them; produced
 // records their outputs.
 func (rc *recorder) collective(ins [][]*graph.Node, outs [][]sched.Out, descs []collDesc) {
-	rc.event(event{kind: eventCollective, nodes: rc.slots(ins), outs: outs, descs: descs})
+	rc.event(&event{kind: eventCollective, nodes: rc.slots(ins), outs: outs, descs: descs})
 }
 
 func (rc *recorder) produced(nodes [][]*graph.Node) {
@@ -318,159 +352,239 @@ func (rc *recorder) upload(leaf *pnode, shards []*graph.Node) {
 		rc.failed = true
 		return
 	}
-	rc.event(event{kind: eventUpload, leaf: leaf.num})
+	rc.event(&event{kind: eventUpload, leaf: leaf.num})
 	e := int32(len(rc.t.events) - 1)
 	for r, n := range shards {
 		rc.define(r, n, slot{kind: slotOutput, from: e})
 	}
 }
 
-// store records each device's shards of the targets.
-func (rc *recorder) store(final [][]*graph.Node) {
-	rc.t.final = rc.slots(final)
-	for r, ss := range rc.t.final {
-		for _, s := range ss {
-			if sl := &rc.t.slots[r][s]; s >= 0 && sl.kind == slotNode && !sl.own {
-				sl.own = true
-				rc.t.owned[r]++
-			}
-		}
-	}
-}
-
-// replay runs the script t of p's graph, computing roots, the targets todo,
-// laid out as want, over dsts.
+// replay runs the script t of p's graph, computing roots, the targets
+// todo, laid out as want, over dsts.
 func (p *plan) replay(t *script, roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node) error {
 	m := p.m
 	m.plans.replays++
 	nd := len(m.devs)
 	devs := make([]replayer, nd)
 	for r := range devs {
-		d := &devs[r]
-		d.slots = make([]*graph.Node, len(t.slots[r]))
-		d.nodes = make([]graph.Node, t.built[r]-t.owned[r])
-		d.ins = make([]*graph.Node, t.inputs[r])
+		devs[r] = replayer{p: p, t: t, r: r, slots: make([]*graph.Node, len(t.slots[r])), outs: make([][]*graph.Node, len(t.events))}
 	}
-	outs := make([][][]*graph.Node, len(t.events)) // each event's outputs, by device
-	// Each device builds its nodes on a goroutine of its own, as lowerAll
-	// does.
-	build := func(upto func(r int) int) {
-		if nd == 1 {
-			devs[0].build(p, t, 0, upto(0), outs)
-			return
-		}
-		var wg sync.WaitGroup
-		for r := range devs {
-			wg.Go(func() { devs[r].build(p, t, r, upto(r), outs) })
-		}
-		wg.Wait()
-	}
-	nodes := func(slots [][]int32) [][]*graph.Node {
-		ns := make([][]*graph.Node, nd)
-		for r, ss := range slots {
-			ns[r] = make([]*graph.Node, len(ss))
-			for i, s := range ss {
-				if s >= 0 {
-					ns[r][i] = devs[r].slots[s]
-				}
-			}
-		}
-		return ns
-	}
-	fail := func(err error) error {
-		p.release(nil)
-		return err
-	}
-	for e := range t.events {
-		ev := &t.events[e]
-		build(func(r int) int { return ev.mark[r] })
+	var final *event
+	for e, ev := range t.events {
 		switch ev.kind {
-		case eventRealize:
-			live := nodes(ev.nodes)
-			err := sched.RealizeEach(p.ctx, m.bes, live, nil, lazy.values)
+		case eventSchedule:
+			if ev.final {
+				final = ev
+				continue
+			}
+			live, err := p.replaySchedule(ev, devs, nil)
 			for _, ns := range live {
 				for _, n := range ns {
-					if sched.Realized(n) {
+					if n != nil && sched.Realized(n) {
 						p.temps = append(p.temps, n)
 					}
 				}
 			}
 			if err != nil {
-				return fail(err)
+				p.release(nil)
+				return err
 			}
 		case eventCollective:
-			out, err := m.collect(p.ctx, nodes(ev.nodes), ev.outs, ev.descs)
-			if err != nil {
-				return fail(err)
+			ins := make([][]*graph.Node, nd)
+			for r, ss := range ev.nodes {
+				ins[r] = make([]*graph.Node, len(ss))
+				for i, s := range ss {
+					if s >= 0 {
+						ins[r][i] = devs[r].node(s)
+					}
+				}
 			}
-			for _, ns := range out {
+			out, err := m.collect(p.ctx, ins, ev.outs, ev.descs)
+			if err != nil {
+				p.release(nil)
+				return err
+			}
+			for r, ns := range out {
+				devs[r].outs[e] = ns
 				for _, n := range ns {
 					if n != nil {
 						p.temps = append(p.temps, n)
 					}
 				}
 			}
-			outs[e] = out
 		case eventUpload:
 			x := p.leaves[ev.leaf]
 			data, err := hostBytes(p.ctx, x)
 			if err != nil {
-				return fail(err)
+				p.release(nil)
+				return err
 			}
-			outs[e] = make([][]*graph.Node, nd)
 			for r, be := range m.bes {
 				s, err := sched.Upload(p.ctx, be, x.DType, data, x.Shape)
 				if err != nil {
-					return fail(err)
+					p.release(nil)
+					return err
 				}
-				outs[e][r] = []*graph.Node{s}
+				devs[r].outs[e] = []*graph.Node{s}
 			}
 		}
 	}
-	build(func(r int) int { return len(t.slots[r]) })
-	return p.finish(roots, want, todo, dsts, nodes(t.final))
+	return p.finish(roots, want, todo, dsts, func(over [][]*graph.Node) ([][]*graph.Node, error) {
+		return p.replaySchedule(final, devs, over)
+	})
 }
 
-// replayer builds one device's nodes from a script.
-type replayer struct {
-	slots []*graph.Node // the device's nodes, by slot
-	built int           // how many slots are built
-	nodes []graph.Node  // the memory of the nodes to build, but those allocated alone
-	ins   []*graph.Node // the memory of their inputs
-}
-
-// build builds device r's slots up to upto, from the script t of p's
-// graph and the outputs of the events run so far.
-func (d *replayer) build(p *plan, t *script, r, upto int, outs [][][]*graph.Node) {
-	for i := d.built; i < upto; i++ {
-		s := &t.slots[r][i]
-		switch s.kind {
-		case slotLeaf:
-			d.slots[i] = p.node(p.leaves[s.from]).val.shards[r]
-		case slotOutput:
-			d.slots[i] = outs[s.from][r][s.at]
-		case slotNode:
-			var n *graph.Node
-			if s.own {
-				n = new(graph.Node)
+// replaySchedule replays the schedules of ev, over the destinations
+// over, and returns each device's targets: computed by the traced
+// program where the scheduler finds that it fits, and otherwise by
+// computing the graph the script builds.
+func (p *plan) replaySchedule(ev *event, devs []replayer, over [][]*graph.Node) ([][]*graph.Node, error) {
+	nd := len(devs)
+	targets := make([][]*graph.Node, nd)
+	leaves := make([][]*graph.Node, nd)
+	args := make([][]*graph.Node, nd)
+	traces := ev.traces
+	if !replayPrograms {
+		traces = make([]*sched.Trace, nd)
+	}
+	for r := range devs {
+		if traces[r] == nil {
+			continue
+		}
+		d := &devs[r]
+		leaves[r] = make([]*graph.Node, len(ev.leaves[r]))
+		for i, s := range ev.leaves[r] {
+			leaves[r][i] = d.get(s)
+		}
+		buf := ev.argBuf[r]
+		for a, src := range ev.args[r] {
+			if src >= 0 {
+				buf[a] = p.order[src]
 			} else {
-				n, d.nodes = &d.nodes[0], d.nodes[1:]
+				buf[a] = zeroArg
 			}
-			*n = graph.Node{Op: s.op, DType: s.dt, Shape: s.shape, Attrs: s.attrs, Dev: s.dev}
-			if s.src >= 0 {
-				a := &p.order[s.src].Attrs
-				n.Attrs.Value, n.Attrs.Seed = a.Value, a.Seed
-			}
-			if k := len(s.ins); k > 0 {
-				in := d.ins[:k:k]
-				d.ins = d.ins[k:]
-				for j, x := range s.ins {
-					in[j] = d.slots[x]
-				}
-				n.Inputs = in
-			}
-			d.slots[i] = n
+		}
+		args[r] = buf
+	}
+	missed, err := sched.ReplayEach(p.ctx, traces, leaves, args, func(r int) []*graph.Node {
+		d := &devs[r]
+		ts := make([]*graph.Node, len(ev.nodes[r]))
+		for i, s := range ev.nodes[r] {
+			ts[i] = d.bare(s)
+		}
+		targets[r] = ts
+		return ts
+	}, over, lazy.values)
+	for _, buf := range args {
+		clear(buf)
+	}
+	if err != nil {
+		return targets, err
+	}
+	var bes []backend.Backend
+	var rest, restOver [][]*graph.Node
+	for r, miss := range missed {
+		if !miss {
+			continue
+		}
+		if traces[r] != nil {
+			p.m.plans.missed++
+		}
+		d := &devs[r]
+		ts := make([]*graph.Node, len(ev.nodes[r]))
+		for i, s := range ev.nodes[r] {
+			ts[i] = d.node(s)
+		}
+		targets[r] = ts
+		bes, rest = append(bes, p.m.bes[r]), append(rest, ts)
+		if over != nil {
+			restOver = append(restOver, over[r])
 		}
 	}
-	d.built = max(d.built, upto)
+	if len(bes) == 0 {
+		return targets, nil
+	}
+	return targets, sched.RealizeEach(p.ctx, bes, rest, restOver, lazy.values)
+}
+
+// replayer gets one device's nodes from a script.
+type replayer struct {
+	p     *plan
+	t     *script
+	r     int
+	slots []*graph.Node   // the device's nodes, by slot, once got
+	outs  [][]*graph.Node // the outputs of each event run so far
+}
+
+// get returns the node of slot s if it is a shard of a leaf, the output
+// of an event or a node built already, and otherwise nil.
+func (d *replayer) get(s int32) *graph.Node {
+	if n := d.slots[s]; n != nil {
+		return n
+	}
+	sl := &d.t.slots[d.r][s]
+	switch sl.kind {
+	case slotLeaf:
+		d.slots[s] = d.p.node(d.p.leaves[sl.from]).val.shards[d.r]
+	case slotOutput:
+		d.slots[s] = d.outs[sl.from][sl.at]
+	}
+	return d.slots[s]
+}
+
+// bare returns the node of slot s, building it without inputs if it is a
+// node the run built that is not built yet: a target that a replayed
+// program computes.
+func (d *replayer) bare(s int32) *graph.Node {
+	if n := d.get(s); n != nil {
+		return n
+	}
+	n := d.build(&d.t.slots[d.r][s])
+	d.slots[s] = n
+	return n
+}
+
+// node returns the node of slot s, building it, and the nodes it reads
+// that are not built yet, if it is not built yet.
+func (d *replayer) node(s int32) *graph.Node {
+	if n := d.get(s); n != nil {
+		return n
+	}
+	stack := []int32{s}
+	for len(stack) > 0 {
+		x := stack[len(stack)-1]
+		sl := &d.t.slots[d.r][x]
+		ready := true
+		for _, in := range sl.ins {
+			if d.get(in) == nil {
+				stack, ready = append(stack, in), false
+			}
+		}
+		if !ready {
+			continue
+		}
+		stack = stack[:len(stack)-1]
+		if d.slots[x] != nil {
+			continue
+		}
+		n := d.build(sl)
+		if len(sl.ins) > 0 {
+			n.Inputs = make([]*graph.Node, len(sl.ins))
+			for i, in := range sl.ins {
+				n.Inputs[i] = d.slots[in]
+			}
+		}
+		d.slots[x] = n
+	}
+	return d.slots[s]
+}
+
+// build returns a node of the fields of sl, without inputs.
+func (d *replayer) build(sl *slot) *graph.Node {
+	n := &graph.Node{Op: sl.op, DType: sl.dt, Shape: sl.shape, Attrs: sl.attrs, Dev: sl.dev}
+	if sl.src >= 0 {
+		a := &d.p.order[sl.src].Attrs
+		n.Attrs.Value, n.Attrs.Seed = a.Value, a.Seed
+	}
+	return n
 }
