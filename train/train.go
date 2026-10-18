@@ -106,7 +106,7 @@ func Eval(ds data.Dataset, ms ...func() metrics.Metric) Option {
 }
 
 // Checkpoint saves the model, the optimizer and the epoch to
-// dir/checkpoint.safetensors after every epoch, and resumes from that file
+// dir/checkpoint.mim after every epoch, and resumes from that file
 // when Fit starts and finds it.
 func Checkpoint(dir string) Option { return func(c *config) { c.ckptDir = dir } }
 

@@ -3,17 +3,46 @@ package main
 import (
 	"bytes"
 	"errors"
+	"maps"
 	"math"
 	"math/rand/v2"
-	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 
-	"github.com/gsoultan/mimir/io/gguf"
-	"github.com/gsoultan/mimir/io/safetensors"
+	mimfile "github.com/gsoultan/mim"
+
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tensor"
 )
+
+// openFile opens the .mim file at path, until the test ends, and returns
+// it with its metadata.
+func openFile(tb testing.TB, path string) (*mim.Model, mimfile.Metadata) {
+	tb.Helper()
+	f, err := mim.Open(path)
+	return opened(tb, f, err)
+}
+
+// openBytes is openFile for the bytes of a file.
+func openBytes(tb testing.TB, b []byte) (*mim.Model, mimfile.Metadata) {
+	tb.Helper()
+	f, err := mim.Parse(b)
+	return opened(tb, f, err)
+}
+
+func opened(tb testing.TB, f *mim.Model, err error) (*mim.Model, mimfile.Metadata) {
+	tb.Helper()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { f.Close() })
+	md, err := f.Metadata()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return f, md
+}
 
 // reference holds the tokens of a test model's prompt and the logits a
 // NumPy implementation of the model computes for them in float64.
@@ -24,21 +53,20 @@ type reference struct {
 
 func readReference(t *testing.T, path string) reference {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	f, _ := openFile(t, path)
+	tokens, err := f.Tensor("tokens")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := safetensors.Parse(b)
+	logits, err := f.Tensor("logits")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tt, _ := f.Tensor("tokens")
-	lt, _ := f.Tensor("logits")
 	var r reference
-	if r.tokens, err = tt.Int32s(); err != nil {
+	if r.tokens, err = tokens.Data[int32](t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if r.logits, err = lt.Float32s(); err != nil {
+	if r.logits, err = logits.Data[float32](t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -53,12 +81,8 @@ func loadModel(t *testing.T, path string) *Model {
 // if deq is set.
 func load(t *testing.T, path string, deq bool) *Model {
 	t.Helper()
-	f, err := gguf.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { f.Close() })
-	m, err := Load(f, tensor.DefaultDevice())
+	f, md := openFile(t, path)
+	m, err := Load(f, md, tensor.DefaultDevice())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,11 +140,12 @@ func argmax(v []float32) int {
 }
 
 // TestLogitsMatchNumPy runs the tiny models of testdata, built by
-// tools/gguf/llama.py, over their prompts, in one batched pass and one
-// token at a time through the KV caches, and checks the logits of every
-// position against those of the script's NumPy implementation of Llama.
-// spm.gguf has grouped-query attention, linear rope scaling, an output
-// projection of its own, and Q8_0, F16, BF16 and F32 weights; bpe.gguf has
+// tools/gguf/llama.py and converted with mim-import, over their prompts,
+// in one batched pass and one token at a time through the KV caches, and
+// checks the logits of every position against those of the script's
+// NumPy implementation of Llama, <name>.logits.mim. spm.mim has
+// grouped-query attention, linear rope scaling, an output projection of
+// its own, and Q8_0, F16, BF16 and F32 weights; bpe.mim has
 // four query heads to one key head, Llama 3.1's rope frequency factors,
 // tied embeddings, and Q4_K and Q6_K weights.
 //
@@ -141,8 +166,16 @@ func TestLogitsMatchNumPy(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			ctx := t.Context()
-			m := load(t, filepath.Join("testdata", c.name+".gguf"), c.deq)
-			ref := readReference(t, filepath.Join("testdata", c.name+".logits.safetensors"))
+			m := load(t, filepath.Join("testdata", c.name+".mim"), c.deq)
+			ref := readReference(t, filepath.Join("testdata", c.name+".logits.mim"))
+			if !c.deq {
+				// The weights keep the file's types.
+				want := map[string][2]tensor.DType{"spm": {tensor.Q8_0, tensor.BFloat16}, "bpe": {tensor.Q4_K, tensor.Q6_K}}[c.name]
+				b := m.Blocks[0]
+				if q, down := b.Q.Weight.Value().DType(), b.Down.Weight.Value().DType(); q != want[0] || down != want[1] {
+					t.Errorf("query and down projections of %v and %v, want the file's %v and %v", q, down, want[0], want[1])
+				}
+			}
 			v := m.Config.Vocab
 			logits, err := m.Logits(ctx, ref.tokens, m.NewCaches(len(ref.tokens)), true)
 			if err != nil {
@@ -177,8 +210,8 @@ func TestLogitsMatchNumPy(t *testing.T) {
 // the whole sequence, the stop condition and the timings.
 func TestGenerate(t *testing.T) {
 	ctx := t.Context()
-	m := loadModel(t, "testdata/bpe.gguf")
-	tok := openTokenizer(t, "testdata/bpe.gguf")
+	m := loadModel(t, "testdata/bpe.mim")
+	tok := openTokenizer(t, "testdata/bpe.mim")
 	prompt := tok.Encode("Hello world", true)
 	out, st, err := Generate(ctx, m, prompt, 8, &Sampler{}, nil, nil)
 	if err != nil {
@@ -239,62 +272,49 @@ func TestSampler(t *testing.T) {
 // TestLoadRejectsBadFiles checks that a file with missing tensors,
 // unknown architecture or impossible hyperparameters is an error.
 func TestLoadRejectsBadFiles(t *testing.T) {
-	b, err := os.ReadFile("testdata/spm.gguf")
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := gguf.Parse(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rewrite := func(edit func(kvs []gguf.KV, ts []gguf.Tensor) ([]gguf.KV, []gguf.Tensor)) *gguf.File {
-		var kvs []gguf.KV
-		for _, k := range f.Keys() {
-			v, _ := f.Metadata(k)
-			kvs = append(kvs, gguf.KV{Key: k, Value: v})
-		}
-		kvs, ts := edit(kvs, f.Tensors())
-		var buf bytes.Buffer
-		if err := gguf.Write(&buf, kvs, ts); err != nil {
-			t.Fatal(err)
-		}
-		g, err := gguf.Parse(buf.Bytes())
-		if err != nil {
-			t.Fatal(err)
-		}
-		return g
-	}
-	set := func(key string, v any) func([]gguf.KV, []gguf.Tensor) ([]gguf.KV, []gguf.Tensor) {
-		return func(kvs []gguf.KV, ts []gguf.Tensor) ([]gguf.KV, []gguf.Tensor) {
-			for i := range kvs {
-				if kvs[i].Key == key {
-					kvs[i].Value = gguf.ValueOf(v)
-				}
+	f, md := openFile(t, "testdata/spm.mim")
+	// rewrite writes the file again with its metadata and tensors as edit
+	// changes them, and reads it back.
+	rewrite := func(edit func(md mimfile.Metadata, ts map[string]*tensor.Tensor)) (*mim.Model, mimfile.Metadata) {
+		md := maps.Clone(md)
+		ts := map[string]*tensor.Tensor{}
+		for _, name := range f.Names() {
+			v, err := f.Tensor(name)
+			if err != nil {
+				t.Fatal(err)
 			}
-			return kvs, ts
+			ts[name] = v
 		}
+		edit(md, ts)
+		var buf bytes.Buffer
+		if err := mim.WriteTensors(t.Context(), &buf, ts, &mim.SaveOptions{Metadata: md}); err != nil {
+			t.Fatal(err)
+		}
+		return openBytes(t, buf.Bytes())
 	}
-	for name, edit := range map[string]func([]gguf.KV, []gguf.Tensor) ([]gguf.KV, []gguf.Tensor){
+	set := func(key string, v any) func(mimfile.Metadata, map[string]*tensor.Tensor) {
+		return func(md mimfile.Metadata, _ map[string]*tensor.Tensor) { md[key] = v }
+	}
+	for name, edit := range map[string]func(mimfile.Metadata, map[string]*tensor.Tensor){
 		"architecture": set("general.architecture", "gpt2"),
-		"heads":        set("llama.attention.head_count", uint32(3)),
-		"layers":       set("llama.block_count", uint32(1<<30)),
-		"base":         set("llama.rope.freq_base", float32(-1)),
+		"heads":        set("llama.attention.head_count", uint64(3)),
+		"layers":       set("llama.block_count", uint64(1<<30)),
+		"base":         set("llama.rope.freq_base", -1.0),
 		"scaling":      set("llama.rope.scaling.type", "yarn"),
-		"missing": func(kvs []gguf.KV, ts []gguf.Tensor) ([]gguf.KV, []gguf.Tensor) {
-			return kvs, slices.DeleteFunc(ts, func(x gguf.Tensor) bool { return x.Name == "blk.1.ffn_up.weight" })
+		"missing": func(_ mimfile.Metadata, ts map[string]*tensor.Tensor) {
+			delete(ts, "blk.1.ffn_up.weight")
 		},
 	} {
-		if _, err := Load(rewrite(edit), tensor.CPU()); err == nil {
+		g, gmd := rewrite(edit)
+		if _, err := Load(g, gmd, tensor.CPU()); err == nil {
 			t.Errorf("%s: loaded", name)
 		}
 	}
-	bad := rewrite(func(kvs []gguf.KV, ts []gguf.Tensor) ([]gguf.KV, []gguf.Tensor) {
-		return set("tokenizer.ggml.model", "wordpiece")(kvs, ts)
-	})
+	_, bad := rewrite(set("tokenizer.ggml.model", "wordpiece"))
 	if _, err := NewTokenizer(bad); !errors.Is(err, errTokenizer) {
 		t.Errorf("tokenizer of an unknown model: %v", err)
 	}
-	m := loadModel(t, "testdata/spm.gguf")
+	m := loadModel(t, "testdata/spm.mim")
 	if _, err := m.Logits(t.Context(), []int32{int32(m.Config.Vocab)}, m.NewCaches(4), false); !errors.Is(err, tensor.ErrIndex) {
 		t.Errorf("token outside the vocabulary: %v", err)
 	}

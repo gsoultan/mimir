@@ -1,8 +1,8 @@
 // Command gpt2 trains a small GPT-2 from scratch on a text file with
 // mimir, then generates text from it.
 //
-//	go run ./examples/gpt2 -data input.txt -model small -steps 2000 -checkpoint gpt2.safetensors
-//	go run ./examples/gpt2 -generate -checkpoint gpt2.safetensors -prompt "ROMEO:" -temperature 0.8 -topk 40
+//	go run ./examples/gpt2 -data input.txt -model small -steps 2000 -checkpoint gpt2.mim
+//	go run ./examples/gpt2 -generate -checkpoint gpt2.mim -prompt "ROMEO:" -temperature 0.8 -topk 40
 //
 // The tokenizer is byte-level: every byte is a token. Training uses AdamW
 // with a linear warmup and a cosine decay of the learning rate, clips the

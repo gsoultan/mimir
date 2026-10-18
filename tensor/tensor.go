@@ -63,9 +63,9 @@
 //
 // # Quantized weights
 //
-// Q8_0, Q4_K and Q6_K hold weights quantized in blocks, as ggml and GGUF
-// files store them (see backend.DType): FromBytes reads their blocks in
-// place, as io/gguf maps them. They are read-only and have no gradient.
+// Q8_0, Q4_K and Q6_K hold weights quantized in blocks, as ggml lays them
+// out and Mimir Model files store them (see backend.DType): FromBytes
+// reads their blocks in place, as io/mim maps them. They are read-only and have no gradient.
 // Cast dequantizes one to a float type, bit for bit as ggml does, Gather
 // dequantizes the elements it reads, so a quantized table serves an
 // embedding, and MatMulT multiplies by the transpose of a quantized
@@ -170,7 +170,7 @@ func wrap(n *graph.Node, err error) *Tensor {
 			return fail(fmt.Errorf("tensor: %s inside VMap has no batching rule: %w", n.Op, ErrNotBatchable))
 		}
 	}
-	if eager {
+	if eager && tracing.Load() == 0 {
 		if err := realizeOn(context.Background(), backendOf(n), []*graph.Node{n}, nil); err != nil {
 			return fail(err)
 		}

@@ -161,7 +161,7 @@ func TestCachedGenerationMatchesUncached(t *testing.T) {
 		t.Errorf("cached generation %q differs from uncached %q", decodeBytes(cached), decodeBytes(uncached))
 	}
 
-	path := filepath.Join(t.TempDir(), "gpt2.safetensors")
+	path := filepath.Join(t.TempDir(), "gpt2.mim")
 	if err := tr.Save(ctx, path); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestResumeContinuesTraining(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	path := filepath.Join(t.TempDir(), "gpt2.safetensors")
+	path := filepath.Join(t.TempDir(), "gpt2.mim")
 	if err := a.Save(ctx, path); err != nil {
 		t.Fatal(err)
 	}

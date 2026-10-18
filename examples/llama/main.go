@@ -1,7 +1,11 @@
-// Command llama generates text with a Llama-family model from a GGUF
-// file, such as Llama 2 or 3, TinyLlama or SmolLM, quantized or not.
+// Command llama generates text with a Llama-family model from a Mimir
+// Model (.mim) file, such as Llama 2 or 3, TinyLlama or SmolLM, quantized
+// or not. A GGUF model is converted to one once with mim-import, which
+// keeps its weights byte for byte and its hyperparameters and vocabulary
+// in the file's metadata:
 //
-//	go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.gguf -prompt "The capital of France is"
+//	go run github.com/gsoultan/mim/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K_M.gguf
+//	go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.mim -prompt "The capital of France is"
 //
 // It builds the model from the file's metadata, keeps the weights in the
 // file's types (Q8_0, Q4_K, Q6_K, F16, BF16 or F32) and reads them from a
@@ -25,13 +29,13 @@ import (
 	"time"
 
 	"github.com/gsoultan/mimir"
-	"github.com/gsoultan/mimir/io/gguf"
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tensor"
 )
 
 func main() {
 	var (
-		path    = flag.String("model", "", "GGUF file of a llama-architecture model")
+		path    = flag.String("model", "", "Mimir Model (.mim) file of a llama-architecture model")
 		prompt  = flag.String("prompt", "Once upon a time", "text to continue")
 		n       = flag.Int("n", 128, "tokens to generate at most")
 		temp    = flag.Float64("temperature", 0.8, "sampling temperature; 0 picks the likeliest token")
@@ -46,7 +50,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if *path == "" {
-		log.Fatal("no -model: give a GGUF file of a llama-architecture model")
+		log.Fatal("no -model: give a .mim file of a llama-architecture model, converted from GGUF with mim-import")
 	}
 	dev, err := pick(*device)
 	if err != nil {
@@ -73,21 +77,25 @@ func pick(name string) (mimir.Device, error) {
 
 func run(ctx context.Context, dev tensor.Device, path, prompt string, n int, s *Sampler, addSpecial bool, profile string) error {
 	start := time.Now()
-	f, err := gguf.Open(path)
+	f, err := mim.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	tok, err := NewTokenizer(f)
+	md, err := f.Metadata()
 	if err != nil {
 		return err
 	}
-	m, err := Load(f, dev)
+	tok, err := NewTokenizer(md)
+	if err != nil {
+		return err
+	}
+	m, err := Load(f, md, dev)
 	if err != nil {
 		return err
 	}
 	c := m.Config
-	name, _ := f.Metadata("general.name")
+	name, _ := md["general.name"].(string)
 	fmt.Fprintf(os.Stderr, "%v: %d layers, %d features, %d heads (%d key heads), vocabulary of %d, on %v, loaded in %v\n",
 		name, c.Layers, c.Embed, c.Heads, c.KVHeads, c.Vocab, dev, time.Since(start).Round(time.Millisecond))
 	if tok.Len() != c.Vocab {

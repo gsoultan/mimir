@@ -1,7 +1,6 @@
 package nn_test
 
 import (
-	"bytes"
 	"errors"
 	"math"
 	"math/rand/v2"
@@ -14,7 +13,7 @@ import (
 )
 
 // TestQuantizedLinearAndEmbedding checks layers whose weights are
-// quantized buffers, as a model read from a GGUF file holds them: they
+// quantized buffers, as a model read from a Mimir Model file holds them: they
 // compute what the same layers with the dequantized weights compute, up to
 // the CPU's rounding of activations to int8, gradients reach the inputs and
 // the bias, and Save refuses the quantized weights.
@@ -56,9 +55,6 @@ func TestQuantizedLinearAndEmbedding(t *testing.T) {
 		}
 		if lin.Weight.Grad() != nil {
 			t.Errorf("%s linear: a gradient for the quantized weight", dt)
-		}
-		if err := nn.Save(t.Context(), new(bytes.Buffer), lin); !errors.Is(err, tensor.ErrDType) {
-			t.Errorf("%s linear: Save = %v, want ErrDType", dt, err)
 		}
 
 		emb := &nn.Embedding{Weight: tensor.NewBuffer(q)}

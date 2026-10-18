@@ -8,8 +8,8 @@ import (
 	"github.com/gsoultan/mimir/tensor"
 )
 
-// transformCase is a golden case of transforms.safetensors: a function of
-// the case's inputs and the inputs it is differentiated with respect to.
+// transformCase is a golden case of transforms.mim: a function of the
+// case's inputs and the inputs it is differentiated with respect to.
 type transformCase struct {
 	kind string // hvp, jvp, jac, hess or perex, as in tools/golden/gen.py
 	diff []int

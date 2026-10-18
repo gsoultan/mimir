@@ -15,9 +15,11 @@ codebase with no cgo and no Python.
 > computation against a memory budget, stores tensors in bfloat16 and
 > float16, and replays repeated training steps from a cached schedule. It
 > has recurrent and transformer layers with fused attention, and runs
-> quantized Llama models from GGUF files. Function transforms, probability
-> distributions, graph network layers and an ONNX interpreter build on the
-> same graph. The API may change between 0.x releases.
+> quantized Llama models. Its one file format is the Mimir Model file
+> (.mim), for models, checkpoints and mapped datasets alike; GGUF,
+> safetensors, ONNX and PyTorch models are converted to it once. Function
+> transforms, probability distributions and graph network layers build on
+> the same graph. The API may change between 0.x releases.
 
 ## Example
 
@@ -294,7 +296,7 @@ grow the Go heap, so the CPU backend runs a collection itself once enough
 has been mapped since the last, paced as `GOGC=50` would, and waits for
 the cleanups that give dropped buffers' mappings back.
 
-`safetensors.Open` maps a file instead of reading it, so `nn.Load` and
+`mim.Open` maps a file instead of reading it, so `Model.Load` and
 `datasets.Mapped` read weights and examples in place, and the file's pages
 stream in from disk as they are used.
 
@@ -439,8 +441,8 @@ scaling), `RMSNorm`, `MLP`, `GatedMLP`, `KVCache` for decoding, the
 features apart with `Split`, which takes parts of given sizes along an
 axis like `torch.split` and joins their gradients with one copy.
 
-`gguf.Open` maps a GGUF file and `File.Load` returns its tensors, including
-the block-quantized `tensor.Q8_0`, `Q4_K` and `Q6_K`. A quantized weight
+A Mimir Model file holds tensors of the block-quantized `tensor.Q8_0`,
+`Q4_K` and `Q6_K`, which `mim.Open` maps in place. A quantized weight
 stays quantized: `MatMulT`, and so `nn.Linear` and `nn.Embedding`, multiply
 by it as llama.cpp does, rounding activations to int8 and summing in
 integers with AVX2 or NEON dot-product kernels, and GPUs dequantize it in
@@ -457,17 +459,20 @@ samples from it with the KV cache:
 
 ```sh
 curl -o input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-go run ./examples/gpt2 -data input.txt -model small -steps 2000 -checkpoint gpt2.safetensors
-go run ./examples/gpt2 -generate -checkpoint gpt2.safetensors -prompt "ROMEO:" -temperature 0.8 -topk 40
+go run ./examples/gpt2 -data input.txt -model small -steps 2000 -checkpoint gpt2.mim
+go run ./examples/gpt2 -generate -checkpoint gpt2.mim -prompt "ROMEO:" -temperature 0.8 -topk 40
 ```
 
-`examples/llama` runs Llama-architecture GGUF models (Llama 2 and 3,
-TinyLlama, SmolLM) in their own quantization, with the file's SentencePiece
-or BPE tokenizer, a batched prompt pass and greedy, temperature, top-k or
-top-p decoding:
+`examples/llama` runs Llama-architecture models (Llama 2 and 3, TinyLlama,
+SmolLM) from a `.mim` file in their own quantization, with the file's
+SentencePiece or BPE tokenizer, a batched prompt pass and greedy,
+temperature, top-k or top-p decoding. A GGUF model is converted to `.mim`
+once with `mim-import`, which copies its weights byte for byte and keeps
+its hyperparameters and vocabulary in the file's metadata:
 
 ```sh
-go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.gguf -prompt "The capital of France is" -n 64 -temperature 0
+go run github.com/gsoultan/mim/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K_M.gguf
+go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.mim -prompt "The capital of France is" -n 64 -temperature 0
 ```
 
 ## Distributions and generative models
@@ -545,41 +550,89 @@ estimation.
 go run ./examples/rl/ppo
 ```
 
-## ONNX
+## Mimir Model files
 
-`onnx.Open` maps an ONNX model, and `onnx.Parse` reads one from bytes.
-`Inputs` and `Outputs` describe what it takes and computes, and `Run`
-turns the whole graph into lazy mimir operations and realizes the outputs
-together, so a model is one schedule that the cache replays from the
-second run, on any device:
+Mimir Model (`.mim`, [github.com/gsoultan/mim](https://github.com/gsoultan/mim))
+is mimir's model format: one file holds a model's weights, which may be
+block-quantized, its graph in the format's 33 primitives and calls of its
+standard library (`linear.v1`, `attention.v2`, `rope.v1`, ...), and typed
+metadata such as a tokenizer. It is the only file format mimir reads and
+writes. The format's own tools convert GGUF, safetensors and ONNX files
+to it (`mim-import`) and export PyTorch models. `mim.Open`
+(in `io/mim`) maps a file and runs its graph with mimir tensors, on any
+device:
 
 ```go
-m, err := onnx.Open("model.onnx")
+m, err := mim.Open("model.mim")
 if err != nil {
 	return err
 }
 defer m.Close()
-out, err := m.Run(ctx, map[string]*tensor.Tensor{"input": x})
-logits := out["output"]
+out, err := m.Run(ctx, map[string]*tensor.Tensor{"x": x})
+probs := out["probs"]
 ```
 
-It reads opsets `onnx.MinOpset` to `onnx.MaxOpset` (11 to 22) and runs
-about ninety operators: the elementwise and comparison operators, `MatMul`
-and `Gemm`, reductions, the shape, joining and indexing operators, `Conv`
-and `ConvTranspose` of any number of spatial axes, the poolings and
-normalizations, `Softmax`, `Gelu`, `Resize`, `Trilu`, `Range` and `CumSum`.
-Shapes and indices that a graph computes, such as a `Reshape`'s target, are
-computed on the host, and nodes of initializers alone are folded when the
-model opens. Attention that an exporter writes as products, a scale, a
-mask and a softmax becomes one `ScaledDotProductAttention` kernel.
-Anything else, such as `Loop`, `If`, `Scan` or a cubic `Resize`, is an
-`*onnx.UnsupportedError` that names it. The reader bounds every length by
-the size of the file, so a corrupt model is an error, never a panic.
-`examples/onnx` runs a model on random inputs and times it:
+Calls of the standard library run on mimir's kernels: fused attention with
+grouped-query heads, the products with Q8_0, Q4_K and Q6_K weights, the
+convolutions, the norms, rotary embeddings and the rest. A graph's
+variables, such as a language model's key-value cache, live in a
+`Session`, which keeps them between runs; `Model.Run` runs in a session
+of its own. The tests run the format's PyTorch exports (a CNN, a 1-D
+convolutional network, GPT- and Llama-style decoders, one with a cache),
+its ONNX conversion and a Q4_K_M Llama converted from GGUF, against the
+outputs of PyTorch, onnxruntime and a float64 forward pass, and every
+primitive against the format's reference interpreter. Bitwise operations
+on integers, `bitcast`, `f64` and composites mimir does not know are an
+`*mim.UnsupportedError` that names them.
 
-```sh
-go run ./examples/onnx -model io/onnx/testdata/transformer.onnx -dim batch=4 -dim seq=16 -intmax 50
+`mim.Save` writes a model's parameters and buffers to a `.mim` file of
+weights alone, as a checkpoint holds them, and `Model.Load` sets them back.
+Saving copies each tensor from its device as it writes it, through one
+buffer, so it takes the memory of the largest tensor rather than of the
+model; loading maps the file and reads the weights in place on the CPU.
+`mim.WriteTensors` writes any named tensors, with metadata and a training
+section for the optimizer's state, as `train.Checkpoint` does:
+
+```go
+f, err := os.Create("model.mim")
+if err != nil {
+	return err
+}
+err = mim.Save(ctx, f, model, nil)
+...
+m, err := mim.Open("model.mim")
+if err != nil {
+	return err
+}
+defer m.Close()
+err = m.Load(model)
 ```
+
+Against safetensors, which mimir read and wrote before, saving the same
+model is two to three times faster and opening a file of 20,000 tensors
+twenty times faster, and reading the weights takes the same time.
+`go test -bench . ./io/mim` measures saving and loading.
+
+`mim.Export` writes a mimir model to a `.mim` file. It traces the model's
+`Forward` once on an input of the given shape (see `tensor.Trace`) and
+writes the operations it records as the format's primitives and calls,
+with the parameters as weights named by their paths, block-quantized
+weights kept as they are, and fixed shapes:
+
+```go
+nn.Eval(model) // dropout draws no random numbers
+f, err := os.Create("model.mim")
+if err != nil {
+	return err
+}
+defer f.Close()
+err = mim.Export(ctx, f, model, tensor.Zeros(tensor.Float32, 1, 3, 32, 32), nil)
+```
+
+`mim.ExportFunc` does the same for a function of several tensors with
+several results. The tests export MLPs, CNNs, embeddings, norms, GPT-2
+and Llama blocks, encoder layers and quantized linear layers, and run
+the files with mimir and with the format's reference interpreter.
 
 ## Requirements
 
@@ -651,7 +704,7 @@ read.
 | Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
 | Distributions (`distributions`) | `Normal`, `MultivariateNormal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet`, `Poisson`; `Sample`, `RSample`, `LogProb`, `Entropy`, `Mean`, `Variance`, `KL` |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
-| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22) |
+| Files (`io`) | Mimir Model (`.mim`), the one model format: save and load parameters, checkpoints and datasets, map in place, run graphs and export; Parquet datasets |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -664,12 +717,12 @@ registration.
 
 ```
 tensor/              public Tensor API, autograd, device groups, meshes and sharding
-nn/                  layers, parameter discovery, save and load, replicas and sharding rules
+nn/                  layers, parameter discovery, replicas and sharding rules
 nn/loss/             loss functions
 optim/               optimizers and learning-rate schedules
 distributions/       probability distributions, sampling, log densities and KL divergences
 data/                datasets, batching, streams of shards and their statistics
-data/datasets/       MNIST, CSV, CSV and Parquet shards, mapped safetensors, synthetic rows
+data/datasets/       MNIST, CSV, CSV and Parquet shards, mapped .mim files, synthetic rows
 train/               Fit, evaluation, checkpoints, data-parallel and sharded training
 metrics/             accuracy
 backend/             Backend interface, DType, Op, View, Kernel, collectives
@@ -685,13 +738,11 @@ internal/sched/      runs graphs: views, buffer reuse, freeing, the schedule cac
 internal/filemap/    read-only file mappings
 internal/goldentest/ golden-file loading and comparison
 internal/quanttest/  reference quantization for tests
-io/safetensors/      safetensors reader, writer and file mapping
 io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
-io/gguf/             GGUF reader and writer
-io/onnx/             ONNX model reader and interpreter
+io/mim/              Mimir Model (.mim) files: save, load, map, run and export
 examples/mnist/      trains an MLP or CNN on MNIST
 examples/gpt2/       trains a GPT-2 on a text file and samples from it
-examples/llama/      runs Llama-architecture GGUF models
+examples/llama/      runs Llama-architecture models from .mim files
 examples/vae/        trains a variational autoencoder on MNIST
 examples/gan/        trains a GAN on MNIST
 examples/diffusion/  trains a diffusion model on MNIST or two moons
@@ -699,7 +750,6 @@ examples/gnn/        trains a GCN on a generated citation graph
 examples/rl/cartpole/        the CartPole environment
 examples/rl/dqn/     learns CartPole with a deep Q-network
 examples/rl/ppo/     learns CartPole with proximal policy optimization
-examples/onnx/       runs an ONNX model and times it
 examples/internal/grid/      writes samples of the generative examples as PNGs
 testdata/golden/     expected results from PyTorch or NumPy
 tools/asmgen/        generates the CPU assembly kernels with avo
@@ -707,8 +757,7 @@ tools/devices/       lists the devices mimir can use
 tools/bench/         PyTorch and NumPy counterparts of the benchmarks
 tools/golden/        golden-file generator (Python, development only)
 tools/parquet/       Parquet test-file generator (Python, development only)
-tools/gguf/          GGUF test-file generators (Python, development only)
-tools/onnx/          ONNX golden-model generator (Python, development only)
+tools/gguf/          the llama example's test model (Python, development only)
 ci/cuda/             CUDA tests and benchmarks on a Modal T4 or any NVIDIA machine, and multi-GPU runs
 ci/rocm/             ROCm tests and benchmarks on any AMD machine
 ```
@@ -722,9 +771,7 @@ MIMIR_DEVICE=gpu go test ./...   # on a Mac, an NVIDIA or an AMD machine: every 
 MIMIR_EMULATE=1 go test -timeout=100m -run Kernels ./backend/...   # the GPU kernels of four dialects on the CPU, with clang++
 go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
-go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/gguf
-go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/onnx
-go test -run='^$' -fuzz=FuzzRun -fuzztime=60s ./io/onnx    # a node of every operator
+go test -run='^$' -fuzz=FuzzOp -fuzztime=60s ./io/mim      # a graph of one primitive or call
 MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train   # the billion-row run
 ```
 
@@ -751,18 +798,6 @@ MIMIR_GOLDEN_DIR=/tmp/golden go test -run TestGolden ./...
 
 `TestGradientsMatchFiniteDifferences` also checks every operation's gradient
 against finite differences in Go.
-
-`io/onnx/testdata` holds four small models, a perceptron, a CNN, a
-convolutional decoder and a causal transformer, with NumPy's outputs.
-`python3 tools/onnx/gen.py` writes them again with a protocol buffer
-writer that needs only NumPy, and with `--oracle torch` it exports the same
-networks with `torch.onnx.export` instead, which CI checks mimir against:
-
-```sh
-pip install numpy torch onnx
-python3 tools/onnx/gen.py --oracle torch --out /tmp/onnx
-MIMIR_ONNX_DIR=/tmp/onnx go test -run TestGolden ./io/onnx
-```
 
 GitHub has Apple silicon runners but no free NVIDIA ones, so the CUDA tests
 run on a [Modal](https://modal.com) T4 through `ci/cuda/modal_test.py`, which
@@ -827,8 +862,8 @@ from the `pytorch-triton-rocm` wheel.
 | M4b CUDA | CUDA driver, NVRTC and cuBLAS through purego, stream-ordered memory pool, on-disk kernel cache, conformance tests on a Modal T4 (done) |
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
-| M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, GGUF and quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
-| M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ONNX import, ROCm through HIP, hiprtc and hipBLAS (done; ROCm pending validation on AMD hardware) |
+| M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
+| M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ROCm through HIP, hiprtc and hipBLAS (done; ROCm pending validation on AMD hardware) |
 | M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism, passing the 8-GPU gate of 85% scaling efficiency on H100s (done) |
 
 ## License

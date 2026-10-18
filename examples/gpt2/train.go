@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
+	"slices"
 	"time"
 
-	"github.com/gsoultan/mimir/io/safetensors"
+	mimfile "github.com/gsoultan/mim"
+
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
 	"github.com/gsoultan/mimir/optim"
@@ -270,35 +272,29 @@ func (t *Trainer) Run(ctx context.Context, w io.Writer, path string) error {
 }
 
 // Save writes the model, the optimizer's state and the progress to a
-// safetensors file at path, replacing it atomically.
+// Mimir Model file at path, replacing it atomically.
 func (t *Trainer) Save(ctx context.Context, path string) error {
-	ts := map[string]safetensors.Tensor{}
+	ts := map[string]*tensor.Tensor{}
 	for name, p := range nn.NamedParams(t.Model) {
-		st, err := nn.Encode(ctx, p.Value())
-		if err != nil {
-			return fmt.Errorf("gpt2: checkpoint %s: %w", name, err)
-		}
-		ts["model."+name] = st
+		ts["model."+name] = p.Value()
 	}
 	state, steps := t.Opt.Snapshot()
-	for key, v := range state {
-		st, err := nn.Encode(ctx, v)
-		if err != nil {
-			return fmt.Errorf("gpt2: checkpoint optimizer %s: %w", key, err)
-		}
-		ts["optim."+key] = st
+	tr := &mimfile.Training{
+		Counters: []mimfile.TrainCounter{{Name: "steps", Value: uint64(steps)}},
+		Hyper:    []mimfile.TrainHyper{{Name: "loss_scale", Value: t.scale}},
 	}
-	meta := configMeta(t.Model.Config)
-	meta["steps"] = strconv.Itoa(steps)
-	meta["loss_scale"] = strconv.FormatFloat(t.scale, 'g', -1, 64)
-	return writeAtomic(path, ts, meta)
+	for _, key := range slices.Sorted(maps.Keys(state)) {
+		ts["optim."+key] = state[key]
+		tr.Extras = append(tr.Extras, mimfile.TrainExtra{Name: key, Tensor: "optim." + key})
+	}
+	return writeAtomic(ctx, path, ts, &mim.SaveOptions{Metadata: configMeta(t.Model.Config), Training: tr})
 }
 
 // Resume loads the model, the optimizer's state and the progress from a
 // checkpoint at path that Save wrote for a model of the same shape. It
 // returns false, and changes nothing, if there is no file at path.
 func (t *Trainer) Resume(path string) (bool, error) {
-	f, err := safetensors.Open(path)
+	f, err := mim.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
@@ -306,37 +302,36 @@ func (t *Trainer) Resume(path string) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	c, err := metaConfig(f.Metadata)
+	c, err := fileConfig(f)
 	if err != nil {
 		return false, err
 	}
 	if c != t.Model.Config {
 		return false, fmt.Errorf("gpt2: checkpoint %s holds a model of %+v, not %+v: %w", path, c, t.Model.Config, errCheckpoint)
 	}
-	steps, errS := strconv.Atoi(f.Metadata["steps"])
-	scale, errL := strconv.ParseFloat(f.Metadata["loss_scale"], 64)
-	if err := errors.Join(errS, errL); err != nil {
-		return false, fmt.Errorf("gpt2: checkpoint %s: %w", path, err)
+	tr, err := f.Training()
+	if err != nil {
+		return false, err
 	}
-	if err := nn.LoadPrefixed(f, "model.", t.Model); err != nil {
+	if tr == nil || len(tr.Counters) != 1 || tr.Counters[0].Name != "steps" || len(tr.Hyper) != 1 || tr.Hyper[0].Name != "loss_scale" {
+		return false, fmt.Errorf("gpt2: checkpoint %s: training section %+v: %w", path, tr, errCheckpoint)
+	}
+	if err := f.LoadPrefixed("model.", t.Model); err != nil {
 		return false, err
 	}
 	state := map[string]*tensor.Tensor{}
-	for _, name := range f.Names() {
-		key, ok := strings.CutPrefix(name, "optim.")
-		if !ok {
-			continue
-		}
-		st, _ := f.Tensor(name)
-		if state[key], err = nn.Decode(st); err != nil {
+	for _, e := range tr.Extras {
+		v, err := f.Tensor(e.Tensor)
+		if err != nil {
 			return false, err
 		}
+		state[e.Name] = v.To(tensor.DefaultDevice())
 	}
-	if err := t.Opt.Restore(state, steps); err != nil {
+	if err := t.Opt.Restore(state, int(tr.Counters[0].Value)); err != nil {
 		return false, err
 	}
 	if t.scale != 0 {
-		t.scale = max(scale, 1)
+		t.scale = max(tr.Hyper[0].Value, 1)
 	}
 	return true, nil
 }
@@ -344,12 +339,12 @@ func (t *Trainer) Resume(path string) (bool, error) {
 // LoadGPT returns the model a checkpoint at path holds, in float32, on
 // the default device.
 func LoadGPT(path string) (*GPT, error) {
-	f, err := safetensors.Open(path)
+	f, err := mim.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	c, err := metaConfig(f.Metadata)
+	c, err := fileConfig(f)
 	if err != nil {
 		return nil, err
 	}
@@ -359,40 +354,47 @@ func LoadGPT(path string) (*GPT, error) {
 	}
 	// Load casts the weights of a model trained in half precision to
 	// float32.
-	if err := nn.LoadPrefixed(f, "model.", g); err != nil {
+	if err := f.LoadPrefixed("model.", g); err != nil {
 		return nil, err
 	}
 	return g, nil
 }
 
-func configMeta(c Config) map[string]string {
-	return map[string]string{
-		"vocab": strconv.Itoa(c.Vocab), "context": strconv.Itoa(c.Context),
-		"embed": strconv.Itoa(c.Embed), "heads": strconv.Itoa(c.Heads), "layers": strconv.Itoa(c.Layers),
-		"tokenizer": "bytes",
+func configMeta(c Config) mimfile.Metadata {
+	return mimfile.Metadata{
+		"gpt2.vocab": int64(c.Vocab), "gpt2.context": int64(c.Context),
+		"gpt2.embed": int64(c.Embed), "gpt2.heads": int64(c.Heads), "gpt2.layers": int64(c.Layers),
+		"gpt2.tokenizer": "bytes",
 	}
 }
 
-func metaConfig(m map[string]string) (Config, error) {
+// fileConfig returns the configuration of the model in f's metadata.
+func fileConfig(f *mim.Model) (Config, error) {
+	md, err := f.Metadata()
+	if err != nil {
+		return Config{}, err
+	}
 	var c Config
 	var errs []error
 	for key, dst := range map[string]*int{"vocab": &c.Vocab, "context": &c.Context, "embed": &c.Embed, "heads": &c.Heads, "layers": &c.Layers} {
-		v, err := strconv.Atoi(m[key])
-		errs = append(errs, err)
-		*dst = v
+		v, ok := md["gpt2."+key].(int64)
+		if !ok {
+			errs = append(errs, fmt.Errorf("no integer %s", key))
+		}
+		*dst = int(v)
 	}
-	if m["tokenizer"] != "bytes" {
-		errs = append(errs, fmt.Errorf("tokenizer %q", m["tokenizer"]))
+	if md["gpt2.tokenizer"] != "bytes" {
+		errs = append(errs, fmt.Errorf("tokenizer %v", md["gpt2.tokenizer"]))
 	}
 	if err := errors.Join(errs...); err != nil {
-		return c, fmt.Errorf("gpt2: checkpoint metadata %v: %w: %w", m, errCheckpoint, err)
+		return c, fmt.Errorf("gpt2: checkpoint metadata %v: %w: %w", md, errCheckpoint, err)
 	}
 	return c, c.validate()
 }
 
-// writeAtomic writes a safetensors file at path through a temporary file
+// writeAtomic writes a Mimir Model file at path through a temporary file
 // in the same directory, renamed over path once complete.
-func writeAtomic(path string, ts map[string]safetensors.Tensor, meta map[string]string) error {
+func writeAtomic(ctx context.Context, path string, ts map[string]*tensor.Tensor, opts *mim.SaveOptions) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -402,7 +404,7 @@ func writeAtomic(path string, ts map[string]safetensors.Tensor, meta map[string]
 		return err
 	}
 	defer os.Remove(tmp.Name()) // no-op after the rename
-	err = safetensors.Write(tmp, ts, meta)
+	err = mim.WriteTensors(ctx, tmp, ts, opts)
 	if serr := tmp.Sync(); err == nil {
 		err = serr
 	}

@@ -294,7 +294,7 @@ func TestQuantGolden(t *testing.T) {
 			kind, op := name[:max(cut, 0)], name[cut+1:]
 			dt, ok := dtypes[kind]
 			raw := c.Inputs[len(c.Inputs)-1]
-			if !ok || raw.DType != "U8" || len(raw.Shape) != 2 {
+			if !ok || raw.DType != "u8" || len(raw.Shape) != 2 {
 				t.Fatalf("weights of %s %s%v", kind, raw.DType, raw.Shape)
 			}
 			rows, k := raw.Shape[0], raw.Shape[1]/dt.BlockBytes()*dt.BlockSize()

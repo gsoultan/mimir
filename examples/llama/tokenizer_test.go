@@ -7,18 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/gsoultan/mimir/io/gguf"
 )
 
 func openTokenizer(t *testing.T, path string) *Tokenizer {
 	t.Helper()
-	f, err := gguf.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { f.Close() })
-	tok, err := NewTokenizer(f)
+	_, md := openFile(t, path)
+	tok, err := NewTokenizer(md)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +21,7 @@ func openTokenizer(t *testing.T, path string) *Tokenizer {
 
 // encodings are texts and the tokens llama.cpp encodes them to, with the
 // beginning-of-text token and special tokens parsed, for the vocabularies
-// of testdata/spm.gguf and testdata/bpe.gguf (Llama 3's pre-tokenizer).
+// of testdata/spm.mim and testdata/bpe.mim (Llama 3's pre-tokenizer).
 var encodings = []struct {
 	text     string
 	spm, bpe []int32
@@ -60,8 +54,8 @@ var encodings = []struct {
 // tokenizers against llama.cpp's encodings of the same texts with the
 // same vocabularies, and that decoding gives the texts back.
 func TestTokenizersMatchLlamaCpp(t *testing.T) {
-	spm := openTokenizer(t, "testdata/spm.gguf")
-	bpe := openTokenizer(t, "testdata/bpe.gguf")
+	spm := openTokenizer(t, "testdata/spm.mim")
+	bpe := openTokenizer(t, "testdata/bpe.mim")
 	for _, e := range encodings {
 		if got := spm.Encode(e.text, true); !slices.Equal(got, e.spm) {
 			t.Errorf("spm %q:\n got %v\nwant %v", e.text, got, e.spm)
@@ -116,7 +110,8 @@ func TestPreTokenizers(t *testing.T) {
 // TestLlamaCppVocabularies checks the tokenizers against the test
 // vocabularies llama.cpp ships in its models directory and their
 // expected encodings, ggml-vocab-<name>.gguf with .inp and .out files,
-// when MIMIR_LLAMA_VOCABS names that directory.
+// when MIMIR_LLAMA_VOCABS names that directory and each vocabulary is
+// converted beside them to ggml-vocab-<name>.mim with mim-import.
 func TestLlamaCppVocabularies(t *testing.T) {
 	dir := os.Getenv("MIMIR_LLAMA_VOCABS")
 	if dir == "" {
@@ -124,13 +119,14 @@ func TestLlamaCppVocabularies(t *testing.T) {
 	}
 	for _, name := range []string{"llama-spm", "llama-bpe", "gpt-2", "phi-3", "starcoder", "refact", "mpt", "command-r"} {
 		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(dir, "ggml-vocab-"+name+".gguf")
-			inp, err1 := os.ReadFile(path + ".inp")
-			out, err2 := os.ReadFile(path + ".out")
-			if err1 != nil || err2 != nil {
-				t.Skip(err1, err2)
+			path := filepath.Join(dir, "ggml-vocab-"+name)
+			inp, err1 := os.ReadFile(path + ".gguf.inp")
+			out, err2 := os.ReadFile(path + ".gguf.out")
+			_, err3 := os.Stat(path + ".mim")
+			if err1 != nil || err2 != nil || err3 != nil {
+				t.Skip(err1, err2, err3)
 			}
-			tok := openTokenizer(t, path)
+			tok := openTokenizer(t, path+".mim")
 			texts := strings.Split(strings.TrimSuffix(string(inp), "\n__ggml_vocab_test__\n"), "\n__ggml_vocab_test__\n")
 			lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 			if len(texts) != len(lines) {

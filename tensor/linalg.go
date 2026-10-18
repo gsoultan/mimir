@@ -254,6 +254,9 @@ func (t *Tensor) onCPU() (*Tensor, Device) {
 // backend.FactorParts, or Cholesky's L.
 func (t *Tensor) factor(op backend.Op) *Tensor {
 	x, d := t.onCPU()
+	if err := firstErr(x); err != nil {
+		return fail(err)
+	}
 	return wrap(graph.Factor(op, x.node)).To(d)
 }
 
@@ -280,6 +283,9 @@ func factorParts(flat *Tensor, op backend.Op, shape []int) []*Tensor {
 func triSolve(a, b *Tensor, upper, unit bool) *Tensor {
 	x, d := a.onCPU()
 	y, _ := b.onCPU()
+	if err := firstErr(x, y); err != nil {
+		return fail(err)
+	}
 	return wrap(graph.TriangularSolve(x.node, y.node, upper, unit)).To(d)
 }
 

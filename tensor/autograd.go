@@ -790,7 +790,7 @@ func NewParam(init *Tensor) *Param { return newParam(init, true) }
 // NewBuffer returns a parameter that is saved and restored with a model
 // but not trained: Backward computes no gradient for it. Batch
 // normalization keeps its running statistics in buffers. A
-// block-quantized init, such as weights read from a GGUF file, is held
+// block-quantized init, such as weights read from a Mimir Model file, is held
 // as it is rather than copied, since nothing writes over it.
 func NewBuffer(init *Tensor) *Param { return newParam(init, false) }
 
