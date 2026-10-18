@@ -10,32 +10,32 @@ import (
 	"testing"
 
 	"github.com/gsoultan/mimir/data"
-	"github.com/gsoultan/mimir/io/safetensors"
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tensor"
 )
 
-// writeExamples writes n examples to a safetensors file: x holds [i, -i]
+// writeExamples writes n examples to a Mimir Model file: x holds [i, -i]
 // and y holds i.
-func writeExamples(t *testing.T, dir string, n int, extra map[string]safetensors.Tensor) string {
+func writeExamples(t *testing.T, dir string, n int, extra map[string]*tensor.Tensor) string {
 	t.Helper()
 	x := make([]float32, 2*n)
 	y := make([]int32, n)
 	for i := range n {
 		x[2*i], x[2*i+1], y[i] = float32(i), -float32(i), int32(i)
 	}
-	tensors := map[string]safetensors.Tensor{
-		"x": safetensors.Float32Tensor([]int{n, 2}, x),
-		"y": safetensors.Int32Tensor([]int{n}, y),
+	tensors := map[string]*tensor.Tensor{
+		"x": tensor.FromSlice(x, n, 2),
+		"y": tensor.FromSlice(y, n),
 	}
 	for name, st := range extra {
 		tensors[name] = st
 	}
-	path := filepath.Join(dir, "examples.safetensors")
+	path := filepath.Join(dir, "examples.mim")
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := safetensors.Write(f, tensors, nil); err != nil {
+	if err := mim.WriteTensors(t.Context(), f, tensors, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
@@ -98,15 +98,15 @@ func TestMappedReadsBatchesFromTheFile(t *testing.T) {
 
 func TestMappedRejectsBadFiles(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Mapped(filepath.Join(dir, "none.safetensors"), "x", "y"); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := Mapped(filepath.Join(dir, "none.mim"), "x", "y"); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("missing file: %v, want ErrNotExist", err)
 	}
-	path := writeExamples(t, dir, 3, map[string]safetensors.Tensor{
-		"bytes": {DType: "U8", Shape: []int{3}, Data: []byte{1, 2, 3}},
-		"short": safetensors.Int32Tensor([]int{2}, []int32{0, 1}),
+	path := writeExamples(t, dir, 3, map[string]*tensor.Tensor{
+		"halves": tensor.FromSlice([]float32{1, 2, 3}, 3).Cast(tensor.BFloat16),
+		"short":  tensor.FromSlice([]int32{0, 1}, 2),
 	})
-	if _, err := Mapped(path, "x", "bytes"); !errors.Is(err, tensor.ErrDType) {
-		t.Errorf("U8 targets: %v, want ErrDType", err)
+	if _, err := Mapped(path, "x", "halves"); !errors.Is(err, tensor.ErrDType) {
+		t.Errorf("bf16 targets: %v, want ErrDType", err)
 	}
 	if _, err := Mapped(path, "x", "labels"); !errors.Is(err, ErrFormat) {
 		t.Errorf("missing tensor: %v, want ErrFormat", err)
@@ -114,11 +114,11 @@ func TestMappedRejectsBadFiles(t *testing.T) {
 	if _, err := Mapped(path, "x", "short"); !errors.Is(err, tensor.ErrShape) {
 		t.Errorf("2 targets for 3 inputs: %v, want ErrShape", err)
 	}
-	if err := os.WriteFile(path, []byte("not a safetensors file"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("not a Mimir Model file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Mapped(path, "x", "y"); !errors.Is(err, safetensors.ErrFormat) {
-		t.Errorf("corrupt file: %v, want safetensors.ErrFormat", err)
+	if _, err := Mapped(path, "x", "y"); !errors.Is(err, mim.ErrFormat) {
+		t.Errorf("corrupt file: %v, want mim.ErrFormat", err)
 	}
 }
 

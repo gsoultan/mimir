@@ -107,7 +107,7 @@ func TestCheckpointResumesExactly(t *testing.T) {
 	if !slices.Equal(straight, resumed) {
 		t.Error("training resumed from a checkpoint diverged from an uninterrupted run")
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 1 || entries[0].Name() != "checkpoint.safetensors" {
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 || entries[0].Name() != "checkpoint.mim" {
 		t.Errorf("checkpoint dir holds %v", entries)
 	}
 }
@@ -163,7 +163,7 @@ func TestFitErrors(t *testing.T) {
 		t.Errorf("cancelled: %v", err)
 	}
 	bad := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bad, "checkpoint.safetensors"), []byte("not a checkpoint"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(bad, "checkpoint.mim"), []byte("not a checkpoint"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := train.Fit(t.Context(), m, opt, ds, train.Loss(loss.CrossEntropy), train.Checkpoint(bad)); err == nil {

@@ -39,6 +39,17 @@
 // Export writes a mimir model as a .mim file, and ExportFunc a function of
 // tensors: they trace it once (see tensor.Trace) and write the operations
 // it records, with the tensors it reads as weights and constants.
+//
+// Save writes the parameters of a model alone, as a checkpoint does, and
+// Model.Load sets a model's parameters from such a file, or from the
+// weights of any other:
+//
+//	err := mim.Save(ctx, w, model, nil)
+//	...
+//	f, err := mim.Open("model.mim")
+//	...
+//	defer f.Close()
+//	err = f.Load(model)
 package mim
 
 import (
@@ -64,6 +75,9 @@ var (
 	// an attribute value or a data type that mimir does not run. An
 	// *UnsupportedError carries the details.
 	ErrUnsupported = errors.New("mim: unsupported")
+	// ErrNoGraph reports a run of a file that holds weights alone, as Save
+	// writes.
+	ErrNoGraph = errors.New("mim: the file has no graph to run")
 )
 
 // UnsupportedError reports what of a model mimir does not run. It matches
@@ -183,11 +197,15 @@ func (m *Model) load(b []byte) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrFormat, err)
 	}
+	m.f = f
+	if _, ok := f.Section(mimfile.SectionGraph); !ok {
+		return nil
+	}
 	g, err := f.Graph()
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrFormat, err)
 	}
-	m.f, m.g = f, g
+	m.g = g
 	if g.PrimitiveVersion > mimfile.CurrentPrimitive || g.StdlibVersion > mimfile.CurrentStdlib {
 		return &UnsupportedError{Op: "graph", Detail: fmt.Sprintf("primitives v%d, stdlib v%d", g.PrimitiveVersion, g.StdlibVersion)}
 	}

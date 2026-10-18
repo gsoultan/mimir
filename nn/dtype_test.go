@@ -1,14 +1,11 @@
 package nn_test
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"math"
 	"slices"
 	"testing"
 
-	"github.com/gsoultan/mimir/io/safetensors"
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
 	"github.com/gsoultan/mimir/optim"
@@ -19,20 +16,6 @@ import (
 func floats(t *testing.T, x *tensor.Tensor) []float32 {
 	t.Helper()
 	return data(t, x.Cast(tensor.Float32))
-}
-
-func TestDTypeNames(t *testing.T) {
-	for dt, name := range map[tensor.DType]string{tensor.Float32: "F32", tensor.Int32: "I32", tensor.BFloat16: "BF16", tensor.Float16: "F16"} {
-		if got := nn.DTypeName(dt); got != name {
-			t.Errorf("DTypeName(%s) = %q, want %q", dt, got, name)
-		}
-		if got, ok := nn.DTypeOf(name); !ok || got != dt {
-			t.Errorf("DTypeOf(%q) = %s, %v; want %s", name, got, ok, dt)
-		}
-	}
-	if _, ok := nn.DTypeOf("F64"); ok {
-		t.Error("DTypeOf(F64) found a dtype")
-	}
 }
 
 func TestCastConvertsTrainableParameters(t *testing.T) {
@@ -78,118 +61,6 @@ func TestCastConvertsTrainableParameters(t *testing.T) {
 	for name, p := range nn.NamedParams(m) {
 		if got := p.Value().DType(); got != tensor.Float32 {
 			t.Errorf("%s is %s after a cast back, want float32", name, got)
-		}
-	}
-}
-
-func TestSaveWritesHalfTensors(t *testing.T) {
-	ctx := t.Context()
-	for _, dt := range []tensor.DType{tensor.BFloat16, tensor.Float16} {
-		nn.ManualSeed(3)
-		a := nn.NewLinear(4, 2)
-		if err := nn.Cast(a, dt); err != nil {
-			t.Fatal(err)
-		}
-		var buf bytes.Buffer
-		if err := nn.Save(ctx, &buf, a); err != nil {
-			t.Fatal(err)
-		}
-		f, err := safetensors.Parse(buf.Bytes())
-		if err != nil {
-			t.Fatal(err)
-		}
-		for name, p := range nn.NamedParams(a) {
-			st, ok := f.Tensor(name)
-			n, _ := p.Value().Shape(), 0
-			if !ok || st.DType != nn.DTypeName(dt) || len(st.Data) != 2*len(floats(t, p.Value())) {
-				t.Errorf("%s saved as %s%v of %d bytes, want %s%v", name, st.DType, st.Shape, len(st.Data), nn.DTypeName(dt), n)
-			}
-			// The file holds the elements as they are, so a decoded tensor
-			// encodes to the same bytes.
-			v, err := nn.Decode(st)
-			if err != nil {
-				t.Fatal(err)
-			}
-			enc, err := nn.Encode(ctx, v)
-			if err != nil || v.DType() != dt || !bytes.Equal(enc.Data, st.Data) {
-				t.Errorf("%s decoded as %s and encoded as %x, %v; want %x", name, v.DType(), enc.Data, err, st.Data)
-			}
-		}
-		// A model of the file's dtype takes the values as they are.
-		nn.ManualSeed(4)
-		b := nn.NewLinear(4, 2)
-		if err := nn.Cast(b, dt); err != nil {
-			t.Fatal(err)
-		}
-		if err := nn.Load(f, b); err != nil {
-			t.Fatal(err)
-		}
-		x := tensor.Randn(1, 3, 4)
-		if b.Weight.Value().DType() != dt || !slices.Equal(data(t, a.Forward(x)), data(t, b.Forward(x))) {
-			t.Errorf("%s model loaded as %s computes differently", dt, b.Weight.Value().DType())
-		}
-		// A float32 model keeps its dtype and takes the values widened.
-		c := nn.NewLinear(4, 2)
-		if err := nn.Load(f, c); err != nil {
-			t.Fatal(err)
-		}
-		if c.Weight.Value().DType() != tensor.Float32 || !slices.Equal(floats(t, c.Weight.Value()), floats(t, a.Weight.Value().Cast(tensor.Float32))) {
-			t.Errorf("%s model loaded into a float32 one: dtype %s, weights %v, want %v", dt, c.Weight.Value().DType(), floats(t, c.Weight.Value()), floats(t, a.Weight.Value().Cast(tensor.Float32)))
-		}
-	}
-}
-
-// TestHalfEncodingMatchesCast checks the safetensors conversions against
-// the tensor's Cast: every element decodes to the value the devices give
-// it, and any float32 rounds to the element they would store.
-func TestHalfEncodingMatchesCast(t *testing.T) {
-	ctx := t.Context()
-	for _, dt := range []tensor.DType{tensor.BFloat16, tensor.Float16} {
-		all := make([]byte, 2*65536)
-		for i := range 65536 {
-			binary.LittleEndian.PutUint16(all[2*i:], uint16(i))
-		}
-		st := safetensors.Tensor{DType: nn.DTypeName(dt), Shape: []int{65536}, Data: all}
-		x, err := nn.Decode(st)
-		if err != nil {
-			t.Fatal(err)
-		}
-		decoded, _ := st.Float32s()
-		enc, err := nn.Encode(ctx, x)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i, v := range floats(t, x) {
-			if v != decoded[i] && !(math.IsNaN(float64(v)) && math.IsNaN(float64(decoded[i]))) {
-				t.Fatalf("%s %#04x decodes to %v, the devices give %v", dt, i, decoded[i], v)
-			}
-			if got := binary.LittleEndian.Uint16(enc.Data[2*i:]); got != uint16(i) && !math.IsNaN(float64(v)) {
-				t.Fatalf("%s %#04x encoded as %#04x", dt, i, got)
-			}
-		}
-		// Around every pair of neighbouring elements: their midpoint, a
-		// tie, and the float32s on either side of it.
-		var tie []float32
-		for h := range 65535 {
-			lo, hi := decoded[h], decoded[h+1]
-			if math.IsInf(float64(lo), 0) || math.IsInf(float64(hi), 0) || math.IsNaN(float64(lo)) || math.IsNaN(float64(hi)) {
-				continue
-			}
-			mid := float32((float64(lo) + float64(hi)) / 2)
-			tie = append(tie, mid, math.Nextafter32(mid, float32(math.Inf(1))), math.Nextafter32(mid, float32(math.Inf(-1))))
-		}
-		rounded := floats(t, tensor.FromSlice(tie).Cast(dt))
-		var file safetensors.Tensor
-		if dt == tensor.BFloat16 {
-			file = safetensors.BFloat16Tensor([]int{len(tie)}, tie)
-		} else {
-			file = safetensors.Float16Tensor([]int{len(tie)}, tie)
-		}
-		got, _ := file.Float32s()
-		for i := range tie {
-			if got[i] != rounded[i] {
-				t.Fatalf("%s: %v (%#08x) written as %v, the devices store %v", dt, tie[i], math.Float32bits(tie[i]), got[i], rounded[i])
-			}
 		}
 	}
 }

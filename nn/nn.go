@@ -28,15 +28,12 @@
 // Checkpoint wraps a module so that training keeps only its inputs and
 // recomputes the rest during Backward, which trades compute for the
 // memory of its activations. Cast stores a model's weights in bfloat16 or
-// float16. Save and Load write and read safetensors files; Load reads a
-// mapped file in place.
+// float16. Package io/mim saves a model's parameters and loads them back.
 package nn
 
 import (
 	"cmp"
-	"context"
 	"fmt"
-	"io"
 	"iter"
 	"reflect"
 	"slices"
@@ -44,7 +41,6 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/gsoultan/mimir/io/safetensors"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -215,119 +211,6 @@ func join(path, name string) string {
 		return name
 	}
 	return path + "." + name
-}
-
-// Save writes every parameter and buffer of m to w in the safetensors
-// format, named by NamedParams.
-func Save(ctx context.Context, w io.Writer, m Module) error {
-	ts := map[string]safetensors.Tensor{}
-	for name, p := range NamedParams(m) {
-		t, err := Encode(ctx, p.Value())
-		if err != nil {
-			return fmt.Errorf("nn: save %s: %w", name, err)
-		}
-		ts[name] = t
-	}
-	return safetensors.Write(w, ts, nil)
-}
-
-// Load sets every parameter and buffer of m from f, which must hold each
-// of them with the same shape, as Save writes them. The values live on
-// the default device. A float tensor of another dtype than its parameter,
-// as a model saved after Cast holds, is cast to the parameter's dtype,
-// which copies it; any other dtype difference is an error.
-//
-// A file that safetensors.Open mapped (f.Mapped reports it) is not copied
-// when the default device is the CPU: each parameter reads its values in
-// the mapping, so loading costs no memory of its own and the file's pages
-// stream in from disk as the values are read. An optimizer step then
-// writes over the parameter's private copy of its pages, never the file.
-// The parameters hold the mapping (see safetensors.File.Hold), so f may
-// be closed once Load returns; the file is unmapped when no parameter
-// reads it any more. A tensor whose bytes do not start at a multiple of
-// its element size, which safetensors.Write never makes, is copied
-// instead. A file parsed from a []byte is copied, so the slice may be
-// changed or reused afterwards.
-func Load(f *safetensors.File, m Module) error {
-	return LoadPrefixed(f, "", m)
-}
-
-// LoadPrefixed is Load for files that name m's parameters prefix+name.
-func LoadPrefixed(f *safetensors.File, prefix string, m Module) error {
-	decode := Decode
-	if f.Mapped() {
-		decode = func(st safetensors.Tensor) (*tensor.Tensor, error) { return decodeInPlace(f, st) }
-	}
-	for name, p := range NamedParams(m) {
-		st, ok := f.Tensor(prefix + name)
-		if !ok {
-			return fmt.Errorf("nn: load: no tensor %q: %w", prefix+name, tensor.ErrShape)
-		}
-		v, err := decode(st)
-		if err != nil {
-			return fmt.Errorf("nn: load %s: %w", name, err)
-		}
-		if cur := p.Value().DType(); v.DType() != cur && v.DType().IsFloat() && cur.IsFloat() {
-			v = v.Cast(cur)
-		}
-		if err := p.Set(v); err != nil {
-			return fmt.Errorf("nn: load %s: %w", name, err)
-		}
-	}
-	return nil
-}
-
-// decodeInPlace returns a safetensors tensor of f as a tensor of the dtype
-// DTypeOf gives over its bytes on the default device: in place on the
-// CPU, as tensor.FromBytes reads them, holding f's mapping for as long as
-// it does, and as a copy on any other device.
-func decodeInPlace(f *safetensors.File, st safetensors.Tensor) (*tensor.Tensor, error) {
-	dt, ok := DTypeOf(st.DType)
-	if !ok {
-		return nil, fmt.Errorf("nn: dtype %s: %w", st.DType, tensor.ErrDType)
-	}
-	return tensor.FromBytesFunc(dt, st.Data, f.Hold(), st.Shape...).To(tensor.DefaultDevice()), nil
-}
-
-// Encode computes t and returns it as a safetensors tensor of the dtype
-// DTypeName gives.
-func Encode(ctx context.Context, t *tensor.Tensor) (safetensors.Tensor, error) {
-	switch t.DType() {
-	case tensor.Float32:
-		v, err := t.Data[float32](ctx)
-		return safetensors.Float32Tensor(t.Shape(), v), err
-	case tensor.Int32:
-		v, err := t.Data[int32](ctx)
-		return safetensors.Int32Tensor(t.Shape(), v), err
-	case tensor.BFloat16, tensor.Float16:
-		return encodeHalf(ctx, t)
-	}
-	if err := t.Err(); err != nil {
-		return safetensors.Tensor{}, err
-	}
-	return safetensors.Tensor{}, fmt.Errorf("nn: encode %s tensor: %w", t.DType(), tensor.ErrDType)
-}
-
-// Decode returns a safetensors tensor of dtype F32, I32, BF16 or F16 as a
-// tensor of the dtype DTypeOf gives.
-func Decode(st safetensors.Tensor) (*tensor.Tensor, error) {
-	switch st.DType {
-	case "BF16", "F16":
-		return decodeHalf(st)
-	case "F32":
-		v, err := st.Float32s()
-		if err != nil {
-			return nil, err
-		}
-		return tensor.FromSlice(v, st.Shape...), nil
-	case "I32":
-		v, err := st.Int32s()
-		if err != nil {
-			return nil, err
-		}
-		return tensor.FromSlice(v, st.Shape...), nil
-	}
-	return nil, fmt.Errorf("nn: dtype %s: %w", st.DType, tensor.ErrDType)
 }
 
 // seeds hands out initialization seeds: a base set by ManualSeed and a

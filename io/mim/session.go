@@ -45,6 +45,9 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.m
+	if m.g == nil {
+		return nil, ErrNoGraph
+	}
 	r := &run{ctx: ctx, m: m, dev: tensor.DefaultDevice(), syms: slices.Repeat([]int{-1}, len(m.g.SymDims))}
 	r.env = make([]*tensor.Tensor, len(m.g.Values))
 	main := m.g.Main()
