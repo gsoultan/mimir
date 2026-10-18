@@ -26,11 +26,12 @@ var checkPlans bool
 
 // planCache holds a mesh's recent analyses. It is guarded by meshMu.
 type planCache struct {
-	byHash map[uint64][]*analysis
-	n      int
-	clock  uint64
-	hits   int // for tests
-	misses int
+	byHash  map[uint64][]*analysis
+	n       int
+	clock   uint64
+	hits    int // for tests
+	misses  int
+	replays int
 }
 
 // analysis is what analyze gave the nodes of a graph, by their place in
@@ -43,6 +44,9 @@ type analysis struct {
 	depths    []int
 	lasts     []int
 	leafLasts []int
+
+	script     *script // the record of a run of the graph (see replay.go), or nil
+	unscripted bool    // whether a run of the graph could not be recorded
 }
 
 func (c *planCache) lookup(hash uint64, key []uint64) *analysis {

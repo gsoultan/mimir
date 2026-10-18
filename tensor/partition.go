@@ -34,6 +34,10 @@ type plan struct {
 	convs map[convKey]*value
 	temps []*graph.Node // shards realized on the way, which go back to their pools at the end
 	cuts  []*value      // the values convert left to cut, until lowerAll cuts them
+
+	an     *analysis     // the analysis of the graph, as the mesh's cache keeps it, or nil
+	leaves []*graph.Node // the graph's leaves, as its key numbers them
+	rec    *recorder     // the recording of the run, if it is recorded (see replay.go)
 }
 
 // pnode is what a plan knows of a node of the graph.
@@ -149,12 +153,12 @@ func (p *plan) analyze(targets []*graph.Node) error {
 		}
 	}
 	key, leaves, keyed := p.structure()
+	p.leaves = leaves
 	var hash uint64
-	var cached *analysis
 	if keyed {
 		hash = sched.HashKey(key)
-		if cached = p.m.plans.lookup(hash, key); cached != nil && !checkPlans {
-			p.apply(cached, leaves)
+		if p.an = p.m.plans.lookup(hash, key); p.an != nil && !checkPlans {
+			p.apply(p.an, leaves)
 			return nil
 		}
 	}
@@ -162,10 +166,11 @@ func (p *plan) analyze(targets []*graph.Node) error {
 		return err
 	}
 	switch {
-	case cached != nil:
-		return p.same(cached, leaves)
+	case p.an != nil:
+		return p.same(p.an, leaves)
 	case keyed:
-		p.m.plans.add(hash, p.record(key, leaves))
+		p.an = p.record(key, leaves)
+		p.m.plans.add(hash, p.an)
 	}
 	return nil
 }
@@ -358,6 +363,17 @@ func (m *Mesh) realize(ctx context.Context, targets, dsts []*graph.Node) error {
 		}
 		maxDepth = max(maxDepth, pt.depth)
 	}
+	if t := p.scripted(roots, want, todo, dsts); t != nil {
+		return p.replay(t, roots, want, todo, dsts)
+	}
+	err := p.lower(roots, want, todo, dsts, maxDepth)
+	p.stopRecording(err)
+	return err
+}
+
+// lower lowers p's graph to each device's and computes roots, the
+// targets todo, laid out as want, over dsts.
+func (p *plan) lower(roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node, maxDepth int) error {
 	last := maxDepth + 1
 	for _, t := range roots {
 		p.node(t).last = last
@@ -522,6 +538,9 @@ func (p *plan) valueOf(n *graph.Node) (*value, error) {
 		}
 		v.shards[r] = s
 	}
+	if p.rec != nil {
+		p.rec.upload(pn, v.shards)
+	}
 	pn.val = v
 	return v, nil
 }
@@ -560,6 +579,9 @@ func (p *plan) convert(n *graph.Node, l layout, later bool) (*value, error) {
 		for r := range out.shards {
 			if out.shards[r], err = graph.Const(n.DType, local, n.Attrs.Value); err != nil {
 				return nil, err
+			}
+			if p.rec != nil {
+				p.rec.source(r, out.shards[r], n, p.node(n).num)
 			}
 		}
 	} else if later {
@@ -627,6 +649,9 @@ func (p *plan) lowerAll(ns []*graph.Node) error {
 			b, err := p.local(s.n, locals, s.ins, s.val.lay)
 			if err != nil {
 				return fmt.Errorf("tensor: sharded %s: %w", s.n.Op, err)
+			}
+			if p.rec != nil {
+				p.rec.source(r, b, s.n, p.node(s.n).num)
 			}
 			s.val.shards[r] = b
 		}
@@ -815,10 +840,8 @@ func (p *plan) store(roots []*graph.Node, want []layout, todo []int, dsts []*gra
 		vals[j] = v
 	}
 	final := make([][]*graph.Node, len(m.devs))
-	var over [][]*graph.Node
 	for r := range m.bes {
 		ts := make([]*graph.Node, len(roots))
-		var ds []*graph.Node
 		seen := map[*graph.Node]bool{}
 		for j, v := range vals {
 			s := v.shards[r]
@@ -839,20 +862,37 @@ func (p *plan) store(roots []*graph.Node, want []layout, todo []int, dsts []*gra
 			}
 			seen[s] = true
 			ts[j] = s
-			if d != nil {
-				if ds == nil {
-					ds = make([]*graph.Node, len(roots))
-				}
-				ds[j] = d.Mem.Buf.(*meshBuffer).shards[r]
-			}
-		}
-		if ds != nil {
-			if over == nil {
-				over = make([][]*graph.Node, len(m.bes))
-			}
-			over[r] = ds
 		}
 		final[r] = ts
+	}
+	if p.rec != nil {
+		p.rec.store(final)
+	}
+	return p.finish(roots, want, todo, dsts, final)
+}
+
+// finish computes final[r], each device's shards of the targets roots,
+// into their destinations' where there are some, and makes them the
+// targets' results, laid out as want.
+func (p *plan) finish(roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node, final [][]*graph.Node) error {
+	m := p.m
+	var over [][]*graph.Node
+	if dsts != nil {
+		for j := range roots {
+			d := dsts[todo[j]]
+			if d == nil {
+				continue
+			}
+			if over == nil {
+				over = make([][]*graph.Node, len(m.bes))
+				for r := range over {
+					over[r] = make([]*graph.Node, len(roots))
+				}
+			}
+			for r, s := range d.Mem.Buf.(*meshBuffer).shards {
+				over[r][j] = s
+			}
+		}
 	}
 	if err := sched.RealizeEach(p.ctx, m.bes, final, over, lazy.values); err != nil {
 		p.release(nil)

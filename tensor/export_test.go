@@ -38,3 +38,20 @@ func PlanMisses(m *Mesh) int {
 	defer meshMu.Unlock()
 	return m.plans.misses
 }
+
+// PlanReplays returns how many runs on m replayed a recorded run.
+func PlanReplays(m *Mesh) int {
+	meshMu.Lock()
+	defer meshMu.Unlock()
+	return m.plans.replays
+}
+
+// SetReplays turns the replay of recorded runs of sharded graphs on and
+// off, returning the old setting.
+func SetReplays(on bool) bool {
+	meshMu.Lock()
+	defer meshMu.Unlock()
+	was := replays
+	replays = on
+	return was
+}
