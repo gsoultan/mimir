@@ -8,9 +8,5 @@ bench-*.txt
 __pycache__/
 .venv/
 
-# Serena: per-machine overrides and caches (project.yml and memories are shared)
-.serena/project.local.yml
-.serena/cache/
-
-# graphify: rebuild locally with `graphify update .`
+# Code graph, rebuilt by .claude/hooks/session-start.sh
 graphify-out/
