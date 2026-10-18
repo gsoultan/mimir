@@ -553,7 +553,7 @@ func constrain(t *Tensor, m *Mesh, l layout) *Tensor {
 		return fail(err)
 	}
 	n.Dev = m.dev
-	constraints.add(n, l)
+	n.Constraint = &l
 	out := wrap(n, nil)
 	return record(out, rule{
 		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(constrain(g, m, l)) },

@@ -27,7 +27,9 @@ import (
 type plan struct {
 	m     *Mesh
 	ctx   context.Context
-	nodes map[*graph.Node]*pnode
+	walk  uint64        // the plan's number, which marks the nodes it knows (graph.Node.Plan)
+	pns   []*pnode      // what it knows of each node it marked, by Plan.Num
+	free  []pnode       // pnodes allocated and not yet used
 	order []*graph.Node // the nodes to compute, each after its inputs
 	convs map[convKey]*value
 	temps []*graph.Node // shards realized on the way, which go back to their pools at the end
@@ -65,8 +67,45 @@ type convKey struct {
 	lay string
 }
 
+// plans counts the plans, which number their marks on nodes. It is
+// guarded by meshMu.
+var plans uint64
+
 func newPlan(ctx context.Context, m *Mesh) *plan {
-	return &plan{m: m, ctx: ctx, nodes: map[*graph.Node]*pnode{}, convs: map[convKey]*value{}}
+	plans++
+	return &plan{m: m, ctx: ctx, walk: plans, convs: map[convKey]*value{}}
+}
+
+// node returns what p knows of n, or nil.
+func (p *plan) node(n *graph.Node) *pnode {
+	if n.Plan.Walk != p.walk {
+		return nil
+	}
+	return p.pns[n.Plan.Num]
+}
+
+// seen reports whether p has marked n.
+func (p *plan) seen(n *graph.Node) bool { return n.Plan.Walk == p.walk }
+
+// set makes pn what p knows of n, marking n.
+func (p *plan) set(n *graph.Node, pn *pnode) {
+	if n.Plan.Walk != p.walk {
+		n.Plan = graph.Mark{Walk: p.walk, Num: int32(len(p.pns))}
+		p.pns = append(p.pns, pn)
+		return
+	}
+	p.pns[n.Plan.Num] = pn
+}
+
+// pnode returns a pointer to a copy of v, allocated with others.
+func (p *plan) pnode(v pnode) *pnode {
+	if len(p.free) == 0 {
+		p.free = make([]pnode, 256)
+	}
+	pn := &p.free[0]
+	p.free = p.free[1:]
+	*pn = v
+	return pn
 }
 
 // analyze walks the graphs of targets and gives each node its layout
@@ -77,11 +116,11 @@ func (p *plan) analyze(targets []*graph.Node) error {
 		next int
 	}
 	for _, t := range targets {
-		if _, ok := p.nodes[t]; ok {
+		if p.seen(t) {
 			continue
 		}
 		stack := []frame{{n: t}}
-		p.nodes[t] = nil // on the stack
+		p.set(t, nil) // on the stack
 		for len(stack) > 0 {
 			f := &stack[len(stack)-1]
 			if f.next == 0 {
@@ -89,18 +128,18 @@ func (p *plan) analyze(targets []*graph.Node) error {
 				if err != nil {
 					return err
 				}
-				p.nodes[f.n] = pn
+				p.set(f.n, pn)
 				if pn.leaf {
 					stack = stack[:len(stack)-1]
 					continue
 				}
 			}
-			pn := p.nodes[f.n]
+			pn := p.node(f.n)
 			if f.next < len(pn.ins) {
 				in := pn.ins[f.next]
 				f.next++
-				if _, seen := p.nodes[in]; !seen {
-					p.nodes[in] = nil
+				if !p.seen(in) {
+					p.set(in, nil)
 					stack = append(stack, frame{n: in})
 				}
 				continue
@@ -135,17 +174,17 @@ func (p *plan) analyze(targets []*graph.Node) error {
 // inputs take, and their depths, by the rules of layout.go.
 func (p *plan) rules() error {
 	for _, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		in := make([]layout, len(pn.ins))
 		for i, x := range pn.ins {
-			in[i] = p.nodes[x].lay
+			in[i] = p.node(x).lay
 		}
 		pn.lay, pn.req = p.m.rule(n, in)
 		if len(pn.req) != len(pn.ins) {
 			return fmt.Errorf("tensor: sharded %s: %d layouts for %d inputs: %w", n.Op, len(pn.req), len(pn.ins), ErrInternal)
 		}
 		for i, x := range pn.ins {
-			d := p.nodes[x].depth
+			d := p.node(x).depth
 			if p.needsCollective(x, pn.req[i]) {
 				d++
 			}
@@ -157,7 +196,7 @@ func (p *plan) rules() error {
 					x = src
 				}
 			}
-			px := p.nodes[x]
+			px := p.node(x)
 			px.last = max(px.last, pn.depth)
 		}
 	}
@@ -167,7 +206,7 @@ func (p *plan) rules() error {
 // visit returns what the plan knows of n before its inputs are walked.
 func (p *plan) visit(n *graph.Node) (*pnode, error) {
 	if !sched.Realized(n) {
-		return &pnode{ins: sched.Inputs(n)}, nil
+		return p.pnode(pnode{ins: sched.Inputs(n)}), nil
 	}
 	if n.Stale() {
 		return nil, fmt.Errorf("tensor: sharded tensor of shape %v: %w", n.Shape, ErrOverwritten)
@@ -176,7 +215,7 @@ func (p *plan) visit(n *graph.Node) (*pnode, error) {
 	if !ok {
 		// Computed on a device, as a constant can be: it is copied
 		// whole to every device of the mesh when it is read.
-		return &pnode{leaf: true, lay: replicated(len(n.Shape))}, nil
+		return p.pnode(pnode{leaf: true, lay: replicated(len(n.Shape))}), nil
 	}
 	if buf.lay.used() != 0 && (len(buf.shards) != len(p.m.devs) || meshOf(n) != p.m) {
 		return nil, fmt.Errorf("tensor: sharded tensor of another mesh: %w", ErrDevice)
@@ -186,7 +225,7 @@ func (p *plan) visit(n *graph.Node) (*pnode, error) {
 			return nil, fmt.Errorf("tensor: sharded tensor of shape %v: %w", n.Shape, ErrOverwritten)
 		}
 	}
-	return &pnode{leaf: true, lay: buf.lay, val: &value{shards: buf.shards, lay: buf.lay, shape: n.Shape, dt: n.DType}}, nil
+	return p.pnode(pnode{leaf: true, lay: buf.lay, val: &value{shards: buf.shards, lay: buf.lay, shape: n.Shape, dt: n.DType}}), nil
 }
 
 // underlying returns the tensor that n permutes or broadcasts, through
@@ -199,7 +238,7 @@ func (p *plan) visit(n *graph.Node) (*pnode, error) {
 func (p *plan) underlying(n *graph.Node, l layout) (*graph.Node, layout, []*graph.Node, bool) {
 	var chain []*graph.Node
 	for l.packed == nil {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		if pn == nil || pn.leaf || pn.lay.packed != nil || len(pn.ins) != 1 {
 			break
 		}
@@ -225,7 +264,7 @@ func (p *plan) underlying(n *graph.Node, l layout) (*graph.Node, layout, []*grap
 		chain = append(chain, n)
 		n, l = x, next
 	}
-	if px := p.nodes[n]; len(chain) == 0 || px == nil || px.lay.packed != nil {
+	if px := p.node(n); len(chain) == 0 || px == nil || px.lay.packed != nil {
 		return nil, layout{}, nil, false
 	}
 	return n, l, chain, true
@@ -234,7 +273,7 @@ func (p *plan) underlying(n *graph.Node, l layout) (*graph.Node, layout, []*grap
 // needsCollective reports whether converting x to the layout to needs a
 // collective: making a split axis whole, or adding up partial values.
 func (p *plan) needsCollective(x *graph.Node, to layout) bool {
-	return needsCollective(p.nodes[x].lay, to)
+	return needsCollective(p.node(x).lay, to)
 }
 
 func needsCollective(from, to layout) bool {
@@ -274,7 +313,7 @@ func (m *Mesh) predict(n *graph.Node) (layout, error) {
 	if err := p.analyze([]*graph.Node{n}); err != nil {
 		return layout{}, err
 	}
-	return final(n, p.nodes[n].lay), nil
+	return final(n, p.node(n).lay), nil
 }
 
 // realize computes the sharded tensors targets on m, writing targets[i]
@@ -307,7 +346,7 @@ func (m *Mesh) realize(ctx context.Context, targets, dsts []*graph.Node) error {
 	maxDepth := 0
 	for j, i := range todo {
 		t := targets[i]
-		pt := p.nodes[t]
+		pt := p.node(t)
 		want[j] = final(t, pt.lay)
 		if dsts != nil && dsts[i] != nil {
 			d := dsts[i]
@@ -321,11 +360,11 @@ func (m *Mesh) realize(ctx context.Context, targets, dsts []*graph.Node) error {
 	}
 	last := maxDepth + 1
 	for _, t := range roots {
-		p.nodes[t].last = last
+		p.node(t).last = last
 	}
 	byDepth := make([][]*graph.Node, maxDepth+1)
 	for _, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		byDepth[pn.depth] = append(byDepth[pn.depth], n)
 	}
 	err := p.build(byDepth, func(k int) []convReq {
@@ -358,8 +397,8 @@ func (p *plan) build(byDepth [][]*graph.Node, extra func(k int) []convReq, last 
 		var reqs []convReq
 		if k < len(byDepth) {
 			for _, n := range byDepth[k] {
-				pn := p.nodes[n]
-				if _, ok := constraints.get(n); ok && len(pn.ins) == 1 {
+				pn := p.node(n)
+				if _, ok := constraint(n); ok && len(pn.ins) == 1 {
 					reqs = append(reqs, convReq{pn.ins[0], pn.req[0]})
 					continue
 				}
@@ -463,7 +502,7 @@ func (p *plan) expand(r convReq) error {
 // valueOf returns the shards of n, which the plan has built or which n
 // holds.
 func (p *plan) valueOf(n *graph.Node) (*value, error) {
-	pn := p.nodes[n]
+	pn := p.node(n)
 	if pn.val != nil {
 		return pn.val, nil
 	}
@@ -497,7 +536,7 @@ func (p *plan) input(n *graph.Node, l layout) (*value, error) {
 // lowering if later is set, returning a value whose shards are cut from
 // another's as shard asks for them.
 func (p *plan) convert(n *graph.Node, l layout, later bool) (*value, error) {
-	if v := p.nodes[n].val; v != nil && v.lay.equal(l) {
+	if v := p.node(n).val; v != nil && v.lay.equal(l) {
 		return v, nil
 	}
 	key := convKey{n, l.key()}
@@ -549,7 +588,7 @@ func (p *plan) lowerAll(ns []*graph.Node) error {
 	}
 	steps := make([]step, 0, len(ns))
 	for _, n := range ns {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		ins := make([]*value, len(pn.ins))
 		for i, x := range pn.ins {
 			v, err := p.convert(x, pn.req[i], true)
@@ -558,7 +597,7 @@ func (p *plan) lowerAll(ns []*graph.Node) error {
 			}
 			ins[i] = v
 		}
-		if _, ok := constraints.get(n); ok && len(ins) == 1 {
+		if _, ok := constraint(n); ok && len(ins) == 1 {
 			pn.val = ins[0]
 			continue
 		}

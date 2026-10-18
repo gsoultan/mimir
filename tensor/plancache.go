@@ -30,6 +30,7 @@ type planCache struct {
 	n      int
 	clock  uint64
 	hits   int // for tests
+	misses int
 }
 
 // analysis is what analyze gave the nodes of a graph, by their place in
@@ -53,6 +54,7 @@ func (c *planCache) lookup(hash uint64, key []uint64) *analysis {
 			return a
 		}
 	}
+	c.misses++
 	return nil
 }
 
@@ -96,12 +98,12 @@ const (
 // them. It reports false if the graph has no key.
 func (p *plan) structure() ([]uint64, []*graph.Node, bool) {
 	for i, n := range p.order {
-		p.nodes[n].num = i
+		p.node(n).num = i
 	}
 	key := make([]uint64, 0, 8*len(p.order))
 	var leaves []*graph.Node
 	for _, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		// The rules read whether a constant or a padding is zero, not
 		// what it is, so that a step's changing scalars, such as a
 		// learning rate, keep its key.
@@ -114,7 +116,7 @@ func (p *plan) structure() ([]uint64, []*graph.Node, bool) {
 			key = append(key, uint64(d))
 		}
 		for _, x := range pn.ins {
-			px := p.nodes[x]
+			px := p.node(x)
 			switch {
 			case !px.leaf:
 				key = append(key, uint64(px.num))
@@ -138,7 +140,7 @@ func (p *plan) structure() ([]uint64, []*graph.Node, bool) {
 		if key, ok = sched.AppendAttrs(key, &n.Attrs); !ok {
 			return nil, nil, false
 		}
-		if l, ok := constraints.get(n); ok {
+		if l, ok := constraint(n); ok {
 			key = l.appendWords(append(key, 1))
 		} else {
 			key = append(key, 0)
@@ -158,11 +160,11 @@ func (p *plan) record(key []uint64, leaves []*graph.Node) *analysis {
 		leafLasts: make([]int, len(leaves)),
 	}
 	for i, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		a.lays[i], a.reqs[i], a.depths[i], a.lasts[i] = pn.lay, pn.req, pn.depth, pn.last
 	}
 	for j, x := range leaves {
-		a.leafLasts[j] = p.nodes[x].last
+		a.leafLasts[j] = p.node(x).last
 	}
 	return a
 }
@@ -170,11 +172,11 @@ func (p *plan) record(key []uint64, leaves []*graph.Node) *analysis {
 // apply gives p's nodes and leaves the analysis a.
 func (p *plan) apply(a *analysis, leaves []*graph.Node) {
 	for i, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		pn.lay, pn.req, pn.depth, pn.last = a.lays[i], a.reqs[i], a.depths[i], a.lasts[i]
 	}
 	for j, x := range leaves {
-		p.nodes[x].last = a.leafLasts[j]
+		p.node(x).last = a.leafLasts[j]
 	}
 }
 

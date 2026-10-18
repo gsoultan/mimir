@@ -28,3 +28,13 @@ func PlanHits(m *Mesh) int {
 	defer meshMu.Unlock()
 	return m.plans.hits
 }
+
+// SetCheckPlans turns the check of cached analyses on or off.
+func SetCheckPlans(on bool) { checkPlans = on }
+
+// PlanMisses returns the number of analyses m did not find in its cache.
+func PlanMisses(m *Mesh) int {
+	meshMu.Lock()
+	defer meshMu.Unlock()
+	return m.plans.misses
+}

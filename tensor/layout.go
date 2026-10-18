@@ -1,12 +1,8 @@
 package tensor
 
 import (
-	"runtime"
 	"slices"
 	"strconv"
-	"sync"
-	"sync/atomic"
-	"weak"
 
 	"github.com/gsoultan/mimir/backend"
 	"github.com/gsoultan/mimir/internal/graph"
@@ -179,45 +175,14 @@ func (m *Mesh) localShape(shape []int, l layout) []int {
 	return out
 }
 
-// constraints holds the layouts that WithSharding demands of its nodes,
-// which they keep as long as they live.
-var constraints constraintSet
-
-type constraintSet struct {
-	mu   sync.Mutex
-	m    map[weak.Pointer[graph.Node]]layout
-	live atomic.Int64 // len(m), read without mu
-}
-
-func (c *constraintSet) add(n *graph.Node, l layout) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = map[weak.Pointer[graph.Node]]layout{}
-	}
-	k := weak.Make(n)
-	c.m[k] = l
-	c.live.Store(int64(len(c.m)))
-	runtime.AddCleanup(n, c.remove, k)
-}
-
-func (c *constraintSet) remove(k weak.Pointer[graph.Node]) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.m, k)
-	c.live.Store(int64(len(c.m)))
-}
-
-func (c *constraintSet) get(n *graph.Node) (layout, bool) {
-	// constrain makes every node it constrains a reshape, and weak.Make
-	// is costly enough not to call for the others.
-	if n.Op != backend.OpReshape || c.live.Load() == 0 {
+// constraint returns the layout that WithSharding demands of n, if it
+// demands one.
+func constraint(n *graph.Node) (layout, bool) {
+	l, ok := n.Constraint.(*layout)
+	if !ok {
 		return layout{}, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	l, ok := c.m[weak.Make(n)]
-	return l, ok
+	return *l, true
 }
 
 // isZero reports whether n is computed from a constant zero by movement
@@ -248,7 +213,7 @@ func isZero(n *graph.Node) bool {
 // inputs laid out as in, and the layout each input must take first. The
 // inputs are converted where they differ.
 func (m *Mesh) rule(n *graph.Node, in []layout) (layout, []layout) {
-	if l, ok := constraints.get(n); ok {
+	if l, ok := constraint(n); ok {
 		return l, []layout{l}
 	}
 	ins := n.Inputs
