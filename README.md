@@ -581,6 +581,40 @@ the size of the file, so a corrupt model is an error, never a panic.
 go run ./examples/onnx -model io/onnx/testdata/transformer.onnx -dim batch=4 -dim seq=16 -intmax 50
 ```
 
+## Mimir Model files
+
+Mimir Model (`.mim`, [github.com/gsoultan/mim](https://github.com/gsoultan/mim))
+is mimir's model format: one file holds a model's weights, which may be
+block-quantized, its graph in the format's 33 primitives and calls of its
+standard library (`linear.v1`, `attention.v2`, `rope.v1`, ...), and typed
+metadata such as a tokenizer. The format's own tools convert GGUF,
+safetensors and ONNX files to it and export PyTorch models. `mim.Open`
+(in `io/mim`) maps a file and runs its graph with mimir tensors, on any
+device:
+
+```go
+m, err := mim.Open("model.mim")
+if err != nil {
+	return err
+}
+defer m.Close()
+out, err := m.Run(ctx, map[string]*tensor.Tensor{"x": x})
+probs := out["probs"]
+```
+
+Calls of the standard library run on mimir's kernels: fused attention with
+grouped-query heads, the products with Q8_0, Q4_K and Q6_K weights, the
+convolutions, the norms, rotary embeddings and the rest. A graph's
+variables, such as a language model's key-value cache, live in a
+`Session`, which keeps them between runs; `Model.Run` runs in a session
+of its own. The tests run the format's PyTorch exports (a CNN, a 1-D
+convolutional network, GPT- and Llama-style decoders, one with a cache),
+its ONNX conversion and a Q4_K_M Llama converted from GGUF, against the
+outputs of PyTorch, onnxruntime and a float64 forward pass, and every
+primitive against the format's reference interpreter. Bitwise operations
+on integers, `bitcast`, `f64` and composites mimir does not know are an
+`*mim.UnsupportedError` that names them.
+
 ## Requirements
 
 Go 1.27 or later. The tensor API uses generic methods (`t.Data[float32](ctx)`).
@@ -651,7 +685,7 @@ read.
 | Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
 | Distributions (`distributions`) | `Normal`, `MultivariateNormal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet`, `Poisson`; `Sample`, `RSample`, `LogProb`, `Entropy`, `Mean`, `Variance`, `KL` |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
-| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22) |
+| Files (`io`) | safetensors read, write and map; Parquet; GGUF read (F32, F16, BF16, Q8_0, Q4_K, Q6_K) and write; ONNX read and run (opsets 11 to 22); Mimir Model (`.mim`) read and run |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -689,6 +723,7 @@ io/safetensors/      safetensors reader, writer and file mapping
 io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
 io/gguf/             GGUF reader and writer
 io/onnx/             ONNX model reader and interpreter
+io/mim/              Mimir Model (.mim) runner
 examples/mnist/      trains an MLP or CNN on MNIST
 examples/gpt2/       trains a GPT-2 on a text file and samples from it
 examples/llama/      runs Llama-architecture GGUF models
@@ -725,6 +760,7 @@ go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/gguf
 go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/onnx
 go test -run='^$' -fuzz=FuzzRun -fuzztime=60s ./io/onnx    # a node of every operator
+go test -run='^$' -fuzz=FuzzOp -fuzztime=60s ./io/mim      # a graph of one primitive or call
 MIMIR_SCALE_ROWS=1000000000 go test -run=FlatMemory -timeout=85m -v ./train   # the billion-row run
 ```
 

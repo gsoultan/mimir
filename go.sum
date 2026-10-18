@@ -1,4 +1,6 @@
 github.com/ebitengine/purego v0.11.1 h1:2zpWRSQNVKN4eKsKO9eM1ILDgWfYMY9GwqRmK6XeQ/0=
 github.com/ebitengine/purego v0.11.1/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
+github.com/gsoultan/mmf v0.0.0-20261018040759-70ce158f529a h1:6ZgR3bKkmRTbKc1nSgUspfFFvW2AgKznIqzDvXMeyhc=
+github.com/gsoultan/mmf v0.0.0-20261018040759-70ce158f529a/go.mod h1:fYpHB4ObPhDZ+hjNNnzFxkJY2uW83TtF/6KPrgWLJAg=
 github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTfY5j4=
 github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
