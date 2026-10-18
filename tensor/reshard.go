@@ -497,37 +497,55 @@ func (p *plan) cut(v *value, l layout) (*value, error) {
 	if v.lay.equal(l) {
 		return v, nil
 	}
-	if v.lay.packed != nil || l.packed != nil || needsCollective(v.lay, l) || l.partial&^v.lay.partial != 0 {
-		return nil, fmt.Errorf("tensor: convert a sharded tensor from %s to %s on each device: %w", v.lay.key(), l.key(), ErrInternal)
+	if err := p.cuttable(v, l); err != nil {
+		return nil, err
 	}
-	m := p.m
-	shards := slices.Clone(v.shards)
-	for d, t := range l.dims {
-		if v.lay.dims[d].equal(t) {
-			continue
-		}
-		k := m.shape[t.axis]
-		for r, x := range shards {
-			c := m.coord(r, int(t.axis))
-			var parts []*graph.Node
-			at := 0
-			for _, n := range t.sections(v.shape[d]) {
-				b := n / k
-				y, err := graph.Shrink(x, rangeAxis(x.Shape, d, at+c*b, at+(c+1)*b))
-				if err != nil {
-					return nil, err
-				}
-				parts = append(parts, y)
-				at += n
-			}
-			y, err := catAll(parts, d)
-			if err != nil {
-				return nil, err
-			}
-			shards[r] = y
+	shards := make([]*graph.Node, len(v.shards))
+	for r, x := range v.shards {
+		var err error
+		if shards[r], err = p.cutShard(x, v.lay, l, v.shape, r); err != nil {
+			return nil, err
 		}
 	}
 	return v.with(shards, l), nil
+}
+
+// cuttable returns an error unless cut can convert v to l.
+func (p *plan) cuttable(v *value, l layout) error {
+	if v.lay.packed != nil || l.packed != nil || needsCollective(v.lay, l) || l.partial&^v.lay.partial != 0 {
+		return fmt.Errorf("tensor: convert a sharded tensor from %s to %s on each device: %w", v.lay.key(), l.key(), ErrInternal)
+	}
+	return nil
+}
+
+// cutShard cuts device r's block of a tensor of shape laid out as to out
+// of x, its block laid out as from, which cuttable allows.
+func (p *plan) cutShard(x *graph.Node, from, to layout, shape []int, r int) (*graph.Node, error) {
+	m := p.m
+	for d, t := range to.dims {
+		if from.dims[d].equal(t) {
+			continue
+		}
+		k := m.shape[t.axis]
+		c := m.coord(r, int(t.axis))
+		var parts []*graph.Node
+		at := 0
+		for _, n := range t.sections(shape[d]) {
+			b := n / k
+			y, err := graph.Shrink(x, rangeAxis(x.Shape, d, at+c*b, at+(c+1)*b))
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, y)
+			at += n
+		}
+		y, err := catAll(parts, d)
+		if err != nil {
+			return nil, err
+		}
+		x = y
+	}
+	return x, nil
 }
 
 // catAll joins xs along axis, in Cats of at most backend.MaxCatInputs
