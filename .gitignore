@@ -7,3 +7,6 @@ bench-*.txt
 # Python caches from tools/golden
 __pycache__/
 .venv/
+
+# Code graph, rebuilt by .claude/hooks/session-start.sh
+graphify-out/
