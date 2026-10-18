@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"math/rand/v2"
+	"sync"
 	"testing"
 
 	mimfile "github.com/gsoultan/mim"
@@ -521,6 +522,53 @@ func TestVariablesKeepTheirValuesBetweenRuns(t *testing.T) {
 	}
 	if got := run(s, 1); got[0] != 3 {
 		t.Fatalf("after a failed run: %v, want 3", got[0])
+	}
+}
+
+func TestSessionsRunConcurrently(t *testing.T) {
+	// Each session keeps its own sum of what it was given; sessions of one
+	// model run on separate goroutines at once.
+	b := newBuilder()
+	x := b.input("x", mimfile.F32, 2)
+	acc := b.value("acc", mimfile.F32, mimfile.KindVariable, 2)
+	b.g.Values[acc].Zero = true
+	sum := b.op(0, mimfile.OpAdd, mimfile.F32, []int{2}, []uint32{acc, x})
+	b.output("sum", sum)
+	b.g.Updates = []mimfile.Update{{Variable: acc, Value: sum}}
+	m, err := mim.Parse(b.file(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	const sessions, runs = 4, 20
+	got := make([][]float32, sessions)
+	errs := make([]error, sessions)
+	var wg sync.WaitGroup
+	for i := range sessions {
+		wg.Go(func() {
+			s, v := m.NewSession(), float32(i+1)
+			for range runs {
+				out, err := s.Run(ctx, map[string]*tensor.Tensor{"x": tensor.FromSlice([]float32{v, -v}, 2)})
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				if got[i], err = out["sum"].Data[float32](ctx); err != nil {
+					errs[i] = err
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	for i := range sessions {
+		if errs[i] != nil {
+			t.Fatalf("session %d: %v", i, errs[i])
+		}
+		if want := float32(runs * (i + 1)); got[i][0] != want || got[i][1] != -want {
+			t.Errorf("session %d: %v, want [%v %v]", i, got[i], want, -want)
+		}
 	}
 }
 
