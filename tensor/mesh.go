@@ -45,6 +45,8 @@ type Mesh struct {
 	groups  map[axisSet][]meshGroup
 	closed  bool
 	traffic Traffic
+
+	plans planCache // the analyses of recent graphs, guarded by meshMu
 }
 
 // Traffic counts the collectives that computing sharded tensors on a mesh

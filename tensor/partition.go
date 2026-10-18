@@ -43,6 +43,8 @@ type pnode struct {
 	last  int // the greatest depth that reads it
 	leaf  bool
 	val   *value // its shards, once built
+	num   int    // its place in the plan's order, or for a leaf in the key (see structure)
+	keyed bool   // whether a leaf has its number
 }
 
 // value is a sharded tensor that a plan built: a node per device, laid
@@ -107,6 +109,31 @@ func (p *plan) analyze(targets []*graph.Node) error {
 			stack = stack[:len(stack)-1]
 		}
 	}
+	key, leaves, keyed := p.structure()
+	var hash uint64
+	var cached *analysis
+	if keyed {
+		hash = sched.HashKey(key)
+		if cached = p.m.plans.lookup(hash, key); cached != nil && !checkPlans {
+			p.apply(cached, leaves)
+			return nil
+		}
+	}
+	if err := p.rules(); err != nil {
+		return err
+	}
+	switch {
+	case cached != nil:
+		return p.same(cached, leaves)
+	case keyed:
+		p.m.plans.add(hash, p.record(key, leaves))
+	}
+	return nil
+}
+
+// rules gives the nodes of p's order their layouts, the layouts their
+// inputs take, and their depths, by the rules of layout.go.
+func (p *plan) rules() error {
 	for _, n := range p.order {
 		pn := p.nodes[n]
 		in := make([]layout, len(pn.ins))

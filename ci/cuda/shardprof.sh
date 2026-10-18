@@ -27,7 +27,7 @@ for model in gpt2 transformer; do
 		MIMIR_DEVICE=gpu "$tmp/train.test" -test.run '^$' -test.bench "$pattern" \
 			-test.benchtime "$benchtime" -test.cpuprofile "$tmp/cpu.out" | grep '^Benchmark'
 		go tool pprof -top -cum -nodecount 45 -focus 'mimir/(tensor|internal|optim|nn)' \
-			-ignore '^runtime\.|^testing\.' "$tmp/train.test" "$tmp/cpu.out" 2>/dev/null |
+			"$tmp/train.test" "$tmp/cpu.out" 2>/dev/null |
 			sed -n '/flat%/,$p'
 	done
 done
