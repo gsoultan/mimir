@@ -1,5 +1,5 @@
 // Package filemap maps the files that model readers read in place, such
-// as safetensors and GGUF files, and counts the readers of each mapping.
+// as Mimir Model files, and counts the readers of each mapping.
 package filemap
 
 import (

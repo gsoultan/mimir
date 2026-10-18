@@ -150,10 +150,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go test -run='^$' -fuzz=FuzzParse -fuzztime=60s ./io/safetensors
       - run: go test -run='^$' -fuzz=FuzzOps -fuzztime=60s ./tensor
       - run: go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s -fuzzminimizetime=0 ./io/parquet
-      - run: go test -run='^$' -fuzz=FuzzOpen -fuzztime=60s ./io/gguf
+      - run: go test -run='^$' -fuzz=FuzzOp -fuzztime=60s ./io/mim
 
   scale:
     name: a billion rows in flat memory
@@ -180,16 +179,12 @@ jobs:
         with:
           python-version: '3.12'
       - run: |
-          pip install numpy onnx onnxscript
+          pip install numpy
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python tools/golden/gen.py --oracle torch --out "$RUNNER_TEMP/golden"
       - run: go test -count=1 -run TestGolden -v ./...
         env:
           MIMIR_GOLDEN_DIR: ${{ runner.temp }}/golden
-      - run: python tools/onnx/gen.py --oracle torch --out "$RUNNER_TEMP/onnx"
-      - run: go test -count=1 -run TestGolden -v ./io/onnx
-        env:
-          MIMIR_ONNX_DIR: ${{ runner.temp }}/onnx
 
   bench:
     if: github.event_name == 'pull_request'

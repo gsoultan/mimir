@@ -1,6 +1,7 @@
 package tensor_test
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -143,5 +144,32 @@ func TestFromBytesFuncReleases(t *testing.T) {
 		}
 		runtime.GC()
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestBytesReturnWhatFromBytesReads(t *testing.T) {
+	ctx := context.Background()
+	half := []byte{0x00, 0x3c, 0x00, 0xc0, 0x00, 0x00} // 1, -2, 0 in binary16
+	q8 := make([]byte, tensor.Q8_0.BlockBytes())
+	q8[0], q8[1], q8[2], q8[33] = 0x00, 0x3c, 7, 0xf9 // scale 1, quants 7 and -7
+	for _, tc := range []struct {
+		dt    tensor.DType
+		data  []byte
+		shape []int
+	}{
+		{tensor.Float32, f32bytes([]float32{1.5, -2, 3, 0}), []int{2, 2}},
+		{tensor.Float16, half, []int{3}},
+		{tensor.Q8_0, q8, []int{1, 32}},
+	} {
+		got, err := tensor.FromBytes(tc.dt, tc.data, tc.shape...).Bytes(ctx)
+		if err != nil || !slices.Equal(got, tc.data) {
+			t.Errorf("%s: bytes %v, %v; want %v", tc.dt, got, err, tc.data)
+		}
+	}
+	// A computed tensor's bytes are its elements, as Data returns them.
+	sum := tensor.FromSlice([]float32{1, 2}).Add(tensor.FromSlice([]float32{3, 4}))
+	got, err := sum.Bytes(ctx)
+	if err != nil || binary.LittleEndian.Uint32(got[4:]) != math.Float32bits(6) {
+		t.Errorf("bytes of a sum: %v, %v", got, err)
 	}
 }

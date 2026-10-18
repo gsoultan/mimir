@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/gsoultan/mimir/io/gguf"
+	mimfile "github.com/gsoultan/mim"
 )
 
 // Token types, as tokenizer.ggml.token_type stores them.
@@ -23,7 +23,8 @@ const (
 )
 
 // Tokenizer turns text into tokens and back as llama.cpp does for the
-// vocabulary a GGUF file holds: SentencePiece's byte-fallback BPE for
+// vocabulary that a GGUF file holds and its conversion to a Mimir Model
+// file keeps in its metadata: SentencePiece's byte-fallback BPE for
 // tokenizer model "llama", as Llama 2 and TinyLlama use, and GPT-2's
 // byte-level BPE for "gpt2", as Llama 3 and SmolLM use, with the
 // pre-tokenizer tokenizer.ggml.pre names.
@@ -54,16 +55,16 @@ const maxTokenLen = 1 << 10
 // errTokenizer reports a tokenizer this program does not read.
 var errTokenizer = errors.New("llama: unsupported tokenizer")
 
-// NewTokenizer returns the tokenizer of the vocabulary that f holds.
-func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
-	meta := func(key string) gguf.Value { v, _ := f.Metadata(key); return v }
-	model, _ := meta("tokenizer.ggml.model").Text()
-	tokens, ok := meta("tokenizer.ggml.tokens").Strings()
+// NewTokenizer returns the tokenizer of the vocabulary that the metadata
+// md holds under the keys of GGUF's "tokenizer.ggml." namespace.
+func NewTokenizer(md mimfile.Metadata) (*Tokenizer, error) {
+	model, _ := md["tokenizer.ggml.model"].(string)
+	tokens, ok := md["tokenizer.ggml.tokens"].([]string)
 	if !ok || len(tokens) == 0 {
 		return nil, fmt.Errorf("%w: no tokenizer.ggml.tokens", errTokenizer)
 	}
 	t := &Tokenizer{tokens: tokens, ids: make(map[string]int32, len(tokens)), bos: -1, eos: -1, unk: -1, eog: map[int32]bool{}}
-	if t.types, ok = meta("tokenizer.ggml.token_type").Int32s(); !ok {
+	if t.types, ok = int32s(md["tokenizer.ggml.token_type"]); !ok {
 		t.types = make([]int32, len(tokens))
 		for i := range t.types {
 			t.types[i] = typeNormal
@@ -83,22 +84,27 @@ func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
 	switch model {
 	case "llama":
 		t.spm, t.addSpacePrefix, t.addBOS = true, true, true
-		if t.scores, ok = meta("tokenizer.ggml.scores").Float32s(); !ok || len(t.scores) != len(tokens) {
+		scores, _ := md["tokenizer.ggml.scores"].([]float64)
+		if len(scores) != len(tokens) {
 			return nil, fmt.Errorf("%w: SentencePiece vocabulary without a score for each token", errTokenizer)
+		}
+		t.scores = make([]float32, len(scores))
+		for i, s := range scores {
+			t.scores[i] = float32(s)
 		}
 		for b := range 256 {
 			t.bytes[b] = t.lookup(fmt.Sprintf("<0x%02X>", b))
 		}
 		t.unk = 0
 	case "gpt2":
-		merges, _ := meta("tokenizer.ggml.merges").Strings()
+		merges, _ := md["tokenizer.ggml.merges"].([]string)
 		t.ranks = make(map[string]int, len(merges))
 		for i, m := range merges {
 			if _, dup := t.ranks[m]; !dup {
 				t.ranks[m] = i
 			}
 		}
-		pre, _ := meta("tokenizer.ggml.pre").Text()
+		pre, _ := md["tokenizer.ggml.pre"].(string)
 		var err error
 		if t.pre, t.ignoreMerges, err = preTokenizerFor(pre); err != nil {
 			return nil, err
@@ -111,11 +117,11 @@ func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
 		return nil, fmt.Errorf("%w: tokenizer model %q", errTokenizer, model)
 	}
 	special := func(key string, dst *int32) error {
-		v, ok := f.Metadata(key)
+		v, ok := md[key]
 		if !ok {
 			return nil
 		}
-		id, ok := v.Int()
+		id, ok := metaInt(md, key)
 		if !ok || id < 0 || id >= int64(len(tokens)) {
 			return fmt.Errorf("%w: %s = %v for %d tokens", errTokenizer, key, v, len(tokens))
 		}
@@ -128,13 +134,13 @@ func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
 		special("tokenizer.ggml.eom_token_id", &eom)); err != nil {
 		return nil, err
 	}
-	if b, ok := meta("tokenizer.ggml.add_bos_token").Bool(); ok {
+	if b, ok := md["tokenizer.ggml.add_bos_token"].(bool); ok {
 		t.addBOS = b
 	}
-	if b, ok := meta("tokenizer.ggml.add_eos_token").Bool(); ok {
+	if b, ok := md["tokenizer.ggml.add_eos_token"].(bool); ok {
 		t.addEOS = b
 	}
-	if b, ok := meta("tokenizer.ggml.add_space_prefix").Bool(); ok && t.spm {
+	if b, ok := md["tokenizer.ggml.add_space_prefix"].(bool); ok && t.spm {
 		t.addSpacePrefix = b
 	}
 	if t.addBOS && t.bos < 0 || t.addEOS && t.eos < 0 {
@@ -158,6 +164,23 @@ func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
 	}
 	slices.SortStableFunc(t.specials, func(a, b int32) int { return len(tokens[b]) - len(tokens[a]) })
 	return t, nil
+}
+
+// int32s returns v, an array of metadata integers, as int32s, and whether
+// it is one whose every element fits.
+func int32s(v any) ([]int32, bool) {
+	ints, ok := v.([]int64)
+	if !ok {
+		return nil, false
+	}
+	out := make([]int32, len(ints))
+	for i, x := range ints {
+		if x != int64(int32(x)) {
+			return nil, false
+		}
+		out[i] = int32(x)
+	}
+	return out, true
 }
 
 // endsTurn holds the texts of tokens that end a turn or a document in

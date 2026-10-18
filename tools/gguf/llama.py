@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Generate the tiny Llama GGUF files that examples/llama's tests read.
+"""Generate the tiny Llama models that examples/llama's tests read.
 
     pip install gguf numpy
-    python tools/gguf/llama.py --out examples/llama/testdata
+    python tools/gguf/llama.py --out /tmp/llama
+    for m in spm bpe; do
+        go run github.com/gsoultan/mim/cmd/mim-import -o examples/llama/testdata/$m.mim /tmp/llama/$m.gguf
+        go run github.com/gsoultan/mim/cmd/mim-import -o examples/llama/testdata/$m.logits.mim /tmp/llama/$m.logits.safetensors
+    done
+
+The tests read Mimir Model files, which mim-import converts the script's
+output to, copying the tensors byte for byte and the GGUF metadata (the
+hyperparameters and the tokenizer) as it is.
 
 It writes two models with random weights, each a GGUF file that llama.cpp
 loads, and the logits of a few tokens that a NumPy implementation of the

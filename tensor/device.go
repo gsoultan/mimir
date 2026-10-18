@@ -243,6 +243,9 @@ func (t *Tensor) To(d Device) *Tensor {
 	if md, ok := to.(*meshDevice); ok {
 		return Shard(t, md.mesh, nil)
 	}
+	if dependsOnTraced(t.node) {
+		return movedInTrace(t.node, to)
+	}
 	src := Device{from}
 	toRule := rule{
 		vjp: func(g *Tensor, _ []*Tensor, _ *Tensor) []*Tensor { return grads(g.To(src)) },
