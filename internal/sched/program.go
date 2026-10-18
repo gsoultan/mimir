@@ -40,11 +40,12 @@ import (
 // program is a compiled schedule. Its scratch slices are bound for one
 // run at a time, under mu.
 type program struct {
-	leaves, targets int       // the slots of the walk's leaves, then of the destinations
-	tmps            []poolKey // the pooled buffers, in the order taken; their slots follow
-	events          []int32   // the pool's bookkeeping in order: k takes tmps[k], ^k gives it back
-	peaks           []peak    // the most buffers of each key held at once
-	moves           []move    // inputs copied from other devices before the kernels
+	leaves, targets int         // the slots of the walk's leaves, then of the destinations
+	tmps            []poolKey   // the pooled buffers, in the order taken; their slots follow
+	events          []int32     // the pool's bookkeeping in order: k takes tmps[k], ^k gives it back
+	peaks           []peak      // the most buffers of each key held at once
+	moves           []move      // inputs copied from other devices before the kernels
+	detached        detachedCtx // what uncancelled returns
 	steps           []kstep
 	results         []int32 // the slot of each target's result, or -1 if it was realized
 	views           []backend.View
@@ -452,7 +453,7 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 	// An asynchronous backend reports the errors of these kernels at its
 	// next Sync, Upload or Download instead (see backend.Asynchronous).
 	if a, ok := m.be.(backend.Asynchronous); !ok || !a.Asynchronous() {
-		if err := m.be.Sync(uncancelled(ctx)); err != nil {
+		if err := m.be.Sync(p.uncancelled(ctx)); err != nil {
 			p.giveBack(m)
 			return err
 		}
@@ -514,7 +515,7 @@ func (p *program) launch(ctx context.Context, be backend.Backend, w *walker, dst
 			return err
 		}
 		if p.into {
-			ctx = uncancelled(ctx)
+			ctx = p.uncancelled(ctx)
 			for i := range p.steps {
 				overwrite(&p.steps[i])
 			}
@@ -529,7 +530,7 @@ func (p *program) launch(ctx context.Context, be backend.Backend, w *walker, dst
 				return err
 			}
 			if len(s.into) > 0 {
-				writing, ctx = true, uncancelled(ctx)
+				writing, ctx = true, p.uncancelled(ctx)
 			}
 		}
 		overwrite(s)
@@ -560,7 +561,7 @@ func (p *program) unbind() {
 		clear(p.batch.Outs[i])
 		clear(p.batch.Ins[i])
 	}
-	detached.parent = nil
+	p.detached.parent = nil
 }
 
 // copyFrom copies the realized node n, which lives on another device,
@@ -574,18 +575,15 @@ func copyFrom(ctx context.Context, n *graph.Node, be backend.Backend, dst backen
 	return be.Upload(ctx, dst, data)
 }
 
-// detached is the context that uncancelled returns, reused by every
-// schedule under mu so that a schedule allocates none.
-var detached detachedCtx
-
 // uncancelled returns a context with the values of ctx that is never
-// cancelled, like context.WithoutCancel, valid until the schedule ends.
-func uncancelled(ctx context.Context) context.Context {
-	if ctx == context.Context(&detached) {
+// cancelled, like context.WithoutCancel, valid until the run ends. It
+// reuses the program's, so that a run allocates none.
+func (p *program) uncancelled(ctx context.Context) context.Context {
+	if ctx == context.Context(&p.detached) {
 		return ctx
 	}
-	detached.parent = ctx
-	return &detached
+	p.detached.parent = ctx
+	return &p.detached
 }
 
 type detachedCtx struct{ parent context.Context }

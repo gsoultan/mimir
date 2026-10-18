@@ -669,7 +669,8 @@ func (p *plan) store(roots []*graph.Node, want []layout, todo []int, dsts []*gra
 		vals[j] = v
 	}
 	final := make([][]*graph.Node, len(m.devs))
-	for r, be := range m.bes {
+	var over [][]*graph.Node
+	for r := range m.bes {
 		ts := make([]*graph.Node, len(roots))
 		var ds []*graph.Node
 		seen := map[*graph.Node]bool{}
@@ -699,19 +700,25 @@ func (p *plan) store(roots []*graph.Node, want []layout, todo []int, dsts []*gra
 				ds[j] = d.Mem.Buf.(*meshBuffer).shards[r]
 			}
 		}
-		if err := sched.RealizeInto(p.ctx, be, ts, ds, lazy.values); err != nil {
-			p.release(nil)
-			if ds != nil {
-				// The destinations are stale, as on a device.
-				for j := range roots {
-					if d := dsts[todo[j]]; d != nil {
-						sched.Invalidate(d)
-					}
-				}
+		if ds != nil {
+			if over == nil {
+				over = make([][]*graph.Node, len(m.bes))
 			}
-			return err
+			over[r] = ds
 		}
 		final[r] = ts
+	}
+	if err := sched.RealizeEach(p.ctx, m.bes, final, over, lazy.values); err != nil {
+		p.release(nil)
+		if over != nil {
+			// The destinations are stale, as on a device.
+			for j := range roots {
+				if d := dsts[todo[j]]; d != nil {
+					sched.Invalidate(d)
+				}
+			}
+		}
+		return err
 	}
 	keep := map[*graph.Node]bool{}
 	for j, t := range roots {

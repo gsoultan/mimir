@@ -136,16 +136,15 @@ func (p *plan) realizeLive(k int) error {
 			live[r] = append(live[r], s)
 		}
 	}
-	for r, ns := range live {
-		if len(ns) == 0 {
-			continue
+	err := sched.RealizeEach(p.ctx, p.m.bes, live, nil, lazy.values)
+	for _, ns := range live {
+		for _, n := range ns {
+			if sched.Realized(n) {
+				p.temps = append(p.temps, n)
+			}
 		}
-		if err := sched.RealizeInto(p.ctx, p.m.bes[r], ns, nil, lazy.values); err != nil {
-			return err
-		}
-		p.temps = append(p.temps, ns...)
 	}
-	return nil
+	return err
 }
 
 // next returns the next collective that converting v to the layout to
