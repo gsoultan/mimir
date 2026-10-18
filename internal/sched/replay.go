@@ -81,7 +81,7 @@ func (w *walker) tracing(prog *program, nt int) *Trace {
 // graph otherwise; newTargets is not called for it, and is called on the
 // device's goroutine.
 func ReplayEach(ctx context.Context, traces []*Trace, leaves, args [][]*graph.Node, newTargets func(r int) []*graph.Node, dsts [][]*graph.Node, keep func() []*graph.Node) ([]bool, error) {
-	mu.Lock()
+	lockAll()
 	defer mu.Unlock()
 	var kept []*graph.Node
 	if keep != nil {
@@ -120,8 +120,8 @@ func (t *Trace) replay(ctx context.Context, leaves, args []*graph.Node, newTarge
 		return true, fmt.Errorf("sched: %d leaves for a trace of %d: %w", len(leaves), len(t.leafAt), backend.ErrInternal)
 	}
 	m := poolOf(t.be)
-	w := &m.walker
-	defer w.forget()
+	w := m.takeWalker()
+	defer m.giveWalker(w)
 	if !t.fits(w, leaves, dsts) {
 		return true, nil
 	}
@@ -144,7 +144,7 @@ func (t *Trace) replay(ctx context.Context, leaves, args []*graph.Node, newTarge
 	if err := t.prog.reserve(m); err != nil {
 		return false, err
 	}
-	return false, t.prog.run(ctx, m, w, targets, dsts)
+	return false, t.prog.run(ctx, m, w, targets, dsts, false)
 }
 
 // fits walks leaves as the leaves of t's graph, and dsts, writing their
