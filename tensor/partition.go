@@ -210,8 +210,8 @@ func (p *plan) rules() error {
 
 // visit returns what the plan knows of n before its inputs are walked.
 func (p *plan) visit(n *graph.Node) (*pnode, error) {
-	if !sched.Realized(n) {
-		return p.pnode(pnode{ins: sched.Inputs(n)}), nil
+	if ins, realized := sched.Inputs(n); !realized {
+		return p.pnode(pnode{ins: ins}), nil
 	}
 	if n.Stale() {
 		return nil, fmt.Errorf("tensor: sharded tensor of shape %v: %w", n.Shape, ErrOverwritten)

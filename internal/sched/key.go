@@ -360,8 +360,16 @@ func encoderOf(t reflect.Type, skip map[string]bool) (encoder, error) {
 	return nil, fmt.Errorf("sched: no key for %s", t)
 }
 
-// allZero reports whether every byte of b is zero.
+// allZero reports whether every byte of b is zero, reading four words at
+// a time.
 func allZero(b []byte) bool {
+	for len(b) >= 32 {
+		p := unsafe.Pointer(&b[0])
+		if *(*uint64)(p)|*(*uint64)(unsafe.Add(p, 8))|*(*uint64)(unsafe.Add(p, 16))|*(*uint64)(unsafe.Add(p, 24)) != 0 {
+			return false
+		}
+		b = b[32:]
+	}
 	for len(b) >= 8 {
 		if *(*uint64)(unsafe.Pointer(&b[0])) != 0 {
 			return false
