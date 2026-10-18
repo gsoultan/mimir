@@ -124,7 +124,7 @@ func (p *plan) realizeLive(k int) error {
 	live := make([][]*graph.Node, len(p.m.devs))
 	seen := map[*graph.Node]bool{}
 	for _, n := range p.order {
-		pn := p.nodes[n]
+		pn := p.node(n)
 		if pn.val == nil || pn.depth >= k || pn.last < k {
 			continue
 		}
