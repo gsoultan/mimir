@@ -1,7 +1,6 @@
 package nn_test
 
 import (
-	"bytes"
 	"errors"
 	"math"
 	"math/rand/v2"
@@ -56,9 +55,6 @@ func TestQuantizedLinearAndEmbedding(t *testing.T) {
 		}
 		if lin.Weight.Grad() != nil {
 			t.Errorf("%s linear: a gradient for the quantized weight", dt)
-		}
-		if err := nn.Save(t.Context(), new(bytes.Buffer), lin); !errors.Is(err, tensor.ErrDType) {
-			t.Errorf("%s linear: Save = %v, want ErrDType", dt, err)
 		}
 
 		emb := &nn.Embedding{Weight: tensor.NewBuffer(q)}

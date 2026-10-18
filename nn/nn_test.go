@@ -1,7 +1,6 @@
 package nn_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/gsoultan/mimir/internal/goldentest"
-	"github.com/gsoultan/mimir/io/safetensors"
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/nn/loss"
 	"github.com/gsoultan/mimir/optim"
@@ -236,7 +234,7 @@ func TestBatchNormRunningStatsSurviveAStepBeforeBackward(t *testing.T) {
 	if math.Abs(float64(got[0])-0.2) > 1e-6 || math.Abs(float64(got[1])-2) > 1e-5 {
 		t.Errorf("running mean = %v, want [0.2 2]", got)
 	}
-	if err := nn.Save(t.Context(), new(bytes.Buffer), b); err != nil {
+	if err := tensor.Realize(t.Context(), b.RunningMean.Value(), b.RunningVar.Value()); err != nil {
 		t.Error(err)
 	}
 }
@@ -271,37 +269,6 @@ func TestBatchNormUpdatesAlongsideOtherSchedules(t *testing.T) {
 		}
 	})
 	wg.Wait()
-}
-
-func TestSaveLoadRoundTrips(t *testing.T) {
-	ctx := t.Context()
-	nn.ManualSeed(1)
-	a := nn.NewSequential(nn.NewConv2d(1, 2, 3), nn.NewBatchNorm2d(2), nn.Flatten(), nn.NewLinear(8, 3))
-	nn.ManualSeed(2)
-	b := nn.NewSequential(nn.NewConv2d(1, 2, 3), nn.NewBatchNorm2d(2), nn.Flatten(), nn.NewLinear(8, 3))
-	x := tensor.Randn(3, 2, 1, 4, 4)
-	nn.Eval(a)
-	nn.Eval(b)
-	if slices.Equal(data(t, a.Forward(x)), data(t, b.Forward(x))) {
-		t.Fatal("different seeds built identical models")
-	}
-	var buf bytes.Buffer
-	if err := nn.Save(ctx, &buf, a); err != nil {
-		t.Fatal(err)
-	}
-	f, err := safetensors.Parse(buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := nn.Load(f, b); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(data(t, a.Forward(x)), data(t, b.Forward(x))) {
-		t.Error("loaded model computes differently")
-	}
-	if err := nn.Load(f, nn.NewLinear(2, 2)); !errors.Is(err, tensor.ErrShape) {
-		t.Errorf("loading into another architecture: %v, want ErrShape", err)
-	}
 }
 
 func TestManualSeedReproducesWeights(t *testing.T) {

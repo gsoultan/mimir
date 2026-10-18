@@ -9,41 +9,33 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
-	"strings"
 
-	"github.com/gsoultan/mimir/io/safetensors"
+	mimfile "github.com/gsoultan/mim"
+
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/optim"
 	"github.com/gsoultan/mimir/tensor"
 )
 
-const checkpointFile = "checkpoint.safetensors"
+const checkpointFile = "checkpoint.mim"
 
-// save writes the model's parameters as "model.<name>", the optimizer's
-// state as "optim.<key>" and the progress as metadata, replacing the
-// previous checkpoint atomically.
+// save writes the model's parameters as "model.<name>" and the optimizer's
+// state as "optim.<key>", with the progress in the file's training
+// section, replacing the previous checkpoint atomically.
 func save(ctx context.Context, dir string, model nn.Module, opt *optim.Optimizer, epochs int) error {
-	ts := map[string]safetensors.Tensor{}
+	ts := map[string]*tensor.Tensor{}
 	for name, p := range nn.NamedParams(model) {
-		t, err := nn.Encode(ctx, p.Value())
-		if err != nil {
-			return fmt.Errorf("train: checkpoint %s: %w", name, err)
-		}
-		ts["model."+name] = t
+		ts["model."+name] = p.Value()
 	}
 	state, steps := opt.Snapshot()
-	for key, v := range state {
-		t, err := nn.Encode(ctx, v)
-		if err != nil {
-			return fmt.Errorf("train: checkpoint optimizer %s: %w", key, err)
-		}
-		ts["optim."+key] = t
+	tr := &mimfile.Training{
+		Counters: []mimfile.TrainCounter{{Name: "epochs", Value: uint64(epochs)}, {Name: "steps", Value: uint64(steps)}},
+		Hyper:    []mimfile.TrainHyper{{Name: "lr", Value: opt.LR()}},
 	}
-	meta := map[string]string{
-		"epochs": strconv.Itoa(epochs),
-		"steps":  strconv.Itoa(steps),
-		"lr":     strconv.FormatFloat(opt.LR(), 'g', -1, 64),
+	for _, key := range slices.Sorted(maps.Keys(state)) {
+		ts["optim."+key] = state[key]
+		tr.Extras = append(tr.Extras, mimfile.TrainExtra{Name: key, Tensor: "optim." + key})
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -53,7 +45,7 @@ func save(ctx context.Context, dir string, model nn.Module, opt *optim.Optimizer
 		return err
 	}
 	defer os.Remove(tmp.Name()) // no-op after the rename
-	err = safetensors.Write(tmp, ts, meta)
+	err = mim.WriteTensors(ctx, tmp, ts, &mim.SaveOptions{Training: tr})
 	if serr := tmp.Sync(); err == nil {
 		err = serr
 	}
@@ -69,42 +61,47 @@ func save(ctx context.Context, dir string, model nn.Module, opt *optim.Optimizer
 // resume loads dir's checkpoint, if any, into model and opt and returns
 // the number of epochs it had completed.
 func resume(dir string, model nn.Module, opt *optim.Optimizer) (int, error) {
-	b, err := os.ReadFile(filepath.Join(dir, checkpointFile))
+	f, err := mim.Open(filepath.Join(dir, checkpointFile))
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("train: checkpoint: %w", err)
 	}
-	f, err := safetensors.Parse(b)
+	defer f.Close()
+	tr, err := f.Training()
 	if err != nil {
 		return 0, fmt.Errorf("train: checkpoint: %w", err)
 	}
-	epochs, errE := strconv.Atoi(f.Metadata["epochs"])
-	steps, errS := strconv.Atoi(f.Metadata["steps"])
-	lr, errL := strconv.ParseFloat(f.Metadata["lr"], 64)
-	if errE != nil || errS != nil || errL != nil {
-		return 0, fmt.Errorf("train: checkpoint metadata %v: %w", f.Metadata, safetensors.ErrFormat)
+	if tr == nil {
+		return 0, fmt.Errorf("train: checkpoint without a training section: %w", mim.ErrFormat)
 	}
-	if err := nn.LoadPrefixed(f, "model.", model); err != nil {
+	counters := map[string]uint64{}
+	for _, c := range tr.Counters {
+		counters[c.Name] = c.Value
+	}
+	epochs, okE := counters["epochs"]
+	steps, okS := counters["steps"]
+	i := slices.IndexFunc(tr.Hyper, func(h mimfile.TrainHyper) bool { return h.Name == "lr" })
+	if !okE || !okS || i < 0 {
+		return 0, fmt.Errorf("train: checkpoint training section %+v: %w", tr, mim.ErrFormat)
+	}
+	if err := f.LoadPrefixed("model.", model); err != nil {
 		return 0, fmt.Errorf("train: checkpoint: %w", err)
 	}
 	state := map[string]*tensor.Tensor{}
-	for _, name := range f.Names() {
-		key, ok := strings.CutPrefix(name, "optim.")
-		if !ok {
-			continue
-		}
-		st, _ := f.Tensor(name)
-		if state[key], err = nn.Decode(st); err != nil {
+	for _, e := range tr.Extras {
+		t, err := f.Tensor(e.Tensor)
+		if err != nil {
 			return 0, fmt.Errorf("train: checkpoint: %w", err)
 		}
+		state[e.Name] = t.To(tensor.DefaultDevice())
 	}
-	if err := opt.Restore(state, steps); err != nil {
+	if err := opt.Restore(state, int(steps)); err != nil {
 		return 0, fmt.Errorf("train: checkpoint: %w", err)
 	}
-	opt.SetLR(lr)
-	return epochs, nil
+	opt.SetLR(tr.Hyper[i].Value)
+	return int(epochs), nil
 }
 
 func sortedKeys(m map[string]float64) []string { return slices.Sorted(maps.Keys(m)) }

@@ -73,28 +73,42 @@ func (m *Model) weight(v mimfile.Value) (*tensor.Tensor, error) {
 	if info.DType != v.DType || len(info.Shape) != len(v.Shape) {
 		return nil, fmt.Errorf("%w: tensor %q is %s%v, the value %s of rank %d", ErrFormat, info.Name, info.DType, info.Shape, v.DType, len(v.Shape))
 	}
+	for i, d := range info.Shape {
+		if !v.Shape[i].Symbolic() && uint64(v.Shape[i]) != d {
+			return nil, fmt.Errorf("%w: tensor %q of shape %v for a value of shape %v", ErrFormat, info.Name, info.Shape, v.Shape)
+		}
+	}
+	return m.tensorOf(info)
+}
+
+// tensorOf returns the tensor of the file that info describes, on the
+// CPU, reading the mapping in place where mimir holds its dtype.
+func (m *Model) tensorOf(info mimfile.TensorInfo) (*tensor.Tensor, error) {
+	if _, ok := storage(info.DType); !ok && !info.DType.IsBlock() {
+		return nil, &UnsupportedError{Op: "dtype", Detail: fmt.Sprintf("tensor %q of dtype %s", info.Name, info.DType)}
+	}
 	shape := make([]int, len(info.Shape))
 	n := 1
 	for i, d := range info.Shape {
-		if d > math.MaxInt32 || (!v.Shape[i].Symbolic() && uint64(v.Shape[i]) != d) {
-			return nil, fmt.Errorf("%w: tensor %q of shape %v for a value of shape %v", ErrFormat, info.Name, info.Shape, v.Shape)
+		if d > math.MaxInt32 {
+			return nil, fmt.Errorf("%w: tensor %q of shape %v", ErrFormat, info.Name, info.Shape)
 		}
 		shape[i] = int(d)
 		n *= int(d)
 	}
 	raw := m.f.TensorData(info)
-	switch v.DType {
+	switch info.DType {
 	case mimfile.F32, mimfile.F16, mimfile.BF16, mimfile.Q8_0, mimfile.Q4_K, mimfile.Q6_K, mimfile.I32:
-		dt, _ := storage(v.DType)
+		dt, _ := storage(info.DType)
 		return scalarShape(tensor.FromBytesFunc(dt, raw, m.hold(), shape...), shape)
 	case mimfile.F8E4M3, mimfile.F8E5M2, mimfile.Q4_0, mimfile.MXFP4, mimfile.Affine4:
 		f := make([]float32, n)
-		if err := mimfile.Dequantize(v.DType, raw, f); err != nil {
+		if err := mimfile.Dequantize(info.DType, raw, f); err != nil {
 			return nil, fmt.Errorf("%w: tensor %q: %w", ErrFormat, info.Name, err)
 		}
 		return scalarShape(tensor.FromSlice(f, shape...), shape)
 	}
-	ints, err := decodeInts(v.DType, raw, n)
+	ints, err := decodeInts(info.DType, raw, n)
 	if err != nil {
 		return nil, fmt.Errorf("tensor %q: %w", info.Name, err)
 	}
