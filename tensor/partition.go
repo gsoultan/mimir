@@ -865,16 +865,29 @@ func (p *plan) store(roots []*graph.Node, want []layout, todo []int, dsts []*gra
 		}
 		final[r] = ts
 	}
-	if p.rec != nil {
-		p.rec.store(final)
-	}
-	return p.finish(roots, want, todo, dsts, final)
+	return p.finish(roots, want, todo, dsts, func(over [][]*graph.Node) ([][]*graph.Node, error) {
+		return final, p.schedule(final, over, true)
+	})
 }
 
-// finish computes final[r], each device's shards of the targets roots,
-// into their destinations' where there are some, and makes them the
-// targets' results, laid out as want.
-func (p *plan) finish(roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node, final [][]*graph.Node) error {
+// schedule computes the nodes of each device on it, writing them over
+// the destinations over, as sched.RealizeEach does, recording the
+// schedules if p's run is recorded. final says whether the nodes are the
+// shards of the run's targets.
+func (p *plan) schedule(nodes, over [][]*graph.Node, final bool) error {
+	if p.rec == nil {
+		return sched.RealizeEach(p.ctx, p.m.bes, nodes, over, lazy.values)
+	}
+	ev := p.rec.realize(nodes, final)
+	return sched.RealizeEachTraced(p.ctx, p.m.bes, nodes, over, lazy.values, func(r int, t *sched.Trace, order, leaves []*graph.Node) {
+		p.rec.traced(ev, r, t, order, leaves)
+	})
+}
+
+// finish computes each device's shards of the targets roots, by compute,
+// into their destinations', over, where there are some, and makes them
+// the targets' results, laid out as want.
+func (p *plan) finish(roots []*graph.Node, want []layout, todo []int, dsts []*graph.Node, compute func(over [][]*graph.Node) ([][]*graph.Node, error)) error {
 	m := p.m
 	var over [][]*graph.Node
 	if dsts != nil {
@@ -894,7 +907,8 @@ func (p *plan) finish(roots []*graph.Node, want []layout, todo []int, dsts []*gr
 			}
 		}
 	}
-	if err := sched.RealizeEach(p.ctx, m.bes, final, over, lazy.values); err != nil {
+	final, err := compute(over)
+	if err != nil {
 		p.release(nil)
 		if over != nil {
 			// The destinations are stale, as on a device.

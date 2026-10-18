@@ -44,6 +44,9 @@ type walker struct {
 	mems   int32         // storages numbered
 	key    []uint64
 	stack  []frame
+	leafAt []int32 // where each leaf's words start in key
+	body   int     // the leaves met before the targets
+	tailAt int     // where the targets start in key
 
 	gifts []gift // the donated leaves whose memory the schedule takes
 }
@@ -105,7 +108,7 @@ func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
 	w.walk, w.be = walks.Add(1), be
 	w.gifts = w.gifts[:0]
 	w.order, w.leaves, w.mems = w.order[:0], w.leaves[:0], 0
-	w.key = w.key[:0]
+	w.key, w.leafAt = w.key[:0], w.leafAt[:0]
 	for _, t := range targets {
 		if t.Stale() {
 			return stale(t)
@@ -136,6 +139,7 @@ func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
 			w.stack = w.stack[:len(w.stack)-1]
 		}
 	}
+	w.body, w.tailAt = len(w.leaves), len(w.key)
 	w.push(tagTargets<<56 | uint64(len(targets)))
 	for _, t := range targets {
 		w.push(w.ref(t))
@@ -211,6 +215,7 @@ func (w *walker) node(n *graph.Node) {
 // schedule may take its memory (see donate.go), and which other leaves
 // share its storage.
 func (w *walker) leaf(n *graph.Node) {
+	w.leafAt = append(w.leafAt, int32(len(w.key)))
 	n.Mark = graph.Mark{Walk: w.walk, Num: int32(len(w.leaves))}
 	w.leaves = append(w.leaves, n)
 	m := n.Mem

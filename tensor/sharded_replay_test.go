@@ -11,13 +11,14 @@ import (
 )
 
 // TestShardedStepsReplay checks that steps that replay their first
-// step's recorded run compute what lowering each anew does, bit for bit:
-// steps whose scalars and random seeds change, read a tensor on a
-// device, and train a model in place.
+// step's recorded run compute what lowering each anew does, bit for bit,
+// whether they replay the schedules' programs or compute the graphs the
+// recording builds: steps whose scalars and random seeds change, read a
+// tensor computed on a device, and train a model in place.
 func TestShardedStepsReplay(t *testing.T) {
 	ctx := t.Context()
-	run := func(t *testing.T, replay bool, step func(m *tensor.Mesh, i int) []*tensor.Tensor) [][]float32 {
-		defer tensor.SetReplays(tensor.SetReplays(replay))
+	run := func(t *testing.T, replay, programs bool, step func(m *tensor.Mesh, i int) []*tensor.Tensor) [][]float32 {
+		defer tensor.SetReplays(replay, programs)()
 		m := meshes(t)["2x2"]
 		var out [][]float32
 		for i := range 4 {
@@ -33,6 +34,11 @@ func TestShardedStepsReplay(t *testing.T) {
 			t.Error("no step replayed the first")
 		} else if !replay && got != 0 {
 			t.Errorf("%d steps replayed with replays off", got)
+		}
+		// In eager mode one script serves every operation of a kind,
+		// whose leaves may be views that another's are not.
+		if got := tensor.ReplayMisses(m); programs && !tensor.Eager() && got != 0 {
+			t.Errorf("%d schedules of replays computed their graphs, want their programs replayed", got)
 		}
 		return out
 	}
@@ -86,14 +92,16 @@ func TestShardedStepsReplay(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			want := run(t, false, step(t))
-			got := run(t, true, step(t))
-			if len(got) != len(want) {
-				t.Fatalf("%d results, want %d", len(got), len(want))
-			}
-			for i := range want {
-				if !slices.Equal(got[i], want[i]) {
-					t.Fatalf("result %d differs when replayed:\n%v\nwant\n%v", i, got[i], want[i])
+			want := run(t, false, false, step(t))
+			for _, programs := range []bool{false, true} {
+				got := run(t, true, programs, step(t))
+				if len(got) != len(want) {
+					t.Fatalf("%d results, want %d", len(got), len(want))
+				}
+				for i := range want {
+					if !slices.Equal(got[i], want[i]) {
+						t.Fatalf("result %d differs when replayed (programs %v):\n%v\nwant\n%v", i, programs, got[i], want[i])
+					}
 				}
 			}
 		})

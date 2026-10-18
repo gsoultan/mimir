@@ -46,12 +46,26 @@ func PlanReplays(m *Mesh) int {
 	return m.plans.replays
 }
 
-// SetReplays turns the replay of recorded runs of sharded graphs on and
-// off, returning the old setting.
-func SetReplays(on bool) bool {
+// ReplayMisses returns how many traced device schedules of replays on m
+// computed their graphs rather than replay their programs.
+func ReplayMisses(m *Mesh) int {
 	meshMu.Lock()
 	defer meshMu.Unlock()
-	was := replays
-	replays = on
-	return was
+	return m.plans.missed
+}
+
+// SetReplays turns the replay of recorded runs of sharded graphs on and
+// off, and, if programs is false, makes replays compute the graphs their
+// scripts build rather than replay the schedules' programs. It returns a
+// function that restores the old settings.
+func SetReplays(on, programs bool) func() {
+	meshMu.Lock()
+	defer meshMu.Unlock()
+	was, wasPrograms := replays, replayPrograms
+	replays, replayPrograms = on, programs
+	return func() {
+		meshMu.Lock()
+		defer meshMu.Unlock()
+		replays, replayPrograms = was, wasPrograms
+	}
 }
