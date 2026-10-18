@@ -10,7 +10,7 @@ import (
 	"slices"
 	"testing"
 
-	mimfile "github.com/gsoultan/mim"
+	mimfile "github.com/gsoultan/mimir-model"
 
 	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tensor"

@@ -4,8 +4,8 @@
     pip install gguf numpy
     python tools/gguf/llama.py --out /tmp/llama
     for m in spm bpe; do
-        go run github.com/gsoultan/mim/cmd/mim-import -o examples/llama/testdata/$m.mim /tmp/llama/$m.gguf
-        go run github.com/gsoultan/mim/cmd/mim-import -o examples/llama/testdata/$m.logits.mim /tmp/llama/$m.logits.safetensors
+        go run github.com/gsoultan/mimir-model/cmd/mim-import -o examples/llama/testdata/$m.mim /tmp/llama/$m.gguf
+        go run github.com/gsoultan/mimir-model/cmd/mim-import -o examples/llama/testdata/$m.logits.mim /tmp/llama/$m.logits.safetensors
     done
 
 The tests read Mimir Model files, which mim-import converts the script's

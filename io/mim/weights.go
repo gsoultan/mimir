@@ -9,7 +9,7 @@ import (
 	"slices"
 	"unicode/utf8"
 
-	mimfile "github.com/gsoultan/mim"
+	mimfile "github.com/gsoultan/mimir-model"
 
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/tensor"

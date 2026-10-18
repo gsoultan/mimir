@@ -5,7 +5,7 @@ import (
 	"math"
 	"slices"
 
-	mimfile "github.com/gsoultan/mim"
+	mimfile "github.com/gsoultan/mimir-model"
 
 	"github.com/gsoultan/mimir/tensor"
 )
