@@ -10,11 +10,11 @@
 #	modal run ci/cuda/modal_test.py --script ci/cuda/m6.sh
 #
 # GATE defaults to 1.25. COUNT sets the runs of each mimir benchmark
-# (default 3), whose median is compared. PyTorch is installed once into
+# (default 5), whose median is compared. PyTorch is installed once into
 # the cache volume that modal_test.py mounts at /cache.
 set -eu
 gate=${GATE:-1.25}
-count=${COUNT:-3}
+count=${COUNT:-5}
 torch=${TORCH_VERSION:-2.8.0}
 out=$(mktemp -d)
 nvidia-smi --query-gpu=name,driver_version,clocks.max.sm --format=csv,noheader || true
@@ -34,10 +34,19 @@ echo "## mimir"
 bench() {
 	MIMIR_DEVICE=gpu MIMIR_CUDA_GRAPHS=1 go test -p 1 -run '^$' -count "$count" "$@" | tee -a "$out/mimir.txt"
 }
-bench -bench '^BenchmarkAttention$/^fused$' -benchtime 10x ./tensor
+bench -bench '^BenchmarkAttention(Forward)?$/^fused$' -benchtime 10x ./tensor
 bench -bench '^BenchmarkDecoderBlockStep$/^seq[0-9]+$' -benchtime 10x ./nn
 bench -bench '^BenchmarkDecode$' -benchtime 20x ./nn
 bench -bench '^BenchmarkLSTM$/^(forward|backward|train)$' -benchtime 10x ./nn
+
+# Larger tiles of attention, which take more group memory and leave
+# room for fewer groups on a multiprocessor, for comparison; the gate
+# reads the default's runs alone.
+for floats in ${ATTN_SHARED:-9216 12288}; do
+	echo "## MIMIR_ATTN_SHARED=$floats"
+	MIMIR_DEVICE=gpu MIMIR_CUDA_GRAPHS=1 MIMIR_ATTN_SHARED=$floats go test -p 1 -run '^$' -count "$count" \
+		-bench '^BenchmarkAttention(Forward)?$/^fused$' -benchtime 10x ./tensor
+done
 
 echo "## M6 speed gates (mimir's time over PyTorch's, at most $gate)"
 awk -v gate="$gate" '
