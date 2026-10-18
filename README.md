@@ -777,6 +777,14 @@ ci/cuda/modal_test.py --script ci/cuda/perf.sh` on Modal). The CUDA
 kernels are also compiled with the real NVRTC on every change, which
 needs no GPU.
 
+`ci/cuda/m6.sh` holds the speed gates of M6. It times PyTorch on the same
+GPU doing the work of mimir's transformer and recurrent benchmarks: causal
+attention and a training step of a block at GPT-2 small shapes, a decoding
+step at Llama 3.2 1B shapes and a 2-layer LSTM. It fails when mimir, with
+CUDA graphs on, takes more than 1.25 times PyTorch's time on any of them
+(`modal run ci/cuda/modal_test.py --script ci/cuda/m6.sh`; `GATE` sets the
+bar).
+
 The multi-GPU tests run on demand, on paid Modal hosts with several GPUs,
 not on every change. `ci/cuda/parallel.sh` runs NCCL's collectives,
 replicas and data-parallel training on every GPU against one device, and
