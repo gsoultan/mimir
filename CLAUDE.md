@@ -3,34 +3,42 @@
 Pure-Go machine learning framework (no cgo, no Python at runtime). Run
 `go vet ./...` and `go test ./...` before pushing.
 
-## Code navigation tools
+## Code tools
 
-This repo ships two MCP servers in `.mcp.json`, both launched with `uvx`
-(install [uv](https://docs.astral.sh/uv/) once):
+Two code-navigation tools are set up for Claude Code sessions in this repo.
+Use graphify to find your way around and Serena to read and change code by
+symbol.
 
-- **serena** ([oraios/serena](https://github.com/oraios/serena)): symbol-level
-  navigation and editing through gopls. Needs `gopls` on `PATH`
-  (`go install golang.org/x/tools/gopls@latest`). Configured in
-  `.serena/project.yml`.
-- **graphify** ([Graphify-Labs/graphify](https://github.com/Graphify-Labs/graphify)):
-  a knowledge graph of the codebase in `graphify-out/` (gitignored). Build it
-  once with `uvx --from graphifyy graphify extract . --code-only`, which
-  parses the code locally with tree-sitter and needs no API key. For the
-  `/graphify` skill and its search hooks, `uv tool install graphifyy` and run
-  `graphify install --project`.
+### graphify
 
-Run `/mcp` in Claude Code to check both servers are connected. The graphify
-server only starts once `graphify-out/graph.json` exists.
+graphify builds a knowledge graph of the code in graphify-out/ (god nodes,
+communities, cross-file relationships). The SessionStart hook rebuilds it, so
+it is not committed.
 
-How to use them:
+- When graphify-out/graph.json exists, run `graphify query "<question>"` before your first grep, search or source-file read for a codebase question, and put this rule in every subagent prompt that explores code. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST only, no API cost).
+- The full skill is in .claude/skills/graphify/ (`/graphify`).
+- The graphify MCP server in .mcp.json serves the same graph as native tools
+  (`query_graph`, `shortest_path`, `god_nodes`); it starts once
+  graphify-out/graph.json exists.
 
-- For a question about how parts of mimir connect (what calls what, what a
-  change breaks), query the graph first: the graphify MCP tools, or
-  `graphify query "<question>"`, `graphify path "<A>" "<B>"` and
-  `graphify explain "<concept>"`. Read raw files only for lines the graph
-  located. `graphify-out/GRAPH_REPORT.md` is for broad architecture review.
-- For reading and editing Go code, prefer Serena's symbol tools
-  (`get_symbols_overview`, `find_symbol`, `find_referencing_symbols`,
-  `replace_symbol_body`) over whole-file reads.
-- After changing code, run `graphify update .` to refresh the graph (AST
-  only, no model calls).
+### Serena
+
+Serena is an MCP server (.mcp.json) that gives language-server tools: symbol
+overviews, find symbol, find references, and symbol-level edits. Its own
+instructions arrive with the server. Once graphify has pointed you at the
+right file or symbol, read and edit it with Serena's symbolic tools rather
+than whole-file reads. Project settings are in .serena/project.yml.
+
+### Running these locally
+
+Cloud sessions install everything in .claude/hooks/session-start.sh. On your
+own machine, install once:
+
+    uv tool install --python 3.13 serena-agent
+    uv tool install 'graphifyy[sql]'
+    go install golang.org/x/tools/gopls@latest
+
+Without them the hooks do nothing, and uvx fetches Serena when the MCP
+server first starts.
