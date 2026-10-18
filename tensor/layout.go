@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"weak"
 
 	"github.com/gsoultan/mimir/backend"
@@ -183,8 +184,9 @@ func (m *Mesh) localShape(shape []int, l layout) []int {
 var constraints constraintSet
 
 type constraintSet struct {
-	mu sync.Mutex
-	m  map[weak.Pointer[graph.Node]]layout
+	mu   sync.Mutex
+	m    map[weak.Pointer[graph.Node]]layout
+	live atomic.Int64 // len(m), read without mu
 }
 
 func (c *constraintSet) add(n *graph.Node, l layout) {
@@ -195,6 +197,7 @@ func (c *constraintSet) add(n *graph.Node, l layout) {
 	}
 	k := weak.Make(n)
 	c.m[k] = l
+	c.live.Store(int64(len(c.m)))
 	runtime.AddCleanup(n, c.remove, k)
 }
 
@@ -202,12 +205,13 @@ func (c *constraintSet) remove(k weak.Pointer[graph.Node]) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.m, k)
+	c.live.Store(int64(len(c.m)))
 }
 
 func (c *constraintSet) get(n *graph.Node) (layout, bool) {
 	// constrain makes every node it constrains a reshape, and weak.Make
 	// is costly enough not to call for the others.
-	if n.Op != backend.OpReshape {
+	if n.Op != backend.OpReshape || c.live.Load() == 0 {
 		return layout{}, false
 	}
 	c.mu.Lock()

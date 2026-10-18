@@ -18,3 +18,13 @@ func DeviceOn(be backend.Backend) Device { return Device{be} }
 
 // BackendOf returns the backend d runs on.
 func BackendOf(d Device) backend.Backend { return d.backend() }
+
+// Every analysis the plan cache finds is checked against one made anew.
+func init() { checkPlans = true }
+
+// PlanHits returns the number of analyses m found in its cache.
+func PlanHits(m *Mesh) int {
+	meshMu.Lock()
+	defer meshMu.Unlock()
+	return m.plans.hits
+}

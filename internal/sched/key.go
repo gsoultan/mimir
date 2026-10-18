@@ -332,7 +332,14 @@ func encoderOf(t reflect.Type, skip map[string]bool) (encoder, error) {
 		if len(fields) > 64 {
 			return nil, fmt.Errorf("sched: no key for %s: %d fields", t, len(fields))
 		}
+		size := t.Size()
 		return func(w *walker, p unsafe.Pointer) {
+			// Most nodes' attributes are all zero bytes, which says every
+			// field is zero at a glance, without asking each.
+			if allZero(unsafe.Slice((*byte)(p), size)) {
+				w.push(0)
+				return
+			}
 			at := len(w.key)
 			w.push(0)
 			var present uint64
@@ -346,6 +353,22 @@ func encoderOf(t reflect.Type, skip map[string]bool) (encoder, error) {
 		}, nil
 	}
 	return nil, fmt.Errorf("sched: no key for %s", t)
+}
+
+// allZero reports whether every byte of b is zero.
+func allZero(b []byte) bool {
+	for len(b) >= 8 {
+		if *(*uint64)(unsafe.Pointer(&b[0])) != 0 {
+			return false
+		}
+		b = b[8:]
+	}
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // zeroOf returns a function that reports whether the value of type t at
@@ -377,3 +400,19 @@ type sliceHeader struct {
 	data     unsafe.Pointer
 	len, cap int
 }
+
+// AppendAttrs appends to key the words that a schedule's key holds of
+// a: those of every field but the ones a program takes as arguments,
+// Value and Seed. It reports false, appending nothing, if the schedule
+// cache is off for want of an encoding of Attrs.
+func AppendAttrs(key []uint64, a *backend.Attrs) ([]uint64, bool) {
+	if keyAttrs == nil {
+		return key, false
+	}
+	w := walker{key: key}
+	keyAttrs(&w, unsafe.Pointer(a))
+	return w.key, true
+}
+
+// HashKey returns a hash of key, as the schedule cache hashes its keys.
+func HashKey(key []uint64) uint64 { return hashKey(key) }
