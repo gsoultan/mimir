@@ -132,7 +132,10 @@ func TestExportQuantizedLinear(t *testing.T) {
 	for _, dt := range []tensor.DType{tensor.Q8_0, tensor.Q4_K, tensor.Q6_K} {
 		t.Run(dt.String(), func(t *testing.T) {
 			raw := quanttest.Random(rand.New(rand.NewPCG(10, uint64(dt))), dt, 4*256)
-			l := &nn.Linear{Weight: tensor.NewBuffer(tensor.FromBytes(dt, raw, 4, 256))}
+			// FromBytes keeps the blocks on the CPU; on the input's device,
+			// the module and the file run the same kernel.
+			w := tensor.FromBytes(dt, raw, 4, 256).To(tensor.DefaultDevice())
+			l := &nn.Linear{Weight: tensor.NewBuffer(w)}
 			x := randn(11, 3, 256)
 			// The file holds the blocks, which a run reads as they are, so
 			// the product is mimir's own; the reference rounds the

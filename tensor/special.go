@@ -102,11 +102,17 @@ func sample(op backend.Op, seed uint64, p *Tensor) *Tensor {
 	}
 	a := p.Cast(Float32)
 	x, d := a.onCPU()
+	if err := firstErr(x); err != nil {
+		return fail(err)
+	}
 	z := wrap(graph.Sample(op, x.node, seed))
 	out := z.To(d)
 	if op == backend.OpRandGamma {
 		out = track(out, func(g *Tensor) []*Tensor {
 			x, _ := a.onCPU()
+			if err := firstErr(x); err != nil {
+				return grads(fail(err))
+			}
 			return grads(g.Mul(wrap(graph.GammaGrad(x.node, z.node)).To(d)))
 		}, a)
 	}
