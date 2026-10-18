@@ -1,0 +1,8 @@
+# graphify also honors .gitignore. These are binary fixtures and datasets
+# with nothing to extract.
+data/mnist/
+testdata/
+**/testdata/
+*.mim
+*.parquet
+*.gz

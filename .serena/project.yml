@@ -1,0 +1,23 @@
+# Serena project configuration for mimir. See
+# https://oraios.github.io/serena/02-usage/050_configuration.html for every key.
+# Machine-specific overrides belong in .serena/project.local.yml (gitignored).
+project_name: "mimir"
+
+# gopls must be on PATH: go install golang.org/x/tools/gopls@latest
+language_servers: ["go"]
+
+encoding: "utf-8"
+line_ending: "lf"
+ignore_all_files_in_gitignore: true
+
+# Binary fixtures and datasets carry no symbols.
+ignored_paths:
+  - "data/mnist/**"
+  - "testdata/**"
+  - "**/testdata/**"
+  - "graphify-out/**"
+
+read_only: false
+excluded_tools: []
+included_optional_tools: []
+initial_prompt: ""
