@@ -184,13 +184,21 @@ func (r *RotaryEmbedding) Apply(x *tensor.Tensor, offset int) *tensor.Tensor {
 }
 
 // splitHeads maps [B, S, heads·dim] to [B, heads, S, dim].
+// A failed x is returned as is, so its error reaches the caller.
 func splitHeads(x *tensor.Tensor, heads, dim int) *tensor.Tensor {
+	if x.Err() != nil {
+		return x
+	}
 	s := x.Shape()
 	return x.Reshape(s[0], s[1], heads, dim).Transpose(1, 2)
 }
 
 // mergeHeads maps [B, heads, S, dim] to [B, S, heads·dim].
+// A failed x is returned as is, so its error reaches the caller.
 func mergeHeads(x *tensor.Tensor) *tensor.Tensor {
+	if x.Err() != nil {
+		return x
+	}
 	s := x.Shape()
 	return x.Transpose(1, 2).Reshape(s[0], s[2], s[1]*s[3])
 }

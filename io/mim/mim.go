@@ -26,7 +26,14 @@
 // A graph may keep state between runs in variables, such as the key-value
 // cache of a language model. A Session holds them: each run reads the
 // values the previous run of the session left, and updates them once
-// all its outputs are computed. Model.Run runs in a session of its own.
+// all its outputs are computed. Model.Run runs in a session of its own,
+// which its callers share; sessions from NewSession are independent and
+// run at once, which is how a server serves one model to many requests:
+//
+//	s := m.NewSession() // one per worker or conversation
+//	out, err := s.Run(ctx, inputs)
+//
+// Runs are inference: they record no tape for gradients.
 //
 // Values of the integer types and bool are held as Int32 tensors, so they
 // must fit in an int32: inputs of type i64 or bool are Int32 tensors, and
@@ -137,7 +144,8 @@ func (v ValueInfo) String() string {
 }
 
 // Model is a loaded mim model. Its methods may be called from several
-// goroutines; runs of one session take turns.
+// goroutines; runs of one session take turns, and runs of different
+// sessions (see NewSession) go on at once.
 type Model struct {
 	f        *mimfile.File
 	g        *mimfile.Graph
@@ -297,7 +305,9 @@ func (m *Model) Metadata() (mimfile.Metadata, error) {
 
 // Run computes the model's outputs from its inputs, in the session the
 // model holds: variables keep the values that the previous call of Run
-// left. See Session.Run.
+// left. See Session.Run. Every caller of Run shares that session, so
+// calls take turns; to run at once, as a server's workers do, each uses a
+// session of its own from NewSession.
 func (m *Model) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (map[string]*tensor.Tensor, error) {
 	return m.session.Run(ctx, inputs)
 }
