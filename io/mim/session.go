@@ -105,6 +105,11 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 		case mimfile.KindVariable:
 			t := s.vars[vi]
 			if t == nil || t.Device() != r.dev {
+				if v.Zero {
+					if err := m.checkSize(v, vi, r.declared(vi)); err != nil {
+						return nil, err
+					}
+				}
 				t = initial(v, consts[vi], r.dev)
 			}
 			r.env[vi] = t

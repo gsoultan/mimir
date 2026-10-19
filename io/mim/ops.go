@@ -43,6 +43,9 @@ func (r *run) op(op *mimfile.Op) error {
 		if err := t.Err(); err != nil {
 			return c.wrap(err)
 		}
+		if err := r.m.checkSize(v, vi, t.Shape()); err != nil {
+			return err
+		}
 		if dt, _ := storage(v.DType); t.DType() != dt {
 			t = t.Cast(dt)
 		}
