@@ -381,3 +381,91 @@ func BenchmarkOpenAndRead(b *testing.B) {
 		})
 	}
 }
+
+// A load that fails on any parameter sets none.
+func TestLoadChangesNothingOnFailure(t *testing.T) {
+	nn.ManualSeed(5)
+	src := nn.NewSequential(nn.NewLinear(4, 3), nn.NewLinear(3, 2))
+	f, err := mim.Open(save(t, src, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for name, c := range map[string]struct {
+		dst  func() *nn.Sequential
+		want error
+	}{
+		// The first layer fits, the second does not.
+		"shape": {func() *nn.Sequential { return nn.NewSequential(nn.NewLinear(4, 3), nn.NewLinear(3, 5)) }, tensor.ErrShape},
+		"missing": {func() *nn.Sequential {
+			return nn.NewSequential(nn.NewLinear(4, 3), nn.NewLinear(3, 2), nn.NewLinear(2, 2))
+		}, tensor.ErrShape},
+	} {
+		t.Run(name, func(t *testing.T) {
+			nn.ManualSeed(6)
+			dst := c.dst()
+			before := map[string][]float32{}
+			for n, p := range nn.NamedParams(dst) {
+				before[n] = values(t, p.Value())
+			}
+			if err := f.Load(dst); !errors.Is(err, c.want) {
+				t.Fatalf("Load: %v, want %v", err, c.want)
+			}
+			for n, p := range nn.NamedParams(dst) {
+				if !slices.Equal(values(t, p.Value()), before[n]) {
+					t.Errorf("%s changed by a load that failed", n)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadOnTakesTheDevice(t *testing.T) {
+	dev := tensor.CPUs(1)[0]
+	nn.ManualSeed(7)
+	a := nn.NewSequential(nn.NewLinear(4, 3), nn.NewBatchNorm1d(3))
+	nn.ManualSeed(8)
+	b := nn.NewSequential(nn.NewLinear(4, 3), nn.NewBatchNorm1d(3))
+	f, err := mim.Open(save(t, a, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.LoadOn(b, dev); err != nil {
+		t.Fatal(err)
+	}
+	for n, p := range nn.NamedParams(b) {
+		if !p.Value().Device().Equal(dev) {
+			t.Errorf("%s on %v, want %v", n, p.Value().Device(), dev)
+		}
+	}
+	nn.Eval(a)
+	nn.Eval(b)
+	x := tensor.Randn(5, 6, 4)
+	if want, got := values(t, a.Forward(x)), values(t, b.Forward(x.To(dev))); !slices.Equal(got, want) {
+		t.Errorf("model loaded on %v computes %v, want %v", dev, got, want)
+	}
+	// LoadPrefixedOn reads the names under a prefix.
+	var buf bytes.Buffer
+	ts := map[string]*tensor.Tensor{}
+	for n, p := range nn.NamedParams(a) {
+		ts["model."+n] = p.Value()
+	}
+	if err := mim.WriteTensors(t.Context(), &buf, ts, nil); err != nil {
+		t.Fatal(err)
+	}
+	g, err := mim.Parse(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	nn.ManualSeed(9)
+	c := nn.NewSequential(nn.NewLinear(4, 3), nn.NewBatchNorm1d(3))
+	if err := g.LoadPrefixedOn("model.", c, dev); err != nil {
+		t.Fatal(err)
+	}
+	nn.Eval(c)
+	if want, got := values(t, a.Forward(x)), values(t, c.Forward(x.To(dev))); !slices.Equal(got, want) {
+		t.Errorf("prefixed load computes %v, want %v", got, want)
+	}
+}
