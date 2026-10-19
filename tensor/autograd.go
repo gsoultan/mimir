@@ -817,6 +817,37 @@ type Param struct {
 	mu        sync.Mutex
 	value     *Tensor
 	trainable bool
+	// of is the parameter a frozen view reads, or nil (see Frozen).
+	of *Param
+}
+
+// ErrFrozen reports a change through a frozen view of a parameter (see
+// Param.Frozen).
+var ErrFrozen = errors.New("tensor: frozen parameter")
+
+// Frozen returns a read-only view of p for inference: its Value is p's
+// current value without gradient tracking, so a computation that reads
+// parameters only through frozen views records no tape and allocates no
+// gradient state, as under torch.no_grad, and its activations are freed
+// as soon as nothing reads them rather than kept for a Backward.
+//
+// This is how mimir runs without gradients: a tape starts only at a
+// tensor that requires gradients, a Param's value or a RequiresGrad, and
+// every tensor computed from untracked tensors is untracked. A view
+// scopes that to the code given it, not to a goroutine or the process, so
+// inference and training of one model run at once on separate goroutines,
+// training through p and inference through its views (see nn.Inference).
+//
+// A view follows p: each Value reads p's value at the time, so it sees
+// what Set and optimizer steps write. A computation built from a value
+// that an optimizer step then writes over fails with ErrOverwritten, as it
+// does through p. The view is not trainable and has no gradient; Set, To
+// and Shard fail with ErrFrozen. The view of a view is itself.
+func (p *Param) Frozen() *Param {
+	if p.of != nil {
+		return p
+	}
+	return &Param{of: p}
 }
 
 // NewParam returns a trainable parameter holding a copy of init's values.
@@ -859,6 +890,9 @@ func newParam(init *Tensor, trainable bool) *Param {
 
 // Value returns the parameter's current value.
 func (p *Param) Value() *Tensor {
+	if p.of != nil {
+		return p.of.Value().detached()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.value
@@ -902,6 +936,9 @@ func (p *Param) Set(v *Tensor) error {
 }
 
 func (p *Param) set(v *Tensor) error {
+	if p.of != nil {
+		return fmt.Errorf("tensor: set a parameter through a frozen view: %w", ErrFrozen)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.value.err; err != nil {
@@ -927,6 +964,9 @@ func (p *Param) To(d Device) error {
 // the last ZeroGrad, by what to makes of them, computed now, as To moves
 // them to where.
 func (p *Param) move(where string, to func(*Tensor) *Tensor) error {
+	if p.of != nil {
+		return fmt.Errorf("tensor: move a parameter to %s through a frozen view: %w", where, ErrFrozen)
+	}
 	v := p.Value()
 	if err := firstErr(v); err != nil {
 		return err

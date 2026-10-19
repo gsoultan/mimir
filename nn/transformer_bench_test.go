@@ -95,7 +95,8 @@ func llama1B() *nn.DecoderBlock {
 
 // BenchmarkDecode times a decoding step of one token with 512 positions
 // in the cache at the shapes of Llama 3.2 1B: the attention alone, with
-// its cache append, and a whole block. The model has 16 blocks.
+// its cache append, and a whole block, trainable in evaluation mode and
+// through nn.Inference. The model has 16 blocks.
 func BenchmarkDecode(b *testing.B) {
 	const past = 512
 	b.Run("attention", func(b *testing.B) {
@@ -126,33 +127,41 @@ func BenchmarkDecode(b *testing.B) {
 		}
 	})
 	b.Run("block", func(b *testing.B) {
-		ctx := b.Context()
 		block := llama1B()
 		nn.Eval(block)
-		cache := nn.NewKVCache(1, 8, past+1, 64, tensor.Float32)
-		prompt := tensor.Randn(2, 1, past, 2048)
-		if _, err := block.Decode(ctx, prompt, cache); err != nil {
-			b.Fatal(err)
-		}
-		x := tensor.Randn(3, 1, 1, 2048)
-		if err := x.Realize(ctx); err != nil {
-			b.Fatal(err)
-		}
-		step := func() {
-			cache.Truncate(past)
-			y, err := block.Decode(ctx, x, cache)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if err := y.Realize(ctx); err != nil {
-				b.Fatal(err)
-			}
-		}
-		for range warmup {
-			step()
-		}
-		for b.Loop() {
-			step()
-		}
+		decodeBlock(b, block, past)
 	})
+	b.Run("block/inference", func(b *testing.B) {
+		decodeBlock(b, nn.Inference(llama1B()), past)
+	})
+}
+
+// decodeBlock times a decoding step of BenchmarkDecode through block.
+func decodeBlock(b *testing.B, block *nn.DecoderBlock, past int) {
+	ctx := b.Context()
+	cache := nn.NewKVCache(1, 8, past+1, 64, tensor.Float32)
+	prompt := tensor.Randn(2, 1, past, 2048)
+	if _, err := block.Decode(ctx, prompt, cache); err != nil {
+		b.Fatal(err)
+	}
+	x := tensor.Randn(3, 1, 1, 2048)
+	if err := x.Realize(ctx); err != nil {
+		b.Fatal(err)
+	}
+	step := func() {
+		cache.Truncate(past)
+		y, err := block.Decode(ctx, x, cache)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := y.Realize(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for range warmup {
+		step()
+	}
+	for b.Loop() {
+		step()
+	}
 }
