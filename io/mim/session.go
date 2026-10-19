@@ -13,7 +13,15 @@ import (
 
 // Session runs a model and holds its variables, such as the key-value
 // cache of a language model, between runs. Its methods may be called from
-// several goroutines; runs take turns.
+// several goroutines; runs of one session take turns.
+//
+// Sessions of one Model are independent: each holds its own variables,
+// and they share only the model's weights, which no run writes, so runs
+// of different sessions may go on at once on different goroutines,
+// sharing the devices as any concurrent computations do. A
+// server gives each worker slot, or each conversation whose cache it
+// keeps, a session of its own from NewSession, rather than calling
+// Model.Run, whose one session every caller shares and waits for.
 type Session struct {
 	m    *Model
 	mu   sync.Mutex
@@ -21,7 +29,8 @@ type Session struct {
 }
 
 // NewSession returns a session whose variables start from their initial
-// values.
+// values, independent of the model's other sessions. It is cheap: the
+// variables take memory once a run sets them.
 func (m *Model) NewSession() *Session { return &Session{m: m} }
 
 // Reset puts the session's variables back to their initial values.
@@ -41,6 +50,10 @@ func (s *Session) Reset() {
 // Variables read the values the previous run of the session left. Once
 // the outputs and the variables' new values are computed, the variables
 // take them; a run that fails changes none.
+//
+// A run is inference: it records no tape, even from inputs that require
+// gradients, so its outputs are not tracked (see tensor.Tensor.Detach)
+// and the intermediate values are freed once computed.
 func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (map[string]*tensor.Tensor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -71,7 +84,9 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 		} else if t.Device() != r.dev {
 			return nil, fmt.Errorf("mim: input %q on %v, others on %v: %w", info.Name, t.Device(), r.dev, tensor.ErrDevice)
 		}
-		r.env[vi] = t
+		// The weights and constants are not tracked, so untracked inputs
+		// leave the whole run untracked.
+		r.env[vi] = t.Detach()
 	}
 	for name := range inputs {
 		if !slices.ContainsFunc(m.inputs, func(v ValueInfo) bool { return v.Name == name }) {

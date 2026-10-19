@@ -50,6 +50,11 @@ import (
 // maxProgram is the most instructions a fused program grows to.
 const maxProgram = 256
 
+// maxInputs is the most inputs a fused program loads. Metal binds at most
+// 31 buffers to a kernel, and a program's outputs, parameters and error
+// word take buffers too.
+const maxInputs = 16
+
 // plan lists the kernels that compute a schedule's targets.
 type plan struct {
 	be     backend.Backend             // the device that runs the kernels
@@ -204,26 +209,39 @@ func newPlan(be backend.Backend, order []*graph.Node, isTarget map[*graph.Node]b
 	// reader: the inputs that would take it past are computed by kernels
 	// of their own. A GPU compiles each program, and a program of a long
 	// chain, such as a running sum, would be too large.
+	// It also stops at maxInputs distinct inputs, keeping room for the
+	// inputs a node has yet to add.
 	cut := map[*graph.Node]bool{}
 	size := make(map[*graph.Node]int, len(order))
+	loads := make(map[*graph.Node][]*graph.Node, len(order))
 	for _, n := range order {
 		if !n.Op.IsElementwise() {
 			continue
 		}
 		s := 1
+		var l []*graph.Node
 		for i, in := range n.Inputs {
 			switch {
 			case slices.Contains(n.Inputs[:i], in):
 			case !joins(in):
 				s++
-			case s+size[in] > maxProgram:
-				cut[in] = true
-				s++
+				l = addLoad(l, in)
 			default:
-				s += size[in]
+				joined := l
+				for _, x := range loads[in] {
+					joined = addLoad(joined, x)
+				}
+				if s+size[in] > maxProgram || len(joined)+len(n.Inputs)-i-1 > maxInputs {
+					cut[in] = true
+					s++
+					l = addLoad(l, in)
+				} else {
+					s += size[in]
+					l = joined
+				}
 			}
 		}
-		size[n] = s
+		size[n], loads[n] = s, l
 	}
 	// roots maps each node to the node whose kernel computes it: itself,
 	// or the root of the group it joins, which is the root of all its
@@ -326,6 +344,14 @@ func newPlan(be backend.Backend, order []*graph.Node, isTarget map[*graph.Node]b
 	}
 	slices.Reverse(p.order)
 	return p
+}
+
+// addLoad returns loads with x added, once.
+func addLoad(loads []*graph.Node, x *graph.Node) []*graph.Node {
+	if slices.Contains(loads, x) {
+		return loads
+	}
+	return append(slices.Clip(loads), x)
 }
 
 // dequantizes reports whether n is a cast of a block-quantized value.

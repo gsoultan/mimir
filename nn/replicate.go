@@ -38,11 +38,45 @@ func Replicate(m Module, d tensor.Device) (Module, error) {
 
 var tensorType = reflect.TypeFor[*tensor.Tensor]()
 
-// copier deep-copies a module onto a device.
+// copier deep-copies a module onto a device or, with frozen set, into an
+// inference view that shares m's tensors and reads its parameters through
+// frozen views.
 type copier struct {
-	dev  tensor.Device
-	done map[pointer]reflect.Value // the copy of each pointer copied so far
-	err  error
+	dev    tensor.Device
+	frozen bool
+	done   map[pointer]reflect.Value // the copy of each pointer copied so far
+	err    error
+}
+
+// Inference returns a view of m for serving: a copy of its structure, in
+// evaluation mode, whose parameters and buffers are frozen views of m's
+// (see tensor.Param.Frozen). A forward pass through it records no tape
+// and allocates no gradient state, and its activations are freed once
+// nothing reads them, while m keeps training: the view reads m's current
+// values at each forward pass and shares its tensors, so it costs no
+// memory for weights. Setting the view's mode, with Train or Eval, does
+// not change m's, nor m's the view's.
+//
+// Inference is the way to serve a model that may also be trained: give
+// each goroutine that runs forward passes a view, or share one between
+// goroutines when its layers keep no state between forward passes. Layers
+// that do, such as a key-value cache a caller passes in, are the caller's
+// to keep per request.
+//
+// As with Replicate, functions are shared, not copied: a Func that holds
+// a layer of m keeps using m's layer, and the parameters it reads record
+// tapes.
+func Inference[M Module](m M) M {
+	src := reflect.ValueOf(m)
+	if !src.IsValid() {
+		return m
+	}
+	c := copier{frozen: true, done: map[pointer]reflect.Value{}}
+	dst := reflect.New(src.Type()).Elem()
+	c.copy(dst, src)
+	out := dst.Interface().(M)
+	setTraining(out, false)
+	return out
 }
 
 // pointer is a pointer and its type: a struct and its first field share
@@ -70,8 +104,12 @@ func (c *copier) copy(dst, src reflect.Value) {
 		p := reflect.NewAt(src.Type().Elem(), ptr.at)
 		var out reflect.Value
 		switch {
+		case p.Type() == paramType && c.frozen:
+			out = reflect.ValueOf(p.Interface().(*tensor.Param).Frozen())
 		case p.Type() == paramType:
 			out = reflect.ValueOf(c.param(p.Interface().(*tensor.Param)))
+		case p.Type() == tensorType && c.frozen:
+			out = p
 		case p.Type() == tensorType:
 			t := p.Interface().(*tensor.Tensor)
 			out = reflect.ValueOf(t.To(c.dev))

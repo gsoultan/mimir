@@ -155,31 +155,80 @@ func (m *Model) Training() (*mimfile.Training, error) {
 }
 
 // Load sets every parameter and buffer of mod from the file's tensor of
-// its name, as Save writes them, which must have its shape. The values
-// live on the default device. A float tensor of another dtype than its
-// parameter, as a model saved after nn.Cast holds, is cast to the
-// parameter's dtype; any other dtype difference is an error.
+// its name, as Save writes them, on the default device. It is LoadOn with
+// tensor.DefaultDevice().
+func (m *Model) Load(mod nn.Module) error { return m.LoadOn(mod, tensor.DefaultDevice()) }
+
+// LoadPrefixed is Load for files that name mod's parameters prefix+name.
+func (m *Model) LoadPrefixed(prefix string, mod nn.Module) error {
+	return m.LoadPrefixedOn(prefix, mod, tensor.DefaultDevice())
+}
+
+// LoadOn sets every parameter and buffer of mod from the file's tensor of
+// its name, as Save writes them, which must have its shape, with the
+// values on d. A float tensor of another dtype than its parameter, as a
+// model saved after nn.Cast holds, is cast to the parameter's dtype; a
+// trainable parameter takes float values only.
+//
+// LoadOn changes all of mod's parameters or none: it finds, checks and
+// computes every value on d before it sets the first, so a missing
+// tensor, a shape or dtype that does not fit, or a failure to copy the
+// values to d leaves mod as it was.
 //
 // On the CPU, a parameter reads its values in the file's mapping, without
 // a copy of its own, and the file's pages stream in from disk as the
 // values are read; an optimizer step then writes over the parameter's
 // private copy of its pages, never the file. The parameters hold the
-// mapping, so the model may be closed once Load returns.
-func (m *Model) Load(mod nn.Module) error { return m.LoadPrefixed("", mod) }
+// mapping, so the model may be closed once LoadOn returns.
+func (m *Model) LoadOn(mod nn.Module, d tensor.Device) error { return m.LoadPrefixedOn("", mod, d) }
 
-// LoadPrefixed is Load for files that name mod's parameters prefix+name.
-func (m *Model) LoadPrefixed(prefix string, mod nn.Module) error {
+// LoadPrefixedOn is LoadOn for files that name mod's parameters
+// prefix+name.
+func (m *Model) LoadPrefixedOn(prefix string, mod nn.Module, d tensor.Device) error {
+	type load struct {
+		name     string
+		p        *tensor.Param
+		old, new *tensor.Tensor
+	}
+	var loads []load
 	for name, p := range nn.NamedParams(mod) {
 		v, err := m.Tensor(prefix + name)
 		if err != nil {
 			return fmt.Errorf("mim: load %s: %w", name, err)
 		}
-		v = v.To(tensor.DefaultDevice())
-		if cur := p.Value().DType(); v.DType() != cur && v.DType().IsFloat() && cur.IsFloat() {
-			v = v.Cast(cur)
-		}
-		if err := p.Set(v); err != nil {
+		cur := p.Value()
+		if err := cur.Err(); err != nil {
 			return fmt.Errorf("mim: load %s: %w", name, err)
+		}
+		if !slices.Equal(v.Shape(), cur.Shape()) {
+			return fmt.Errorf("mim: load %s: %s%v into a %s%v parameter: %w", name, v.DType(), v.Shape(), cur.DType(), cur.Shape(), tensor.ErrShape)
+		}
+		if v.DType() != cur.DType() && v.DType().IsFloat() && cur.DType().IsFloat() {
+			v = v.Cast(cur.DType())
+		}
+		if p.Trainable() && !v.DType().IsFloat() {
+			return fmt.Errorf("mim: load %s: %s values into a trainable parameter: %w", name, v.DType(), tensor.ErrDType)
+		}
+		loads = append(loads, load{name: name, p: p, old: cur, new: v.To(d)})
+	}
+	vs := make([]*tensor.Tensor, len(loads))
+	for i, l := range loads {
+		vs[i] = l.new
+	}
+	// Values the file maps on the CPU are computed already, and stay
+	// mapped; copies and casts are computed now, so a failure to make
+	// them, such as running out of memory on d, sets nothing.
+	if err := tensor.Realize(context.Background(), vs...); err != nil {
+		return fmt.Errorf("mim: load on %v: %w", d, err)
+	}
+	for i, l := range loads {
+		if err := l.p.Set(l.new); err != nil {
+			// Only a change to mod during LoadOn gets here: put back the
+			// values set before it.
+			for _, done := range slices.Backward(loads[:i]) {
+				_ = done.p.Set(done.old)
+			}
+			return fmt.Errorf("mim: load %s: %w", l.name, err)
 		}
 	}
 	return nil
