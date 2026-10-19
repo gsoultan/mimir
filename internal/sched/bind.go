@@ -14,6 +14,9 @@ import (
 func Bind(n *graph.Node, dev backend.Backend, buf backend.Buffer, over *graph.Node) {
 	mu.Lock()
 	defer mu.Unlock()
+	if over != nil {
+		waitUnclaimed(over)
+	}
 	if over != nil && over.Realized() {
 		m := over.Mem
 		m.Version++
@@ -32,6 +35,7 @@ func Bind(n *graph.Node, dev backend.Backend, buf backend.Buffer, over *graph.No
 func Invalidate(n *graph.Node) {
 	mu.Lock()
 	defer mu.Unlock()
+	waitUnclaimed(n)
 	if n.Realized() && !n.Stale() {
 		n.Mem.Version++
 		n.Mem.Refs = 0
