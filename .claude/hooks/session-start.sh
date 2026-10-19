@@ -23,3 +23,13 @@ fi
 if command -v graphify >/dev/null; then
   graphify update . >&2 || echo "graphify update failed; the code graph may be stale" >&2
 fi
+
+# Warm Serena's symbol cache in the background so startup is not held up, and
+# record the tree state so the Stop hook only refreshes after code changes.
+if command -v serena >/dev/null; then
+  nohup serena project index --log-level ERROR . </dev/null >/dev/null 2>&1 &
+fi
+"$CLAUDE_PROJECT_DIR"/.claude/hooks/refresh-code-maps.sh --mark
+
+# Stdout from this hook is added to Claude's context.
+echo "Code tools: run \`graphify query\` and use Serena's symbol tools to understand the task before grepping or opening files. The graph and Serena's index refresh automatically after code changes."
