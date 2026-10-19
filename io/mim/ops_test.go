@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"testing"
 
@@ -629,6 +630,66 @@ func TestRunChecksInputs(t *testing.T) {
 		if _, err := m.Run(ctx, in); err == nil {
 			t.Errorf("%s: no error", name)
 		}
+	}
+}
+
+// TestHugeValuesFailBeforeAllocating runs graphs that declare values far
+// larger than memory, as a hostile file may: the run fails with
+// tensor.ErrMemoryBudget instead of allocating them.
+func TestHugeValuesFailBeforeAllocating(t *testing.T) {
+	ctx := context.Background()
+	expand := func(n int) []byte {
+		b := newBuilder()
+		x := b.input("x", mimfile.F32, 1, 4)
+		big := b.op(0, mimfile.OpExpand, mimfile.F32, []int{n, 4}, []uint32{x})
+		b.output("y", b.op(0, mimfile.OpReduce, mimfile.F32, []int{1, 4}, []uint32{big}, aStr("mode", "add"), aInts("axes", 0)))
+		return b.file(t)
+	}
+	zero := func(n int) []byte {
+		b := newBuilder()
+		x := b.input("x", mimfile.F32, 1, 4)
+		v := b.value("cache", mimfile.F32, mimfile.KindVariable, n, 4)
+		b.g.Values[v].Zero = true
+		b.output("y", b.op(0, mimfile.OpAdd, mimfile.F32, []int{1, 4}, []uint32{x, x}))
+		b.g.Updates = []mimfile.Update{{Variable: v, Value: v}}
+		return b.file(t)
+	}
+	x := map[string]*tensor.Tensor{"x": tensor.Ones(tensor.Float32, 1, 4)}
+	for _, tc := range []struct {
+		name string
+		file []byte
+	}{
+		{"expanded to 32 GiB", expand(1 << 31)},
+		{"expanded to 2^62 elements", expand(1 << 60)},
+		{"variable of 16 GiB", zero(1 << 30)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := mim.Parse(tc.file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if _, err := m.Run(ctx, x); !errors.Is(err, tensor.ErrMemoryBudget) {
+				t.Fatalf("Run: %v, want ErrMemoryBudget", err)
+			}
+		})
+	}
+	m, err := mim.Parse(expand(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	m.SetMaxValueBytes(47) // [3 4] f32 is 48 bytes
+	if _, err := m.Run(ctx, x); !errors.Is(err, tensor.ErrMemoryBudget) {
+		t.Errorf("value of 48 bytes over a bound of 47: %v", err)
+	}
+	m.SetMaxValueBytes(48)
+	out, err := m.Run(ctx, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := out["y"].Data[float32](ctx); !slices.Equal(got, []float32{3, 3, 3, 3}) {
+		t.Errorf("y = %v", got)
 	}
 }
 
