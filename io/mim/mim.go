@@ -68,6 +68,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	mimfile "github.com/gsoultan/mimir-model"
 
@@ -155,6 +156,8 @@ type Model struct {
 	producer []*mimfile.Op             // the op that computes each value, if any
 	locals   map[string]uint32         // model-local composites by name.vN, their subgraphs
 
+	maxBytes atomic.Int64 // the bound on each value a run computes; see SetMaxValueBytes
+
 	mu       sync.Mutex
 	onDevice map[tensor.Device]map[uint32]*tensor.Tensor
 	session  *Session
@@ -187,6 +190,7 @@ func Parse(b []byte) (*Model, error) { return parse(b, nil) }
 
 func parse(b []byte, mp *filemap.Mapping) (*Model, error) {
 	m := &Model{mapping: mp, onDevice: map[tensor.Device]map[uint32]*tensor.Tensor{}}
+	m.maxBytes.Store(DefaultMaxValueBytes)
 	if err := m.load(b); err != nil {
 		if mp != nil {
 			_ = mp.Close()
@@ -282,6 +286,40 @@ func valueName(v mimfile.Value, i uint32) string {
 		return v.Name
 	}
 	return "%" + strconv.Itoa(int(i))
+}
+
+// DefaultMaxValueBytes is the bound a model starts with on the bytes of
+// each value a run computes (see Model.SetMaxValueBytes).
+const DefaultMaxValueBytes = 4 << 30
+
+// SetMaxValueBytes bounds the bytes of each value a run computes, and of
+// each variable that starts as zeros, counted in the dtype the file
+// declares: a run that would compute a larger one fails with
+// tensor.ErrMemoryBudget before it allocates it. The bound keeps a broken
+// or hostile file, which may declare an intermediate value of any size,
+// from exhausting memory; it starts at DefaultMaxValueBytes. A negative n
+// removes it. Inputs, weights and constants are not counted.
+func (m *Model) SetMaxValueBytes(n int64) { m.maxBytes.Store(n) }
+
+// checkSize fails with tensor.ErrMemoryBudget when a value of dtype dt and
+// shape is over the model's bound on the bytes of a value.
+func (m *Model) checkSize(v mimfile.Value, vi uint32, shape []int) error {
+	limit := m.maxBytes.Load()
+	if limit < 0 {
+		return nil
+	}
+	dims := make([]uint64, len(shape))
+	for i, d := range shape {
+		if d < 0 {
+			return nil // not bound yet; checked once computed
+		}
+		dims[i] = uint64(d)
+	}
+	n, err := mimfile.ByteSize(v.DType, dims)
+	if err == nil && n <= uint64(limit) {
+		return nil
+	}
+	return fmt.Errorf("mim: %s %q of shape %v takes more than the %d bytes a value may: %w", kindName(v.Kind), valueName(v, vi), shape, limit, tensor.ErrMemoryBudget)
 }
 
 // Inputs returns the inputs a run takes, in the order of the graph.
