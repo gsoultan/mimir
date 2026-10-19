@@ -1000,6 +1000,47 @@ func (l *longest) Run(ctx context.Context, k *backend.Kernel, outs, ins []backen
 	return l.counting.Run(ctx, k, outs, ins)
 }
 
+// widest records the most inputs a fused program loads.
+type widest struct {
+	*counting
+	max int
+}
+
+func (w *widest) Run(ctx context.Context, k *backend.Kernel, outs, ins []backend.Buffer) error {
+	if k.Op == backend.OpFused {
+		w.max = max(w.max, len(ins))
+	}
+	return w.counting.Run(ctx, k, outs, ins)
+}
+
+func TestSumsOfManyInputsSplitIntoProgramsOfBoundedInputs(t *testing.T) {
+	be := &widest{counting: &counting{Backend: cpu.New()}}
+	const n = 100
+	xs := make([]*graph.Node, n)
+	want := make([]float32, 3)
+	for i := range xs {
+		xs[i] = realized(t, be, []int{3}, uint64(i))
+		for j, v := range floats(t, be, xs[i]) {
+			want[j] += v
+		}
+	}
+	y := xs[0]
+	for _, x := range xs[1:] {
+		y = must(graph.Binary(backend.OpAdd, y, x))
+	}
+	if err := Realize(t.Context(), be, y); err != nil {
+		t.Fatal(err)
+	}
+	if be.max > maxInputs {
+		t.Errorf("a program loads %d inputs, want at most %d", be.max, maxInputs)
+	}
+	for i, v := range floats(t, be, y) {
+		if math.Abs(float64(v-want[i])) > 1e-3 {
+			t.Fatalf("y[%d] = %v, want %v", i, v, want[i])
+		}
+	}
+}
+
 func TestLongChainsSplitIntoProgramsOfBoundedLength(t *testing.T) {
 	be := &longest{counting: &counting{Backend: cpu.New()}}
 	x := realized(t, be, []int{3}, 1)
