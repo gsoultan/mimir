@@ -38,7 +38,8 @@ import (
 // run.
 
 // program is a compiled schedule. Its scratch slices are bound for one
-// run at a time, under mu.
+// run at a time, under mu or, while busy, by the schedule that runs it
+// without mu.
 type program struct {
 	leaves, targets int         // the slots of the walk's leaves, then of the destinations
 	tmps            []poolKey   // the pooled buffers, in the order taken; their slots follow
@@ -60,6 +61,9 @@ type program struct {
 	mems  []*graph.Storage // by pooled buffer: the storage of the results it holds
 
 	donated []donation // the donated leaves the program gives to the pool
+
+	busy bool             // a schedule runs it without mu
+	lent []backend.Buffer // pooled buffers given back that its kernels may still read
 }
 
 // donation is a donated leaf, in slot leaf, whose buffer the program
@@ -394,8 +398,10 @@ func (p *program) reserve(m *pool) error {
 // run computes targets, writing them over dsts as compiled, on m's
 // backend, reading the leaves and constants of the walk w. It assigns
 // each target its result and makes stale the destinations it consumes,
-// as realize documents.
-func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*graph.Node) (err error) {
+// as realize documents. mu is held; if unlock is set, run gives it up
+// while the kernels run, with the claims of w held (see claims in
+// sched.go), and takes it again before it changes any node.
+func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*graph.Node, unlock bool) (err error) {
 	defer p.unbind()
 	for i, n := range w.leaves {
 		p.bufs[i] = n.Buf()
@@ -446,17 +452,25 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 			return err
 		}
 	}
-	if err := p.launch(ctx, m.be, w, dsts); err != nil {
+	p.bind(w)
+	var started int
+	if unlock {
+		started, err = p.launchUnlocked(ctx, m, w)
+	} else {
+		started, err = p.launch(ctx, m.be)
+	}
+	// The destinations that kernels began to write over are stale, whether
+	// or not they failed.
+	for i := range started {
+		for _, t := range p.steps[i].into {
+			d := dsts[t]
+			d.Mem.Version++
+			d.Mem.Refs = 0
+		}
+	}
+	if err != nil {
 		p.giveBack(m)
 		return err
-	}
-	// An asynchronous backend reports the errors of these kernels at its
-	// next Sync, Upload or Download instead (see backend.Asynchronous).
-	if a, ok := m.be.(backend.Asynchronous); !ok || !a.Asynchronous() {
-		if err := m.be.Sync(p.uncancelled(ctx)); err != nil {
-			p.giveBack(m)
-			return err
-		}
 	}
 	for i, t := range targets {
 		slot := p.results[i]
@@ -479,14 +493,58 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 	}
 	clear(p.held)
 	consume(targets, dsts)
+	if unlock {
+		// The nodes it changed are not those an earlier schedule saw.
+		generation.Add(1)
+	}
 	return nil
 }
 
-// launch runs the program's kernels on be, as one batch if be runs
-// batches, taking their arguments from the nodes of w. Once a kernel has
-// begun to write over a destination, it ignores cancellation, so that the
-// schedule does not stop with some targets written and others not.
-func (p *program) launch(ctx context.Context, be backend.Backend, w *walker, dsts []*graph.Node) error {
+// launchUnlocked is launch, and the Sync after it, run without mu: it
+// takes the claims of w, puts the buffers that the run gave back to the
+// pool out of reach of other schedules until its kernels have run (see
+// hide), and gives mu up while the kernels run. It takes mu again, and
+// gives the claims and buffers back, before it returns.
+func (p *program) launchUnlocked(ctx context.Context, m *pool, w *walker) (started int, err error) {
+	p.hide(m)
+	w.hold()
+	running++
+	p.busy = true
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		p.busy = false
+		running--
+		w.unhold()
+		for _, buf := range p.lent {
+			m.release(buf)
+		}
+		clear(p.lent)
+		p.lent = p.lent[:0]
+		idle.Broadcast()
+	}()
+	return p.launch(ctx, m.be)
+}
+
+// hide takes off m's free lists the pooled buffers that the run gave back
+// during its bookkeeping and did not take again, into p.lent, for the
+// kernels that read them may not have run. Under mu no other schedule
+// runs between the bookkeeping and the kernels, so the buffers can stay
+// in the pool; while the kernels run without mu, another schedule would
+// take them.
+func (p *program) hide(m *pool) {
+	base := p.leaves + p.targets
+	for k, h := range p.held {
+		if buf := p.bufs[base+k]; !h && buf != nil && m.unfree(buf) {
+			p.lent = append(p.lent, buf)
+		}
+	}
+}
+
+// bind sets the arguments and buffers of the program's kernels from the
+// walk w and the run's slots, under mu: the nodes of w may change once
+// mu is given up.
+func (p *program) bind(w *walker) {
 	for i := range p.steps {
 		s := &p.steps[i]
 		if s.argsOf >= 0 {
@@ -503,42 +561,54 @@ func (p *program) launch(ctx context.Context, be backend.Backend, w *walker, dst
 			p.batch.Ins[i][j] = p.bufs[slot]
 		}
 	}
-	overwrite := func(s *kstep) {
-		for _, t := range s.into {
-			d := dsts[t]
-			d.Mem.Version++
-			d.Mem.Refs = 0
-		}
-	}
+}
+
+// launch runs the program's kernels, which bind set up, on be, as one
+// batch if be runs batches, and, unless be is asynchronous, waits for
+// them. It returns how many of the kernels it began, whose destinations
+// the caller makes stale. Once a kernel has begun to write over a
+// destination, it ignores cancellation, so that the schedule does not
+// stop with some targets written and others not. It touches nothing but
+// the program and the buffers, so it may run without mu.
+func (p *program) launch(ctx context.Context, be backend.Backend) (started int, err error) {
 	if b, ok := be.(backend.Batcher); ok && len(p.steps) > 0 {
 		if err := ctx.Err(); err != nil {
-			return err
+			return 0, err
 		}
 		if p.into {
 			ctx = p.uncancelled(ctx)
-			for i := range p.steps {
-				overwrite(&p.steps[i])
-			}
 		}
-		return b.RunBatch(ctx, &p.batch)
+		if err := b.RunBatch(ctx, &p.batch); err != nil {
+			return len(p.steps), err
+		}
+		return len(p.steps), p.sync(ctx, be)
 	}
 	writing := false
 	for i := range p.steps {
 		s := &p.steps[i]
 		if !writing {
 			if err := ctx.Err(); err != nil {
-				return err
+				return i, err
 			}
 			if len(s.into) > 0 {
 				writing, ctx = true, p.uncancelled(ctx)
 			}
 		}
-		overwrite(s)
 		if err := be.Run(ctx, s.k, p.batch.Outs[i], p.batch.Ins[i]); err != nil {
-			return err
+			return i + 1, err
 		}
 	}
-	return nil
+	return len(p.steps), p.sync(ctx, be)
+}
+
+// sync waits for the kernels on be, unless be is asynchronous, which
+// reports their errors at its next Sync, Upload or Download instead (see
+// backend.Asynchronous).
+func (p *program) sync(ctx context.Context, be backend.Backend) error {
+	if a, ok := be.(backend.Asynchronous); ok && a.Asynchronous() {
+		return nil
+	}
+	return be.Sync(p.uncancelled(ctx))
 }
 
 // giveBack returns to m the pooled buffers the run still holds.
@@ -569,7 +639,7 @@ func (p *program) unbind() {
 func copyFrom(ctx context.Context, n *graph.Node, be backend.Backend, dst backend.Buffer) error {
 	size, _ := n.DType.Bytes(n.Size())
 	data := make([]byte, size)
-	if err := download(ctx, n, data); err != nil {
+	if err := download(ctx, n, data, false); err != nil {
 		return err
 	}
 	return be.Upload(ctx, dst, data)

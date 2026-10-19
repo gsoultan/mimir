@@ -85,6 +85,11 @@ type Storage struct {
 	// node realized into it reports ErrDonated.
 	Donated bool
 
+	// Readers and Writers count the schedules whose kernels read, and
+	// write, Buf while they run without the scheduler's lock. They are
+	// guarded by that lock.
+	Readers, Writers int32
+
 	Mark Mark // the scheduler's scratch space, like Node.Mark
 }
 

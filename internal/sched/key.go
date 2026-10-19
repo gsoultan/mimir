@@ -35,7 +35,8 @@ var walks atomic.Uint64
 
 // walker walks the graph of one schedule. Its slices are reused from walk
 // to walk, so that a schedule replayed from the cache allocates nothing
-// to find its program. It is guarded by mu.
+// to find its program. It belongs to one schedule at a time, and is
+// guarded by mu except while that schedule runs without it.
 type walker struct {
 	walk   uint64
 	be     backend.Backend
@@ -49,6 +50,65 @@ type walker struct {
 	tailAt int     // where the targets start in key
 
 	gifts []gift // the donated leaves whose memory the schedule takes
+
+	claims []claim // the storages the schedule reads and writes (see claims in sched.go)
+}
+
+// claim is a storage that a schedule's kernels read, or write.
+type claim struct {
+	mem   *graph.Storage
+	write bool
+}
+
+// contended lists in w.claims the storages that the schedule w walked,
+// which writes over dsts, reads and writes, and reports whether a running
+// schedule claims one of them in a way that keeps this one from starting:
+// one writes a storage that this one reads or writes, or reads one that
+// this one writes. It reads the leaves' storages, and writes those of the
+// destinations, whether it writes over them or only makes them stale, and
+// those of the donated leaves it may take.
+func (w *walker) contended(dsts []*graph.Node) bool {
+	w.claims = w.claims[:0]
+	for _, n := range w.leaves {
+		w.claims = append(w.claims, claim{mem: n.Mem})
+	}
+	for _, g := range w.gifts {
+		w.claims = append(w.claims, claim{mem: w.leaves[g.leaf].Mem, write: true})
+	}
+	for _, d := range dsts {
+		if d != nil && d.Realized() && !d.Stale() {
+			w.claims = append(w.claims, claim{mem: d.Mem, write: true})
+		}
+	}
+	for _, c := range w.claims {
+		if c.mem.Writers > 0 || c.write && c.mem.Readers > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hold takes the claims that contended listed, as the schedule starts to
+// run without mu. A storage listed twice is counted twice.
+func (w *walker) hold() {
+	for _, c := range w.claims {
+		if c.write {
+			c.mem.Writers++
+		} else {
+			c.mem.Readers++
+		}
+	}
+}
+
+// unhold drops the claims that hold took.
+func (w *walker) unhold() {
+	for _, c := range w.claims {
+		if c.write {
+			c.mem.Writers--
+		} else {
+			c.mem.Readers--
+		}
+	}
 }
 
 // gift is a donated leaf whose memory a schedule takes (see donate.go):
@@ -160,6 +220,8 @@ func (w *walker) run(be backend.Backend, targets, dsts []*graph.Node) error {
 func (w *walker) forget() {
 	clear(w.order)
 	clear(w.leaves)
+	clear(w.claims)
+	w.claims = w.claims[:0]
 	clear(w.stack[:cap(w.stack)])
 	w.order, w.leaves, w.stack, w.be = w.order[:0], w.leaves[:0], w.stack[:0], nil
 }

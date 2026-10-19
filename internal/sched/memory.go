@@ -36,7 +36,8 @@ import (
 const poolAge = 16
 
 // pool holds the free buffers of one backend. It is guarded by mu, except
-// for its account, which cleanups update outside mu.
+// for its account, which cleanups update outside mu. The buffers that
+// running schedules hold are off its free lists (see claims in sched.go).
 type pool struct {
 	be     backend.Backend
 	free   map[poolKey][]pooled
@@ -48,8 +49,8 @@ type pool struct {
 	// prediction was exact.
 	obtained, predicted int64
 
-	programs cache  // the programs of recent schedules (see cache.go)
-	walker   walker // walks the graphs of the schedules on be
+	programs cache     // the programs of recent schedules (see cache.go)
+	walkers  []*walker // walk the graphs of the schedules on be, one each
 
 	loads map[poolKey]*loadOrder // the buffers uploads and copies took (see freeBuffer)
 
@@ -105,6 +106,25 @@ func poolOf(be backend.Backend) *pool {
 	return p
 }
 
+// takeWalker returns a walker for a schedule on p's backend, one that an
+// earlier schedule used if there is one, so that its slices are reused.
+// Each schedule has its own, as several run at once.
+func (p *pool) takeWalker() *walker {
+	if n := len(p.walkers); n > 0 {
+		w := p.walkers[n-1]
+		p.walkers = p.walkers[:n-1]
+		return w
+	}
+	return new(walker)
+}
+
+// giveWalker returns w, which takeWalker returned, once its schedule has
+// ended.
+func (p *pool) giveWalker(w *walker) {
+	w.forget()
+	p.walkers = append(p.walkers, w)
+}
+
 // alloc returns a buffer of n elements of dt with unspecified contents,
 // the most recently freed one if the pool has one.
 func (p *pool) alloc(dt backend.DType, n int) (backend.Buffer, error) {
@@ -153,6 +173,20 @@ func (p *pool) take(key poolKey, at uintptr, obtain bool) (backend.Buffer, bool,
 	p.obtained += key.bytes()
 	p.track(buf)
 	return buf, true, nil
+}
+
+// unfree takes buf off the free lists, if it is on them, and reports
+// whether it was. The most recently freed buffers are at the end.
+func (p *pool) unfree(buf backend.Buffer) bool {
+	key := poolKey{buf.DType(), buf.Len()}
+	bufs := p.free[key]
+	for i := len(bufs) - 1; i >= 0; i-- {
+		if bufs[i].buf == buf {
+			p.free[key] = append(bufs[:i], bufs[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // release returns buf to the pool.

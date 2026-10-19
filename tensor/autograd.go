@@ -19,21 +19,35 @@ import (
 var ErrNoGrad = errors.New("tensor does not require gradients")
 
 // gradMu guards the mutable state of tapes: the gradients accumulated in
-// leaves and the release of graphs after Backward. It is held only while
-// code of this package reads or writes them, never while user code runs,
-// so a checkpointed function or a Func may read gradients. Building
-// tensors reads only the immutable parts of tapes and never takes it.
+// leaves, the release of graphs after Backward, and which tapes a
+// Backward holds. It is held only while code of this package reads or
+// writes them, never while user code or a schedule runs, so a
+// checkpointed function or a Func may read gradients. Building tensors
+// reads only the immutable parts of tapes and never takes it.
 //
-// Lock order: backwardMu, then gradMu, then Param.mu.
+// A Backward holds the tapes it walked (tape.busy) from reading the
+// leaves' gradients until it has written their sums and released the
+// graph, while it computes them without gradMu. It takes them all at
+// once, under gradMu, once no other Backward holds any of them, and holds
+// nothing while it waits, so Backwards cannot deadlock: those that share
+// no tape, as those of separate models do, run at once, and those that
+// share one, a leaf or part of a graph, run one at a time. Code that
+// reads or replaces a leaf's gradient waits while a Backward holds it
+// (see waitIdle).
+//
+// Lock order: gradMu, then Param.mu; the scheduler's lock comes after
+// both.
 var gradMu sync.Mutex
 
-// backwardMu serialises Backward, so that two of them never add to the
-// same gradient at once. Backward holds it from start to end, including
-// while its gradient rules run user code: the functions Checkpoint
-// recomputes and the rules of Func. A release of a graph happens under
-// both backwardMu and gradMu, so a walk of tapes under either one sees it
-// whole.
-var backwardMu sync.Mutex
+// gradIdle is signalled, with gradMu, when a Backward lets its tapes go.
+var gradIdle = sync.Cond{L: &gradMu}
+
+// waitIdle waits, with gradMu held, until no Backward holds t.
+func waitIdle(t *tape) {
+	for t != nil && t.busy {
+		gradIdle.Wait()
+	}
+}
 
 // tape records how a tracked tensor was computed, so that the chain rule
 // can run through it in either direction. A leaf's tape has no rule and
@@ -61,6 +75,7 @@ type tape struct {
 	grad     *Tensor // accumulated gradient of a leaf
 	own      bool    // grad's memory is the tape's to reuse
 	released bool    // Backward has run through this node
+	busy     bool    // a Backward holds the tape (see gradMu)
 	// stand marks a tensor that stands for an argument of a function a
 	// transformation calls (see standIn): to Checkpoint, a leaf.
 	stand bool
@@ -269,6 +284,7 @@ func (t *Tensor) Grad() *Tensor {
 	}
 	gradMu.Lock()
 	defer gradMu.Unlock()
+	waitIdle(t.tape)
 	return t.tape.grad
 }
 
@@ -282,6 +298,7 @@ func (t *Tensor) ZeroGrad() {
 	}
 	gradMu.Lock()
 	defer gradMu.Unlock()
+	waitIdle(t.tape)
 	if g := t.tape.grad; g != nil && t.tape.own {
 		release(g.node)
 	}
@@ -307,9 +324,10 @@ func (t *Tensor) ZeroGrad() {
 // tensors. Gradients and the transformations built on it, such as Grad
 // and Hessian, return gradients that can be differentiated again.
 //
-// Backwards on different goroutines run one at a time. A function that
-// Backward recomputes, or a gradient rule of Func, may read gradients but
-// must not call Backward, which would wait for the Backward running it.
+// Backwards on different goroutines run at once when their graphs share
+// no tracked tensor, as those of separate models do, and one at a time
+// otherwise (see gradMu). A function that Backward recomputes, or a
+// gradient rule of Func, may read gradients.
 func (t *Tensor) Backward(ctx context.Context) error {
 	if err := firstErr(t); err != nil {
 		return err
@@ -326,23 +344,39 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	backwardMu.Lock()
-	defer backwardMu.Unlock()
-
 	// The gradient rules run without gradMu: those of checkpoints run
 	// user code, which may read gradients.
-	r := reverse{backward: true}
+	var r reverse
 	_, walked, effects, err := r.propagate([]*tape{t.tape}, []*Tensor{Ones(t.node.DType, t.node.Shape...)}, nil)
 	if err != nil {
 		return err
 	}
 	leaves := r.order
 
-	// From reading the leaves' gradients to writing their sums back,
-	// gradMu keeps ZeroGrad and Param.To from changing or freeing them:
-	// they see the gradients before this Backward or after it.
+	// From reading the leaves' gradients to writing their sums back and
+	// releasing the graph, this Backward holds the tapes it walked, so that
+	// no other Backward adds to the same gradients or releases the same
+	// graph, and ZeroGrad, Grad and Param.To see the gradients before it
+	// or after it.
 	gradMu.Lock()
 	defer gradMu.Unlock()
+	for slices.ContainsFunc(walked.tapes, func(n *tape) bool { return n.busy }) {
+		gradIdle.Wait()
+	}
+	// A Backward that held some of them while this one waited may have
+	// released them.
+	if slices.ContainsFunc(walked.tapes, func(n *tape) bool { return n.released }) {
+		return fmt.Errorf("tensor: derivative through a graph an earlier Backward released: %w", ErrNoGrad)
+	}
+	for _, n := range walked.tapes {
+		n.busy = true
+	}
+	defer func() {
+		for _, n := range walked.tapes {
+			n.busy = false
+		}
+		gradIdle.Broadcast()
+	}()
 
 	// The sums go over the memory of the gradients they add to, where
 	// that memory is the tapes' own. A sum that Backward computes, rather
@@ -377,7 +411,12 @@ func (t *Tensor) Backward(ctx context.Context) error {
 	}
 	targets = append(targets, effects...)
 	dsts = append(dsts, make([]*Tensor, len(effects))...)
-	if err := RealizeInto(ctx, dsts, targets); err != nil {
+	// The schedule runs without gradMu, so that other Backwards and
+	// readers of other gradients go on meanwhile.
+	gradMu.Unlock()
+	err = RealizeInto(ctx, dsts, targets)
+	gradMu.Lock()
+	if err != nil {
 		return err
 	}
 	for i, l := range leaves {
@@ -399,7 +438,8 @@ type walk struct {
 	tapes []*tape
 	pos   map[*tape]int // the index of each tape in tapes
 	// copies holds a copy of each tape, taken under gradMu, for a pass
-	// that may run while a Backward releases the tapes; nil otherwise.
+	// that may run while a Backward releases the tapes, as every pass
+	// may; nil otherwise.
 	copies []tape
 }
 
@@ -471,10 +511,6 @@ type reverse struct {
 	// compute can be differentiated in turn. Otherwise the rules get
 	// detached tensors.
 	create bool
-	// backward marks the pass of Backward, which holds backwardMu, so
-	// that no other Backward releases the tapes it walks. Other passes
-	// read copies of them.
-	backward bool
 	// want reports the tapes whose gradients the pass collects: every
 	// leaf if nil, as Backward collects.
 	want map[*tape]bool
@@ -537,7 +573,9 @@ func (r *reverse) propagate(roots []*tape, gs []*Tensor, stops []*tape) (atStops
 	if len(stops) > 0 {
 		stop = func(t *tape) bool { return slices.Contains(stops, t) }
 	}
-	w, err = walkTapes(roots, stop, 0, !r.backward)
+	// Another Backward may release the tapes while the pass runs, so it
+	// reads copies of them.
+	w, err = walkTapes(roots, stop, 0, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -902,6 +940,7 @@ func (p *Param) move(where string, to func(*Tensor) *Tensor) error {
 	// gradient the copy then replaces.
 	gradMu.Lock()
 	defer gradMu.Unlock()
+	waitIdle(v.tape)
 	var grad *Tensor
 	if v.tape != nil && v.tape.grad != nil {
 		g := v.tape.grad
