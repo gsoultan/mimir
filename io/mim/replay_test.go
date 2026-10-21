@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -151,6 +152,14 @@ func TestRunsReplayTheFirst(t *testing.T) {
 			m.mu.Unlock()
 			if known == 0 {
 				t.Fatal("no run was recorded or found unrecordable")
+			}
+			if os.Getenv("MIMIR_EAGER") == "1" {
+				// Every value is computed as it is created, leaving
+				// nothing to record.
+				if recorded > 0 {
+					t.Fatalf("%d runs recorded in eager mode", recorded)
+				}
+				return
 			}
 			if (recorded > 0) == m.dataDependent {
 				t.Fatalf("%d runs recorded, while the model's graph is data-dependent: %v", recorded, m.dataDependent)

@@ -48,7 +48,8 @@ type bare struct {
 //
 // It returns a nil recording, with targets computed, when the
 // computation cannot be replayed: when it runs on several devices or on
-// a mesh, or when a target is realized already or is a leaf. The leaves'
+// a mesh, or when a target is realized already or is a leaf, as every
+// target is in eager mode. The leaves'
 // values do not matter to what a replay computes, only their shapes,
 // dtypes and layouts, so a computation whose graph depends on a leaf's
 // values, as one built by reading them does, must not be recorded.
