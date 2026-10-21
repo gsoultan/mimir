@@ -160,10 +160,14 @@ type Model struct {
 
 	mu       sync.Mutex
 	onDevice map[tensor.Device]map[uint32]*tensor.Tensor
-	session  *Session
-	mapping  *filemap.Mapping
-	cleanup  runtime.Cleanup
-	closed   bool
+	recorded map[recordingKey][]*tensor.Recording // see replay.go; a nil entry is a run that could not be recorded
+	// dataDependent is set for a graph that reads values as it is built,
+	// whose runs are not recorded.
+	dataDependent bool
+	session       *Session
+	mapping       *filemap.Mapping
+	cleanup       runtime.Cleanup
+	closed        bool
 }
 
 // Open reads the model at path. It maps the file, and the model's weights
@@ -218,6 +222,7 @@ func (m *Model) load(b []byte) error {
 		return fmt.Errorf("%w: %w", ErrFormat, err)
 	}
 	m.g = g
+	m.dataDependent = dataDependent(g)
 	if g.PrimitiveVersion > mimfile.CurrentPrimitive || g.StdlibVersion > mimfile.CurrentStdlib {
 		return &UnsupportedError{Op: "graph", Detail: fmt.Sprintf("primitives v%d, stdlib v%d", g.PrimitiveVersion, g.StdlibVersion)}
 	}
@@ -360,7 +365,7 @@ func (m *Model) Close() error {
 	}
 	m.closed = true
 	m.cleanup.Stop()
-	m.consts, m.onDevice = nil, nil
+	m.consts, m.onDevice, m.recorded = nil, nil, nil
 	if m.mapping == nil {
 		return nil
 	}
