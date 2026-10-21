@@ -14,6 +14,9 @@ import (
 // building the graph again would, without compiling anything; leaves of
 // another shape do not fit it.
 func TestRecordReplaysOverNewLeaves(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("eager mode computes every operation as it is created, leaving nothing to record")
+	}
 	ctx := context.Background()
 	const n = 4
 	step := func(x, w *tensor.Tensor, c float32) (y, z *tensor.Tensor) {
@@ -101,6 +104,9 @@ func TestRecordReplaysOverNewLeaves(t *testing.T) {
 // targets, is computed and not recorded. A realized tensor that the
 // leaves do not name is read again by every replay.
 func TestRecordRefusesWhatItCannotReplay(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("eager mode computes every operation as it is created, leaving nothing to record")
+	}
 	ctx := context.Background()
 	x := tensor.Randn(1, 4)
 	if err := tensor.Realize(ctx, x); err != nil {
@@ -130,6 +136,9 @@ func TestRecordRefusesWhatItCannotReplay(t *testing.T) {
 // own leaves' result, replaying or, while the program is busy, reporting
 // a miss.
 func TestReplayConcurrent(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("eager mode computes every operation as it is created, leaving nothing to record")
+	}
 	ctx := context.Background()
 	const n = 64
 	x := tensor.Randn(1, n, n)
