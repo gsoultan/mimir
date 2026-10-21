@@ -186,6 +186,19 @@ jobs:
         env:
           MIMIR_GOLDEN_DIR: ${{ runner.temp }}/golden
 
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
   bench:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -215,3 +228,7 @@ jobs:
             benchstat "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt" || benchstat "$RUNNER_TEMP/head.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: fail on a slowdown
+        run: |
+          git checkout --quiet ${{ github.event.pull_request.head.sha }}
+          ci/benchgate.sh "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt"
