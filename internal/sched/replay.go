@@ -105,17 +105,38 @@ func ReplayEach(ctx context.Context, traces []*Trace, leaves, args [][]*graph.No
 			ds = dsts[r]
 		}
 		wg.Go(func() {
-			missed[r], errs[r] = t.replay(ctx, leaves[r], args[r], func() []*graph.Node { return newTargets(r) }, ds)
+			missed[r], errs[r] = t.replay(ctx, leaves[r], args[r], func() []*graph.Node { return newTargets(r) }, ds, nil, false)
 		})
 	}
 	wg.Wait()
 	return missed, errors.Join(errs...)
 }
 
+// Replay replays t on its device over leaves, as ReplayEach does for one
+// device without destinations, but as RealizeInto runs a schedule: it
+// gives the scheduler's lock up while the kernels run, so that
+// computations that share no memory with it go on at once. keep is as
+// for RealizeInto. It reports the replay as missed, having run nothing,
+// when the trace does not fit the leaves, when the memory that keep
+// spares would change its program, or when the program is running
+// already; newTargets may have been called, and the caller computes its
+// graph otherwise.
+func Replay(ctx context.Context, t *Trace, leaves, args []*graph.Node, newTargets func() []*graph.Node, keep func() []*graph.Node) (missed bool, err error) {
+	mu.Lock()
+	defer mu.Unlock()
+	err = retry(func() error {
+		missed, err = t.replay(ctx, leaves, args, newTargets, nil, keep, true)
+		return err
+	})
+	return missed, err
+}
+
 // replay runs t over leaves, as schedule does, unless t does not fit
-// them, which it reports. mu is held by the caller of the goroutines that
-// run replays.
-func (t *Trace) replay(ctx context.Context, leaves, args []*graph.Node, newTargets func() []*graph.Node, dsts []*graph.Node) (missed bool, err error) {
+// them, which it reports. mu is held: by the caller of the goroutines
+// that run replays, or, with unlock set, by the caller, which gives it
+// up while the kernels run and reports errBusy, having changed nothing,
+// when running schedules keep this one from starting.
+func (t *Trace) replay(ctx context.Context, leaves, args []*graph.Node, newTargets func() []*graph.Node, dsts []*graph.Node, keep func() []*graph.Node, unlock bool) (missed bool, err error) {
 	if len(leaves) != len(t.leafAt) {
 		return true, fmt.Errorf("sched: %d leaves for a trace of %d: %w", len(leaves), len(t.leafAt), backend.ErrInternal)
 	}
@@ -125,9 +146,24 @@ func (t *Trace) replay(ctx context.Context, leaves, args []*graph.Node, newTarge
 	if !t.fits(w, leaves, dsts) {
 		return true, nil
 	}
+	if unlock && t.prog != nil && t.prog.busy {
+		// Another schedule runs the program without mu; it is not
+		// reentrant.
+		return true, nil
+	}
 	targets := newTargets()
 	if len(targets) != t.nt || slices.ContainsFunc(targets, (*graph.Node).Realized) {
 		return false, fmt.Errorf("sched: %d targets for a trace of %d unrealized ones: %w", len(targets), t.nt, backend.ErrInternal)
+	}
+	if keep != nil && len(w.gifts) > 0 {
+		// The program takes the memory of the donated leaves; one that
+		// keep spares would need another.
+		if w.withhold(keep, targets); !slices.Equal(w.key, t.key) {
+			return true, nil
+		}
+	}
+	if unlock && w.contended(dsts) {
+		return false, errBusy
 	}
 	generation.Add(1)
 	if t.prog == nil {
@@ -142,9 +178,14 @@ func (t *Trace) replay(ctx context.Context, leaves, args []*graph.Node, newTarge
 		}
 	}()
 	if err := t.prog.reserve(m); err != nil {
+		// Memory that running schedules hold may be back in the pool
+		// once they end.
+		if unlock && running > 0 && errors.Is(err, backend.ErrMemoryBudget) {
+			return false, errBusy
+		}
 		return false, err
 	}
-	return false, t.prog.run(ctx, m, w, targets, dsts, false)
+	return false, t.prog.run(ctx, m, w, targets, dsts, unlock)
 }
 
 // fits walks leaves as the leaves of t's graph, and dsts, writing their

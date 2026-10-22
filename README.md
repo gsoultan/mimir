@@ -577,7 +577,11 @@ grouped-query heads, the products with Q8_0, Q4_K and Q6_K weights, the
 convolutions, the norms, rotary embeddings and the rest. A graph's
 variables, such as a language model's key-value cache, live in a
 `Session`, which keeps them between runs; `Model.Run` runs in a session
-of its own. The tests run the format's PyTorch exports (a CNN, a 1-D
+of its own. The first run with inputs of given shapes builds the graph
+and records the program the scheduler compiled for it; later runs with
+inputs of those shapes replay the program over their inputs and
+variables, building no graph (`tensor.Record`), which takes a third off a
+small CNN's run. The tests run the format's PyTorch exports (a CNN, a 1-D
 convolutional network, GPT- and Llama-style decoders, one with a cache),
 its ONNX conversion and a Q4_K_M Llama converted from GGUF, against the
 outputs of PyTorch, onnxruntime and a float64 forward pass, and every

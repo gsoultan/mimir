@@ -195,13 +195,14 @@ func realizeEach(ctx context.Context, bes []backend.Backend, targets, dsts [][]*
 			}
 		}
 		keeps[i] = func() []*graph.Node { return mine }
-		if len(mine) > 0 {
-			// The schedule may compute some of mine first (see protect),
-			// which a replay would not.
+		// No schedule runs, so none is busy.
+		var computed []*graph.Node
+		ts[i], ds[i], _ = protect(ctx, be, ts[i], ds[i], keeps[i], &computed)
+		if len(computed) > 0 {
+			// The schedule computed some of mine first and computes them
+			// among the targets, which a replay would not.
 			traces[i] = nil
 		}
-		// No schedule runs, so none is busy.
-		ts[i], ds[i], _ = protect(ctx, be, ts[i], ds[i], keeps[i], new([]*graph.Node))
 	}
 	errs := make([]error, len(bes))
 	var wg sync.WaitGroup
