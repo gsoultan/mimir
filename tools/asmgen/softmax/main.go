@@ -2,7 +2,8 @@
 // backend/cpu's attention kernels: the maximum of a row, exponentials
 // shifted by it and their sum, scaling a row, and the softmax gradient;
 // and of its elementwise kernels and products of few rows: sums,
-// products, reciprocals and powers of 2 of vectors, and dot products.
+// products, reciprocals, square roots and powers of 2 of vectors, and dot
+// products.
 //
 //	go run ./softmax -out ../../backend/cpu/softmax_amd64.s -stubs ../../backend/cpu/softmax_stub_amd64.go -pkg cpu
 //
@@ -68,6 +69,7 @@ func main() {
 			binaryVS(v, op)
 		}
 		recip(v)
+		sqrt(v)
 	}
 	Generate()
 }
@@ -207,6 +209,21 @@ func recip(v isa) {
 	elementLoop(v, name, []Register{pd, pa}, n, func(disp int) {
 		x := v.vec()
 		VDIVPS(Mem{Base: pa, Disp: disp}, one, x)
+		VMOVUPS(x, Mem{Base: pd, Disp: disp})
+	})
+}
+
+func sqrt(v isa) {
+	name := "sqrt" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the square roots of those at a, correctly rounded.", name, v.lanes))
+	pd := Load(Param("dst"), GP64())
+	pa := Load(Param("a"), GP64())
+	n := Load(Param("n"), GP64())
+	elementLoop(v, name, []Register{pd, pa}, n, func(disp int) {
+		x := v.vec()
+		VSQRTPS(Mem{Base: pa, Disp: disp}, x)
 		VMOVUPS(x, Mem{Base: pd, Disp: disp})
 	})
 }
