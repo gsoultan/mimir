@@ -10,3 +10,6 @@ __pycache__/
 
 # Code graph, rebuilt by .claude/hooks/session-start.sh
 graphify-out/
+
+# GoReleaser output
+/dist/

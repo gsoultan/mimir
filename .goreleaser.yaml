@@ -1,0 +1,16 @@
+# mimir is a library, fetched with `go get` from a tag, so a release is just
+# GitHub release notes: `goreleaser release --clean` on a v* tag (see
+# .github/workflows/release.yml).
+version: 2
+
+project_name: mimir
+
+builds:
+  - skip: true
+
+changelog:
+  # Release notes from the merged pull requests.
+  use: github-native
+
+release:
+  prerelease: auto
