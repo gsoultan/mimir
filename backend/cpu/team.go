@@ -45,7 +45,8 @@ type team struct {
 // parked meanwhile starts the next loop late, after the runtime wakes it.
 //
 // A helper polls at most spinPerBusy times as long as recent loops ran,
-// and at least minSpin. Polling saves the next loop the time a parked
+// and at least minSpin, which covers the host work between the short
+// loops of one kernel, such as a factorization's between its panels. Polling saves the next loop the time a parked
 // helper takes to wake, tens of microseconds, which matters to loops that
 // take about as long and follow each other closely, as a model's kernels
 // do. Loops much shorter than the gaps between them, as those of small
@@ -54,7 +55,7 @@ type team struct {
 // for many times the work.
 const (
 	teamSpin    = 5 * time.Millisecond
-	minSpin     = 50 * time.Microsecond
+	minSpin     = 500 * time.Microsecond
 	spinPerBusy = 4
 )
 
