@@ -2,8 +2,6 @@
 
 package cpu
 
-import "syscall"
-
 // tileAMX is in amx_amd64.s.
 //
 //go:noescape
@@ -21,8 +19,7 @@ func init() {
 }
 
 // amxSupported reports whether the CPU multiplies bfloat16 tiles with AMX
-// and Linux lets this process use them. The tile data is too large for
-// the kernel to save for every process, so each asks for it first.
+// and the operating system lets this process use them.
 func amxSupported() bool {
 	maxID, _, _, _ := cpuid(0, 0)
 	if maxID < 0xd {
@@ -39,7 +36,5 @@ func amxSupported() bool {
 	if eax71&avx512BF16 == 0 || !x86Features().avx512 {
 		return false
 	}
-	const archReqXcompPerm, xfeatureXtiledata = 0x1023, 18
-	_, _, errno := syscall.RawSyscall(syscall.SYS_ARCH_PRCTL, archReqXcompPerm, xfeatureXtiledata, 0)
-	return errno == 0
+	return amxPermitted()
 }
