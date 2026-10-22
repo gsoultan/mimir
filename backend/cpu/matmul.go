@@ -74,6 +74,9 @@ func matmul[T number](ctx context.Context, b *Backend, k *backend.Kernel, out, x
 	if out32, ok := any(out).([]float32); ok {
 		a := operand{data: any(x).([]float32), rs: sxm, cs: sxk}
 		bm := operand{data: any(y).([]float32), rs: syk, cs: syn}
+		if ok, err := b.amxGemm(ctx, out32, a, offX, bm, offY, m, n, kk, sums, epi); ok {
+			return err
+		}
 		if ok, err := b.sgemv(ctx, out32, a, offX, bm, offY, m, n, kk, sums, epi); ok {
 			return err
 		}

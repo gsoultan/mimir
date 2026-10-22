@@ -59,6 +59,11 @@ func mulVSAVX512(dst *float32, a *float32, s float32, n int)
 //go:noescape
 func recipAVX512(dst *float32, a *float32, n int)
 
+// sqrtAVX512 sets the n elements at dst, a multiple of 16, to the square roots of those at a, correctly rounded.
+//
+//go:noescape
+func sqrtAVX512(dst *float32, a *float32, n int)
+
 // rowMaxAVX2 returns the largest of the n elements at x, a positive multiple of 8.
 //
 //go:noescape
@@ -113,3 +118,8 @@ func mulVSAVX2(dst *float32, a *float32, s float32, n int)
 //
 //go:noescape
 func recipAVX2(dst *float32, a *float32, n int)
+
+// sqrtAVX2 sets the n elements at dst, a multiple of 8, to the square roots of those at a, correctly rounded.
+//
+//go:noescape
+func sqrtAVX2(dst *float32, a *float32, n int)
