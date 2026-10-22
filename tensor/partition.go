@@ -732,6 +732,8 @@ func (p *plan) local(n *graph.Node, x []*graph.Node, ins []*value, l layout) (*g
 		return graph.Gather(x[0], x[1], a.Axis)
 	case op == backend.OpScatterAdd:
 		return graph.ScatterAdd(x[0], x[1], x[2], a.Axis)
+	case op == backend.OpScatter:
+		return graph.Scatter(x[0], x[1], x[2], a.Axis)
 	case op == backend.OpQMatMul:
 		return graph.QMatMul(x[0], x[1])
 	case op == backend.OpUnfold:

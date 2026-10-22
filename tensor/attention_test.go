@@ -259,6 +259,49 @@ func TestSliceScatterWritesTheBlock(t *testing.T) {
 	}
 }
 
+func TestScatterWritesThePositions(t *testing.T) {
+	ctx := t.Context()
+	x := tensor.FromSlice([]float32{0, 1, 2, 3, 4, 5}, 3, 2).RequiresGrad()
+	src := tensor.FromSlice([]float32{-1, -2, -3, -4}, 2, 2).RequiresGrad()
+	// Row 2 of x takes the first row of src; the second row of src lands
+	// on row 0 in column 0 and row 2 in column 1, after the first.
+	idx := tensor.FromSlice([]int32{2, 2, 0, 2}, 2, 2)
+	y := x.Scatter(0, idx, src)
+	got, err := y.Data[float32](ctx)
+	if err != nil || !slices.Equal(got, []float32{-3, 1, 2, 3, -1, -4}) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	w := tensor.FromSlice([]float32{1, 2, 3, 4, 5, 6}, 3, 2)
+	if err := y.Mul(w).Sum().Backward(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gx, _ := x.Grad().Data[float32](ctx)
+	gs, _ := src.Grad().Data[float32](ctx)
+	if !slices.Equal(gx, []float32{0, 2, 3, 4, 0, 0}) || !slices.Equal(gs, []float32{5, 6, 1, 6}) {
+		t.Errorf("gradients %v and %v", gx, gs)
+	}
+	// A half tensor takes float updates in its own dtype.
+	h := tensor.Zeros(tensor.Float16, 3, 2).Scatter(0, idx, src.Detach())
+	if h.DType() != tensor.Float16 {
+		t.Errorf("dtype %v, want float16", h.DType())
+	}
+	for _, bad := range []struct {
+		idx, src *tensor.Tensor
+		want     error
+	}{
+		{idx, tensor.Zeros(tensor.Float32, 2, 1), tensor.ErrShape},
+		{tensor.Zeros(tensor.Int32, 2, 3), tensor.Zeros(tensor.Float32, 2, 3), tensor.ErrShape},
+		{idx, tensor.Zeros(tensor.Int32, 2, 2), tensor.ErrDType},
+	} {
+		if err := x.Scatter(0, bad.idx, bad.src).Err(); !errors.Is(err, bad.want) {
+			t.Errorf("%v at %v: got %v, want %v", bad.src, bad.idx, err, bad.want)
+		}
+	}
+	if _, err := x.Scatter(0, tensor.FromSlice([]int32{3, 0}, 1, 2), tensor.Zeros(tensor.Float32, 1, 2)).Data[float32](ctx); !errors.Is(err, tensor.ErrIndex) {
+		t.Errorf("position out of range: got %v, want ErrIndex", err)
+	}
+}
+
 // TestKVCacheAppendsInPlace checks that decoding steps write their keys
 // and values into the cache's memory instead of copying the cache.
 func TestKVCacheAppendsInPlace(t *testing.T) {

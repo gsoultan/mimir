@@ -132,6 +132,9 @@ func gradCases() []gradCase {
 	add("scatter_add", func(x []*tensor.Tensor) *tensor.Tensor {
 		return x[0].ScatterAdd(0, tensor.FromSlice([]int32{1, 0, 1, 1}, 1, 4), x[1])
 	}, u(-2, 2, 3, 4), u(-2, 2, 1, 4))
+	add("scatter", func(x []*tensor.Tensor) *tensor.Tensor {
+		return x[0].Scatter(0, tensor.FromSlice([]int32{1, 0, 2, 1}, 1, 4), x[1])
+	}, u(-2, 2, 3, 4), u(-2, 2, 1, 4))
 
 	add("conv2d", func(x []*tensor.Tensor) *tensor.Tensor {
 		return x[0].Conv2d(x[1], x[2], tensor.ConvOptions{Padding: 1})

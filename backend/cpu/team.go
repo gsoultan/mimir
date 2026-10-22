@@ -35,13 +35,39 @@ type team struct {
 
 	sleepers atomic.Int32  // helpers parked or about to park
 	wake     chan struct{} // receives a token per helper to wake
+
+	busy atomic.Int64 // how long recent loops ran, in nanoseconds, a moving average
 }
 
 // teamSpin is how long a helper polls for a new loop, once the last has
 // finished, before parking. It covers the host work between the schedules
 // of a training step, such as building the next graph: a helper that
 // parked meanwhile starts the next loop late, after the runtime wakes it.
-const teamSpin = 5 * time.Millisecond
+//
+// A helper polls at most spinPerBusy times as long as recent loops ran,
+// and at least minSpin. Polling saves the next loop the time a parked
+// helper takes to wake, tens of microseconds, which matters to loops that
+// take about as long and follow each other closely, as a model's kernels
+// do. Loops much shorter than the gaps between them, as those of small
+// predictions a server makes one at a time, gain nothing from it, and
+// helpers polling for milliseconds after each would keep processors busy
+// for many times the work.
+const (
+	teamSpin    = 5 * time.Millisecond
+	minSpin     = 50 * time.Microsecond
+	spinPerBusy = 4
+)
+
+// spin returns how long a helper polls for a new loop before parking.
+func (t *team) spin() time.Duration {
+	return min(teamSpin, max(minSpin, spinPerBusy*time.Duration(t.busy.Load())))
+}
+
+// ran records that a loop ran for d.
+func (t *team) ran(d time.Duration) {
+	b := t.busy.Load()
+	t.busy.Store(b + (int64(d)-b)/8)
+}
 
 // yieldEvery is how many polls a helper makes between yields. Yielding
 // lets other goroutines run, but every yield takes the scheduler's lock,
@@ -76,6 +102,7 @@ func (t *team) run(ctx context.Context, n, size int, fn func(lo, hi int) error) 
 	chunks := (n + size - 1) / size
 	t.ctx, t.fn, t.n, t.size = ctx, fn, n, size
 	t.errs = append(t.errs[:0], make([]error, chunks)...)
+	start := time.Now()
 	t.left.Store(int64(chunks))
 	t.todo.Store(int64(chunks))
 	// A helper that parked before seeing the loop needs a token. One that
@@ -93,6 +120,7 @@ func (t *team) run(ctx context.Context, n, size int, fn func(lo, hi int) error) 
 	for t.left.Load() > 0 {
 		runtime.Gosched()
 	}
+	t.ran(time.Since(start))
 	t.ctx, t.fn = nil, nil
 	for _, err := range t.errs {
 		if err != nil {
@@ -124,7 +152,7 @@ const pollStolen = 200 * time.Microsecond
 func (t *team) help() {
 	for {
 		idle := time.Now()
-		last := idle
+		last, spin := idle, t.spin()
 		for polls := 0; !t.poll(); polls++ {
 			now := time.Now()
 			switch {
@@ -142,10 +170,10 @@ func (t *team) help() {
 				// Others are finishing a loop, and the next is likely to
 				// follow: a helper parked now would start it late.
 				idle = now
-			case now.Sub(idle) > teamSpin:
+			case now.Sub(idle) > spin:
 				t.park()
 				now = time.Now()
-				idle = now
+				idle, spin = now, t.spin()
 			}
 			// Let other goroutines have the processor now and then. One
 			// that takes it has work of its own, such as reading the next

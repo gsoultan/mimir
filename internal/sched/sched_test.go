@@ -591,6 +591,31 @@ func TestRealizeIntoScattersInPlace(t *testing.T) {
 	}
 }
 
+func TestRealizeIntoScattersRowsInPlace(t *testing.T) {
+	be := &counting{Backend: cpu.New()}
+	cache := realized(t, be, []int{2, 8, 3}, 1)
+	step := realized(t, be, []int{2, 1, 3}, 2)
+	old, add := floats(t, be, cache), floats(t, be, step)
+	idx := must(graph.Const(backend.Int32, []int{2, 1, 3}, 5))
+	next := must(graph.Scatter(cache, idx, step, 1))
+	buf := cache.Buf()
+	if err := RealizeInto(t.Context(), be, []*graph.Node{next}, []*graph.Node{cache}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if next.Buf() != buf {
+		t.Error("scatter not written over its destination")
+	}
+	for i, v := range floats(t, be, next) {
+		want := old[i]
+		if row := i / 3 % 8; row == 5 {
+			want = add[i/24*3+i%3]
+		}
+		if v != want {
+			t.Fatalf("element %d = %v, want %v", i, v, want)
+		}
+	}
+}
+
 func TestRealizeIntoWritesOverTheDestinations(t *testing.T) {
 	be := &counting{Backend: cpu.New()}
 	const n = 3000

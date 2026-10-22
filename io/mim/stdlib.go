@@ -501,7 +501,10 @@ func attention(v2 bool) func(c *call) ([]*tensor.Tensor, error) {
 		if err := c.need(3, 5); err != nil {
 			return nil, err
 		}
-		q, k, v := c.f32(0), c.f32(1), c.f32(2)
+		// The kernel reads keys and values of any float dtype as they
+		// are, as a half key-value cache, rather than a Float32 copy of
+		// the whole cache made every run.
+		q, k, v := c.f32(0), c.in[1], c.in[2]
 		if !v2 && (c.dt(1) != c.dt(0) || c.dt(2) != c.dt(0)) {
 			return nil, fmt.Errorf("%w: attention.v1 of %s, %s and %s", ErrFormat, c.dt(0), c.dt(1), c.dt(2))
 		}
@@ -523,7 +526,7 @@ func attention(v2 bool) func(c *call) ([]*tensor.Tensor, error) {
 			sinks = c.f32(4)
 		}
 		if softcap > 0 || sinks != nil {
-			return one(c.attentionBody(q, k, v, mask, sinks, scale, softcap, causal))
+			return one(c.attentionBody(q, c.f32(1), c.f32(2), mask, sinks, scale, softcap, causal))
 		}
 		opts := []tensor.AttentionOption{tensor.AttentionScale(scale)}
 		if causal {

@@ -49,7 +49,12 @@ func (s *Session) Reset() {
 //
 // Variables read the values the previous run of the session left. Once
 // the outputs and the variables' new values are computed, the variables
-// take them; a run that fails changes none.
+// take them. A new value that no output is may be computed over the
+// memory of the old one, as a key-value cache that a run writes a few
+// rows of is. A run that fails before it starts computing changes no
+// variable, as one whose ctx is cancelled first does; one that fails
+// while it writes them, as a device error can make it, leaves them
+// unreadable, and the session's later runs fail until Reset.
 //
 // A run is inference: it records no tape, even from inputs that require
 // gradients, so its outputs are not tracked (see tensor.Tensor.Detach)
@@ -97,6 +102,9 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 	if err != nil {
 		return nil, err
 	}
+	// owned marks the variables whose values the session holds alone, as
+	// it does the values runs leave, which a run may write over.
+	var owned map[uint32]bool
 	for i, v := range m.g.Values {
 		vi := uint32(i)
 		switch v.Kind {
@@ -104,7 +112,12 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 			r.env[vi] = consts[vi]
 		case mimfile.KindVariable:
 			t := s.vars[vi]
-			if t == nil || t.Device() != r.dev {
+			if t != nil && t.Device() == r.dev {
+				if owned == nil {
+					owned = map[uint32]bool{}
+				}
+				owned[vi] = true
+			} else {
 				if v.Zero {
 					if err := m.checkSize(v, vi, r.declared(vi)); err != nil {
 						return nil, err
@@ -124,13 +137,13 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 	// A run of this binding on this device replays the program of an
 	// earlier one that this run's inputs and variables fit, if there is
 	// one (see replay.go).
-	key, leaves := r.key(), r.leaves()
+	key, leaves, dsts := r.key(), r.leaves(), r.destinations(owned)
 	recs, record := m.recordings(key)
 	for _, rec := range recs {
 		if rec == nil {
 			continue
 		}
-		outs, ok, err := rec.Replay(ctx, leaves)
+		outs, ok, err := rec.ReplayInto(ctx, leaves, dsts)
 		if err != nil {
 			return nil, err
 		}
@@ -152,18 +165,51 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 		}
 		ts = append(ts, t)
 	}
-	if !record {
+	switch {
+	case !record && dsts == nil:
 		if err := tensor.Realize(ctx, ts...); err != nil {
 			return nil, err
 		}
-	} else {
-		rec, err := tensor.Record(ctx, leaves, ts)
+	case !record:
+		if err := tensor.RealizeInto(ctx, dsts, ts); err != nil {
+			return nil, err
+		}
+	default:
+		rec, err := tensor.RecordInto(ctx, leaves, dsts, ts)
 		if err != nil {
 			return nil, err
 		}
 		m.addRecording(key, rec)
 	}
 	return s.finish(ts)
+}
+
+// destinations returns where a run computes its outputs and the new
+// values of the variables, in the order Run computes them: the memory of
+// a variable's old value, which the session holds alone as owned marks,
+// for an update that no output is, so that a variable such as a key-value
+// cache, whose new value is the old one with a few rows written, is
+// written in place instead of copied; nil elsewhere. It returns nil if
+// there is no such update.
+func (r *run) destinations(owned map[uint32]bool) []*tensor.Tensor {
+	if len(owned) == 0 {
+		return nil
+	}
+	g := r.m.g
+	outs := g.Main().Outputs
+	var dsts []*tensor.Tensor
+	for i, u := range g.Updates {
+		old := r.env[u.Variable]
+		if !owned[u.Variable] || r.env[u.Value] == old || slices.Contains(outs, u.Value) ||
+			slices.ContainsFunc(g.Updates, func(o mimfile.Update) bool { return (o.Variable == u.Variable) != (o.Value == u.Value) }) {
+			continue
+		}
+		if dsts == nil {
+			dsts = make([]*tensor.Tensor, len(outs)+len(g.Updates))
+		}
+		dsts[len(outs)+i] = old
+	}
+	return dsts
 }
 
 // finish returns the outputs of a run, the first of ts, computed, and
