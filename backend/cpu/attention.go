@@ -50,8 +50,10 @@ type attnGeom struct {
 
 type attnView struct {
 	data    []float32
-	offs    []int // of each problem
-	g, x, y int   // strides
+	half    []uint16      // the elements of a half input that forwardFew converts as it reads them, instead of data
+	dt      backend.DType // the dtype of half
+	offs    []int         // of each problem
+	g, x, y int           // strides
 }
 
 // at returns the offset of element (x, y) of query head g of problem p.
@@ -60,6 +62,14 @@ func (v *attnView) at(p, g, x, y int) int { return v.offs[p] + g*v.g + x*v.x + y
 // newAttnGeom returns the layout of the inputs ins of the attention
 // kernel k, read as float32: a half input is converted first.
 func newAttnGeom(ctx context.Context, b *Backend, k *backend.Kernel, ins []backend.Buffer) (*attnGeom, error) {
+	return newAttnGeomFew(ctx, b, k, ins, false)
+}
+
+// newAttnGeomFew is newAttnGeom that, with few set, leaves the half keys
+// and values of a problem of few rows, whose features are contiguous, for
+// forwardFew to convert: it converts the keys its rows see, which in a
+// decoding step from a cache that is mostly empty are few.
+func newAttnGeomFew(ctx context.Context, b *Backend, k *backend.Kernel, ins []backend.Buffer, few bool) (*attnGeom, error) {
 	q, kk, v := k.In[0].Shape, k.In[1].Shape, k.In[2].Shape
 	var mask []int
 	maskAt := 3
@@ -75,10 +85,17 @@ func newAttnGeom(ctx context.Context, b *Backend, k *backend.Kernel, ins []backe
 	}
 	g := &attnGeom{s: s, problems: s.Batches() * s.KVHeads, rows: s.Group() * s.Q}
 	lead := len(s.Batch) + 1 // the dimensions of the problems: B..., HK
+	few = few && g.rows <= attnFew && k.Op == backend.OpAttention
 	for i, view := range k.In {
-		data, err := floats(ctx, b, ins[i])
-		if err != nil {
-			return nil, err
+		var av attnView
+		if h, dt, ok := halfOf(ins[i]); ok && few && (i == 1 || i == 2) && view.Strides[len(view.Strides)-1] == 1 {
+			av.half, av.dt = h, dt
+		} else {
+			data, err := floats(ctx, b, ins[i])
+			if err != nil {
+				return nil, err
+			}
+			av.data = data
 		}
 		if k.Op == backend.OpAttentionGrad && i == 4 {
 			// The logsumexp, [B..., H, Q], as [B..., H, Q, 1].
@@ -89,11 +106,9 @@ func newAttnGeom(ctx context.Context, b *Backend, k *backend.Kernel, ins []backe
 		}
 		split := s.SplitHeads(view)
 		r := len(split.Strides)
-		g.in = append(g.in, attnView{
-			data: data,
-			offs: batchOffsets(split.Shape[:lead], split),
-			g:    split.Strides[r-3], x: split.Strides[r-2], y: split.Strides[r-1],
-		})
+		av.offs = batchOffsets(split.Shape[:lead], split)
+		av.g, av.x, av.y = split.Strides[r-3], split.Strides[r-2], split.Strides[r-1]
+		g.in = append(g.in, av)
 	}
 	return g, nil
 }
@@ -110,6 +125,51 @@ func floats(ctx context.Context, b *Backend, buf backend.Buffer) ([]float32, err
 		return halfFloats(ctx, b, backend.Float16, bitsOf(buf.data))
 	}
 	return nil, fmt.Errorf("attention of %s: %w", buf.DType(), backend.ErrDType)
+}
+
+// halfOf returns the elements of a half buffer, and its dtype.
+func halfOf(buf backend.Buffer) ([]uint16, backend.DType, bool) {
+	switch buf := buf.(type) {
+	case *buffer[bf16]:
+		return bitsOf(buf.data), backend.BFloat16, true
+	case *buffer[f16]:
+		return bitsOf(buf.data), backend.Float16, true
+	}
+	return nil, 0, false
+}
+
+// rows returns the n rows of features of problem pr of v from position
+// 0, each m features long: in place, at off, rows v.x and features v.y
+// apart, or converted from half into buf, contiguous, as an operand.
+func (v *attnView) rows(buf *[]float32, pr, n, m int) operand {
+	off := v.at(pr, 0, 0, 0)
+	if v.half == nil {
+		return operand{data: v.data, off: off, rs: v.x, cs: v.y}
+	}
+	*buf = grow(*buf, n*m)
+	for j := range n {
+		loadHalf(v.dt, (*buf)[j*m:][:m], v.half, off+j*v.x, 1)
+	}
+	return operand{data: *buf, rs: m, cs: 1}
+}
+
+// extent returns how many of the first keys some row of problem pr sees:
+// causality or a mask of -Inf hides every key after them from every row.
+func (g *attnGeom) extent(k *backend.Kernel, pr int) int {
+	n := 0
+	for r := range g.rows {
+		hd, i := r/g.s.Q, r%g.s.Q
+		e := visible(k, i, 0, g.s.K)
+		if len(g.in) > 3 {
+			m := &g.in[3]
+			off := m.at(pr, hd, i, 0)
+			for e > n && math.IsInf(float64(m.data[off+(e-1)*m.y]), -1) {
+				e--
+			}
+		}
+		n = max(n, e)
+	}
+	return n
 }
 
 func halfFloats(ctx context.Context, b *Backend, dt backend.DType, h []uint16) ([]float32, error) {
@@ -204,7 +264,7 @@ func (g *attnGeom) prepare(k *backend.Kernel, pr int, t attnTile, j0, bc int, s 
 // attention computes the attention kernel k into out: the result, then
 // the logsumexp of each query row.
 func attention(ctx context.Context, b *Backend, k *backend.Kernel, out []float32, ins []backend.Buffer) error {
-	g, err := newAttnGeom(ctx, b, k, ins)
+	g, err := newAttnGeomFew(ctx, b, k, ins, k.In[1].Strides[len(k.In[1].Strides)-1] == 1)
 	if err != nil {
 		return err
 	}
@@ -345,14 +405,16 @@ func (g *attnGeom) forwardFew(k *backend.Kernel, ws *attnWorkspace, pr int, out 
 	s := g.s
 	q, kk, v := &g.in[0], &g.in[1], &g.in[2]
 	scale := float32(k.Attrs.Scale)
-	rows, n := g.rows, s.K
+	// The keys after the first n, which no row sees, add nothing.
+	rows, n := g.rows, g.extent(k, pr)
 	o := out[pr*rows*s.DV:][:rows*s.DV]
 	lse := out[s.Size()-s.Batches()*s.Heads*s.Q+pr*rows:][:rows]
 	// Packing reads whole panels of rows.
 	ws.s = grow(ws.s, roundUp(rows, gk.mr)*n)
 	ws.q = grow(ws.q, s.D)
 	ws.l = grow(ws.l, rows)
-	keys := kk.data[kk.at(pr, 0, 0, 0):]
+	ko := kk.rows(&ws.k, pr, n, s.D)
+	keys, kx := ko.data[ko.off:], ko.rs
 	var d [4]float32
 	for r := range rows {
 		hd, i := r/s.Q, r%s.Q
@@ -365,11 +427,11 @@ func (g *attnGeom) forwardFew(k *backend.Kernel, ws *attnWorkspace, pr int, out 
 		seen := visible(k, i, 0, n)
 		j := 0
 		for ; j+4 <= seen; j += 4 {
-			dots4(&d, qr, keys[j*kk.x:], kk.x)
+			dots4(&d, qr, keys[j*kx:], kx)
 			copy(row[j:], d[:])
 		}
 		for ; j < seen; j++ {
-			dots4(&d, qr, keys[j*kk.x:], 0)
+			dots4(&d, qr, keys[j*kx:], 0)
 			row[j] = d[0]
 		}
 		g.prepare(k, pr, attnTile{r0: r, r1: r + 1, hi: i}, 0, n, row, n, 3)
@@ -389,7 +451,7 @@ func (g *attnGeom) forwardFew(k *backend.Kernel, ws *attnWorkspace, pr int, out 
 	ws.p = grow(ws.p, roundUp(rows, gk.mr)*n+packSlack)
 	packA(ws.p, operand{data: ws.s, rs: n, cs: 1}, 0, rows, 0, n, gk.mr)
 	ws.v = grow(ws.v, roundUp(s.DV, gk.nr)*n+packSlack)
-	packB(ws.v, operand{data: v.data, off: v.at(pr, 0, 0, 0), rs: v.x, cs: v.y}, 0, n, 0, s.DV, gk.nr)
+	packB(ws.v, v.rows(&ws.kr, pr, n, s.DV), 0, n, 0, s.DV, gk.nr)
 	macroKernel(gk, ws.p, ws.v, n, rows, s.DV, o, s.DV, false, &ws.tile)
 	for r, l := range ws.l[:rows] {
 		if l == 0 {

@@ -388,6 +388,11 @@ func batchScatterAdd(l uint64, t *Tensor, axis int, idx, src *Tensor) *Tensor {
 	return newBatched(t.physical(l, n).ScatterAdd(axis+1, idx.physical(l, n), src.physical(l, n)), l)
 }
 
+func batchScatter(l uint64, t *Tensor, axis int, idx, src *Tensor) *Tensor {
+	n := batchSize(l, t, idx, src)
+	return newBatched(t.physical(l, n).Scatter(axis+1, idx.physical(l, n), src.physical(l, n)), l)
+}
+
 func batchCat(l uint64, axis int, ts []*Tensor) *Tensor {
 	n := batchSize(l, ts...)
 	ps := make([]*Tensor, len(ts))

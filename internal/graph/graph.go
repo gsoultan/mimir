@@ -447,6 +447,22 @@ func ScatterAdd(x, idx, src *Node, axis int) (*Node, error) {
 	return newNode(&Node{Op: backend.OpScatterAdd, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, idx, src}, Attrs: backend.Attrs{Axis: axis}})
 }
 
+// Scatter returns x with src written at Int32 positions idx along axis,
+// like torch.Tensor.scatter: of repeated positions, the last along the
+// axis lands. idx and src share a shape.
+func Scatter(x, idx, src *Node, axis int) (*Node, error) {
+	if err := checkIndex(backend.OpScatter, x, idx, axis); err != nil {
+		return nil, err
+	}
+	if !slices.Equal(idx.Shape, src.Shape) {
+		return nil, errorf(backend.OpScatter, backend.ErrShape, "index %v and source %v", idx.Shape, src.Shape)
+	}
+	if src.DType != x.DType || x.DType.IsQuantized() {
+		return nil, errorf(backend.OpScatter, backend.ErrDType, "%s and %s", x.DType, src.DType)
+	}
+	return newNode(&Node{Op: backend.OpScatter, DType: x.DType, Shape: x.Shape, Inputs: []*Node{x, idx, src}, Attrs: backend.Attrs{Axis: axis}})
+}
+
 // Window describes sliding windows over the trailing len(Kernel)
 // dimensions of a tensor; see backend.OpUnfold.
 type Window struct {
