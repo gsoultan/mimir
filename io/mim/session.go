@@ -121,34 +121,66 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 		}
 	}
 
+	// A run of this binding on this device replays the program of an
+	// earlier one that this run's inputs and variables fit, if there is
+	// one (see replay.go).
+	key, leaves := r.key(), r.leaves()
+	recs, record := m.recordings(key)
+	for _, rec := range recs {
+		if rec == nil {
+			continue
+		}
+		outs, ok, err := rec.Replay(ctx, leaves)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			replayed.Add(1)
+			return s.finish(outs)
+		}
+	}
 	outs, err := r.body(main)
 	if err != nil {
 		return nil, err
 	}
-	res := make(map[string]*tensor.Tensor, len(outs))
 	ts := make([]*tensor.Tensor, 0, len(outs)+len(m.g.Updates))
-	for i, t := range outs {
-		res[m.outputs[i].Name] = t
-		ts = append(ts, t)
-	}
-	updates := make(map[uint32]*tensor.Tensor, len(m.g.Updates))
+	ts = append(ts, outs...)
 	for _, u := range m.g.Updates {
 		t := r.env[u.Value]
 		if t == nil {
 			return nil, fmt.Errorf("%w: the update of variable %q is not computed", ErrFormat, valueName(m.g.Values[u.Variable], u.Variable))
 		}
-		updates[u.Variable] = t
 		ts = append(ts, t)
 	}
-	if err := tensor.Realize(ctx, ts...); err != nil {
-		return nil, err
+	if !record {
+		if err := tensor.Realize(ctx, ts...); err != nil {
+			return nil, err
+		}
+	} else {
+		rec, err := tensor.Record(ctx, leaves, ts)
+		if err != nil {
+			return nil, err
+		}
+		m.addRecording(key, rec)
 	}
-	if len(updates) > 0 {
+	return s.finish(ts)
+}
+
+// finish returns the outputs of a run, the first of ts, computed, and
+// gives the variables their new values, the rest of ts, one per update
+// of the graph.
+func (s *Session) finish(ts []*tensor.Tensor) (map[string]*tensor.Tensor, error) {
+	m := s.m
+	res := make(map[string]*tensor.Tensor, len(m.outputs))
+	for i, info := range m.outputs {
+		res[info.Name] = ts[i]
+	}
+	if updates := ts[len(m.outputs):]; len(updates) > 0 {
 		if s.vars == nil {
 			s.vars = map[uint32]*tensor.Tensor{}
 		}
-		for vi, t := range updates {
-			s.vars[vi] = t
+		for i, u := range m.g.Updates {
+			s.vars[u.Variable] = updates[i]
 		}
 	}
 	return res, nil

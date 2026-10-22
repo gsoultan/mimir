@@ -102,3 +102,41 @@ func TestReplayEachMatchesRealizeEach(t *testing.T) {
 		t.Errorf("replays of leaves that do not fit: missed %v, targets %v", missed, targets)
 	}
 }
+
+// A node that keep lists on the device keeps a schedule from being
+// traced only when the schedule computes it first, to protect it from a
+// destination it reads; without destinations it is only kept from the
+// memory the schedule takes, which a replay does too.
+func TestTracedWithKeptNodes(t *testing.T) {
+	be := cpu.NewStream(1)
+	x := realized(t, be, []int{4, 4}, 1)
+	kept := must(graph.Binary(backend.OpAdd, x, x))
+	kept.Dev = be
+	keep := func() []*graph.Node { return []*graph.Node{kept} }
+	y := must(graph.Unary(backend.OpNeg, x))
+	traced := false
+	err := RealizeEachTraced(t.Context(), []backend.Backend{be}, [][]*graph.Node{{y}}, nil, keep, func(int, *Trace, []*graph.Node, []*graph.Node) { traced = true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !traced {
+		t.Error("a schedule without destinations was not traced while a kept node was unrealized")
+	}
+	if kept.Realized() {
+		t.Error("the schedule computed the kept node")
+	}
+	// Written over x, which kept reads, the schedule computes kept first,
+	// and is not traced.
+	z := must(graph.Unary(backend.OpNeg, x))
+	traced = false
+	err = RealizeEachTraced(t.Context(), []backend.Backend{be}, [][]*graph.Node{{z}}, [][]*graph.Node{{x}}, keep, func(int, *Trace, []*graph.Node, []*graph.Node) { traced = true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if traced {
+		t.Error("a schedule that computed a kept node first was traced")
+	}
+	if !kept.Realized() {
+		t.Error("the schedule did not compute the kept node it endangered")
+	}
+}
