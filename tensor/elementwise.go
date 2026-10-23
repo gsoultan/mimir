@@ -468,10 +468,16 @@ func (t *Tensor) ReLU() *Tensor {
 }
 
 // reluRule is ReLU's rule, whose derivative is 0 at 0, like PyTorch's.
+// reluRule is the rule of ReLU. Its derivative, 1 where the input is
+// positive, is read off the result, which is positive exactly there: the
+// result is kept for the next layer anyway, where the input, read by no
+// other rule, then joins the kernel that computes the result, such as the
+// epilogue of the product before it, instead of being written to memory
+// for the backward pass.
 func reluRule() rule {
 	return rule{
-		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor { return grads(g.Mul(in[0].Greater(g.scalar(0)))) },
-		jvp: func(t, in []*Tensor, _ *Tensor) *Tensor { return t[0].Mul(in[0].Greater(t[0].scalar(0))) },
+		vjp: func(g *Tensor, _ []*Tensor, out *Tensor) []*Tensor { return grads(g.Mul(out.Greater(g.scalar(0)))) },
+		jvp: func(t, _ []*Tensor, out *Tensor) *Tensor { return t[0].Mul(out.Greater(t[0].scalar(0))) },
 	}
 }
 

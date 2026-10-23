@@ -270,7 +270,49 @@ func (t *Tensor) MaxPool2d(k int, opts ConvOptions) *Tensor {
 	if o.Padding > k/2 {
 		return fail(fmt.Errorf("tensor: max pool padding %d for kernel %d: %w", o.Padding, k, ErrShape))
 	}
+	if t.poolsWithKernels() {
+		return t.maxPool(k, o)
+	}
 	return t.pool(k, o, math.Inf(-1), (*Tensor).Max)
+}
+
+// poolsWithKernels reports whether t pools with its device's pooling
+// kernels (see backend.Pooler) rather than a reduction over its windows:
+// when the device runs them and t is a plain Float32 tensor, not batched
+// by VMap or an argument of a Trace, whose graph an exporter reads.
+func (t *Tensor) poolsWithKernels() bool {
+	if t.err != nil || t.node.DType != backend.Float32 || batchLevel(t) != 0 || tracing.Load() != 0 {
+		return false
+	}
+	p, ok := backendOf(t.node).(backend.Pooler)
+	return ok && p.Pools()
+}
+
+// maxPool is MaxPool2d on a device that runs pooling kernels. Its
+// gradient goes to the first largest element of each window, as
+// torch.nn.functional.max_pool2d's does, where the reduction over the
+// windows shares it between tied elements; the two agree on windows
+// without ties. Derivatives of the gradient, and forward derivatives,
+// come from the reduction over the windows.
+func (t *Tensor) maxPool(k int, o ConvOptions) *Tensor {
+	if err := t.checkWindows(k, o); err != nil {
+		return fail(err)
+	}
+	w := o.window(k)
+	out := wrap(graph.MaxPool(t.node, w))
+	if out.err != nil || !tracked(t) {
+		return out
+	}
+	composed := func(in []*Tensor) *Tensor { return in[0].pool(k, o, math.Inf(-1), (*Tensor).Max) }
+	return record(out, rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor {
+			if anyTracked(g, in[0]) || batchLevel(g) != 0 || batchLevel(in[0]) != 0 || !in[0].poolsWithKernels() {
+				return vjpOf(composed, in, g)
+			}
+			return grads(wrap(graph.MaxPoolGrad(in[0].node, g.node, w)))
+		},
+		jvp: func(t, in []*Tensor, _ *Tensor) *Tensor { return jvpOf(composed, in, t) },
+	}, t)
 }
 
 // AvgPool2d returns the mean of each k×k window of t, shaped [N, C, H, W],

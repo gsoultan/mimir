@@ -205,6 +205,19 @@ const (
 	// ErrIndex.
 	OpScatter
 
+	// Pooling over the trailing len(Attrs.Kernel) dimensions of a Float32
+	// In[0], [B..., D...], through windows placed as OpUnfold places them,
+	// for a backend that runs them (see Pooler); other backends pool with
+	// OpUnfold and a reduction. Padding holds no element: a window's
+	// maximum is over the elements inside the input, and NaN propagates.
+	OpMaxPool // [B..., D...] -> [B..., O...]: the largest element of each window
+	// OpMaxPoolGrad routes the gradient In[1], [B..., O...], of an
+	// OpMaxPool of In[0] back to the input: each window's gradient goes to
+	// the first of its elements, in row-major order, that holds the
+	// maximum, or NaN, as torch.nn.functional.max_pool2d's does, and
+	// elements that several windows pick sum their gradients.
+	OpMaxPoolGrad
+
 	numOps
 )
 
@@ -311,6 +324,8 @@ var opNames = [numOps]string{
 	OpGammaGrad:   "gamma_grad",
 	OpSegment:     "segment",
 	OpScatter:     "scatter",
+	OpMaxPool:     "max_pool",
+	OpMaxPoolGrad: "max_pool_grad",
 }
 
 func (o Op) String() string {
