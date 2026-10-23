@@ -12,7 +12,8 @@ import (
 
 // BenchmarkTrainStep times one training step: the forward pass, the loss,
 // the backward pass and an AdamW update. The mlp and cnn models are those
-// of examples/mnist, on a batch of 128 MNIST-sized images. resnet18 is
+// of examples/mnist, on a batch of 128 MNIST-sized images. deep is a deep
+// network for table rows, on a batch of 512. resnet18 is
 // ResNet-18 on a batch of 16 ImageNet-sized images, a step of seconds,
 // which runs only when MIMIR_BENCH_RESNET=1. tools/bench times the same
 // steps in PyTorch.
@@ -32,6 +33,7 @@ func BenchmarkTrainStep(b *testing.B) {
 	}{
 		{"mlp", mnistMLP, 128, []int{1, 28, 28}, 10},
 		{"cnn", mnistCNN, 128, []int{1, 28, 28}, 10},
+		{"deep", deepMLP, 512, []int{20}, 3},
 		{"resnet18", resnet18, 16, []int{3, 224, 224}, 1000},
 	} {
 		for _, feed := range []string{"", "/upload", "/donated"} {
@@ -115,6 +117,20 @@ func mnistMLP() nn.Module {
 		nn.Flatten(),
 		nn.NewLinear(28*28, 256), nn.ReLU(),
 		nn.NewLinear(256, 10),
+	)
+}
+
+// deepMLP is a deep, wide network for rows of a table, like those
+// mimir-server builds for a designed table model: 20 numbers in, three
+// answers out, 2.8 million parameters.
+func deepMLP() nn.Module {
+	return nn.NewSequential(
+		nn.NewLinear(20, 1024), nn.ReLU(),
+		nn.NewLinear(1024, 1024), nn.ReLU(),
+		nn.NewLinear(1024, 1024), nn.ReLU(),
+		nn.NewLinear(1024, 512), nn.ReLU(),
+		nn.NewLinear(512, 256), nn.ReLU(),
+		nn.NewLinear(256, 3),
 	)
 }
 

@@ -854,6 +854,44 @@ recipAVX512_done:
 	VZEROUPPER
 	RET
 
+// func sqrtAVX512(dst *float32, a *float32, n int)
+// Requires: AVX, AVX512F
+TEXT ·sqrtAVX512(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP), AX
+	MOVQ a+8(FP), CX
+	MOVQ n+16(FP), DX
+	CMPQ DX, $0x00000040
+	JL   sqrtAVX512_one
+
+sqrtAVX512_wide:
+	VSQRTPS (CX), Z0
+	VMOVUPS Z0, (AX)
+	VSQRTPS 64(CX), Z0
+	VMOVUPS Z0, 64(AX)
+	VSQRTPS 128(CX), Z0
+	VMOVUPS Z0, 128(AX)
+	VSQRTPS 192(CX), Z0
+	VMOVUPS Z0, 192(AX)
+	ADDQ    $0x00000100, AX
+	ADDQ    $0x00000100, CX
+	SUBQ    $0x00000040, DX
+	CMPQ    DX, $0x00000040
+	JGE     sqrtAVX512_wide
+
+sqrtAVX512_one:
+	TESTQ   DX, DX
+	JZ      sqrtAVX512_done
+	VSQRTPS (CX), Z0
+	VMOVUPS Z0, (AX)
+	ADDQ    $0x00000040, AX
+	ADDQ    $0x00000040, CX
+	SUBQ    $0x00000010, DX
+	JMP     sqrtAVX512_one
+
+sqrtAVX512_done:
+	VZEROUPPER
+	RET
+
 // func rowMaxAVX2(x *float32, n int) float32
 // Requires: AVX, SSE
 TEXT ·rowMaxAVX2(SB), NOSPLIT, $0-20
@@ -1310,5 +1348,43 @@ recipAVX2_one:
 	JMP     recipAVX2_one
 
 recipAVX2_done:
+	VZEROUPPER
+	RET
+
+// func sqrtAVX2(dst *float32, a *float32, n int)
+// Requires: AVX
+TEXT ·sqrtAVX2(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP), AX
+	MOVQ a+8(FP), CX
+	MOVQ n+16(FP), DX
+	CMPQ DX, $0x00000020
+	JL   sqrtAVX2_one
+
+sqrtAVX2_wide:
+	VSQRTPS (CX), Y0
+	VMOVUPS Y0, (AX)
+	VSQRTPS 32(CX), Y0
+	VMOVUPS Y0, 32(AX)
+	VSQRTPS 64(CX), Y0
+	VMOVUPS Y0, 64(AX)
+	VSQRTPS 96(CX), Y0
+	VMOVUPS Y0, 96(AX)
+	ADDQ    $0x00000080, AX
+	ADDQ    $0x00000080, CX
+	SUBQ    $0x00000020, DX
+	CMPQ    DX, $0x00000020
+	JGE     sqrtAVX2_wide
+
+sqrtAVX2_one:
+	TESTQ   DX, DX
+	JZ      sqrtAVX2_done
+	VSQRTPS (CX), Y0
+	VMOVUPS Y0, (AX)
+	ADDQ    $0x00000020, AX
+	ADDQ    $0x00000020, CX
+	SUBQ    $0x00000008, DX
+	JMP     sqrtAVX2_one
+
+sqrtAVX2_done:
 	VZEROUPPER
 	RET

@@ -814,6 +814,13 @@ func unaryLoop[T number](op backend.Op, dst, a []T) {
 			dst[i] = 1 / x
 		}
 	case backend.OpSqrt:
+		if d, ok := any(dst).([]float32); ok && rowVector != nil {
+			n := vectorPart(len(d))
+			if n > 0 {
+				rowVector.sqrt(&d[0], &any(a).([]float32)[0], n)
+			}
+			dst, a = dst[n:], a[n:]
+		}
 		for i, x := range a {
 			dst[i] = T(math.Sqrt(float64(x)))
 		}
