@@ -54,6 +54,17 @@ type bare struct {
 // dtypes and layouts, so a computation whose graph depends on a leaf's
 // values, as one built by reading them does, must not be recorded.
 func Record(ctx context.Context, leaves, targets []*Tensor) (*Recording, error) {
+	return RecordInto(ctx, leaves, nil, targets)
+}
+
+// RecordInto is Record that writes targets[i] over the memory of dsts[i]
+// where it can, as RealizeInto does, and records that too: a replay then
+// writes each target over the destination ReplayInto gives it. dsts is
+// nil or holds a destination, or nil, for each target, as for
+// RealizeInto, whose caller must be done with each. A destination may be
+// a leaf, as the state a computation reads and writes, such as a
+// key-value cache, is.
+func RecordInto(ctx context.Context, leaves, dsts, targets []*Tensor) (*Recording, error) {
 	if err := firstErr(leaves...); err != nil {
 		return nil, err
 	}
@@ -61,6 +72,9 @@ func Record(ctx context.Context, leaves, targets []*Tensor) (*Recording, error) 
 		return nil, err
 	}
 	if err := computable(targets...); err != nil {
+		return nil, err
+	}
+	if err := checkDestinations(dsts, targets); err != nil {
 		return nil, err
 	}
 	if err := Realize(ctx, leaves...); err != nil {
@@ -76,12 +90,16 @@ func Record(ctx context.Context, leaves, targets []*Tensor) (*Recording, error) 
 		rec.at[i] = len(nodes)
 		nodes = append(nodes, t.node)
 	}
+	over := rec.destinations(dsts, len(nodes))
 	var devices int
 	for be := range byDevice(nodes) {
 		devices++
 		rec.be = be
 	}
 	if _, mesh := rec.be.(*meshDevice); devices != 1 || mesh || slices.ContainsFunc(nodes, sched.Realized) {
+		if dsts != nil {
+			return nil, RealizeInto(ctx, dsts, targets)
+		}
 		return nil, Realize(ctx, targets...)
 	}
 	leafAt := make(map[*graph.Node]int, len(leaves))
@@ -95,7 +113,11 @@ func Record(ctx context.Context, leaves, targets []*Tensor) (*Recording, error) 
 		rec.targets[i] = bare{op: n.Op, dt: n.DType, shape: slices.Clone(n.Shape), dev: n.Dev}
 	}
 	traced := false
-	err := sched.RealizeEachTraced(ctx, []backend.Backend{rec.be}, [][]*graph.Node{nodes}, nil, lazy.values, func(_ int, t *sched.Trace, order, ls []*graph.Node) {
+	var each [][]*graph.Node
+	if over != nil {
+		each = [][]*graph.Node{over}
+	}
+	err := sched.RealizeEachTraced(ctx, []backend.Backend{rec.be}, [][]*graph.Node{nodes}, each, lazy.values, func(_ int, t *sched.Trace, order, ls []*graph.Node) {
 		traced = true
 		rec.leaves = make([]int, t.Leaves())
 		for i := range rec.leaves {
@@ -135,8 +157,25 @@ func Record(ctx context.Context, leaves, targets []*Tensor) (*Recording, error) 
 // again has been written over, or when its program is busy with another
 // replay: the caller then computes its graph otherwise.
 func (r *Recording) Replay(ctx context.Context, leaves []*Tensor) ([]*Tensor, bool, error) {
+	return r.ReplayInto(ctx, leaves, nil)
+}
+
+// ReplayInto is Replay that writes the targets over dsts, as RecordInto
+// did over the destinations it was given: dsts is nil or holds a
+// destination, or nil, for each target Record was given, which stands
+// for the one RecordInto was given. It returns false, having computed
+// nothing and left dsts alone, when the destinations do not fit the
+// recording either: when one is given where RecordInto had none, or the
+// other way around, or when one is not computed or stale.
+func (r *Recording) ReplayInto(ctx context.Context, leaves, dsts []*Tensor) ([]*Tensor, bool, error) {
 	if err := firstErr(leaves...); err != nil {
 		return nil, false, err
+	}
+	if err := checkDestinations(dsts, nil); err != nil {
+		return nil, false, err
+	}
+	if dsts != nil && len(dsts) != len(r.at) {
+		return nil, false, fmt.Errorf("tensor: %d destinations for a recording of %d targets: %w", len(dsts), len(r.at), ErrShape)
 	}
 	var unrealized []*Tensor
 	for _, l := range leaves {
@@ -165,7 +204,7 @@ func (r *Recording) Replay(ctx context.Context, leaves []*Tensor) ([]*Tensor, bo
 			made[i] = &graph.Node{Op: b.op, DType: b.dt, Shape: b.shape, Dev: b.dev}
 		}
 		return made
-	}, lazy.values)
+	}, r.destinations(dsts, len(r.targets)), lazy.values)
 	if err != nil {
 		return nil, false, err
 	}
@@ -181,4 +220,53 @@ func (r *Recording) Replay(ctx context.Context, leaves []*Tensor) ([]*Tensor, bo
 		out[i] = ts[j]
 	}
 	return out, true, nil
+}
+
+// destinations returns the destination of each of the n nodes a recording
+// computes, from dsts, given for the targets in Record's order, or nil if
+// there are none.
+func (r *Recording) destinations(dsts []*Tensor, n int) []*graph.Node {
+	var over []*graph.Node
+	for i, d := range dsts {
+		if d == nil {
+			continue
+		}
+		if over == nil {
+			over = make([]*graph.Node, n)
+		}
+		if j := r.at[i]; over[j] == nil {
+			over[j] = d.node
+		}
+	}
+	return over
+}
+
+// checkDestinations checks that each destination of dsts is computable
+// and, if targets is not nil, has the shape and dtype of its target, as
+// RealizeInto requires.
+func checkDestinations(dsts, targets []*Tensor) error {
+	if dsts == nil {
+		return nil
+	}
+	if targets != nil && len(dsts) != len(targets) {
+		return fmt.Errorf("tensor: %d destinations for %d tensors: %w", len(dsts), len(targets), ErrShape)
+	}
+	for i, d := range dsts {
+		if d == nil {
+			continue
+		}
+		if err := firstErr(d); err != nil {
+			return err
+		}
+		if err := computable(d); err != nil {
+			return err
+		}
+		if targets == nil {
+			continue
+		}
+		if t := targets[i].node; !slices.Equal(d.node.Shape, t.Shape) || d.node.DType != t.DType {
+			return fmt.Errorf("tensor: %s%v into %s%v: %w", t.DType, t.Shape, d.node.DType, d.node.Shape, ErrShape)
+		}
+	}
+	return nil
 }

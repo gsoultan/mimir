@@ -687,7 +687,7 @@ read.
 | Reductions | `Sum`, `Max`, `Min`, `Mean`, `Var` |
 | Shape | `Reshape`, `Permute`, `Transpose`, `Expand`, `Pad`, `Shrink`, `Flip`, `Unsqueeze`, `Squeeze` |
 | Linear algebra | `MatMul` with NumPy semantics and batch broadcasting, `MatMulT` (also by quantized weights) |
-| Indexing | `Gather`, `ScatterAdd`, `Argmax` |
+| Indexing | `Gather`, `Scatter`, `ScatterAdd`, `Argmax` |
 | Joining and windows | `Cat`, `Stack`, `Split`, `Flatten`, `Unfold`, `SliceScatter` |
 | Sparse | `Pattern` with `MatMul`, `Mean` and `Max` over its entries, as one segment kernel |
 | Scans | `CumSum`, `CumMax`, `LogCumSumExp`, `Scan` |

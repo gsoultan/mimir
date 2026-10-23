@@ -271,9 +271,19 @@ func Movement(t *testing.T) []Case {
 					In: []backend.View{x.V, backend.Contiguous(upd), backend.Contiguous(upd)}, Attrs: backend.Attrs{Axis: axis}},
 				Ins: []backend.Buffer{HostBuffer(t, rng, f, x.N, 0, 0), HostBuffer(t, rng, i, m, 0, []int{3, 4, 5}[axis]), HostBuffer(t, rng, f, m, 0, 0)},
 			})
+			// Seven updates along an axis of at most five collide: the
+			// last along the axis lands.
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("scatter/%d/%s", axis, name),
+				K: backend.Kernel{Op: backend.OpScatter, DType: f, Shape: []int{3, 4, 5},
+					In: []backend.View{x.V, backend.Contiguous(upd), backend.Contiguous(upd)}, Attrs: backend.Attrs{Axis: axis}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, f, x.N, 0, 0), HostBuffer(t, rng, i, m, 0, []int{3, 4, 5}[axis]), HostBuffer(t, rng, f, m, 0, 0)},
+			})
 		}
 	}
 	cases = append(cases,
+		Case{Name: "scatter out of range", K: backend.Kernel{Op: backend.OpScatter, DType: i, Shape: []int{4}, In: []backend.View{backend.Contiguous([]int{4}), backend.Contiguous([]int{6}), backend.Contiguous([]int{6})}},
+			Ins: []backend.Buffer{HostBuffer(t, rng, i, 4, 0, 9), HostBuffer(t, rng, i, 6, -1, 1), HostBuffer(t, rng, i, 6, 0, 9)}},
 		Case{Name: "gather out of range", K: backend.Kernel{Op: backend.OpGather, DType: i, Shape: []int{4}, In: []backend.View{backend.Contiguous([]int{4}), backend.Contiguous([]int{4})}},
 			Ins: []backend.Buffer{HostBuffer(t, rng, i, 4, 0, 9), HostBuffer(t, rng, i, 4, 3, 5)}},
 		Case{Name: "scatter add out of range", K: backend.Kernel{Op: backend.OpScatterAdd, DType: i, Shape: []int{4}, In: []backend.View{backend.Contiguous([]int{4}), backend.Contiguous([]int{6}), backend.Contiguous([]int{6})}},
@@ -304,6 +314,12 @@ func Movement(t *testing.T) []Case {
 			cases = append(cases, Case{
 				Name: fmt.Sprintf("scatter add/%s/%s", dt, name),
 				K: backend.Kernel{Op: backend.OpScatterAdd, DType: dt, Shape: []int{3, 4, 5},
+					In: []backend.View{x.V, backend.Contiguous(upd), backend.Contiguous(upd)}, Attrs: backend.Attrs{Axis: 0}},
+				Ins: []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0), HostBuffer(t, rng, i, m, 0, 3), HostBuffer(t, rng, dt, m, 0, 0)},
+			})
+			cases = append(cases, Case{
+				Name: fmt.Sprintf("scatter/%s/%s", dt, name),
+				K: backend.Kernel{Op: backend.OpScatter, DType: dt, Shape: []int{3, 4, 5},
 					In: []backend.View{x.V, backend.Contiguous(upd), backend.Contiguous(upd)}, Attrs: backend.Attrs{Axis: 0}},
 				Ins: []backend.Buffer{HostBuffer(t, rng, dt, x.N, 0, 0), HostBuffer(t, rng, i, m, 0, 3), HostBuffer(t, rng, dt, m, 0, 0)},
 			})

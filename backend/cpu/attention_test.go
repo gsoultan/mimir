@@ -67,6 +67,7 @@ type attnCase struct {
 	workers         int
 	scale           float64
 	fullyMaskedRows bool
+	hidden          int // keys at the end that the mask hides from every query, as an empty part of a cache
 }
 
 // attnRef computes an attention in float64: the result, the logsumexp
@@ -146,6 +147,10 @@ func TestAttentionMatchesReference(t *testing.T) {
 		{name: "decoding", batch: []int{1}, h: 8, hk: 2, q: 1, k: 50, d: 16, dv: 16, causal: true, offset: 49},
 		{name: "bfloat16", batch: []int{2}, h: 2, hk: 1, q: 12, k: 20, d: 8, dv: 8, causal: true, dt: backend.BFloat16},
 		{name: "float16", batch: []int{1}, h: 2, hk: 2, q: 12, k: 20, d: 8, dv: 8, mask: true, dt: backend.Float16},
+		{name: "decoding from a cache", batch: []int{1}, h: 8, hk: 2, q: 1, k: 70, d: 16, dv: 16, mask: true, hidden: 61},
+		{name: "decoding from a half cache", batch: []int{1}, h: 8, hk: 2, q: 2, k: 70, d: 16, dv: 12, mask: true, hidden: 55, dt: backend.Float16},
+		{name: "decoding from a strided half cache", batch: []int{2}, h: 4, hk: 4, q: 1, k: 40, d: 8, dv: 8, mask: true, hidden: 33, strided: true, dt: backend.BFloat16},
+		{name: "decoding from an empty cache", batch: []int{1}, h: 2, hk: 1, q: 1, k: 9, d: 4, dv: 4, mask: true, hidden: 9, dt: backend.Float16, fullyMaskedRows: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -191,6 +196,11 @@ func TestAttentionMatchesReference(t *testing.T) {
 				// [B..., 1, Q, K], broadcast over the heads.
 				ms := slices.Concat(c.batch, []int{1, c.q, c.k})
 				mask = rounded(c.dt, rnd(n(ms), 3))
+				for i := range mask {
+					if i%c.k >= c.k-c.hidden {
+						mask[i] = math.Inf(-1)
+					}
+				}
 				mb, mv = place(t, c.dt, mask, ms, perm(ms))
 				mv = mv.Expand(slices.Concat(c.batch, []int{c.h, c.q, c.k}))
 				ins, views = append(ins, mb), append(views, mv)

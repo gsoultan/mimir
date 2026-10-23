@@ -83,6 +83,42 @@ func TestSliceScatterInPlaceWritesTheBlock(t *testing.T) {
 	}
 }
 
+// TestScatterInPlaceWritesTheUpdates checks that a scatter written over
+// its input writes the elements its updates land on, the last of each,
+// and nothing else.
+func TestScatterInPlaceWritesTheUpdates(t *testing.T) {
+	f, i := backend.Float32, backend.Int32
+	rng := rand.New(rand.NewPCG(5, 6))
+	shape, upd := []int{3, 8, 4}, []int{2, 5, 4}
+	k := &backend.Kernel{Op: backend.OpScatter, DType: f, Shape: shape,
+		In:    []backend.View{backend.Contiguous(shape), backend.Contiguous(upd), backend.Contiguous([]int{5, 2, 4}).Permute([]int{1, 0, 2})},
+		Attrs: backend.Attrs{Axis: 1}}
+	x, idx, src := kerneltest.HostBuffer(t, rng, f, 96, 0, 0), kerneltest.HostBuffer(t, rng, i, 40, 0, 8), kerneltest.HostBuffer(t, rng, f, 40, 0, 0)
+	want := kerneltest.HostBuffer(t, nil, f, 96, 0, 0)
+	if err := kerneltest.Host.Run(t.Context(), k, []backend.Buffer{want}, []backend.Buffer{x, idx, src}); err != nil {
+		t.Fatal(err)
+	}
+	wv, xv := kerneltest.Floats(t, want), kerneltest.Floats(t, x)
+	for _, d := range dialects {
+		l, err := gen.Plan(d, k, []backend.Buffer{x}, []backend.Buffer{x, idx, src})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := kerneltest.NewEmulator(t, d)
+		if e == nil {
+			continue
+		}
+		// The launch writes into a buffer of NaNs: where no update lands
+		// they must stay, as x does when the output is x.
+		got, _ := e.Exec(t, l, []backend.Buffer{kerneltest.HostBuffer(t, nil, f, 96, 0, 0)}, []backend.Buffer{x, idx, src})
+		for j, v := range kerneltest.FromBytes(got[0]) {
+			if hit := wv[j] != xv[j]; hit && v != wv[j] || !hit && v == v {
+				t.Fatalf("%s: element %d = %v, want %v (x has %v)", d.Name, j, v, wv[j], xv[j])
+			}
+		}
+	}
+}
+
 // TestAttentionOfHugeHeadsIsRefused checks that attention whose tiles
 // cannot fit a group's memory fails with ErrShape instead of compiling.
 func TestAttentionOfHugeHeadsIsRefused(t *testing.T) {

@@ -197,6 +197,14 @@ const (
 	// rounded once.
 	OpSegment
 
+	// OpScatter replaces elements of In[0] along Attrs.Axis at Int32
+	// positions, like torch.Tensor.scatter: out = In[0]; out[m with
+	// m[axis] = In[1][m]] = In[2][m]. In[1] and In[2] share a shape that
+	// fits In[0] outside the axis. Of the updates of one element, the
+	// last along the axis lands. Positions outside the axis fail with
+	// ErrIndex.
+	OpScatter
+
 	numOps
 )
 
@@ -302,6 +310,7 @@ var opNames = [numOps]string{
 	OpRandPoisson: "rand_poisson",
 	OpGammaGrad:   "gamma_grad",
 	OpSegment:     "segment",
+	OpScatter:     "scatter",
 }
 
 func (o Op) String() string {

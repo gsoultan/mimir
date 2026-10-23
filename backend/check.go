@@ -51,7 +51,7 @@ func CheckRun(k *Kernel, outs, ins []Buffer) error {
 		if !slices.Contains(outs, in) {
 			continue
 		}
-		inPlace := k.Op.RunsElementwise() || k.Op == OpSliceScatter && i == 0
+		inPlace := k.Op.RunsElementwise() || (k.Op == OpSliceScatter || k.Op == OpScatter) && i == 0
 		if v := k.In[i]; !inPlace || !v.IsContiguous() || v.Offset != 0 || !slices.Equal(v.Shape, k.Shape) {
 			return fmt.Errorf("%s: input %d is also an output: %w", k.Op, i, ErrInternal)
 		}
