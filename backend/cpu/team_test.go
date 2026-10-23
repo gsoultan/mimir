@@ -167,12 +167,14 @@ func TestShortLoopsRunOnTheCaller(t *testing.T) {
 		t.Fatalf("the first loop ran in %d calls, want 64 chunks", calls)
 	}
 	// After a run of loops over in no time, the next runs on the caller:
-	// one call over the whole range.
+	// one call over the whole range. The loops are recorded rather than
+	// run, since how long a loop of nothing takes depends on the machine
+	// (and the race detector).
 	for range 200 {
-		run(func(int, int) error { return nil })
+		tm.ran(time.Microsecond)
 	}
 	if !tm.solo() {
-		t.Fatalf("after 200 loops of nothing, helpers still join: recent loops ran %v", time.Duration(tm.busy.Load()))
+		t.Fatalf("after 200 loops of a microsecond, helpers still join: recent loops ran %v", time.Duration(tm.busy.Load()))
 	}
 	if calls := run(func(int, int) error { return nil }); calls != 1 {
 		t.Fatalf("a short loop ran in %d calls, want 1, on the caller", calls)
