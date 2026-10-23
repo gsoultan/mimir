@@ -277,6 +277,24 @@ func sumInto[T number, A float64 | number, S elem](ctx context.Context, b *Backe
 				acc += sumRun[A](in[src : src+inner])
 				return
 			}
+			if f, ok := any(in).([]float32); ok && step > 0 {
+				// Four running sums, as sumFloats keeps, without a
+				// conversion call per element.
+				var a0, a1, a2, a3 float64
+				f = f[src : src+(inner-1)*step+1]
+				i := 0
+				for ; i+4 <= inner; i += 4 {
+					a0 += float64(f[i*step])
+					a1 += float64(f[(i+1)*step])
+					a2 += float64(f[(i+2)*step])
+					a3 += float64(f[(i+3)*step])
+				}
+				for ; i < inner; i++ {
+					a0 += float64(f[i*step])
+				}
+				acc += A((a0 + a1) + (a2 + a3))
+				return
+			}
 			for range inner {
 				acc += conv[A](in[src])
 				src += step
@@ -353,6 +371,15 @@ func addRow[A float64 | number, S elem](acc []A, in []S, src, step int) {
 			acc[j] += conv[A](v)
 		}
 		return
+	}
+	if a, ok := any(acc).([]float64); ok && step > 0 && len(a) > 0 {
+		if f, ok := any(in).([]float32); ok {
+			f = f[src : src+(len(a)-1)*step+1]
+			for j := range a {
+				a[j] += float64(f[j*step])
+			}
+			return
+		}
 	}
 	for j := range acc {
 		acc[j] += conv[A](in[src])

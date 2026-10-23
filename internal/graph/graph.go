@@ -543,6 +543,47 @@ func Fold(x *Node, spatial []int, w Window) (*Node, error) {
 	return newNode(&Node{Op: backend.OpFold, DType: x.DType, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)})
 }
 
+// MaxPool returns the largest element of each window w of x, a Float32
+// [B..., D...], as [B..., O...]; see backend.OpMaxPool.
+func MaxPool(x *Node, w Window) (*Node, error) {
+	s := len(w.Kernel)
+	if len(x.Shape) < s {
+		return nil, errorf(backend.OpMaxPool, backend.ErrShape, "window %+v over %v", w, x.Shape)
+	}
+	if x.DType != backend.Float32 {
+		return nil, errorf(backend.OpMaxPool, backend.ErrDType, "%s input", x.DType)
+	}
+	lead, spatial := x.Shape[:len(x.Shape)-s], x.Shape[len(x.Shape)-s:]
+	pos, err := w.positions(backend.OpMaxPool, spatial)
+	if err != nil {
+		return nil, err
+	}
+	for d := range s {
+		// Every window must hold an element, or it has no maximum.
+		if span := (w.Kernel[d]-1)*w.Dilation[d] + 1; w.Pads[d][0] >= span || w.Pads[d][1] >= span {
+			return nil, errorf(backend.OpMaxPool, backend.ErrShape, "window %+v padded past its size", w)
+		}
+	}
+	shape := slices.Concat(lead, pos)
+	if err := checkShape(backend.OpMaxPool, shape); err != nil {
+		return nil, err
+	}
+	return newNode(&Node{Op: backend.OpMaxPool, DType: backend.Float32, Shape: shape, Inputs: []*Node{x}, Attrs: w.attrs(0)})
+}
+
+// MaxPoolGrad routes g, the gradient of MaxPool(x, w), back to x's shape;
+// see backend.OpMaxPoolGrad.
+func MaxPoolGrad(x, g *Node, w Window) (*Node, error) {
+	out, err := MaxPool(x, w)
+	if err != nil {
+		return nil, err
+	}
+	if g.DType != backend.Float32 || !slices.Equal(g.Shape, out.Shape) {
+		return nil, errorf(backend.OpMaxPoolGrad, backend.ErrShape, "%s gradient %v for %v", g.DType, g.Shape, out.Shape)
+	}
+	return newNode(&Node{Op: backend.OpMaxPoolGrad, DType: backend.Float32, Shape: slices.Clone(x.Shape), Inputs: []*Node{x, g}, Attrs: w.attrs(0)})
+}
+
 // Scan is the inclusive scan of x along axis by combine; see
 // backend.OpScan. The result has x's shape and dtype. CombineLogSumExp
 // accepts only float types.

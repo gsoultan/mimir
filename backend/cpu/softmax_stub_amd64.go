@@ -39,7 +39,7 @@ func exp2AVX512(dst *float32, src *float32, n int)
 //go:noescape
 func addVVAVX512(dst *float32, a *float32, b *float32, n int)
 
-// addVSAVX512 sets the n elements at dst, a multiple of 16, to the sums of those at a and s.
+// addVSAVX512 sets the n elements at dst, a multiple of 16, to the sums of those at a and s, which is not NaN.
 //
 //go:noescape
 func addVSAVX512(dst *float32, a *float32, s float32, n int)
@@ -49,10 +49,35 @@ func addVSAVX512(dst *float32, a *float32, s float32, n int)
 //go:noescape
 func mulVVAVX512(dst *float32, a *float32, b *float32, n int)
 
-// mulVSAVX512 sets the n elements at dst, a multiple of 16, to the products of those at a and s.
+// mulVSAVX512 sets the n elements at dst, a multiple of 16, to the products of those at a and s, which is not NaN.
 //
 //go:noescape
 func mulVSAVX512(dst *float32, a *float32, s float32, n int)
+
+// maxVVAVX512 sets the n elements at dst, a multiple of 16, to the maxima, NaN where either is NaN, of those at a and b.
+//
+//go:noescape
+func maxVVAVX512(dst *float32, a *float32, b *float32, n int)
+
+// maxVSAVX512 sets the n elements at dst, a multiple of 16, to the maxima, NaN where either is NaN, of those at a and s, which is not NaN.
+//
+//go:noescape
+func maxVSAVX512(dst *float32, a *float32, s float32, n int)
+
+// cmpltVVAVX512 sets the n elements at dst, a multiple of 16, to 1 where the element at a is less than that at b, and 0 elsewhere.
+//
+//go:noescape
+func cmpltVVAVX512(dst *float32, a *float32, b *float32, n int)
+
+// cmpltVSAVX512 sets the n elements at dst, a multiple of 16, to 1 where the element at a is less than s, and 0 elsewhere.
+//
+//go:noescape
+func cmpltVSAVX512(dst *float32, a *float32, s float32, n int)
+
+// cmpltSVAVX512 sets the n elements at dst, a multiple of 16, to 1 where s is less than the element at a, and 0 elsewhere.
+//
+//go:noescape
+func cmpltSVAVX512(dst *float32, a *float32, s float32, n int)
 
 // recipAVX512 sets the n elements at dst, a multiple of 16, to the reciprocals of those at a, correctly rounded.
 //
@@ -99,7 +124,7 @@ func exp2AVX2(dst *float32, src *float32, n int)
 //go:noescape
 func addVVAVX2(dst *float32, a *float32, b *float32, n int)
 
-// addVSAVX2 sets the n elements at dst, a multiple of 8, to the sums of those at a and s.
+// addVSAVX2 sets the n elements at dst, a multiple of 8, to the sums of those at a and s, which is not NaN.
 //
 //go:noescape
 func addVSAVX2(dst *float32, a *float32, s float32, n int)
@@ -109,10 +134,35 @@ func addVSAVX2(dst *float32, a *float32, s float32, n int)
 //go:noescape
 func mulVVAVX2(dst *float32, a *float32, b *float32, n int)
 
-// mulVSAVX2 sets the n elements at dst, a multiple of 8, to the products of those at a and s.
+// mulVSAVX2 sets the n elements at dst, a multiple of 8, to the products of those at a and s, which is not NaN.
 //
 //go:noescape
 func mulVSAVX2(dst *float32, a *float32, s float32, n int)
+
+// maxVVAVX2 sets the n elements at dst, a multiple of 8, to the maxima, NaN where either is NaN, of those at a and b.
+//
+//go:noescape
+func maxVVAVX2(dst *float32, a *float32, b *float32, n int)
+
+// maxVSAVX2 sets the n elements at dst, a multiple of 8, to the maxima, NaN where either is NaN, of those at a and s, which is not NaN.
+//
+//go:noescape
+func maxVSAVX2(dst *float32, a *float32, s float32, n int)
+
+// cmpltVVAVX2 sets the n elements at dst, a multiple of 8, to 1 where the element at a is less than that at b, and 0 elsewhere.
+//
+//go:noescape
+func cmpltVVAVX2(dst *float32, a *float32, b *float32, n int)
+
+// cmpltVSAVX2 sets the n elements at dst, a multiple of 8, to 1 where the element at a is less than s, and 0 elsewhere.
+//
+//go:noescape
+func cmpltVSAVX2(dst *float32, a *float32, s float32, n int)
+
+// cmpltSVAVX2 sets the n elements at dst, a multiple of 8, to 1 where s is less than the element at a, and 0 elsewhere.
+//
+//go:noescape
+func cmpltSVAVX2(dst *float32, a *float32, s float32, n int)
 
 // recipAVX2 sets the n elements at dst, a multiple of 8, to the reciprocals of those at a, correctly rounded.
 //

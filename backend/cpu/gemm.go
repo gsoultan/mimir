@@ -75,7 +75,7 @@ const packSlack = 8
 var transpose8x8 func(dst *float32, ldd int, src *float32, lds int, blocks int)
 
 // minUnitFlops is the least work worth giving a worker of its own.
-const minUnitFlops = 1 << 18
+const minUnitFlops = 1 << 20
 
 // packCost is the cost of packing an element of A, in multiply-adds.
 const packCost = 8
@@ -273,6 +273,14 @@ func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a operand, of
 						if !last {
 							continue
 						}
+						if j0 == 0 && j1 == n {
+							// Whole rows: one contiguous range, which the
+							// epilogue runs in wide tiles.
+							if err := epi.apply(base+i0*n, base+i1*n); err != nil {
+								return err
+							}
+							continue
+						}
 						for i := i0; i < i1; i++ {
 							row := base + i*n + jc
 							if err := epi.apply(row+j0, row+j1); err != nil {
@@ -354,6 +362,13 @@ func (be *Backend) sgemmWide(ctx context.Context, g *gemmKernel, out []float32, 
 					}
 					var err error
 					spans(q0+s0, q0+s1, func(q, i, j0, cols int) {
+						if j0 == 0 && cols == n {
+							// Whole rows of an item: one contiguous range.
+							if err == nil {
+								err = epi.apply(i*m*n+i0*n, i*m*n+i1*n)
+							}
+							return
+						}
 						for r := i0; r < i1 && err == nil; r++ {
 							row := i*m*n + r*n + j0
 							err = epi.apply(row, row+cols)
