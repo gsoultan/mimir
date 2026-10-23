@@ -149,6 +149,7 @@ type Backend interface {
 	// needs. An OpSliceScatter kernel may write its output over input 0
 	// when it reads it through Contiguous(k.Shape): it then writes only
 	// the block, which leaves the rest of input 0 as the output's values.
+	// So may an OpScatter kernel, which then writes only the updates.
 	// No other kernel shares memory between its inputs and outputs.
 	Run(ctx context.Context, k *Kernel, outs []Buffer, ins []Buffer) error
 	// Sync waits until all submitted work has finished.
@@ -168,7 +169,7 @@ type Kernel struct {
 // Each Op documents which fields it uses.
 type Attrs struct {
 	Axes   []int    // Reduce*: reduced axes. Permute: the permutation. Flip: flipped axes. MatMul kernels: summed batch axes.
-	Axis   int      // Gather, ScatterAdd: the indexed axis. Scan: the scanned axis. Cat: the joined axis. Argsort, FFT: the transformed axis.
+	Axis   int      // Gather, ScatterAdd, Scatter: the indexed axis. Scan: the scanned axis. Cat: the joined axis. Argsort, FFT: the transformed axis.
 	Pads   [][2]int // Pad: elements added before and after each dimension. Unfold, Fold: each windowed dimension.
 	Ranges [][2]int // Shrink: half-open [start, end) kept in each dimension. SliceScatter: the block replaced.
 	Value  float64  // Const, Pad, Unfold: the fill value.

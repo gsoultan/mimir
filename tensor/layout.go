@@ -297,7 +297,7 @@ func (m *Mesh) rule(n *graph.Node, in []layout) (layout, []layout) {
 		return m.matmulRule(n, in[0], in[1])
 	case op == backend.OpGather:
 		return m.gatherRule(n, in)
-	case op == backend.OpScatterAdd:
+	case op == backend.OpScatterAdd || op == backend.OpScatter:
 		return m.scatterRule(n, in)
 	case op == backend.OpQMatMul:
 		x := in[0].clone()
@@ -734,7 +734,7 @@ func (m *Mesh) scatterRule(n *graph.Node, in []layout) (layout, []layout) {
 	}
 	// Scattering into zeros from a split run of positions along the axis
 	// gives each device a partial sum.
-	zero := isZero(x)
+	zero := n.Op == backend.OpScatterAdd && isZero(x)
 	for _, l := range in[1:] {
 		if dl := l.dims[axis]; zero && dl.split() && dl.sec == nil && !used.has(int(dl.axis)) {
 			src.dims[axis] = dl

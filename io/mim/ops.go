@@ -577,38 +577,23 @@ func (c *call) clamp(idx *tensor.Tensor, n int) *tensor.Tensor {
 
 // scatter returns data with the slices along axis at the positions idx
 // replaced by those of updates. Of repeated positions, the last in
-// row-major order wins.
+// row-major order wins. Computed into data's memory, as a session's run
+// computes the new value of a variable such as a key-value cache, it
+// writes only the slices at the positions.
 func (c *call) scatter(data, idx, updates *tensor.Tensor, axis int) *tensor.Tensor {
 	shape := data.Shape()
 	if axis < 0 || axis >= len(shape) {
 		return tensor.Failed(fmt.Errorf("%w: scatter along axis %d of rank %d", ErrFormat, axis, len(shape)))
 	}
-	p, q := 1, 1
-	for d, s := range shape {
-		if d < axis {
-			p *= s
-		} else if d > axis {
-			q *= s
-		}
-	}
 	n := idx.Size()
-	pos := c.clamp(idx, shape[axis]).Reshape(n)
-	// keep marks the positions no later position repeats.
-	later := pos.Reshape(n, 1).Equal(pos.Reshape(1, n)).Mul(c.upper(n))
-	keep := c.not(later.Max(1)).Reshape(1, n, 1).Expand(p, n, q)
-	ix := pos.Reshape(1, n, 1).Expand(p, n, q)
-	upd := updates.Reshape(p, n, q)
-	upd = tensor.Where(keep, upd, c.scalar(upd, 0))
-	hit := c.full(tensor.Int32, 0, p, shape[axis], q).ScatterAdd(1, ix, keep)
-	sum := c.full(data.DType(), 0, p, shape[axis], q).ScatterAdd(1, ix, upd)
-	return tensor.Where(hit, sum.Cast(data.DType()), data.Reshape(p, shape[axis], q)).Reshape(shape...)
-}
-
-// upper returns the Int32 [n, n] matrix of 1 above the diagonal and 0
-// elsewhere.
-func (c *call) upper(n int) *tensor.Tensor {
-	i := tensor.Arange[int32](0, int32(n), 1).To(c.r.dev)
-	return i.Reshape(n, 1).Less(i.Reshape(1, n))
+	// The positions in row-major order run along axis, where the last of
+	// the updates of an element lands.
+	upd := slices.Clone(shape)
+	upd[axis] = n
+	at := slices.Repeat([]int{1}, len(shape))
+	at[axis] = n
+	ix := c.clamp(idx, shape[axis]).Reshape(at...).Expand(upd...)
+	return data.Scatter(axis, ix, updates.Reshape(upd...))
 }
 
 // while runs the while op: the body runs on the loop-carried values for

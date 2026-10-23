@@ -2,10 +2,12 @@ package tensor_test
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
 
+	"github.com/gsoultan/mimir/backend/cpu"
 	"github.com/gsoultan/mimir/internal/sched"
 	"github.com/gsoultan/mimir/tensor"
 )
@@ -185,5 +187,70 @@ func TestReplayConcurrent(t *testing.T) {
 	wg.Wait()
 	if hits == 0 {
 		t.Error("no replay fit")
+	}
+}
+
+// A recording made into destinations replays into new ones: a decoding
+// step that writes a row of a cache writes it over the cache's memory
+// every time, allocating nothing the cache's size.
+func TestRecordIntoReplaysOverTheDestinations(t *testing.T) {
+	if tensor.Eager() {
+		t.Skip("eager mode computes every operation as it is created, leaving nothing to record")
+	}
+	ctx := t.Context()
+	be := &allocCounter{Backend: cpu.New()}
+	defer tensor.SetDevice(be)()
+	const heads, capacity, dim = 2, 64, 8
+	want := make([]float32, heads*capacity*dim)
+	cache := tensor.FromSlice(make([]float32, len(want)), 1, heads, capacity, dim)
+	var rec *tensor.Recording
+	for i := range 6 {
+		pos := tensor.Full(tensor.Int32, float64(i), 1, heads, 1, dim)
+		row := tensor.Randn(uint64(i), 1, heads, 1, dim)
+		if err := tensor.Realize(ctx, cache, pos, row); err != nil {
+			t.Fatal(err)
+		}
+		r, _ := row.Data[float32](ctx)
+		for h := range heads {
+			copy(want[(h*capacity+i)*dim:][:dim], r[h*dim:][:dim])
+		}
+		leaves, dsts := []*tensor.Tensor{cache, pos, row}, []*tensor.Tensor{cache, nil}
+		before, buf := be.elements, tensor.BufferOf(cache)
+		var outs []*tensor.Tensor
+		if rec == nil {
+			next := cache.Scatter(2, pos, row)
+			targets := []*tensor.Tensor{next, next.Sum()}
+			var err error
+			if rec, err = tensor.RecordInto(ctx, leaves, dsts, targets); err != nil || rec == nil {
+				t.Fatalf("recording: %v, %v", rec, err)
+			}
+			outs = targets
+		} else {
+			var ok bool
+			var err error
+			if outs, ok, err = rec.ReplayInto(ctx, leaves, dsts); err != nil || !ok {
+				t.Fatalf("step %d: replay %v, %v", i, ok, err)
+			}
+			if n := be.elements - before; n >= heads*capacity*dim {
+				t.Errorf("step %d allocated %d elements, as much as the cache", i, n)
+			}
+			if tensor.BufferOf(outs[0]) != buf {
+				t.Errorf("step %d did not write the cache over its memory", i)
+			}
+		}
+		if _, err := cache.Data[float32](ctx); !errors.Is(err, tensor.ErrOverwritten) {
+			t.Errorf("step %d: the old cache reads %v, want ErrOverwritten", i, err)
+		}
+		cache = outs[0]
+		got, err := cache.Data[float32](ctx)
+		if err != nil || !slices.Equal(got, want) {
+			t.Fatalf("step %d: cache %v, %v, want %v", i, got, err, want)
+		}
+	}
+	// A replay given no destinations does not fit a recording made into
+	// them.
+	pos, row := tensor.Full(tensor.Int32, 9, 1, heads, 1, dim), tensor.Randn(9, 1, heads, 1, dim)
+	if _, ok, err := rec.Replay(ctx, []*tensor.Tensor{cache, pos, row}); ok || err != nil {
+		t.Errorf("replay without destinations: %v, %v", ok, err)
 	}
 }

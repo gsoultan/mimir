@@ -69,3 +69,6 @@ func SetReplays(on, programs bool) func() {
 		replays, replayPrograms = was, wasPrograms
 	}
 }
+
+// BufferOf returns the buffer that holds the computed t.
+func BufferOf(t *Tensor) backend.Buffer { return t.node.Buf() }

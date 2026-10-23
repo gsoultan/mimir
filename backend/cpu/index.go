@@ -92,3 +92,56 @@ func scatterAddInto[A number, S elem](ctx context.Context, b *Backend, k *backen
 		return nil
 	})
 }
+
+// scatter copies dst into out, unless out is dst's buffer already, and
+// then writes each update over out[m with m[axis] = idx[m]]. Workers write
+// whole lines, each in order along axis, so of the updates of an element
+// the last along axis lands, as for scatterAddInto.
+func scatter[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, dst []T, idx []int32, upd []T, inPlace bool) error {
+	if !inPlace {
+		err := forRows(ctx, b, k.Shape, []backend.View{k.In[0], backend.Contiguous(k.Shape)}, func(_ int, offs, steps []int, n int) {
+			from, to := offs[0], offs[1]
+			if steps[0] == 1 && steps[1] == 1 {
+				copy(out[to:to+n], dst[from:from+n])
+				return
+			}
+			for range n {
+				out[to] = dst[from]
+				from += steps[0]
+				to += steps[1]
+			}
+		})
+		if err != nil {
+			return err
+		}
+	}
+	axis := k.Attrs.Axis
+	vi, vu := k.In[1], k.In[2]
+	limit, length := k.Shape[axis], vi.Shape[axis]
+	strides := backend.ContiguousStrides(k.Shape)
+	step, si, su := strides[axis], vi.Strides[axis], vu.Strides[axis]
+	drop := func(s []int) []int { return slices.Delete(slices.Clone(s), axis, axis+1) }
+	shape, views := backend.Coalesce(drop(vi.Shape), []backend.View{
+		{Strides: drop(vi.Strides), Offset: vi.Offset},
+		{Strides: drop(vu.Strides), Offset: vu.Offset},
+		{Strides: drop(strides)},
+	})
+	lines, _ := backend.NumElements(shape)
+	return b.parallelFor(ctx, lines, max(1, elementGrain/max(length, 1)), func(lo, hi int) error {
+		c := newCursor(shape, views, lo)
+		for range hi - lo {
+			oi, ou, base := c.offs[0], c.offs[1], c.offs[2]
+			for range length {
+				j := int(idx[oi])
+				if j < 0 || j >= limit {
+					return fmt.Errorf("index %d for axis %d of size %d: %w", j, axis, limit, backend.ErrIndex)
+				}
+				out[base+j*step] = upd[ou]
+				oi += si
+				ou += su
+			}
+			c.next()
+		}
+		return nil
+	})
+}

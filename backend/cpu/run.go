@@ -103,7 +103,7 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 }
 
 // runTyped executes ops whose inputs share the output dtype, except for
-// Int32 index inputs to Gather and ScatterAdd.
+// Int32 index inputs to Gather, ScatterAdd and Scatter.
 func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf backend.Buffer, ins []backend.Buffer) error {
 	out, err := data[T](outBuf)
 	if err != nil {
@@ -111,7 +111,7 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 	}
 	in := make([][]T, len(ins))
 	for i, buf := range ins {
-		if (k.Op == backend.OpGather || k.Op == backend.OpScatterAdd) && i == 1 {
+		if (k.Op == backend.OpGather || k.Op == backend.OpScatterAdd || k.Op == backend.OpScatter) && i == 1 {
 			continue // Int32 indices, read below
 		}
 		if in[i], err = data[T](buf); err != nil {
@@ -146,6 +146,12 @@ func runTyped[T elem](ctx context.Context, b *Backend, k *backend.Kernel, outBuf
 			return err
 		}
 		return scatterAdd(ctx, b, k, out, in[0], idx, in[2])
+	case op == backend.OpScatter:
+		idx, err := data[int32](ins[1])
+		if err != nil {
+			return err
+		}
+		return scatter(ctx, b, k, out, in[0], idx, in[2], outBuf == ins[0])
 	case op == backend.OpUnfold:
 		return unfold(ctx, b, k, out, in[0])
 	case op == backend.OpFold:

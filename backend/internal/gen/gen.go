@@ -533,6 +533,8 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 
 	case op == backend.OpSegment:
 		return g.segment(n)
+	case op == backend.OpScatter:
+		return planScatter(d, k, outs, ins, n)
 	}
 	return nil, fmt.Errorf("no kernel for %s: %w", k.Op, backend.ErrInternal)
 }
@@ -788,6 +790,83 @@ func (g *gen) scatterAdd(n int) (*Launch, error) {
 	g.line("\t}")
 	g.line("}")
 	g.line("o0[i] = %s;", store(dt, "acc"))
+	return g.perElement(n)
+}
+
+// planScatter copies input 0 with the updates written over it at
+// out[m with m[axis] = idx[m]]: each output element takes the last update
+// along axis that lands on it, as the CPU backend's does, and the threads
+// at position 0 along axis check the indices of their column. Written
+// over input 0, it runs a thread per line of the updates instead, which
+// writes them in order along axis.
+func planScatter(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer, n int) (*Launch, error) {
+	axis := k.Attrs.Axis
+	vd, vi, vu := k.In[0], k.In[1], k.In[2]
+	r := len(k.Shape)
+	if len(ins) != 3 || ins[1].DType() != backend.Int32 || axis < 0 || axis >= r || len(vd.Shape) != r || len(vi.Shape) != r || !slices.Equal(vi.Shape, vu.Shape) {
+		return nil, fmt.Errorf("scatter along axis %d: %w", axis, backend.ErrInternal)
+	}
+	g := newGen(d, k, outs, ins)
+	if outs[0] == ins[0] {
+		drop := func(s []int) []int { return slices.Delete(slices.Clone(s), axis, axis+1) }
+		rest := drop(vi.Shape)
+		lines, _ := backend.NumElements(rest)
+		if lines == 0 || vi.Shape[axis] == 0 {
+			return nil, nil
+		}
+		out := backend.ContiguousStrides(k.Shape)
+		g.line("if (gid >= uint(%s)) return;", g.param(lines))
+		g.line("int line = int(gid);")
+		coords := g.index("line", rest)
+		g.line("int o = 0, idx = %s, upd = %s;", g.param(vi.Offset), g.param(vu.Offset))
+		for j, c := range coords {
+			d := j
+			if j >= axis {
+				d++
+			}
+			g.line("o += %s * %s;", c, g.param(out[d]))
+			g.line("idx += %s * %s;", c, g.param(vi.Strides[d]))
+			g.line("upd += %s * %s;", c, g.param(vu.Strides[d]))
+		}
+		g.line("int so = %s, si = %s, su = %s;", g.param(out[axis]), g.param(vi.Strides[axis]), g.param(vu.Strides[axis]))
+		g.line("for (int j = 0; j < %s; j++) {", g.param(vi.Shape[axis]))
+		g.line("\tint to = i1[idx + j * si];")
+		g.line("\tif (to < 0 || to >= %s) {", g.param(k.Shape[axis]))
+		g.line("\t\treport(err, %du);", ErrIndex)
+		g.line("\t\tcontinue;")
+		g.line("\t}")
+		g.line("\to0[o + to * so] = i2[upd + j * su];")
+		g.line("}")
+		return g.perElement(lines)
+	}
+	g.line("if (gid >= uint(%s)) return;", g.param(n))
+	g.line("int i = int(gid);")
+	coords := g.index("i", k.Shape)
+	g.line("int dst = %s;", g.param(vd.Offset))
+	g.line("int idx = %s;", g.param(vi.Offset))
+	g.line("int upd = %s;", g.param(vu.Offset))
+	g.line("bool covered = true;")
+	for d, c := range coords {
+		g.line("dst += %s * %s;", c, g.param(vd.Strides[d]))
+		if d == axis {
+			continue
+		}
+		g.line("covered = covered && %s < %s;", c, g.param(vi.Shape[d]))
+		g.line("idx += %s * %s;", c, g.param(vi.Strides[d]))
+		g.line("upd += %s * %s;", c, g.param(vu.Strides[d]))
+	}
+	g.line("int from = -1;")
+	g.line("if (covered) {")
+	g.line("\tint at = %s;", coords[axis])
+	g.line("\tint limit = %s;", g.param(k.Shape[axis]))
+	g.line("\tint si = %s, su = %s;", g.param(vi.Strides[axis]), g.param(vu.Strides[axis]))
+	g.line("\tfor (int j = 0; j < %s; j++) {", g.param(vi.Shape[axis]))
+	g.line("\t\tint to = i1[idx + j * si];")
+	g.line("\t\tif (at == 0 && (to < 0 || to >= limit)) report(err, %du);", ErrIndex)
+	g.line("\t\tif (to == at) from = upd + j * su;")
+	g.line("\t}")
+	g.line("}")
+	g.line("o0[i] = from < 0 ? i0[dst] : i2[from];")
 	return g.perElement(n)
 }
 

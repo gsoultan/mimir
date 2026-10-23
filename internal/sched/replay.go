@@ -112,20 +112,21 @@ func ReplayEach(ctx context.Context, traces []*Trace, leaves, args [][]*graph.No
 	return missed, errors.Join(errs...)
 }
 
-// Replay replays t on its device over leaves, as ReplayEach does for one
-// device without destinations, but as RealizeInto runs a schedule: it
-// gives the scheduler's lock up while the kernels run, so that
-// computations that share no memory with it go on at once. keep is as
-// for RealizeInto. It reports the replay as missed, having run nothing,
-// when the trace does not fit the leaves, when the memory that keep
+// Replay replays t on its device over leaves, writing its targets over
+// dsts, nil or one destination or nil per target, as ReplayEach does for
+// one device, but as RealizeInto runs a schedule: it gives the
+// scheduler's lock up while the kernels run, so that computations that
+// share no memory with it go on at once. keep is as for RealizeInto. It
+// reports the replay as missed, having run nothing, when the trace does
+// not fit the leaves or the destinations, when the memory that keep
 // spares would change its program, or when the program is running
 // already; newTargets may have been called, and the caller computes its
 // graph otherwise.
-func Replay(ctx context.Context, t *Trace, leaves, args []*graph.Node, newTargets func() []*graph.Node, keep func() []*graph.Node) (missed bool, err error) {
+func Replay(ctx context.Context, t *Trace, leaves, args []*graph.Node, newTargets func() []*graph.Node, dsts []*graph.Node, keep func() []*graph.Node) (missed bool, err error) {
 	mu.Lock()
 	defer mu.Unlock()
 	err = retry(func() error {
-		missed, err = t.replay(ctx, leaves, args, newTargets, nil, keep, true)
+		missed, err = t.replay(ctx, leaves, args, newTargets, dsts, keep, true)
 		return err
 	})
 	return missed, err

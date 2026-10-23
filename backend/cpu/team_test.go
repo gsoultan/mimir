@@ -118,3 +118,23 @@ func TestParallelForWakesParkedHelpers(t *testing.T) {
 		}
 	}
 }
+
+func TestHelpersPollAboutAsLongAsLoopsRun(t *testing.T) {
+	tm := &team{}
+	for _, c := range []struct {
+		loops time.Duration
+		want  time.Duration
+	}{
+		{10 * time.Microsecond, minSpin},
+		{400 * time.Microsecond, spinPerBusy * 400 * time.Microsecond},
+		{10 * time.Millisecond, teamSpin},
+		{0, minSpin},
+	} {
+		for range 200 {
+			tm.ran(c.loops)
+		}
+		if got := tm.spin(); got < c.want*9/10 || got > c.want*11/10 {
+			t.Errorf("after loops of %v, helpers poll for %v, want %v", c.loops, got, c.want)
+		}
+	}
+}

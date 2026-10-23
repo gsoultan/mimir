@@ -329,6 +329,63 @@ func (t *Tensor) ScatterAdd(axis int, idx, src *Tensor) *Tensor {
 	}, x, idx.detached(), s)
 }
 
+// Scatter returns a copy of t with src written at the Int32 positions in
+// idx along axis, like torch.Tensor.scatter. idx and src share a shape,
+// which must fit t outside axis; a float src is cast to t's float dtype. Of repeated
+// positions, the last along axis lands. Positions outside the axis fail
+// with ErrIndex when computed.
+//
+// Computed into the memory of t, as RealizeInto computes it when t is its
+// destination, it writes only the elements at the positions, which makes
+// it the cheap way to update a few rows of a large tensor, such as a
+// key-value cache, a step at a time.
+//
+// The gradient of src is the gradient of the result at the positions,
+// which counts every update of a repeated position, not only the one
+// that lands.
+func (t *Tensor) Scatter(axis int, idx, src *Tensor) *Tensor {
+	if err := firstErr(t, idx, src); err != nil {
+		return fail(err)
+	}
+	a, err := normAxis(axis, len(t.node.Shape))
+	if err != nil {
+		return fail(err)
+	}
+	s := src
+	if s.node.DType != t.node.DType && s.node.DType.IsFloat() && t.node.DType.IsFloat() {
+		if s = s.Cast(t.node.DType); s.err != nil {
+			return s
+		}
+	}
+	var out *Tensor
+	if l := batchLevel(t, idx, s); l != 0 {
+		out = batchScatter(l, t, a, idx, s)
+	} else {
+		out = wrap(graph.Scatter(t.node, idx.node, s.node, a))
+	}
+	if !tracked(t, s) || out.err != nil {
+		return out
+	}
+	return record(out, rule{
+		vjp: func(g *Tensor, in []*Tensor, _ *Tensor) []*Tensor {
+			return grads(g.Scatter(a, in[1], Zeros(g.node.DType, in[1].node.Shape...)), nil, g.Gather(a, in[1]))
+		},
+		jvp: func(t, in []*Tensor, out *Tensor) *Tensor {
+			base, src := t[0], t[2]
+			if base == nil && src == nil {
+				return nil
+			}
+			if base == nil {
+				base = Zeros(out.node.DType, out.node.Shape...)
+			}
+			if src == nil {
+				src = Zeros(base.node.DType, in[1].node.Shape...)
+			}
+			return base.Scatter(a, in[1], src)
+		},
+	}, t, idx.detached(), s)
+}
+
 // The movement primitives below take validated arguments and record their
 // gradients, which are the inverse movement.
 
