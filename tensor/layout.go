@@ -322,6 +322,19 @@ func (m *Mesh) rule(n *graph.Node, in []layout) (layout, []layout) {
 		copy(out.dims, req.dims[:lead])
 		out.partial = req.partial
 		return out, []layout{req}
+	case op == backend.OpMaxPool || op == backend.OpMaxPoolGrad:
+		// The windows need whole spatial dimensions and whole values.
+		lead := len(ins[0].Shape) - len(n.Attrs.Kernel)
+		req := replicated(len(ins[0].Shape))
+		copy(req.dims, in[0].dims[:lead])
+		out := replicated(rank)
+		copy(out.dims, req.dims[:lead])
+		if op == backend.OpMaxPool {
+			return out, []layout{req}
+		}
+		g := replicated(len(ins[1].Shape))
+		copy(g.dims, req.dims[:lead])
+		return out, []layout{req, g}
 	case op == backend.OpScan:
 		req := in[0].clone()
 		req.dims[n.Attrs.Axis] = unsplit

@@ -156,10 +156,41 @@ func fold[T elem](ctx context.Context, b *Backend, k *backend.Kernel, out, x []T
 // foldRows sums the rows of the windows of x at base into plane.
 func foldRows[A number, S elem](plane []A, x []S, base int, w windowRows) {
 	clear(plane)
+	if p, ok := any(plane).([]float32); ok {
+		if f, ok := any(x).([]float32); ok {
+			foldRowsF32(p, f, base, w)
+			return
+		}
+	}
 	for _, row := range w.rows {
 		src, dst := base+row.win+row.lo*w.winStep, row.in
 		for range row.hi - row.lo {
 			plane[dst] += conv[A](x[src])
+			src += w.winStep
+			dst += w.inStep
+		}
+	}
+}
+
+// foldRowsF32 is foldRows for float32 windows and plane, whose rows add
+// as slices when both run contiguously, as the windows of an unstrided
+// convolution do, without a conversion call per element.
+func foldRowsF32(plane, x []float32, base int, w windowRows) {
+	for _, row := range w.rows {
+		n := row.hi - row.lo
+		if n <= 0 {
+			continue
+		}
+		src, dst := base+row.win+row.lo*w.winStep, row.in
+		if w.winStep == 1 && w.inStep == 1 {
+			d := plane[dst:][:n]
+			for i, v := range x[src:][:n] {
+				d[i] += v
+			}
+			continue
+		}
+		for range n {
+			plane[dst] += x[src]
 			src += w.winStep
 			dst += w.inStep
 		}

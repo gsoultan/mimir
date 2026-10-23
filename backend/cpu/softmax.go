@@ -25,6 +25,12 @@ type rowRoutines struct {
 	mulVS       func(dst, a *float32, s float32, n int)
 	recip       func(dst, a *float32, n int)
 	sqrt        func(dst, a *float32, n int)
+	// The rest may be nil where the routines above are not.
+	maxVV   func(dst, a, b *float32, n int)
+	maxVS   func(dst, a *float32, s float32, n int) // s not NaN; -0 and +0 tie either way
+	cmpltVV func(dst, a, b *float32, n int)         // 1 where a < b, else 0
+	cmpltVS func(dst, a *float32, s float32, n int) // 1 where a < s
+	cmpltSV func(dst, a *float32, s float32, n int) // 1 where s < a
 }
 
 // vectorPart returns how many leading elements of a row of n the vector
