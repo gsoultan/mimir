@@ -33,10 +33,13 @@ type team struct {
 	size int
 	errs []error
 
+	helpers  int           // the helpers of the team
 	sleepers atomic.Int32  // helpers parked or about to park
 	wake     chan struct{} // receives a token per helper to wake
 
 	busy atomic.Int64 // how long recent loops ran, in nanoseconds, a moving average
+	gap  atomic.Int64 // how long the gaps before them were, likewise
+	last time.Time    // when the last loop ended
 }
 
 // teamSpin is how long a helper polls for a new loop, once the last has
@@ -46,28 +49,68 @@ type team struct {
 //
 // A helper polls at most spinPerBusy times as long as recent loops ran,
 // and at least minSpin, which covers the host work between the short
-// loops of one kernel, such as a factorization's between its panels. Polling saves the next loop the time a parked
-// helper takes to wake, tens of microseconds, which matters to loops that
-// take about as long and follow each other closely, as a model's kernels
-// do. Loops much shorter than the gaps between them, as those of small
-// predictions a server makes one at a time, gain nothing from it, and
-// helpers polling for milliseconds after each would keep processors busy
-// for many times the work.
+// loops of one kernel, such as a factorization's between its panels.
+// Polling saves the next loop the time a parked helper takes to wake,
+// tens of microseconds, which matters to loops that take about as long
+// and follow each other closely, as a model's kernels do. Loops much
+// shorter than the gaps between them, as those of small predictions a
+// server makes one at a time, gain nothing from it, and helpers polling
+// for milliseconds after each would keep processors busy for many times
+// the work (see solo).
 const (
 	teamSpin    = 5 * time.Millisecond
 	minSpin     = 500 * time.Microsecond
 	spinPerBusy = 4
 )
 
-// spin returns how long a helper polls for a new loop before parking.
-func (t *team) spin() time.Duration {
-	return min(teamSpin, max(minSpin, spinPerBusy*time.Duration(t.busy.Load())))
+// Short loops that follow each other closely, as a factorization's do,
+// are worth the helpers however short: those polling join at once, and
+// those woken for the first arrive for the rest. Short loops that come
+// far apart, as the kernels of a small model on a small batch do, with
+// the host work of a training step between them, are not: a helper's
+// share of such a loop is about what claiming it costs, one parked would
+// arrive as the loop ends, and one polling keeps a processor busy between
+// the loops for many times the work, which for a step of many small
+// kernels means every processor spinning for the whole step. A loop runs
+// on the caller alone when recent loops ran under wakeBelow, about what
+// waking a helper takes, and the gaps between them ran more than sparse
+// times as long. A team starts with the helpers, and a long loop run
+// solo brings them back for the next.
+//
+// After loops shorter than shortLoop, helpers poll for spinPerBusy times
+// as long as the loops ran rather than for minSpin: a few short loops a
+// millisecond, which the gaps have yet to mark as sparse, would otherwise
+// keep every helper polling without a break, for a loop's worth of work
+// a hundred times over.
+const (
+	wakeBelow = 100 * time.Microsecond
+	sparse    = 4
+	shortLoop = 50 * time.Microsecond
+)
+
+// solo reports whether the next loop runs on the caller alone. The
+// caller must hold t.mu.
+func (t *team) solo() bool {
+	busy, gap := time.Duration(t.busy.Load()), time.Duration(t.gap.Load())
+	return busy < wakeBelow && gap > sparse*busy
 }
 
-// ran records that a loop ran for d.
-func (t *team) ran(d time.Duration) {
+// spin returns how long a helper polls for a new loop before parking.
+func (t *team) spin() time.Duration {
+	busy := time.Duration(t.busy.Load())
+	s := spinPerBusy * busy
+	if busy >= shortLoop {
+		s = max(s, minSpin)
+	}
+	return min(teamSpin, s)
+}
+
+// ran records that a loop ran for d, after idle since the last.
+func (t *team) ran(d, idle time.Duration) {
 	b := t.busy.Load()
 	t.busy.Store(b + (int64(d)-b)/8)
+	g := t.gap.Load()
+	t.gap.Store(g + (int64(idle)-g)/8)
 }
 
 // yieldEvery is how many polls a helper makes between yields. Yielding
@@ -89,7 +132,9 @@ func newTeam(helpers int) *team {
 	if helpers < 1 {
 		return nil
 	}
-	t := &team{wake: make(chan struct{}, helpers)}
+	t := &team{helpers: helpers, wake: make(chan struct{}, helpers)}
+	t.busy.Store(int64(teamSpin)) // start with the helpers (see solo)
+	t.last = time.Now()
 	for range helpers {
 		go t.help()
 	}
@@ -100,10 +145,20 @@ func newTeam(helpers int) *team {
 // goroutine and any helpers that are free, and returns the error of the
 // first chunk that failed. The caller must hold t.mu.
 func (t *team) run(ctx context.Context, n, size int, fn func(lo, hi int) error) error {
+	start := time.Now()
+	idle := start.Sub(t.last)
+	if t.solo() {
+		err := runChunk(ctx, fn, 0, n)
+		t.last = time.Now()
+		// Record about what the loop would have run on the team, so that
+		// loops run solo, which take the helpers' share too, do not read
+		// as longer loops and bring the helpers back for the next.
+		t.ran(t.last.Sub(start)/time.Duration(t.helpers+1), idle)
+		return err
+	}
 	chunks := (n + size - 1) / size
 	t.ctx, t.fn, t.n, t.size = ctx, fn, n, size
 	t.errs = append(t.errs[:0], make([]error, chunks)...)
-	start := time.Now()
 	t.left.Store(int64(chunks))
 	t.todo.Store(int64(chunks))
 	// A helper that parked before seeing the loop needs a token. One that
@@ -121,7 +176,8 @@ func (t *team) run(ctx context.Context, n, size int, fn func(lo, hi int) error) 
 	for t.left.Load() > 0 {
 		runtime.Gosched()
 	}
-	t.ran(time.Since(start))
+	t.last = time.Now()
+	t.ran(t.last.Sub(start), idle)
 	t.ctx, t.fn = nil, nil
 	for _, err := range t.errs {
 		if err != nil {

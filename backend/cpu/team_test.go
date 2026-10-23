@@ -37,6 +37,7 @@ func TestParallelForCoversEveryIndexOnce(t *testing.T) {
 
 func TestParallelForReturnsErrorOfFirstFailedChunk(t *testing.T) {
 	b := &Backend{workers: 4}
+	useHelpers()
 	var mu sync.Mutex
 	first := -1
 	err := b.parallelFor(t.Context(), 100, 1, func(lo, hi int) error {
@@ -93,6 +94,7 @@ func TestParallelForWakesParkedHelpers(t *testing.T) {
 		t.Skip("needs two processors")
 	}
 	b := &Backend{workers: workers}
+	useHelpers()
 	for range 3 {
 		time.Sleep(10 * teamSpin) // long enough for the helpers to park
 		// Every chunk waits for all of them to start, so the loop ends only
@@ -125,16 +127,61 @@ func TestHelpersPollAboutAsLongAsLoopsRun(t *testing.T) {
 		loops time.Duration
 		want  time.Duration
 	}{
-		{10 * time.Microsecond, minSpin},
+		{10 * time.Microsecond, spinPerBusy * 10 * time.Microsecond},
+		{60 * time.Microsecond, minSpin},
 		{400 * time.Microsecond, spinPerBusy * 400 * time.Microsecond},
 		{10 * time.Millisecond, teamSpin},
-		{0, minSpin},
+		{time.Microsecond, spinPerBusy * time.Microsecond},
 	} {
 		for range 200 {
-			tm.ran(c.loops)
+			tm.ran(c.loops, 0)
 		}
 		if got := tm.spin(); got < c.want*9/10 || got > c.want*11/10 {
 			t.Errorf("after loops of %v, helpers poll for %v, want %v", c.loops, got, c.want)
 		}
+	}
+}
+
+// useHelpers has the default team's next loop use its helpers, which
+// other tests' loops over in no time may have sent solo (see solo).
+func useHelpers() {
+	defaultTeam().busy.Store(int64(teamSpin))
+}
+
+func TestShortLoopsRunOnTheCaller(t *testing.T) {
+	tm := newTeam(3)
+	run := func(fn func(lo, hi int) error) (calls int) {
+		tm.mu.Lock()
+		defer tm.mu.Unlock()
+		var n atomic.Int32
+		if err := tm.run(t.Context(), 64, 1, func(lo, hi int) error {
+			n.Add(1)
+			return fn(lo, hi)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return int(n.Load())
+	}
+	// A new team uses its helpers, so a loop that could use them does.
+	if calls := run(func(int, int) error { return nil }); calls != 64 {
+		t.Fatalf("the first loop ran in %d calls, want 64 chunks", calls)
+	}
+	// After a run of loops over in no time, the next runs on the caller:
+	// one call over the whole range. The loops are recorded rather than
+	// run, since how long a loop of nothing takes depends on the machine
+	// (and the race detector).
+	for range 200 {
+		tm.ran(time.Microsecond, time.Millisecond)
+	}
+	if !tm.solo() {
+		t.Fatalf("after 200 loops of a microsecond a millisecond apart, helpers still join: recent loops ran %v", time.Duration(tm.busy.Load()))
+	}
+	if calls := run(func(int, int) error { return nil }); calls != 1 {
+		t.Fatalf("a short loop ran in %d calls, want 1, on the caller", calls)
+	}
+	// A loop that runs long brings the helpers back for the next.
+	run(func(int, int) error { time.Sleep(5 * time.Millisecond); return nil })
+	if calls := run(func(int, int) error { return nil }); calls != 64 {
+		t.Fatalf("after a long loop, the next ran in %d calls, want 64 chunks", calls)
 	}
 }
