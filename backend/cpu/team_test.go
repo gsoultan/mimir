@@ -134,7 +134,7 @@ func TestHelpersPollAboutAsLongAsLoopsRun(t *testing.T) {
 		{time.Microsecond, spinPerBusy * time.Microsecond},
 	} {
 		for range 200 {
-			tm.ran(c.loops)
+			tm.ran(c.loops, 0)
 		}
 		if got := tm.spin(); got < c.want*9/10 || got > c.want*11/10 {
 			t.Errorf("after loops of %v, helpers poll for %v, want %v", c.loops, got, c.want)
@@ -143,7 +143,7 @@ func TestHelpersPollAboutAsLongAsLoopsRun(t *testing.T) {
 }
 
 // useHelpers has the default team's next loop use its helpers, which
-// other tests' loops over in no time may have sent solo (see soloBelow).
+// other tests' loops over in no time may have sent solo (see solo).
 func useHelpers() {
 	defaultTeam().busy.Store(int64(teamSpin))
 }
@@ -171,16 +171,16 @@ func TestShortLoopsRunOnTheCaller(t *testing.T) {
 	// run, since how long a loop of nothing takes depends on the machine
 	// (and the race detector).
 	for range 200 {
-		tm.ran(time.Microsecond)
+		tm.ran(time.Microsecond, time.Millisecond)
 	}
 	if !tm.solo() {
-		t.Fatalf("after 200 loops of a microsecond, helpers still join: recent loops ran %v", time.Duration(tm.busy.Load()))
+		t.Fatalf("after 200 loops of a microsecond a millisecond apart, helpers still join: recent loops ran %v", time.Duration(tm.busy.Load()))
 	}
 	if calls := run(func(int, int) error { return nil }); calls != 1 {
 		t.Fatalf("a short loop ran in %d calls, want 1, on the caller", calls)
 	}
 	// A loop that runs long brings the helpers back for the next.
-	run(func(int, int) error { time.Sleep(2 * time.Millisecond); return nil })
+	run(func(int, int) error { time.Sleep(5 * time.Millisecond); return nil })
 	if calls := run(func(int, int) error { return nil }); calls != 64 {
 		t.Fatalf("after a long loop, the next ran in %d calls, want 64 chunks", calls)
 	}
