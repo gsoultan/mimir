@@ -75,6 +75,8 @@ func (b *Backend) run(ctx context.Context, k *backend.Kernel, outs []backend.Buf
 		return attentionGrad(ctx, b, k, o, ins)
 	case k.Op == backend.OpConv || k.Op == backend.OpConvWeight || k.Op == backend.OpConvInput:
 		return runConv(ctx, b, k, outs, ins)
+	case k.Op == backend.OpMaxPool || k.Op == backend.OpMaxPoolGrad:
+		return runPool(ctx, b, k, out, ins)
 
 	case k.Op == backend.OpArgsort:
 		return runArgsort(ctx, b, k, out, ins[0])

@@ -48,7 +48,7 @@ const elementGrain = 1 << 15
 const tileLen = 1024
 
 // wideRow is the row length below which tiles span rows.
-const wideRow = 64
+const wideRow = 256
 
 // program is a fused program compiled for one kernel.
 type program struct {
@@ -372,6 +372,7 @@ type evaluator struct {
 	base   []int   // by input
 	gather []int   // the gathered inputs
 	pat    [][]int // by gathered input
+	runs   []int   // by gathered input: the length of its contiguous runs, or 0
 }
 
 // newEvaluator prepares prog to compute outs[0], indexed by shape, and the
@@ -415,6 +416,13 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 			pat := make([]int, 0, e.block)
 			walk(backend.View{Shape: shape[outer:], Strides: view.Strides[outer:]}, func(off int) { pat = append(pat, off) })
 			e.pat = append(e.pat, pat)
+			// An input read at stride 1 along the rows, such as a bias
+			// broadcast over them, is gathered a row at a time.
+			runs := 0
+			if view.Strides[r-1] == 1 && shape[r-1] > 1 {
+				runs = shape[r-1]
+			}
+			e.runs = append(e.runs, runs)
 		}
 	}
 	aliasOf := make([]int, len(ins))
@@ -512,13 +520,17 @@ func (e *evaluator) runWide(s *scratch, lo, hi int) error {
 			n := min(e.block-j, m-k)
 			for g, v := range e.gather {
 				pat := e.pat[g][j : j+n]
+				runs, first := e.runs[g], 0
+				if runs > 0 {
+					first = runs - j%runs // what is left of the run j is in
+				}
 				switch {
 				case e.p.inF[v] != nil:
-					gatherAt(s.inF[v][k:k+n], e.p.inF[v], c.offs[v], pat)
+					gatherAt(s.inF[v][k:k+n], e.p.inF[v], c.offs[v], pat, runs, first)
 				case e.p.inH[v] != nil:
-					gatherAt(s.inH[v][k:k+n], e.p.inH[v], c.offs[v], pat)
+					gatherAt(s.inH[v][k:k+n], e.p.inH[v], c.offs[v], pat, runs, first)
 				default:
-					gatherAt(s.inI[v][k:k+n], e.p.inI[v], c.offs[v], pat)
+					gatherAt(s.inI[v][k:k+n], e.p.inI[v], c.offs[v], pat, runs, first)
 				}
 			}
 			k += n
@@ -553,7 +565,17 @@ func linear(shape, strides []int) bool {
 }
 
 // gatherAt sets dst to the elements of src at off plus each offset in pat.
-func gatherAt[T any](dst, src []T, off int, pat []int) {
+// With runs positive, pat is runs of consecutive offsets, the first run
+// first long and the rest runs long, and each run is copied whole.
+func gatherAt[T any](dst, src []T, off int, pat []int, runs, first int) {
+	if runs > 0 {
+		for i, n := 0, first; i < len(pat); i, n = i+n, runs {
+			n = min(n, len(pat)-i)
+			start := off + pat[i]
+			copy(dst[i:i+n], src[start:start+n])
+		}
+		return
+	}
 	for i, p := range pat {
 		dst[i] = src[off+p]
 	}
@@ -867,18 +889,60 @@ func binaryLane[T number](op backend.Op, dst *lane[T], buf []T, x, y lane[T]) er
 	return err
 }
 
+// vvRoutine returns the vector routine of op on two vectors of float32,
+// or nil.
+func vvRoutine(op backend.Op) func(dst, a, b *float32, n int) {
+	if rowVector == nil {
+		return nil
+	}
+	switch op {
+	case backend.OpAdd:
+		return rowVector.addVV
+	case backend.OpMul:
+		return rowVector.mulVV
+	case backend.OpMax:
+		return rowVector.maxVV
+	case backend.OpCmpLT:
+		return rowVector.cmpltVV
+	}
+	return nil
+}
+
+// vsRoutine returns the vector routine of op on a vector of float32 and
+// the scalar s, in that order, or reversed, or nil.
+func vsRoutine(op backend.Op, s float32, reversed bool) func(dst, a *float32, s float32, n int) {
+	if rowVector == nil {
+		return nil
+	}
+	switch op {
+	case backend.OpAdd:
+		return rowVector.addVS
+	case backend.OpMul:
+		return rowVector.mulVS
+	case backend.OpMax:
+		if s != s {
+			return nil // the routine takes NaN from the vector only
+		}
+		return rowVector.maxVS
+	case backend.OpCmpLT:
+		if reversed {
+			return rowVector.cmpltSV
+		}
+		return rowVector.cmpltVS
+	}
+	return nil
+}
+
 // binaryVV sets dst[i] = a[i] op b[i].
 func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 	a, b = a[:len(dst)], b[:len(dst)]
-	if d, ok := any(dst).([]float32); ok && rowVector != nil && (op == backend.OpAdd || op == backend.OpMul) {
-		if n := vectorPart(len(d)); n > 0 {
-			x, y := any(a).([]float32), any(b).([]float32)
-			if op == backend.OpAdd {
-				rowVector.addVV(&d[0], &x[0], &y[0], n)
-			} else {
-				rowVector.mulVV(&d[0], &x[0], &y[0], n)
+	if d, ok := any(dst).([]float32); ok {
+		if f := vvRoutine(op); f != nil {
+			if n := vectorPart(len(d)); n > 0 {
+				x, y := any(a).([]float32), any(b).([]float32)
+				f(&d[0], &x[0], &y[0], n)
+				dst, a, b = dst[n:], a[n:], b[n:]
 			}
-			dst, a, b = dst[n:], a[n:], b[n:]
 		}
 	}
 	switch op {
@@ -917,15 +981,13 @@ func binaryVV[T number](op backend.Op, dst, a, b []T) error {
 // binaryVS sets dst[i] = a[i] op s.
 func binaryVS[T number](op backend.Op, dst, a []T, s T) error {
 	a = a[:len(dst)]
-	if d, ok := any(dst).([]float32); ok && rowVector != nil && (op == backend.OpAdd || op == backend.OpMul) {
-		if n := vectorPart(len(d)); n > 0 {
-			x, v := any(a).([]float32), float32(s)
-			if op == backend.OpAdd {
-				rowVector.addVS(&d[0], &x[0], v, n)
-			} else {
-				rowVector.mulVS(&d[0], &x[0], v, n)
+	if d, ok := any(dst).([]float32); ok {
+		if f := vsRoutine(op, float32(s), false); f != nil {
+			if n := vectorPart(len(d)); n > 0 {
+				x := any(a).([]float32)
+				f(&d[0], &x[0], float32(s), n)
+				dst, a = dst[n:], a[n:]
 			}
-			dst, a = dst[n:], a[n:]
 		}
 	}
 	switch op {
@@ -966,6 +1028,15 @@ func binarySV[T number](op backend.Op, dst []T, s T, b []T) error {
 	switch op {
 	case backend.OpCmpLT:
 		b = b[:len(dst)]
+		if d, ok := any(dst).([]float32); ok {
+			if f := vsRoutine(op, float32(s), true); f != nil {
+				if n := vectorPart(len(d)); n > 0 {
+					x := any(b).([]float32)
+					f(&d[0], &x[0], float32(s), n)
+					dst, b = dst[n:], b[n:]
+				}
+			}
+		}
 		for i, x := range b {
 			dst[i] = boolTo[T](s < x)
 		}

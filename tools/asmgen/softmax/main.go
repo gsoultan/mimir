@@ -64,10 +64,13 @@ func main() {
 		softmaxGrad(v)
 		dot4(v)
 		exp2(v)
-		for _, op := range []string{"add", "mul"} {
+		for _, op := range []string{"add", "mul", "max"} {
 			binaryVV(v, op)
 			binaryVS(v, op)
 		}
+		cmpltVV(v)
+		cmpltVS(v, false)
+		cmpltVS(v, true)
 		recip(v)
 		sqrt(v)
 	}
@@ -118,13 +121,39 @@ func exp2(v isa) {
 }
 
 // arith emits the instruction of a binary operation: dst = x op y, with y
-// a register or memory.
+// a register or memory. The maximum is NaN where y is, as VMAXPS takes
+// its second source where either is NaN; a NaN in x the callers of a
+// VV routine fix up with maxFix.
 func arith(op string, y, x Op, dst VecVirtual) {
 	switch op {
 	case "add":
 		VADDPS(y, x, dst)
 	case "mul":
 		VMULPS(y, x, dst)
+	case "max":
+		VMAXPS(y, x, dst)
+	}
+}
+
+// maxFix sets the lanes of m where x is NaN to x, after arith("max") has
+// taken the other operand there.
+func maxFix(v isa, x, m VecVirtual) {
+	k := v.mask()
+	VCMPPS(U8(3), x, x, k)
+	if v.lanes == 16 {
+		VBLENDMPS(x, m, k, m)
+	} else {
+		VBLENDVPS(k, x, m, m)
+	}
+}
+
+// ones emits a move of 1 in every lane of dst where mask k is set and 0
+// elsewhere.
+func ones(v isa, one VecVirtual, k Register, dst VecVirtual) {
+	if v.lanes == 16 {
+		VMOVAPS_Z(one, k, dst)
+	} else {
+		VANDPS(one, k, dst)
 	}
 }
 
@@ -163,11 +192,13 @@ func elementLoop(v isa, name string, ptrs []Register, n Register, body func(disp
 	RET()
 }
 
+var opNouns = map[string]string{"add": "sums", "mul": "products", "max": "maxima, NaN where either is NaN,"}
+
 func binaryVV(v isa, op string) {
 	name := op + "VV" + v.name
 	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, b *float32, n int)")
 	Pragma("noescape")
-	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the %s of those at a and b.", name, v.lanes, map[string]string{"add": "sums", "mul": "products"}[op]))
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the %s of those at a and b.", name, v.lanes, opNouns[op]))
 	pd := Load(Param("dst"), GP64())
 	pa := Load(Param("a"), GP64())
 	pb := Load(Param("b"), GP64())
@@ -175,7 +206,16 @@ func binaryVV(v isa, op string) {
 	elementLoop(v, name, []Register{pd, pa, pb}, n, func(disp int) {
 		x := v.vec()
 		VMOVUPS(Mem{Base: pa, Disp: disp}, x)
-		arith(op, Mem{Base: pb, Disp: disp}, x, x)
+		if op != "max" {
+			arith(op, Mem{Base: pb, Disp: disp}, x, x)
+		} else {
+			// The maximum is NaN where b is; where a is, maxFix sets it.
+			y, m := v.vec(), v.vec()
+			VMOVUPS(Mem{Base: pb, Disp: disp}, y)
+			arith(op, y, x, m)
+			maxFix(v, x, m)
+			x = m
+		}
 		VMOVUPS(x, Mem{Base: pd, Disp: disp})
 	})
 }
@@ -184,15 +224,65 @@ func binaryVS(v isa, op string) {
 	name := op + "VS" + v.name
 	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, s float32, n int)")
 	Pragma("noescape")
-	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the %s of those at a and s.", name, v.lanes, map[string]string{"add": "sums", "mul": "products"}[op]))
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to the %s of those at a and s, which is not NaN.", name, v.lanes, opNouns[op]))
 	pd := Load(Param("dst"), GP64())
 	pa := Load(Param("a"), GP64())
 	sv := broadcast(v, "s")
 	n := Load(Param("n"), GP64())
 	elementLoop(v, name, []Register{pd, pa}, n, func(disp int) {
 		x := v.vec()
+		// With a as the second source, a maximum is NaN where a is.
 		arith(op, Mem{Base: pa, Disp: disp}, sv, x)
 		VMOVUPS(x, Mem{Base: pd, Disp: disp})
+	})
+}
+
+// cmpltVV emits dst[i] = 1 where a[i] < b[i], 0 elsewhere.
+func cmpltVV(v isa) {
+	name := "cmpltVV" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, b *float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to 1 where the element at a is less than that at b, and 0 elsewhere.", name, v.lanes))
+	pd := Load(Param("dst"), GP64())
+	pa := Load(Param("a"), GP64())
+	pb := Load(Param("b"), GP64())
+	one := v.vec()
+	VMOVUPS(consts["one"], one)
+	n := Load(Param("n"), GP64())
+	elementLoop(v, name, []Register{pd, pa, pb}, n, func(disp int) {
+		x, r := v.vec(), v.vec()
+		VMOVUPS(Mem{Base: pa, Disp: disp}, x)
+		k := v.mask()
+		VCMPPS(U8(1), Mem{Base: pb, Disp: disp}, x, k) // x < b
+		ones(v, one, k, r)
+		VMOVUPS(r, Mem{Base: pd, Disp: disp})
+	})
+}
+
+// cmpltVS emits dst[i] = 1 where a[i] < s, or where s < a[i] if
+// reversed, and 0 elsewhere.
+func cmpltVS(v isa, reversed bool) {
+	name := "cmpltVS" + v.name
+	pred, what := U8(14), "the element at a is less than s" // s > a
+	if reversed {
+		name = "cmpltSV" + v.name
+		pred, what = U8(1), "s is less than the element at a" // s < a
+	}
+	TEXT(name, NOSPLIT, "func(dst *float32, a *float32, s float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to 1 where %s, and 0 elsewhere.", name, v.lanes, what))
+	pd := Load(Param("dst"), GP64())
+	pa := Load(Param("a"), GP64())
+	sv := broadcast(v, "s")
+	one := v.vec()
+	VMOVUPS(consts["one"], one)
+	n := Load(Param("n"), GP64())
+	elementLoop(v, name, []Register{pd, pa}, n, func(disp int) {
+		r := v.vec()
+		k := v.mask()
+		VCMPPS(pred, Mem{Base: pa, Disp: disp}, sv, k)
+		ones(v, one, k, r)
+		VMOVUPS(r, Mem{Base: pd, Disp: disp})
 	})
 }
 
