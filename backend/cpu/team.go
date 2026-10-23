@@ -33,6 +33,7 @@ type team struct {
 	size int
 	errs []error
 
+	helpers  int           // the helpers of the team
 	sleepers atomic.Int32  // helpers parked or about to park
 	wake     chan struct{} // receives a token per helper to wake
 
@@ -59,9 +60,46 @@ const (
 	spinPerBusy = 4
 )
 
+// soloBelow is how short recent loops must have run for the next to run
+// on the calling goroutine alone, without the helpers. A loop of a few
+// microseconds, such as the kernels of a small model on a small batch,
+// gains little from being split: the helpers' share of it is about what
+// claiming it costs, and a helper parked meanwhile would arrive after it
+// ends. Giving such loops to the team keeps the helpers polling for
+// minSpin after each, which for a training step of many small kernels
+// means every processor spinning for the whole step. A team starts with
+// the helpers, and goes solo once its loops have run short for a while;
+// a long loop run solo brings them back for the next.
+const soloBelow = 25 * time.Microsecond
+
+// shortLoop is how long recent loops must have run for helpers to poll
+// for minSpin after each. After shorter loops they poll for spinPerBusy
+// times as long as the loops ran: a few short loops a millisecond, as a
+// small model's training step makes, would otherwise keep every helper
+// polling without a break, for a loop's worth of work a hundred times
+// over.
+const shortLoop = 2 * soloBelow
+
 // spin returns how long a helper polls for a new loop before parking.
 func (t *team) spin() time.Duration {
-	return min(teamSpin, max(minSpin, spinPerBusy*time.Duration(t.busy.Load())))
+	busy := time.Duration(t.busy.Load())
+	s := spinPerBusy * busy
+	if busy >= shortLoop {
+		s = max(s, minSpin)
+	}
+	return min(teamSpin, s)
+}
+
+// wakeBelow is how long recent loops must have run for a loop to wake
+// parked helpers. Waking one takes tens of microseconds, so a shorter
+// loop is over, or nearly, by the time it joins, and runs on the caller
+// alone instead; helpers that are polling join loops of any length.
+const wakeBelow = 100 * time.Microsecond
+
+// solo reports whether the next loop runs on the caller alone.
+func (t *team) solo() bool {
+	busy := time.Duration(t.busy.Load())
+	return busy < soloBelow || busy < wakeBelow && int(t.sleepers.Load()) >= t.helpers
 }
 
 // ran records that a loop ran for d.
@@ -89,7 +127,8 @@ func newTeam(helpers int) *team {
 	if helpers < 1 {
 		return nil
 	}
-	t := &team{wake: make(chan struct{}, helpers)}
+	t := &team{helpers: helpers, wake: make(chan struct{}, helpers)}
+	t.busy.Store(int64(teamSpin)) // start with the helpers (see soloBelow)
 	for range helpers {
 		go t.help()
 	}
@@ -100,10 +139,15 @@ func newTeam(helpers int) *team {
 // goroutine and any helpers that are free, and returns the error of the
 // first chunk that failed. The caller must hold t.mu.
 func (t *team) run(ctx context.Context, n, size int, fn func(lo, hi int) error) error {
+	start := time.Now()
+	if t.solo() {
+		err := runChunk(ctx, fn, 0, n)
+		t.ran(time.Since(start))
+		return err
+	}
 	chunks := (n + size - 1) / size
 	t.ctx, t.fn, t.n, t.size = ctx, fn, n, size
 	t.errs = append(t.errs[:0], make([]error, chunks)...)
-	start := time.Now()
 	t.left.Store(int64(chunks))
 	t.todo.Store(int64(chunks))
 	// A helper that parked before seeing the loop needs a token. One that
