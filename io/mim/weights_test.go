@@ -442,9 +442,8 @@ func TestLoadOnTakesTheDevice(t *testing.T) {
 	nn.Eval(a)
 	nn.Eval(b)
 	x := tensor.Randn(5, 6, 4)
-	if want, got := values(t, a.Forward(x)), values(t, b.Forward(x.To(dev))); !slices.Equal(got, want) {
-		t.Errorf("model loaded on %v computes %v, want %v", dev, got, want)
-	}
+	// a runs on the default device, which can round differently from dev.
+	near(t, "model loaded on "+dev.String(), values(t, b.Forward(x.To(dev))), values(t, a.Forward(x)), 1e-6)
 	// LoadPrefixedOn reads the names under a prefix.
 	var buf bytes.Buffer
 	ts := map[string]*tensor.Tensor{}
@@ -465,7 +464,5 @@ func TestLoadOnTakesTheDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	nn.Eval(c)
-	if want, got := values(t, a.Forward(x)), values(t, c.Forward(x.To(dev))); !slices.Equal(got, want) {
-		t.Errorf("prefixed load computes %v, want %v", got, want)
-	}
+	near(t, "prefixed load", values(t, c.Forward(x.To(dev))), values(t, a.Forward(x)), 1e-6)
 }
