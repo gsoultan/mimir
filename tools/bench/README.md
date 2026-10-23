@@ -47,6 +47,26 @@ them back (`Unfold` and `Fold`) take 9 percent, and batch normalization and
 other elementwise kernels most of the rest. PyTorch convolves directly with
 oneDNN instead of copying windows.
 
+### Deep MLP and bfloat16
+
+A deep fully connected network for tables (20 → 1024 → 1024 → 1024 → 512 →
+256 → 3 with ReLU), one training step on a batch of 512, measured on
+2026-10-22 on the same machine. mimir reports the mean of its iterations
+and PyTorch the median, with the best in parentheses:
+
+| Precision | mimir | PyTorch |
+| --- | ---: | ---: |
+| float32 | 31.1 | 33.5 (28.2) |
+| bfloat16 matmuls, float32 accumulate | 17.5 to 21.0 | 19.6 to 22.2 (15.9) |
+
+The bfloat16 rows set `MIMIR_MATMUL_PRECISION=bf16` (or call
+`cpu.SetMatMulBFloat16(true)`) for mimir and run under
+`torch.autocast("cpu", torch.bfloat16)` for PyTorch. On CPUs with Intel
+AMX, mimir then multiplies on AMX tiles; elsewhere the setting does
+nothing. Training that network for 3 epochs on a 500,000-row table reached
+99.2% accuracy in bfloat16 against 99.3% in float32, in 70 s instead of
+111 s.
+
 ### Training on MNIST
 
 The convolutional network of `examples/mnist`, trained for 10 epochs with
@@ -63,12 +83,14 @@ AdamW and cosine annealing:
 # mimir
 go test -run='^$' -bench=SGEMM/avx512 -count=6 ./backend/cpu
 MIMIR_BENCH_RESNET=1 go test -run='^$' -bench=TrainStep -benchtime=20x -count=6 ./train
+MIMIR_MATMUL_PRECISION=bf16 go test -run='^$' -bench='TrainStep/deep$' -benchtime=200x -cpu=4 ./train
 go run ./examples/mnist -model cnn -epochs 10
 
 # NumPy and PyTorch, on as many threads as mimir uses
 pip install numpy torch
 OPENBLAS_NUM_THREADS=4 python3 tools/bench/gemm.py
-python3 tools/bench/train_step.py mlp 4    # or cnn, resnet18
+python3 tools/bench/train_step.py mlp 4    # or cnn, resnet18, deep
+python3 tools/bench/train_step.py deep 4 bf16
 python3 tools/bench/mnist.py data/mnist 10
 ```
 

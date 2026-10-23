@@ -24,6 +24,7 @@ type rowRoutines struct {
 	addVS       func(dst, a *float32, s float32, n int)
 	mulVS       func(dst, a *float32, s float32, n int)
 	recip       func(dst, a *float32, n int)
+	sqrt        func(dst, a *float32, n int)
 }
 
 // vectorPart returns how many leading elements of a row of n the vector

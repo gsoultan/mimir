@@ -2,7 +2,10 @@
 BenchmarkTrainStep: the forward pass, the loss, the backward pass and an
 AdamW update.
 
-    python3 train_step.py mlp|cnn|resnet18 [threads]
+    python3 train_step.py mlp|cnn|deep|resnet18 [threads] [bf16]
+
+bf16 runs the forward pass under torch.autocast with bfloat16, so matrix
+products use bfloat16 inputs (AMX where the CPU has it).
 """
 import sys
 import time
@@ -16,6 +19,13 @@ torch.set_num_threads(int(sys.argv[2]) if len(sys.argv) > 2 else 4)
 
 def mlp():
     return nn.Sequential(nn.Flatten(), nn.Linear(28 * 28, 256), nn.ReLU(), nn.Linear(256, 10))
+
+
+def deep():
+    return nn.Sequential(
+        nn.Linear(20, 1024), nn.ReLU(), nn.Linear(1024, 1024), nn.ReLU(),
+        nn.Linear(1024, 1024), nn.ReLU(), nn.Linear(1024, 512), nn.ReLU(),
+        nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 3))
 
 
 def cnn():
@@ -55,16 +65,22 @@ def resnet18():
 name = sys.argv[1]
 if name == "resnet18":
     batch, x, classes, warm, steps = 16, torch.rand(16, 3, 224, 224), 1000, 2, 5
+elif name == "deep":
+    batch, x, classes, warm, steps = 512, torch.rand(512, 20), 3, 20, 200
 else:
     batch, x, classes, warm, steps = 128, torch.rand(128, 1, 28, 28), 10, 20, 200
-model = {"mlp": mlp, "cnn": cnn, "resnet18": resnet18}[name]()
+model = {"mlp": mlp, "cnn": cnn, "deep": deep, "resnet18": resnet18}[name]()
 y = torch.arange(batch) % classes
 opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
 lossf = nn.CrossEntropyLoss()
 
 
+amp = len(sys.argv) > 3 and sys.argv[3] == "bf16"
+
+
 def step():
-    loss = lossf(model(x), y)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
+        loss = lossf(model(x), y)
     loss.backward()
     opt.step()
     opt.zero_grad()
@@ -78,5 +94,5 @@ for _ in range(steps):
     step()
     times.append(time.perf_counter() - t)
 times.sort()
-print(f"{name}: torch {torch.__version__}, {torch.get_num_threads()} threads, "
+print(f"{name}{' bf16' if amp else ''}: torch {torch.__version__}, {torch.get_num_threads()} threads, "
       f"median {times[len(times) // 2] * 1e3:.2f} ms, best {times[0] * 1e3:.2f} ms")
