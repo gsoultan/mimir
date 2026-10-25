@@ -29,6 +29,11 @@ func softmaxGradAVX512(p *float32, dp *float32, n int, d float32)
 //go:noescape
 func dot4AVX512(x *float32, y *float32, stride int, n int, out *float32)
 
+// sumAVX512 returns the sum in float64 of the n elements at x, a multiple of 16.
+//
+//go:noescape
+func sumAVX512(x *float32, n int) float64
+
 // exp2AVX512 sets the n elements at dst, a multiple of 16, to 2 to the power of those at src, which it clamps to [-126, 127].
 //
 //go:noescape
@@ -113,6 +118,11 @@ func softmaxGradAVX2(p *float32, dp *float32, n int, d float32)
 //
 //go:noescape
 func dot4AVX2(x *float32, y *float32, stride int, n int, out *float32)
+
+// sumAVX2 returns the sum in float64 of the n elements at x, a multiple of 8.
+//
+//go:noescape
+func sumAVX2(x *float32, n int) float64
 
 // exp2AVX2 sets the n elements at dst, a multiple of 8, to 2 to the power of those at src, which it clamps to [-126, 127].
 //
