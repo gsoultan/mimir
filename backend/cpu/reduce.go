@@ -410,9 +410,13 @@ func sumRun[A float64 | number, S elem](x []S) A {
 }
 
 // sumFloats is sumRun of float32 elements in float64, without a call to
-// convert each.
+// convert each, and with the vector routines where there are some.
 func sumFloats(x []float32) float64 {
 	var a0, a1, a2, a3 float64
+	if n := vectorPart(len(x)); n > 0 && rowVector.sum != nil {
+		a0 = rowVector.sum(&x[0], n)
+		x = x[n:]
+	}
 	for len(x) >= 4 {
 		a0 += float64(x[0])
 		a1 += float64(x[1])
