@@ -607,6 +607,37 @@ dot4AVX512_done:
 	VZEROUPPER
 	RET
 
+// func sumAVX512(x *float32, n int) float64
+// Requires: AVX, AVX512DQ, AVX512F, SSE2
+TEXT ·sumAVX512(SB), NOSPLIT, $0-24
+	MOVQ   x+0(FP), AX
+	MOVQ   n+8(FP), CX
+	VXORPD Z0, Z0, Z0
+	VXORPD Z1, Z1, Z1
+	TESTQ  CX, CX
+	JZ     sumAVX512_done
+
+sumAVX512_loop:
+	VCVTPS2PD (AX), Z2
+	VCVTPS2PD 32(AX), Z3
+	VADDPD    Z2, Z0, Z0
+	VADDPD    Z3, Z1, Z1
+	ADDQ      $0x00000040, AX
+	SUBQ      $0x00000010, CX
+	JNZ       sumAVX512_loop
+
+sumAVX512_done:
+	VADDPD        Z1, Z0, Z0
+	VEXTRACTF64X4 $0x01, Z0, Y1
+	VADDPD        Y0, Y1, Y1
+	VEXTRACTF128  $0x01, Y1, X0
+	VADDPD        X1, X0, X0
+	VUNPCKHPD     X0, X0, X1
+	VADDSD        X1, X0, X0
+	MOVSD         X0, ret+16(FP)
+	VZEROUPPER
+	RET
+
 // func exp2AVX512(dst *float32, src *float32, n int)
 // Requires: AVX, AVX512F
 TEXT ·exp2AVX512(SB), NOSPLIT, $0-24
@@ -1346,6 +1377,36 @@ dot4AVX2_done:
 	VPERMILPS    $0xb1, X6, X0
 	VADDPS       X0, X6, X6
 	MOVSS        X6, 12(AX)
+	VZEROUPPER
+	RET
+
+// func sumAVX2(x *float32, n int) float64
+// Requires: AVX, SSE2
+TEXT ·sumAVX2(SB), NOSPLIT, $0-24
+	MOVQ   x+0(FP), AX
+	MOVQ   n+8(FP), CX
+	VXORPD Y0, Y0, Y0
+	VXORPD Y1, Y1, Y1
+	TESTQ  CX, CX
+	JZ     sumAVX2_done
+
+sumAVX2_loop:
+	VCVTPS2PD (AX), Y2
+	VCVTPS2PD 16(AX), Y3
+	VADDPD    Y2, Y0, Y0
+	VADDPD    Y3, Y1, Y1
+	ADDQ      $0x00000020, AX
+	SUBQ      $0x00000008, CX
+	JNZ       sumAVX2_loop
+
+sumAVX2_done:
+	VADDPD       Y1, Y0, Y0
+	VMOVAPD      Y0, Y0
+	VEXTRACTF128 $0x01, Y0, X1
+	VADDPD       X0, X1, X1
+	VUNPCKHPD    X1, X1, X0
+	VADDSD       X0, X1, X1
+	MOVSD        X1, ret+16(FP)
 	VZEROUPPER
 	RET
 
