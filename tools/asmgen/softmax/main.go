@@ -63,6 +63,7 @@ func main() {
 		scaleRow(v)
 		softmaxGrad(v)
 		dot4(v)
+		sum(v)
 		exp2(v)
 		for _, op := range []string{"add", "mul", "max"} {
 			binaryVV(v, op)
@@ -316,6 +317,49 @@ func sqrt(v isa) {
 		VSQRTPS(Mem{Base: pa, Disp: disp}, x)
 		VMOVUPS(x, Mem{Base: pd, Disp: disp})
 	})
+}
+
+// sum adds up a row in float64, as a reduction sums float32 elements,
+// with two accumulators of half a vector each.
+func sum(v isa) {
+	name := "sum" + v.name
+	TEXT(name, NOSPLIT, "func(x *float32, n int) float64")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s returns the sum in float64 of the n elements at x, a multiple of %d.", name, v.lanes))
+	px := Load(Param("x"), GP64())
+	n := Load(Param("n"), GP64())
+	a0, a1 := v.vec(), v.vec()
+	VXORPD(a0, a0, a0)
+	VXORPD(a1, a1, a1)
+	half := 2 * v.lanes // bytes in half a vector of float32
+	TESTQ(n, n)
+	JZ(LabelRef(name + "_done"))
+	Label(name + "_loop")
+	l, h := v.vec(), v.vec()
+	VCVTPS2PD(Mem{Base: px}, l)
+	VCVTPS2PD(Mem{Base: px, Disp: half}, h)
+	VADDPD(l, a0, a0)
+	VADDPD(h, a1, a1)
+	ADDQ(U32(4*v.lanes), px)
+	SUBQ(U32(v.lanes), n)
+	JNZ(LabelRef(name + "_loop"))
+	Label(name + "_done")
+	VADDPD(a1, a0, a0)
+	y := YMM()
+	if v.lanes == 16 {
+		VEXTRACTF64X4(U8(1), a0, y)
+		VADDPD(a0.AsY(), y, y)
+	} else {
+		VMOVAPD(a0, y)
+	}
+	x, hi := XMM(), XMM()
+	VEXTRACTF128(U8(1), y, x)
+	VADDPD(y.AsX(), x, x)
+	VUNPCKHPD(x, x, hi)
+	VADDSD(hi, x, x)
+	Store(x, ReturnIndex(0))
+	VZEROUPPER()
+	RET()
 }
 
 // dot4 computes the dot products of a vector with four rows at once, so

@@ -31,6 +31,7 @@ type rowRoutines struct {
 	cmpltVV func(dst, a, b *float32, n int)         // 1 where a < b, else 0
 	cmpltVS func(dst, a *float32, s float32, n int) // 1 where a < s
 	cmpltSV func(dst, a *float32, s float32, n int) // 1 where s < a
+	sum     func(x *float32, n int) float64         // in float64
 }
 
 // vectorPart returns how many leading elements of a row of n the vector

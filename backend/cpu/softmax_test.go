@@ -120,6 +120,13 @@ func TestRowOperations(t *testing.T) {
 			}
 			p := append([]float32(nil), x...)
 			softmaxGrad(p, dp, 0.5)
+			var want float64
+			for _, v := range x {
+				want += float64(v)
+			}
+			if got := sumFloats(x); math.Abs(got-want) > 1e-12*float64(n) {
+				t.Errorf("n=%d: sum %v, want %v", n, got, want)
+			}
 			s := append([]float32(nil), x...)
 			scaleRow(s, 3)
 			for i := range x {
