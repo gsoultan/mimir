@@ -459,6 +459,10 @@ func MatMul(t *testing.T) []Case {
 		for _, a := range s.axes {
 			out[a] = 1
 		}
+		// Rounding grows with the length of the sums, and cuBLAS adds
+		// in another order than the CPU: two orders of a sum of 70
+		// products differ by more than 1e-5 about once in a million.
+		tol := math.Max(1e-5, 5e-6*math.Sqrt(float64(s.k)))
 		for xn, x := range Views(xs) {
 			for yn, y := range Views(ys) {
 				// Every pair of views for float32, which a matrix library
@@ -472,7 +476,7 @@ func MatMul(t *testing.T) []Case {
 						Name: fmt.Sprintf("%s/%v x %v sum %v/%s/%s", dt, xs, ys, s.axes, xn, yn),
 						K:    backend.Kernel{Op: backend.OpMatMul, DType: dt, Shape: out, In: []backend.View{x.V, y.V}, Attrs: backend.Attrs{Axes: s.axes}},
 						Ins:  []backend.Buffer{HostBuffer(t, rng, dt, x.N, -5, 5), HostBuffer(t, rng, dt, y.N, -5, 5)},
-						Tol:  1e-5,
+						Tol:  tol,
 					})
 				}
 			}
