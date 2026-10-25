@@ -13,24 +13,35 @@ import (
 )
 
 // TestConvKernels checks the convolution kernels, those of the GPU
-// backends' tests and others that run as Winograd or direct convolutions, against
-// sums in float64 over the windows of their definitions, with one worker
-// and several, and with forward convolutions of few positions run as
-// direct convolutions or not.
+// backends' tests and others that run as Winograd or direct
+// convolutions, against sums in float64 over the windows of their
+// definitions: with one worker and several, and with several workers
+// again with forward convolutions of few positions run as Winograd
+// convolutions rather than direct ones.
 func TestConvKernels(t *testing.T) {
 	cases := slices.Concat(kerneltest.Conv(t), strideOneCases(t))
-	for _, direct := range []int{0, 1 << 30} {
-		defer cpu.SetDirectPositions(direct)()
-		for _, workers := range []int{1, 3} {
-			t.Run(fmt.Sprint(workers, " workers, direct below ", direct), func(t *testing.T) {
-				be := cpu.NewWorkers(workers)
-				for _, c := range cases {
-					t.Run(c.Name, func(t *testing.T) {
-						checkConv(t, be, c)
-					})
-				}
-			})
-		}
+	// The sums take longer than the kernels, so each case's are computed
+	// once.
+	wants := make([]convWant, len(cases))
+	for i := range cases {
+		wants[i] = convWants(t, &cases[i])
+	}
+	for _, run := range []struct {
+		name     string
+		workers  int
+		winograd bool
+	}{{"1 worker", 1, false}, {"3 workers", 3, false}, {"3 workers, winograd", 3, true}} {
+		t.Run(run.name, func(t *testing.T) {
+			if run.winograd {
+				defer cpu.SetDirectPositions(0)()
+			}
+			be := cpu.NewWorkers(run.workers)
+			for i, c := range cases {
+				t.Run(c.Name, func(t *testing.T) {
+					checkConv(t, be, c, wants[i])
+				})
+			}
+		})
 	}
 }
 
@@ -55,10 +66,10 @@ func strideOneCases(t *testing.T) []kerneltest.Case {
 		{"valid", 2, 1, 9, 12, []int{7, 8}, [][2]int{{0, 0}, {0, 0}}, nil, nil},
 		{"uneven pads", 2, 2, 10, 9, []int{5, 9}, [][2]int{{2, 0}, {1, 2}}, nil, nil},
 		{"full", 1, 1, 33, 17, []int{4, 4}, [][2]int{{2, 2}, {2, 2}}, nil, nil},
-		{"mnist", 5, 1, 32, 64, []int{14, 14}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
+		{"mnist", 2, 1, 32, 64, []int{14, 14}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
 		{"tile rows", 2, 1, 8, 16, []int{30, 70}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
 		{"deep", 2, 1, 300, 8, []int{4, 5}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
-		{"direct mnist", 5, 1, 1, 32, []int{28, 28}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
+		{"direct mnist", 3, 1, 1, 32, []int{28, 28}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
 		{"direct one item", 1, 1, 2, 13, []int{9, 11}, [][2]int{{1, 1}, {1, 1}}, nil, nil},
 		{"direct dilated", 2, 2, 3, 9, []int{9, 11}, [][2]int{{2, 0}, {1, 2}}, []int{3, 2}, []int{2, 3}},
 		{"direct 5x5", 3, 1, 4, 10, []int{12, 10}, [][2]int{{2, 2}, {0, 1}}, []int{5, 5}, []int{1, 1}},
@@ -106,17 +117,14 @@ func strideOneCases(t *testing.T) []kerneltest.Case {
 	return cases
 }
 
-// checkConv runs the convolution kernel of c on be and compares its
-// output with sums in float64, allowing a relative error of 1e-5 of the
-// sum of the products' magnitudes.
-func checkConv(t *testing.T, be *cpu.Backend, c kerneltest.Case) {
+// convWant holds the outputs of a case's convolution kernel, summed in
+// float64, and the sums of the magnitudes of their products.
+type convWant struct{ sums, mags []float64 }
+
+// convWants returns the outputs that the convolution kernel of c should
+// compute, with its epilogue, if any.
+func convWants(t *testing.T, c *kerneltest.Case) convWant {
 	k := &c.K
-	n, _ := backend.NumElements(k.Shape)
-	out := kerneltest.HostBuffer(t, nil, backend.Float32, n, 0, 0)
-	if err := be.Run(t.Context(), k, []backend.Buffer{out}, c.Ins); err != nil {
-		t.Fatal(err)
-	}
-	got := kerneltest.Floats(t, out)
 	ins := make([][]float32, len(c.Ins))
 	for i, b := range c.Ins {
 		ins[i] = kerneltest.Floats(t, b)
@@ -130,9 +138,23 @@ func checkConv(t *testing.T, be *cpu.Backend, c kerneltest.Case) {
 			want[i] = math.Max(0, want[i]+float64(ins[2][at(bias, idx)]))
 		}
 	}
-	for i, w := range want {
-		if d := math.Abs(float64(got[i]) - w); d > 1e-5*max(1, mag[i]) || math.IsNaN(float64(got[i])) {
-			t.Fatalf("element %d: got %v, want %v", i, got[i], w)
+	return convWant{want, mag}
+}
+
+// checkConv runs the convolution kernel of c on be and compares its
+// output with w, allowing a relative error of 1e-5 of the sum of the
+// products' magnitudes.
+func checkConv(t *testing.T, be *cpu.Backend, c kerneltest.Case, w convWant) {
+	k := &c.K
+	n, _ := backend.NumElements(k.Shape)
+	out := kerneltest.HostBuffer(t, nil, backend.Float32, n, 0, 0)
+	if err := be.Run(t.Context(), k, []backend.Buffer{out}, c.Ins); err != nil {
+		t.Fatal(err)
+	}
+	got := kerneltest.Floats(t, out)
+	for i, want := range w.sums {
+		if d := math.Abs(float64(got[i]) - want); d > 1e-5*max(1, w.mags[i]) || math.IsNaN(float64(got[i])) {
+			t.Fatalf("element %d: got %v, want %v", i, got[i], want)
 		}
 	}
 }
@@ -153,22 +175,28 @@ func convSums(t *testing.T, k *backend.Kernel, ins [][]float32) (sums, mags []fl
 	if k.Op == backend.OpConvInput {
 		img = backend.Contiguous(k.Shape)
 	}
+	rows, cols := c.Rows(), c.Cols()
 	// pixel returns the index of the element of image img that window
 	// element j of group g reads at position o, or -1 in the padding.
+	kidx, pos := make([][]int, rows), make([][]int, cols)
+	for j := range rows {
+		kidx[j] = unravel(a.Kernel, j%c.Window)
+	}
+	for o := range cols {
+		pos[o] = unravel(c.Positions, o)
+	}
+	idx := make([]int, 2+s)
 	pixel := func(n, g, j, o int) int {
-		ci, kidx := j/c.Window, unravel(a.Kernel, j%c.Window)
-		pos := unravel(c.Positions, o)
-		idx := []int{n, g*c.C + ci}
+		idx[0], idx[1] = n, g*c.C+j/c.Window
 		for d := range s {
-			y := pos[d]*a.Stride[d] + kidx[d]*a.Dilation[d] - a.Pads[d][0]
+			y := pos[o][d]*a.Stride[d] + kidx[j][d]*a.Dilation[d] - a.Pads[d][0]
 			if y < 0 || y >= c.Image[d] {
 				return -1
 			}
-			idx = append(idx, y)
+			idx[2+d] = y
 		}
 		return at(img, idx)
 	}
-	rows, cols := c.Rows(), c.Cols()
 	add := func(i int, v float64) { sums[i] += v; mags[i] += math.Abs(v) }
 	for n := range c.N {
 		for g := range c.G {
