@@ -102,6 +102,7 @@ func (s *Session) Run(ctx context.Context, inputs map[string]*tensor.Tensor) (ma
 	if err != nil {
 		return nil, err
 	}
+	r.consts = consts
 	// owned marks the variables whose values the session holds alone, as
 	// it does the values runs leave, which a run may write over.
 	var owned map[uint32]bool
@@ -269,6 +270,9 @@ type run struct {
 	dev  tensor.Device
 	syms []int            // the size of each symbolic dimension, -1 until bound
 	env  []*tensor.Tensor // the value of each graph value, once computed
+	// consts are the model's weights and constants on dev, and its
+	// adapter's pairs.
+	consts map[uint32]*tensor.Tensor
 }
 
 // bind checks shape against the declared shape of value vi, binding the

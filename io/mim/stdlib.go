@@ -119,7 +119,8 @@ func linear(c *call) ([]*tensor.Tensor, error) {
 	if err := c.need(2, 3); err != nil {
 		return nil, err
 	}
-	return one(c.bias(c.f32(0).MatMulT(c.f32(1)), 2))
+	x := c.f32(0)
+	return one(c.adapt(c.bias(x.MatMulT(c.f32(1)), 2), x))
 }
 
 // bias adds input i, of shape [N], to the last axis of y, if the call has
@@ -159,7 +160,8 @@ func dequantMatmul(a8 bool) func(c *call) ([]*tensor.Tensor, error) {
 				w = w.Cast(tensor.Float32)
 			}
 		}
-		return one(c.bias(c.f32(0).MatMulT(w), 2))
+		x := c.f32(0)
+		return one(c.adapt(c.bias(x.MatMulT(w), 2), x))
 	}
 }
 
