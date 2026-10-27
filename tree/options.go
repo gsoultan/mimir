@@ -29,6 +29,7 @@ type config struct {
 	val       *tabular.Data
 	patience  int
 	bootstrap bool
+	progress  func(done, total int)
 }
 
 // Trees sets how many trees to grow: boosting rounds, or forest trees.
@@ -95,6 +96,11 @@ func Validation(val tabular.Data, patience int) Option {
 // Bootstrap sets whether each forest tree learns from rows drawn with
 // replacement. The default is true for RandomForest.
 func Bootstrap(b bool) Option { return func(c *config) { c.bootstrap = b } }
+
+// Progress calls f after each tree grows with the trees grown so far and
+// the most there will be. Boosting may stop early on Validation; a forest
+// calls f from one goroutine at a time.
+func Progress(f func(done, total int)) Option { return func(c *config) { c.progress = f } }
 
 func (c *config) check(d tabular.Data) error {
 	bad := func(name string, v any) error { return fmt.Errorf("tree: %s %v: %w", name, v, tensor.ErrShape) }
