@@ -1,7 +1,8 @@
 // Package automl picks the best model for a table and tunes it: it tries
-// boosted trees, random forests and linear models with a range of
-// settings, scores each on rows it didn't learn from, and fits the best
-// to the whole table, as AutoGluon and FLAML do for tables.
+// boosted trees, random forests, linear models, support vector machines,
+// nearest neighbours and naive Bayes with a range of settings, scores
+// each on rows it didn't learn from, and fits the best to the whole
+// table, as AutoGluon and FLAML do for tables.
 //
 //	r, err := automl.Search(ctx, d, tabular.Classification, automl.Classes(3))
 //	if err != nil { ... }
@@ -22,11 +23,32 @@ import (
 	"slices"
 	"time"
 
+	"github.com/gsoultan/mimir/bayes"
 	"github.com/gsoultan/mimir/linear"
 	"github.com/gsoultan/mimir/metrics"
+	"github.com/gsoultan/mimir/neighbors"
+	"github.com/gsoultan/mimir/svm"
 	"github.com/gsoultan/mimir/tabular"
 	"github.com/gsoultan/mimir/tensor"
 	"github.com/gsoultan/mimir/tree"
+)
+
+// The families, by the names Candidate.Family holds.
+const (
+	Boost     = "boost"
+	Forest    = "forest"
+	Linear    = "linear"
+	SVM       = "svm"   // tried on tables of up to SVMRows rows
+	Neighbors = "knn"   // tried on tables of up to NeighborRows rows
+	Bayes     = "bayes" // Gaussian naive Bayes, for classification
+)
+
+// SVMRows and NeighborRows bound the tables support vector machines and
+// nearest neighbours are tried on: a kernel machine's fit and a
+// neighbour's every answer grow with the rows.
+const (
+	SVMRows      = 10_000
+	NeighborRows = 50_000
 )
 
 // Option configures Search.
@@ -63,8 +85,9 @@ func Seed(s uint64) Option { return func(c *config) { c.seed = s } }
 // best so far wins. The default is no limit.
 func Budget(d time.Duration) Option { return func(c *config) { c.budget = d } }
 
-// Families limits the candidates to these families: "boost", "forest"
-// and "linear". The default is all three.
+// Families limits the candidates to these families: Boost, Forest,
+// Linear, SVM, Neighbors and Bayes. The default is all of them that fit
+// the table and task.
 func Families(names ...string) Option { return func(c *config) { c.families = names } }
 
 // Progress is told how many candidates are scored, of how many, after
@@ -77,10 +100,12 @@ func Workers(n int) Option { return func(c *config) { c.workers = n } }
 
 // Candidate is a family and its settings.
 type Candidate struct {
-	Family string // "boost", "forest" or "linear"
+	Family string // Boost, Forest, Linear, SVM, Neighbors or Bayes
 	// Settings, by the name of the option that takes them: LearningRate,
 	// MaxDepth, MinLeaf, L2, Subsample and ColSample for boosted trees,
-	// MinLeaf for forests, L2 for linear models.
+	// MinLeaf for forests, L2 for linear models, C and Gamma for support
+	// vector machines (RBF kernel), K and Distance (0 or 1) for
+	// neighbours.
 	Settings map[string]float64
 }
 
@@ -108,8 +133,8 @@ type Trial struct {
 
 // Result is what Search found.
 type Result struct {
-	// Best is the best candidate fit to every row: a *tree.Model or a
-	// *linear.Model.
+	// Best is the best candidate fit to every row: a *tree.Model,
+	// *linear.Model, *svm.Model, *neighbors.Model or *bayes.Model.
 	Best tabular.Model
 	// Winner is Best's candidate and score.
 	Winner Trial
@@ -121,12 +146,24 @@ type Result struct {
 
 // Search finds the best model of the candidates for d answering task.
 func Search(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Option) (*Result, error) {
-	c := &config{trials: 12, folds: 3, seed: 1, families: []string{"boost", "forest", "linear"}}
+	c := &config{trials: 12, folds: 3, seed: 1}
 	for _, o := range opts {
 		o(c)
 	}
 	if err := d.Check(task); err != nil {
 		return nil, err
+	}
+	if c.families == nil {
+		c.families = []string{Boost, Forest, Linear}
+		if d.Rows() <= SVMRows {
+			c.families = append(c.families, SVM)
+		}
+		if d.Rows() <= NeighborRows {
+			c.families = append(c.families, Neighbors)
+		}
+		if task == tabular.Classification {
+			c.families = append(c.families, Bayes)
+		}
 	}
 	if c.trials < 1 || c.folds < 2 {
 		return nil, fmt.Errorf("automl: %d trials of %d folds: %w", c.trials, c.folds, tensor.ErrShape)
@@ -134,7 +171,7 @@ func Search(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Opti
 	if task == tabular.Classification && c.classes == 0 {
 		c.classes = d.Classes()
 	}
-	cands := candidates(c)
+	cands := candidates(c, task)
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("automl: no candidates of families %v: %w", c.families, tensor.ErrShape)
 	}
@@ -214,25 +251,38 @@ func evaluate(ctx context.Context, d tabular.Data, c *config, fit tabular.Fit, s
 
 // candidates returns the defaults of each family, then boosted trees
 // with random settings, up to c.trials of them.
-func candidates(c *config) []Candidate {
+func candidates(c *config, task tabular.Task) []Candidate {
 	has := func(f string) bool { return slices.Contains(c.families, f) }
 	var out []Candidate
-	if has("boost") {
-		out = append(out, Candidate{Family: "boost", Settings: map[string]float64{"LearningRate": 0.05, "MaxDepth": 6, "MinLeaf": 5, "L2": 1}})
+	if has(Boost) {
+		out = append(out, Candidate{Family: Boost, Settings: map[string]float64{"LearningRate": 0.05, "MaxDepth": 6, "MinLeaf": 5, "L2": 1}})
 	}
-	if has("forest") {
-		out = append(out, Candidate{Family: "forest", Settings: map[string]float64{"MinLeaf": 2}})
+	if has(Forest) {
+		out = append(out, Candidate{Family: Forest, Settings: map[string]float64{"MinLeaf": 2}})
 	}
-	if has("linear") {
-		out = append(out, Candidate{Family: "linear", Settings: map[string]float64{}})
+	if has(Linear) {
+		out = append(out, Candidate{Family: Linear, Settings: map[string]float64{}})
+	}
+	if has(SVM) {
+		out = append(out, Candidate{Family: SVM, Settings: map[string]float64{"C": 1, "Gamma": 0}})
+	}
+	if has(Neighbors) {
+		out = append(out, Candidate{Family: Neighbors, Settings: map[string]float64{"K": 5, "Distance": 1}})
+	}
+	if has(Bayes) && task == tabular.Classification {
+		out = append(out, Candidate{Family: Bayes, Settings: map[string]float64{}})
 	}
 	r := rand.New(rand.NewPCG(c.seed, 0x6175746f))
 	pick := func(v ...float64) float64 { return v[r.IntN(len(v))] }
 	for tries := 0; len(out) < c.trials && tries < 10*c.trials; tries++ {
 		var cand Candidate
 		switch {
-		case has("boost"):
-			cand = Candidate{Family: "boost", Settings: map[string]float64{
+		case has(SVM) && tries%4 == 3:
+			cand = Candidate{Family: SVM, Settings: map[string]float64{"C": pick(0.3, 3, 10, 30, 100), "Gamma": pick(0, 0.03, 0.3, 1)}}
+		case has(Neighbors) && tries%7 == 5:
+			cand = Candidate{Family: Neighbors, Settings: map[string]float64{"K": pick(3, 10, 20, 40), "Distance": pick(0, 1)}}
+		case has(Boost):
+			cand = Candidate{Family: Boost, Settings: map[string]float64{
 				"LearningRate": pick(0.02, 0.05, 0.1, 0.2),
 				"MaxDepth":     pick(3, 4, 6, 8, 10),
 				"MinLeaf":      pick(1, 5, 20, 50),
@@ -240,10 +290,16 @@ func candidates(c *config) []Candidate {
 				"Subsample":    pick(0.7, 0.85, 1),
 				"ColSample":    pick(0.5, 0.8, 1),
 			}}
-		case has("forest"):
-			cand = Candidate{Family: "forest", Settings: map[string]float64{"MinLeaf": pick(1, 2, 5, 10)}}
-		case has("linear"):
-			cand = Candidate{Family: "linear", Settings: map[string]float64{"L2": pick(1e-4, 1e-2, 1, 10)}}
+		case has(Forest):
+			cand = Candidate{Family: Forest, Settings: map[string]float64{"MinLeaf": pick(1, 2, 5, 10)}}
+		case has(Linear):
+			cand = Candidate{Family: Linear, Settings: map[string]float64{"L2": pick(1e-4, 1e-2, 1, 10)}}
+		case has(SVM):
+			cand = Candidate{Family: SVM, Settings: map[string]float64{"C": pick(0.3, 3, 10, 30, 100), "Gamma": pick(0, 0.03, 0.3, 1)}}
+		case has(Neighbors):
+			cand = Candidate{Family: Neighbors, Settings: map[string]float64{"K": pick(3, 10, 20, 40), "Distance": pick(0, 1)}}
+		default:
+			continue
 		}
 		if !slices.ContainsFunc(out, func(o Candidate) bool { return o.String() == cand.String() }) {
 			out = append(out, cand)
@@ -257,7 +313,27 @@ func fitter(cand Candidate, task tabular.Task, c *config) tabular.Fit {
 	s := cand.Settings
 	return func(ctx context.Context, d tabular.Data) (tabular.Model, error) {
 		switch cand.Family {
-		case "linear":
+		case SVM:
+			opts := []svm.Option{svm.C(s["C"]), svm.Gamma(s["Gamma"])}
+			if c.workers > 0 {
+				opts = append(opts, svm.Workers(c.workers))
+			}
+			if task == tabular.Classification {
+				opts = append(opts, svm.Classes(c.classes))
+			}
+			return svm.Fit(ctx, d, task, opts...)
+		case Neighbors:
+			opts := []neighbors.Option{neighbors.K(int(s["K"]))}
+			if s["Distance"] == 1 {
+				opts = append(opts, neighbors.ByDistance())
+			}
+			if task == tabular.Classification {
+				opts = append(opts, neighbors.Classes(c.classes))
+			}
+			return neighbors.Fit(ctx, d, task, opts...)
+		case Bayes:
+			return bayes.Gaussian(ctx, d, bayes.Classes(c.classes))
+		case Linear:
 			var opts []linear.Option
 			if v, ok := s["L2"]; ok {
 				opts = append(opts, linear.L2(v))
@@ -272,7 +348,7 @@ func fitter(cand Candidate, task tabular.Task, c *config) tabular.Fit {
 				return linear.Regression(ctx, d, opts...)
 			}
 			return linear.Logistic(ctx, d, append(opts, linear.Classes(c.classes))...)
-		case "forest":
+		case Forest:
 			opts := []tree.Option{tree.Trees(200), tree.MinLeaf(int(s["MinLeaf"]))}
 			return tree.RandomForest(ctx, d, task, append(opts, treeOpts(task, c)...)...)
 		default:

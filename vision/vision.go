@@ -1,6 +1,8 @@
 // Package vision builds the networks that read pictures best, as
 // torchvision's models do: ResNet, MobileNetV2 and the Vision
-// Transformer, ViT.
+// Transformer, ViT, to classify them; a CenterNet Detector to find the
+// things in them, with box IoU, NMS and mean average precision; and a
+// U-Net to segment them, a class for every pixel.
 //
 //	m := vision.ResNet18(10)          // ten classes, 224×224 photos
 //	logits := m.Forward(x)            // x is [N, 3, H, W]
@@ -44,7 +46,7 @@ type Option func(*config)
 type config struct {
 	in    int     // channels of each picture
 	small bool    // for pictures of 32 to 64 pixels a side
-	width float64 // MobileNetV2's width multiplier
+	width float64 // the channels' multiplier
 	drop  float64 // dropout before the head
 }
 
@@ -57,8 +59,8 @@ func Channels(n int) Option { return func(c *config) { c.in = n } }
 // a 224-pixel photo fourfold.
 func Small() Option { return func(c *config) { c.small = true } }
 
-// Width multiplies MobileNetV2's channels, such as 0.5 for a model a
-// quarter the size. The default is 1.
+// Width multiplies a ResNet's or MobileNetV2's channels, such as 0.5 for
+// a model a quarter the size. The default is 1.
 func Width(w float64) Option { return func(c *config) { c.width = w } }
 
 // Dropout drops this share of the features before the head while
