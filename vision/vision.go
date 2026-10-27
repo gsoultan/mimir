@@ -1,6 +1,8 @@
 // Package vision builds the networks that read pictures best, as
 // torchvision's models do: ResNet, MobileNetV2 and the Vision
-// Transformer, ViT.
+// Transformer, ViT, to classify them; a CenterNet Detector to find the
+// things in them, with box IoU, NMS and mean average precision; and a
+// U-Net to segment them, a class for every pixel.
 //
 //	m := vision.ResNet18(10)          // ten classes, 224×224 photos
 //	logits := m.Forward(x)            // x is [N, 3, H, W]
