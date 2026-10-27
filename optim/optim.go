@@ -302,7 +302,6 @@ type config struct {
 	clip                                 float64
 	lrDecay, initial, rho                float64
 	momentumDecay                        float64
-	trust                                bool
 }
 
 // LR sets the learning rate.
