@@ -583,13 +583,47 @@ def np_optimize(kind, p, t, s, **kw):
             alpha, eps = kw.get("alpha", 0.99), 1e-8
             v = state["v"] = alpha * state.get("v", 0) + (1 - alpha) * g * g
             p = p - lr * g / (np.sqrt(v) + eps)
+        elif kind == "adagrad":
+            eps, decay = 1e-10, kw.get("lr_decay", 0)
+            v = state["v"] = state.get("v", kw.get("initial_accumulator_value", 0)) + g * g
+            p = p - lr / (1 + (step - 1) * decay) * g / (np.sqrt(v) + eps)
+        elif kind == "adadelta":
+            rho, eps = kw.get("rho", 0.9), 1e-6
+            v = state["v"] = rho * state.get("v", 0) + (1 - rho) * g * g
+            delta = np.sqrt(state.get("u", 0) + eps) / np.sqrt(v + eps) * g
+            state["u"] = rho * state.get("u", 0) + (1 - rho) * delta * delta
+            p = p - lr * delta
+        elif kind == "adamax":
+            b1, b2, eps = 0.9, 0.999, 1e-8
+            m = state["m"] = b1 * state.get("m", 0) + (1 - b1) * g
+            u = state["u"] = np.maximum(b2 * state.get("u", 0), np.abs(g) + eps)
+            p = p - lr / (1 - b1**step) * m / u
+        elif kind == "nadam":
+            b1, b2, eps, psi = 0.9, 0.999, 1e-8, 4e-3
+            mu = b1 * (1 - 0.5 * 0.96 ** (step * psi))
+            mu_next = b1 * (1 - 0.5 * 0.96 ** ((step + 1) * psi))
+            prod = state["prod"] = state.get("prod", 1.0) * mu
+            m = state["m"] = b1 * state.get("m", 0) + (1 - b1) * g
+            v = state["v"] = b2 * state.get("v", 0) + (1 - b2) * g * g
+            denom = np.sqrt(v / (1 - b2**step)) + eps
+            p = p - lr * (1 - mu) / (1 - prod) * g / denom - lr * mu_next / (1 - prod * mu_next) * m / denom
+        elif kind == "lion":
+            b1, b2, wd = 0.9, 0.99, kw.get("weight_decay", 0)
+            p = p * (1 - lr * wd)
+            m = state.get("m", 0)
+            p = p - lr * np.sign(b1 * m + (1 - b1) * g)
+            state["m"] = b2 * m + (1 - b2) * g
     return p
 
 
 def torch_optimize(T, kind, p, t, s, **kw):
     p = T.tensor(p, dtype=T.float64, requires_grad=True)
     t, s = T.tensor(t, dtype=T.float64), T.tensor(s, dtype=T.float64)
-    cls = {"sgd": T.optim.SGD, "adam": T.optim.Adam, "adamw": T.optim.AdamW, "rmsprop": T.optim.RMSprop}[kind]
+    if kind == "lion":
+        return np_optimize(kind, p.detach().numpy(), t.numpy(), s.numpy(), **kw)  # not in torch
+    cls = {"sgd": T.optim.SGD, "adam": T.optim.Adam, "adamw": T.optim.AdamW, "rmsprop": T.optim.RMSprop,
+           "adagrad": T.optim.Adagrad, "adadelta": T.optim.Adadelta, "adamax": T.optim.Adamax,
+           "nadam": T.optim.NAdam}[kind]
     if kind == "adamw":
         kw.setdefault("weight_decay", 0)
     opt = cls([p], **kw)
@@ -608,6 +642,11 @@ OPTIMIZERS = {
     "adam_l2": ("adam", {"lr": 0.1, "weight_decay": 0.1}),
     "adamw": ("adamw", {"lr": 0.1, "weight_decay": 0.1}),
     "rmsprop": ("rmsprop", {"lr": 0.01, "alpha": 0.9}),
+    "adagrad": ("adagrad", {"lr": 0.1, "lr_decay": 0.05, "initial_accumulator_value": 0.1}),
+    "adadelta": ("adadelta", {"lr": 1.0, "rho": 0.9}),
+    "adamax": ("adamax", {"lr": 0.1}),
+    "nadam": ("nadam", {"lr": 0.1}),
+    "lion": ("lion", {"lr": 0.05, "weight_decay": 0.1}),
 }
 
 SCHEDULES = {
@@ -617,7 +656,22 @@ SCHEDULES = {
                lambda T, o: T.optim.lr_scheduler.CosineAnnealingLR(o, 5, 0.01), 6),
     "warmup": (lambda e: 0.1 * (0.25 + 0.75 * min(e, 4) / 4),
                lambda T, o: T.optim.lr_scheduler.LinearLR(o, 0.25, 1.0, 4), 7),
+    "exponential": (lambda e: 0.1 * 0.8**e, lambda T, o: T.optim.lr_scheduler.ExponentialLR(o, 0.8), 6),
+    "polynomial": (lambda e: 0.1 * (1 - min(e, 5) / 5) ** 2,
+                   lambda T, o: T.optim.lr_scheduler.PolynomialLR(o, 5, 2.0), 7),
+    "onecycle": (lambda e: np_onecycle(0.1, 10, 0.3, e),
+                 lambda T, o: T.optim.lr_scheduler.OneCycleLR(o, 0.1, total_steps=10, pct_start=0.3,
+                                                              cycle_momentum=False), 10),
 }
+
+
+def np_onecycle(peak, total, warm, e):
+    start, end = peak / 25, peak / 25 / 1e4
+    up = warm * total - 1
+    cos = lambda a, b, f: b + (a - b) * (1 + math.cos(math.pi * f)) / 2
+    if e <= up:
+        return cos(start, peak, e / up)
+    return cos(peak, end, (e - up) / (total - 1 - up))
 
 
 def optim_tensors(oracle, rng):

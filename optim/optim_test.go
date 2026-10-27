@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/gsoultan/mimir/internal/goldentest"
@@ -31,12 +32,24 @@ var optimizers = map[string]func(ps []*tensor.Param) *optim.Optimizer{
 		return optim.AdamW(ps, optim.LR(0.1), optim.WeightDecay(0.1))
 	},
 	"rmsprop": func(ps []*tensor.Param) *optim.Optimizer { return optim.RMSprop(ps, optim.LR(0.01), optim.Alpha(0.9)) },
+	"adagrad": func(ps []*tensor.Param) *optim.Optimizer {
+		return optim.Adagrad(ps, optim.LR(0.1), optim.LRDecay(0.05), optim.InitialAccumulator(0.1))
+	},
+	"adadelta": func(ps []*tensor.Param) *optim.Optimizer { return optim.Adadelta(ps, optim.LR(1), optim.Rho(0.9)) },
+	"adamax":   func(ps []*tensor.Param) *optim.Optimizer { return optim.Adamax(ps, optim.LR(0.1)) },
+	"nadam":    func(ps []*tensor.Param) *optim.Optimizer { return optim.NAdam(ps, optim.LR(0.1)) },
+	"lion": func(ps []*tensor.Param) *optim.Optimizer {
+		return optim.Lion(ps, optim.LR(0.05), optim.WeightDecay(0.1))
+	},
 }
 
 var schedules = map[string]optim.Schedule{
-	"step":   optim.StepDecay(0.1, 2, 0.5),
-	"cosine": optim.Cosine(0.1, 0.01, 5),
-	"warmup": optim.Warmup(0.1, 0.25, 4),
+	"step":        optim.StepDecay(0.1, 2, 0.5),
+	"cosine":      optim.Cosine(0.1, 0.01, 5),
+	"warmup":      optim.Warmup(0.1, 0.25, 4),
+	"exponential": optim.Exponential(0.1, 0.8),
+	"polynomial":  optim.Polynomial(0.1, 5, 2),
+	"onecycle":    optim.OneCycle(0.1, 10, 0.3),
 }
 
 // TestGolden runs each optimizer on sum(scale * (p - target)²) and each
@@ -311,5 +324,85 @@ func TestStepsReplayTheirProgram(t *testing.T) {
 				t.Errorf("5 steps compiled %d programs, want none", n)
 			}
 		})
+	}
+}
+
+// TestRAdamRectifies follows torch.optim.RAdam past the steps where it
+// takes plain momentum steps, which the five golden steps never leave.
+func TestRAdamRectifies(t *testing.T) {
+	p0, target := []float64{1.5, -0.5, 0.25}, []float64{-1, 1, 0}
+	p := tensor.NewParam(tensor.FromSlice([]float32{1.5, -0.5, 0.25}, 3))
+	tgt := tensor.FromSlice([]float32{-1, 1, 0}, 3)
+	opt := optim.RAdam([]*tensor.Param{p}, optim.LR(0.05), optim.Betas(0.9, 0.9))
+	want := slices.Clone(p0)
+	m, v := make([]float64, 3), make([]float64, 3)
+	b1, b2, eps, lr := 0.9, 0.9, 1e-8, 0.05
+	rhoInf := 2/(1-b2) - 1
+	for step := 1; step <= 30; step++ {
+		d := p.Value().Sub(tgt)
+		if err := d.Mul(d).Sum().Backward(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := opt.Step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		opt.ZeroGrad()
+		b2t := math.Pow(b2, float64(step))
+		bc1, bc2 := 1-math.Pow(b1, float64(step)), 1-b2t
+		rho := rhoInf - 2*float64(step)*b2t/bc2
+		for i := range want {
+			g := 2 * (want[i] - target[i])
+			m[i] = b1*m[i] + (1-b1)*g
+			v[i] = b2*v[i] + (1-b2)*g*g
+			mhat := m[i] / bc1
+			if rho > 5 {
+				r := math.Sqrt((rho - 4) * (rho - 2) * rhoInf / ((rhoInf - 4) * (rhoInf - 2) * rho))
+				want[i] -= lr * mhat * r * math.Sqrt(bc2) / (math.Sqrt(v[i]) + eps)
+			} else {
+				want[i] -= lr * mhat
+			}
+		}
+	}
+	got, err := p.Value().Data[float32](t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want {
+		if math.Abs(float64(got[i])-want[i]) > 1e-4 {
+			t.Fatalf("after 30 steps %v, want %v", got, want)
+		}
+	}
+}
+
+func TestClipNorm(t *testing.T) {
+	// Gradients 2·(p - target) = (6, 8), norm 10, clipped to 1: (0.6, 0.8).
+	p := tensor.NewParam(tensor.FromSlice([]float32{3, 4}, 2))
+	opt := optim.SGD([]*tensor.Param{p}, optim.LR(1), optim.ClipNorm(1))
+	if err := p.Value().Mul(p.Value()).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := opt.Step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := p.Value().Data[float32](t.Context())
+	if math.Abs(float64(got[0])-2.4) > 1e-5 || math.Abs(float64(got[1])-3.2) > 1e-5 {
+		t.Errorf("after a clipped step %v, want [2.4 3.2]", got)
+	}
+	// A norm already below the limit is left alone.
+	opt.ZeroGrad()
+	opt.SetClipNorm(100)
+	if err := p.Value().Mul(p.Value()).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := opt.Step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = p.Value().Data[float32](t.Context())
+	if math.Abs(float64(got[0])+2.4) > 1e-4 {
+		t.Errorf("after an unclipped step %v, want [-2.4 -3.2]", got)
+	}
+	opt.SetClipNorm(-1)
+	if err := opt.Step(t.Context()); err == nil {
+		t.Error("stepped with a negative clip norm")
 	}
 }
