@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gsoultan/mimir/io/mim"
 	"github.com/gsoultan/mimir/tabular"
 	"github.com/gsoultan/mimir/tensor"
 )
@@ -343,6 +345,32 @@ func TestProgressCountsTrees(t *testing.T) {
 		}
 		if calls != 7 {
 			t.Errorf("%s: %d progress calls for 7 trees", name, calls)
+		}
+	}
+}
+
+func TestIsolationForestScoresOutliersHigh(t *testing.T) {
+	ctx := context.Background()
+	d := table(2000, 3, 19, func([]float32) float32 { return 0 })
+	m, err := IsolationForest(ctx, d.X, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := m.Predict([]float32{0, 0, 0, 5, -5, 5, 0.9, float32(math.NaN()), 0.1})
+	if s[0] > 0.5 || s[1] < 0.65 || s[0] >= s[1] {
+		t.Errorf("scores %v: want the centre low and (5, -5, 5) high", s)
+	}
+	var buf bytes.Buffer
+	if err := mim.Save(ctx, &buf, m.Module(), nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Module().Forward(tensor.FromSlice([]float32{0, 0, 0, 5, -5, 5}, 2, 3)).Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range got {
+		if math.Abs(float64(got[i]-s[i])) > 1e-5 {
+			t.Errorf("module score %v, want %v", got[i], s[i])
 		}
 	}
 }

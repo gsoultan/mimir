@@ -30,6 +30,7 @@ type config struct {
 	patience  int
 	bootstrap bool
 	progress  func(done, total int)
+	samples   int
 }
 
 // Trees sets how many trees to grow: boosting rounds, or forest trees.
@@ -96,6 +97,10 @@ func Validation(val tabular.Data, patience int) Option {
 // Bootstrap sets whether each forest tree learns from rows drawn with
 // replacement. The default is true for RandomForest.
 func Bootstrap(b bool) Option { return func(c *config) { c.bootstrap = b } }
+
+// Samples sets how many rows each isolation tree cuts. The default is
+// 256.
+func Samples(n int) Option { return func(c *config) { c.samples = n } }
 
 // Progress calls f after each tree grows with the trees grown so far and
 // the most there will be. Boosting may stop early on Validation; a forest
