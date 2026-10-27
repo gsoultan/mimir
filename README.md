@@ -475,6 +475,32 @@ go run github.com/gsoultan/mimir-model/cmd/mim-import Llama-3.2-1B-Instruct-Q4_K
 go run ./examples/llama -model Llama-3.2-1B-Instruct-Q4_K_M.mim -prompt "The capital of France is" -n 64 -temperature 0
 ```
 
+Package `llm` holds the model the example runs, for the "llama" and
+"qwen2" (Qwen 2 and 2.5) architectures, and fine-tunes it with LoRA:
+`AddLoRA` puts a trainable low-rank pair (`nn.LoRA`) next to the chosen
+projections of every block, whose gradients flow through the frozen
+weights in their own quantization, and `Loss` is the causal language
+modeling loss over the tokens to learn, such as the answers of a chat.
+`WriteAdapter` saves the pairs alone, as an adapter file of the Mimir
+Model format, and `mim.Model.ApplyLoRA` runs a base model's graph with
+one applied:
+
+```go
+m, err := llm.Load(f, md, tensor.DefaultDevice())
+err = m.AddLoRA(llm.LoRAConfig{Rank: 8})
+opt := optim.AdamW(m.Adapters(), optim.LR(2e-4))
+for _, b := range batches {
+	loss := m.Loss(b.Tokens, b.Learn)
+	err = loss.Backward(ctx)
+	err = opt.Step(ctx)
+	opt.ZeroGrad()
+}
+err = m.WriteAdapter(ctx, w, baseSHA256, "my fine-tune")
+```
+
+`Embedding` turns a text into the mean of the last block's outputs,
+scaled to length 1, for search.
+
 ## Distributions and generative models
 
 Package `distributions` follows `torch.distributions`: `Normal`,
@@ -903,7 +929,8 @@ internal/filemap/    read-only file mappings
 internal/goldentest/ golden-file loading and comparison
 internal/quanttest/  reference quantization for tests
 io/parquet/          Parquet reader: flat schemas, every standard encoding, Snappy, gzip and zstd
-io/mim/              Mimir Model (.mim) files: save, load, map, run and export
+io/mim/              Mimir Model (.mim) files: save, load, map, run and export, with LoRA adapters
+llm/                 Llama and Qwen 2 language models from .mim files: run, embed and fine-tune with LoRA
 examples/mnist/      trains an MLP or CNN on MNIST
 examples/gpt2/       trains a GPT-2 on a text file and samples from it
 examples/llama/      runs Llama-architecture models from .mim files
@@ -1026,7 +1053,7 @@ from the `pytorch-triton-rocm` wheel.
 | M4b CUDA | CUDA driver, NVRTC and cuBLAS through purego, stream-ordered memory pool, on-disk kernel cache, conformance tests on a Modal T4 (done) |
 | M5 Billion-row scale | streaming Parquet and CSV shards, memory budget planner, micro-batching and activation checkpointing, off-heap and memory-mapped tensors, bf16 and f16 with loss scaling, a billion-row test in CI (done) |
 | M5b Compiled steps | schedule cache, replay into fixed buffers with no allocations, CUDA graphs, one Metal command buffer per step (done) |
-| M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, quantized matmul, GPU convolution kernels, GPT-2 and Llama examples (in progress: speed gates) |
+| M6 Transformers and LLMs | scans, RNN, LSTM and GRU, fused attention, transformer layers and KV cache, quantized matmul, GPU convolution kernels, GPT-2 and Llama examples, LoRA fine-tuning of Llama and Qwen 2 (in progress: speed gates) |
 | M7 Full coverage | function transforms (differentiable gradients, forward mode, vmap), sorting, FFT and linear algebra, distributions with VAE, GAN and diffusion examples, reinforcement learning (DQN, PPO), graph networks, ROCm through HIP, hiprtc and hipBLAS (done; ROCm pending validation on AMD hardware) |
 | M8 Multiple devices | collectives over CPU devices and NCCL, data parallelism, tensor sharding modeled on `jax.sharding` with data, tensor and fully sharded parallelism, passing the 8-GPU gate of 85% scaling efficiency on H100s (done) |
 
