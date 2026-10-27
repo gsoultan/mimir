@@ -537,6 +537,36 @@ logits := conv2.Convolve(g, conv1.Convolve(g, x).ReLU())
 `examples/gnn` trains this network to classify the papers of a citation
 graph with Cora's sizes, generated in code so nothing is downloaded.
 
+## Tables: trees, boosting and linear models
+
+Package `tree` grows decision trees, random forests and gradient-boosted
+trees, as scikit-learn and XGBoost do, and package `linear` fits linear
+regression (least squares, ridge, lasso and elastic net) and logistic
+regression, for two classes or many. They learn from a `tabular.Data`, a
+table of float32 rows where NaN is a missing value, and answer a
+probability for each class or a number for each row:
+
+```go
+d := tabular.Data{X: x, Features: 8, Y: y} // len(y) rows of 8 numbers
+train, test := d.Split(0.2, 1)
+m, err := tree.GradientBoosting(ctx, train, tabular.Classification,
+	tree.Trees(300), tree.LearningRate(0.05), tree.Validation(test, 20))
+if err != nil {
+	return err
+}
+fmt.Println(metrics.ROCAUC(m.Predict(test.X), test.Y), m.Importance)
+```
+
+Trees sort each feature into 255 quantile bins first, like LightGBM, and
+learn which side of each split missing values belong on. Linear models
+standardize their features, then fit by coordinate descent, L-BFGS or
+FISTA. `tabular.CrossValidate` scores any of them over k folds, and
+`metrics` has accuracy, precision, recall, F1, ROC AUC, log loss, the
+confusion matrix, MAE, RMSE and R² over plain slices. On scikit-learn's
+breast cancer and digits sets and two generated ones, boosting and
+logistic regression match XGBoost's, LightGBM's and scikit-learn's test
+scores to within half a point.
+
 ## Reinforcement learning
 
 `examples/rl/cartpole` simulates Gymnasium's CartPole-v1 in pure Go, and
@@ -710,6 +740,8 @@ read.
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
 | Files (`io`) | Mimir Model (`.mim`), the one model format: save and load parameters, checkpoints and datasets, map in place, run graphs and export; Parquet datasets |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
+| Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax; early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
+| Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
 block-quantized `Q8_0`, `Q4_K` and `Q6_K` for weights. Broadcasting follows NumPy.
@@ -728,7 +760,10 @@ distributions/       probability distributions, sampling, log densities and KL d
 data/                datasets, batching, streams of shards and their statistics
 data/datasets/       MNIST, CSV, CSV and Parquet shards, mapped .mim files, synthetic rows
 train/               Fit, evaluation, checkpoints, data-parallel and sharded training
-metrics/             accuracy
+metrics/             accuracy, and scores of a table model's answers
+tabular/             tables of numbers to learn from, splits and cross-validation
+tree/                decision trees, random forests and gradient-boosted trees
+linear/              linear and logistic regression
 backend/             Backend interface, DType, Op, View, Kernel, collectives
 backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives
 backend/metal/       Metal backend: Metal Performance Shaders and tensor operations, through purego
