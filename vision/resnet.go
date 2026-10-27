@@ -51,14 +51,17 @@ func newResNet(classes int, blocks []int, deep bool, opts []Option) *ResNet {
 	c := options(opts, config{})
 	relu := nn.ReLU()
 	r := &ResNet{drop: c.drop}
+	// Width scales every layer's channels, keeping at least 8.
+	scaled := func(n int) int { return max(int(float64(n)*c.width), 8) }
+	stem := scaled(64)
 	if c.small {
-		r.Stem = nn.NewSequential(newConvBN(c.in, 64, 3, 1, 1, relu))
+		r.Stem = nn.NewSequential(newConvBN(c.in, stem, 3, 1, 1, relu))
 	} else {
-		r.Stem = nn.NewSequential(newConvBN(c.in, 64, 7, 2, 1, relu), nn.MaxPool2d(3, nn.Stride(2), nn.Padding(1)))
+		r.Stem = nn.NewSequential(newConvBN(c.in, stem, 7, 2, 1, relu), nn.MaxPool2d(3, nn.Stride(2), nn.Padding(1)))
 	}
-	in := 64
+	in := stem
 	for i, n := range blocks {
-		mid := 64 << i
+		mid := scaled(64 << i)
 		out := mid
 		if deep {
 			out = mid * 4
@@ -118,7 +121,8 @@ func (r *ResNet) Features(x *tensor.Tensor) *tensor.Tensor {
 // Forward maps [N, C, H, W] to [N, classes] logits.
 func (r *ResNet) Forward(x *tensor.Tensor) *tensor.Tensor { return r.Head.Forward(r.Features(x)) }
 
-// Width returns 512 for ResNet-18 and 34, and 2048 for ResNet-50.
+// Width returns 512 for ResNet-18 and 34, and 2048 for ResNet-50, times
+// the Width option.
 func (r *ResNet) Width() int { return r.width }
 
 // SetHead starts a new head for classes classes.
