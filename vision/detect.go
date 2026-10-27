@@ -126,7 +126,9 @@ func NewDetector(classes int, backbone Backbone) (*Detector, error) {
 		ups++
 	}
 	for i := range ups {
-		out := widths[max(len(widths)-ups+i, 0)]
+		// Each step up at most halves the channels, so a narrow backbone
+		// keeps a narrow, cheap neck.
+		out := min(widths[max(len(widths)-ups+i, 0)], max(c/2, 16))
 		d.Up = append(d.Up, &upBlock{Conv: nn.NewConvTranspose2d(c, out, 4, nn.Stride(2), nn.Padding(1), nn.NoBias()), BN: nn.NewBatchNorm2d(out)})
 		c = out
 	}
