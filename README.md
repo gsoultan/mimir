@@ -567,6 +567,23 @@ breast cancer and digits sets and two generated ones, boosting and
 logistic regression match XGBoost's, LightGBM's and scikit-learn's test
 scores to within half a point.
 
+Three more families learn from the same tables. Package `svm` fits
+support vector machines, classifiers and ε-regression, with linear, RBF,
+polynomial and sigmoid kernels: SMO with libsvm's working-set selection
+for kernels, LIBLINEAR's dual coordinate descent for linear classifiers,
+and Platt-scaled probabilities; its decision values match
+scikit-learn's. Package `neighbors` answers from the k nearest rows,
+uniform or weighted by distance, Euclidean, Manhattan or cosine.
+Package `bayes` fits Gaussian, multinomial and Bernoulli naive Bayes,
+whose log-likelihoods match scikit-learn's. Each, like the trees and
+linear models, serves as an `nn.Module` through `Module()`.
+
+```go
+m, err := svm.Fit(ctx, train, tabular.Classification, svm.Kernel(svm.RBF), svm.C(10))
+k, err := neighbors.Fit(ctx, train, tabular.Regression, neighbors.K(7), neighbors.ByDistance())
+nb, err := bayes.Multinomial(ctx, wordCounts)
+```
+
 ## Groups, outliers, forecasts and recommendations
 
 Four more packages learn from tables without a model of answers per row:
@@ -611,6 +628,27 @@ head := optim.AdamW(m.HeadParameters(), optim.LR(1e-2))
 `ConvTranspose1d` and `ConvTranspose2d`, depthwise convolution,
 `GroupNorm`, `GlobalAvgPool` and `Upsample`.
 
+`vision` also finds and outlines things. `NewDetector` is CenterNet: on
+a grid a quarter of the picture it scores each kind of thing's centres
+and says each thing's size, on any `Backbone`, a ResNet's feature maps
+(so a trained classifier starts it) or `TinyBackbone`; `Targets`,
+`Loss` and `Detect` turn true boxes into what it should give, score it,
+and read the boxes it finds. `NewUNet` segments, a class for every
+pixel. `IoU`, `NMS`, `BoxIoU`, `GIoULoss`, `AveragePrecision` (mAP) and
+`MeanIoU` score them.
+
+```go
+d, err := vision.NewDetector(3, vision.ResNet18(1).Backbone())
+t, err := d.Targets(boxes, 256, 256) // the true boxes of a batch of 256×256 photos
+l := d.Loss(d.Forward(x), t)
+found, err := d.Detect(ctx, d.Forward(x), 0.3, 100)
+```
+
+Package `audio` reads and writes WAV files, resamples them, and computes
+spectrograms, mel spectrograms and MFCCs with tensor operations, so they
+run inside a model on any device; `audio.NewClassifier` tells sounds
+apart from their log mel spectrogram with a four-block CNN.
+
 Package `automl` picks the best model for a table: it scores boosted
 trees, random forests and linear models with a range of settings by
 cross-validation, then fits the winner to the whole table.
@@ -622,6 +660,19 @@ fmt.Println(r.Winner, r.Metric) // e.g. "boost L2=5 LearningRate=0.1 ... 0.21 lo
 
 ## Reinforcement learning
 
+Package `rl` trains agents on any environment with its `Env` interface:
+`TrainPPO`, proximal policy optimization with generalized advantage
+estimation over environments side by side, and `TrainDQN`, deep
+Q-learning with a replay buffer, double Q targets and a target network.
+It comes with CartPole and a chain to learn on, and `Evaluate` scores
+any policy.
+
+```go
+agent, err := rl.TrainPPO(ctx, func(uint64) rl.Env { return rl.NewCartPole() }, rl.PPOConfig{Steps: 40_000, LR: 1e-3})
+score, err := rl.Evaluate(ctx, agent, rl.NewCartPole(), 10, 1) // 500, the most CartPole gives
+```
+
+The examples write the same algorithms out step by step:
 `examples/rl/cartpole` simulates Gymnasium's CartPole-v1 in pure Go, and
 two examples learn it until the greedy policy's mean return over 100
 episodes reaches 195: `examples/rl/dqn` with a double deep Q-network and a
@@ -784,18 +835,21 @@ read.
 | Devices | `CPUs`, `GPUs`, `NewGroup` with `AllReduce`, `Broadcast`, `AllGather`, `ReduceScatter`, `ReduceGrads`, `BroadcastParams` (CPU devices, or CUDA GPUs over NCCL) |
 | Sharding | `NewMesh`, `P`, `PartitionSpec` (`WithSections`), `Shard`, `WithSharding`, `Sharding`, `Param.Shard`, `Mesh.Traffic` |
 | Layers (`nn`) | `Linear`, `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d`, `ConvTranspose2d`, `DepthwiseConv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `GroupNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `GlobalAvgPool`, `Upsample`, `Flatten`, `Cast` |
-| Pictures (`vision`) | `ResNet18`, `ResNet34`, `ResNet50`, `NewMobileNetV2`, `NewViT` (`ViTB16`, `ViTTiny`); `Features`, `SetHead`, `HeadParameters` |
+| Pictures (`vision`) | `ResNet18`, `ResNet34`, `ResNet50`, `NewMobileNetV2`, `NewViT` (`ViTB16`, `ViTTiny`); `Features`, `SetHead`, `HeadParameters`; `NewDetector` (CenterNet, on `ResNet.Backbone` or `TinyBackbone`), `NewUNet`; `IoU`, `NMS`, `BoxIoU`, `GIoULoss`, `AveragePrecision`, `MeanIoU` |
+| Sound (`audio`) | `ReadWAV`, `WriteWAV`, `Clip.Resample`, `Spectrogram`, `Filterbank`, `MelSpectrogram`, `MFCC`, `NewClassifier` |
+| Agents (`rl`) | `Env`, `TrainPPO`, `TrainDQN`, `Evaluate`; `CartPole`, `Chain` |
 | Text (`text`) | WordPiece `Tokenizer`, `BuildVocab`, `NewBERT` (`BERTBase`, `BERTMini`, `BERTTiny`) |
 | Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
 | Graph layers (`nn`) | `Graph` (`Source`, `Target`, `Sum`, `Mean`, `Max`, `Softmax`, `Adjacency`), `GCNConv`, `SAGEConv`, `GATConv` |
 | Placement (`nn`) | `Replicate`, `Shard`, `Rules`, `FullyShard`, `TensorParallel` |
-| Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `MSE`, `L1`, `Huber` |
-| Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `MasterWeights`; `StepDecay`, `Cosine`, `Warmup` schedules |
+| Losses (`nn/loss`) | `CrossEntropy`, `NLL`, `BCEWithLogits`, `BCE`, `MSE`, `L1`, `Huber`, `SmoothL1`, `LabelSmoothing`, `Focal`, `BinaryFocal`, `KLDiv`, `Hinge`, `MarginRanking`, `Triplet`, `CosineEmbedding`, `PoissonNLL`, `GaussianNLL`, `Dice`, `BinaryDice` |
+| Optimizers (`optim`) | `SGD` (momentum, Nesterov), `Adam`, `AdamW`, `RMSprop`, `Adagrad`, `Adadelta`, `Adamax`, `NAdam`, `RAdam`, `Lion`, `MasterWeights`, `ClipNorm`; `StepDecay`, `Cosine`, `Warmup`, `Exponential`, `Polynomial`, `OneCycle` schedules |
 | Distributions (`distributions`) | `Normal`, `MultivariateNormal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`, `Laplace`, `Gamma`, `Beta`, `Dirichlet`, `Poisson`; `Sample`, `RSample`, `LogProb`, `Entropy`, `Mean`, `Variance`, `KL` |
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
 | Files (`io`) | Mimir Model (`.mim`), the one model format: save and load parameters, checkpoints and datasets, map in place, run graphs and export; Parquet datasets |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 | Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax; early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
+| Kernels, neighbours, naive Bayes (`svm`, `neighbors`, `bayes`) | `svm.Fit` (C-SVC and ε-SVR; linear, RBF, polynomial, sigmoid kernels; Platt probabilities), `neighbors.Fit` (uniform or by distance; Euclidean, Manhattan, cosine), `bayes.Gaussian`, `Multinomial`, `Bernoulli` |
 | Unsupervised (`cluster`, `decompose`, `tree`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Silhouette`; `PCA`; `IsolationForest` |
 | Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`; `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
 | Model search (`automl`) | `Search` over boosted trees, forests and linear models, with trials, folds, time budgets and families |
@@ -827,8 +881,13 @@ decompose/           principal component analysis
 forecast/            forecasts of many series with one boosted-tree model
 recommend/           recommendations by matrix factorization
 automl/              picks and tunes the best model for a table
-vision/              ResNet, MobileNetV2 and ViT
+svm/                 support vector machines
+neighbors/           k nearest neighbours
+bayes/               naive Bayes
+vision/              ResNet, MobileNetV2, ViT, a CenterNet detector, U-Net and box scores
 text/                WordPiece tokenizer and BERT
+audio/               WAV files, spectrograms, mel features and a sound classifier
+rl/                  PPO and DQN agents and environments
 backend/             Backend interface, DType, Op, View, Kernel, collectives
 backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives
 backend/metal/       Metal backend: Metal Performance Shaders and tensor operations, through purego
