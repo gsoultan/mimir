@@ -165,9 +165,12 @@ type Model struct {
 	// whose runs are not recorded.
 	dataDependent bool
 	session       *Session
-	mapping       *filemap.Mapping
-	cleanup       runtime.Cleanup
-	closed        bool
+	// lora is the adapter of each weight value it changes, by the value's
+	// index (see ApplyLoRA); nil without an adapter.
+	lora    map[uint32]loraPair
+	mapping *filemap.Mapping
+	cleanup runtime.Cleanup
+	closed  bool
 }
 
 // Open reads the model at path. It maps the file, and the model's weights
