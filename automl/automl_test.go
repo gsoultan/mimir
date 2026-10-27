@@ -93,8 +93,10 @@ func TestSearchRegressionAndLimits(t *testing.T) {
 	if r.Winner.Family != "forest" {
 		t.Errorf("a line beat a forest on a product: %v", r.Trials)
 	}
-	// A budget of nothing still scores one candidate.
-	r, err = automl.Search(ctx, table(200, "line", 5), tabular.Classification, automl.Budget(1), automl.Families("linear"))
+	// A budget of nothing still scores one candidate. The table is large
+	// enough that one fit takes longer than a tick of the coarsest clock
+	// (about 16 ms on Windows), so the budget is seen to be spent.
+	r, err = automl.Search(ctx, table(50000, "line", 5), tabular.Classification, automl.Budget(1), automl.Families("linear"))
 	if err != nil {
 		t.Fatal(err)
 	}
