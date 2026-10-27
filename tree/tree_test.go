@@ -326,3 +326,23 @@ func BenchmarkRandomForest(b *testing.B) {
 		}
 	}
 }
+
+func TestProgressCountsTrees(t *testing.T) {
+	d := table(200, 2, 18, xor)
+	for name, fit := range fitters {
+		var calls, last int
+		_, err := fit(context.Background(), d, tabular.Classification, Trees(7), Progress(func(done, total int) {
+			calls++
+			if done != last+1 || total != 7 {
+				t.Errorf("%s: progress %d of %d after %d", name, done, total, last)
+			}
+			last = done
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 7 {
+			t.Errorf("%s: %d progress calls for 7 trees", name, calls)
+		}
+	}
+}

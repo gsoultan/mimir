@@ -98,6 +98,8 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 	}
 	next := make(chan int)
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	done := 0
 	for range min(workers, c.trees) {
 		wg.Go(func() {
 			for t := range next {
@@ -114,6 +116,12 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 					workers: inner, cfg: c, gain: make([]float64, f)}
 				m.Trees[t] = gr.grow(rows)
 				gains[t] = gr.gain
+				if c.progress != nil {
+					mu.Lock()
+					done++
+					c.progress(done, c.trees)
+					mu.Unlock()
+				}
 			}
 		})
 	}

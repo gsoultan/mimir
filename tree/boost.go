@@ -115,6 +115,9 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 			delta[j] = gr.gain[j] - before[j]
 		}
 		gains = append(gains, delta)
+		if c.progress != nil {
+			c.progress(round+1, c.trees)
+		}
 		if c.val == nil {
 			continue
 		}
