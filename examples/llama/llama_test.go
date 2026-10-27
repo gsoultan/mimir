@@ -13,6 +13,7 @@ import (
 	mimfile "github.com/gsoultan/mimir-model"
 
 	"github.com/gsoultan/mimir/io/mim"
+	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/tensor"
 )
 
@@ -172,7 +173,7 @@ func TestLogitsMatchNumPy(t *testing.T) {
 				// The weights keep the file's types.
 				want := map[string][2]tensor.DType{"spm": {tensor.Q8_0, tensor.BFloat16}, "bpe": {tensor.Q4_K, tensor.Q6_K}}[c.name]
 				b := m.Blocks[0]
-				if q, down := b.Q.Weight.Value().DType(), b.Down.Weight.Value().DType(); q != want[0] || down != want[1] {
+				if q, down := b.Q.(*nn.Linear).Weight.Value().DType(), b.Down.(*nn.Linear).Weight.Value().DType(); q != want[0] || down != want[1] {
 					t.Errorf("query and down projections of %v and %v, want the file's %v and %v", q, down, want[0], want[1])
 				}
 			}
