@@ -151,6 +151,8 @@ func (mod *Module) Forward(x *tensor.Tensor) *tensor.Tensor {
 	case s.Link == Sigmoid:
 		// Logits 0 and the log-odds have the sigmoid's probabilities.
 		return tensor.Cat(1, tensor.Zeros(tensor.Float32, n, 1), out)
+	case s.Link == Isolation:
+		return out.Neg().Exp2()
 	case s.Link == Identity && s.Classes > 0:
 		// A forest averages probabilities: their logs are logits.
 		return out.Maximum(tensor.Scalar(float32(math.SmallestNonzeroFloat32))).Log()

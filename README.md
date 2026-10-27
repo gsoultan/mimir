@@ -593,6 +593,26 @@ breast cancer and digits sets and two generated ones, boosting and
 logistic regression match XGBoost's, LightGBM's and scikit-learn's test
 scores to within half a point.
 
+## Groups, outliers, forecasts and recommendations
+
+Four more packages learn from tables without a model of answers per row:
+
+- `cluster` groups rows by `KMeans` (k-means++ starts), `GaussianMixture`
+  (diagonal covariances, by EM) and `DBSCAN` (any shape, with noise), and
+  scores a grouping by its `Silhouette`.
+- `decompose.PCA` finds the directions rows vary in most, to draw a table
+  in two dimensions or shrink it.
+- `tree.IsolationForest` scores how unusual each row is, from 0 to 1.
+- `forecast` predicts what comes next in many series at once with one
+  boosted-tree model over each step's recent values and its place in the
+  season, and checks itself against the naive seasonal forecast.
+- `recommend` factorizes who did what with which item by alternating
+  least squares, for clicks and purchases or for ratings, and recommends
+  items and finds similar ones.
+
+k-means, mixtures, isolation forests and recommenders convert to an
+`nn.Module` like the trees and linear models do.
+
 ## Reinforcement learning
 
 `examples/rl/cartpole` simulates Gymnasium's CartPole-v1 in pure Go, and
@@ -767,6 +787,8 @@ read.
 | Files (`io`) | Mimir Model (`.mim`), the one model format: save and load parameters, checkpoints and datasets, map in place, run graphs and export; Parquet datasets |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 | Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax; early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
+| Unsupervised (`cluster`, `decompose`, `tree`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Silhouette`; `PCA`; `IsolationForest` |
+| Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`; `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
 | Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -790,6 +812,10 @@ metrics/             accuracy, and scores of a table model's answers
 tabular/             tables of numbers to learn from, splits and cross-validation
 tree/                decision trees, random forests and gradient-boosted trees
 linear/              linear and logistic regression
+cluster/             k-means, Gaussian mixtures, DBSCAN and silhouettes
+decompose/           principal component analysis
+forecast/            forecasts of many series with one boosted-tree model
+recommend/           recommendations by matrix factorization
 backend/             Backend interface, DType, Op, View, Kernel, collectives
 backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives
 backend/metal/       Metal backend: Metal Performance Shaders and tensor operations, through purego
