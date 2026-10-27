@@ -650,8 +650,9 @@ run inside a model on any device; `audio.NewClassifier` tells sounds
 apart from their log mel spectrogram with a four-block CNN.
 
 Package `automl` picks the best model for a table: it scores boosted
-trees, random forests and linear models with a range of settings by
-cross-validation, then fits the winner to the whole table.
+trees, random forests, linear models, support vector machines, nearest
+neighbours and naive Bayes with a range of settings by cross-validation,
+then fits the winner to the whole table.
 
 ```go
 r, err := automl.Search(ctx, d, tabular.Classification, automl.Trials(20))
@@ -852,7 +853,7 @@ read.
 | Kernels, neighbours, naive Bayes (`svm`, `neighbors`, `bayes`) | `svm.Fit` (C-SVC and ε-SVR; linear, RBF, polynomial, sigmoid kernels; Platt probabilities), `neighbors.Fit` (uniform or by distance; Euclidean, Manhattan, cosine), `bayes.Gaussian`, `Multinomial`, `Bernoulli` |
 | Unsupervised (`cluster`, `decompose`, `tree`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Silhouette`; `PCA`; `IsolationForest` |
 | Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`; `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
-| Model search (`automl`) | `Search` over boosted trees, forests and linear models, with trials, folds, time budgets and families |
+| Model search (`automl`) | `Search` over boosted trees, forests, linear models, SVMs, neighbours and naive Bayes, with trials, folds, time budgets and families |
 | Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
