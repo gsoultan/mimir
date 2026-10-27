@@ -55,7 +55,8 @@ type Optimizer struct {
 }
 
 // New returns an optimizer that updates params with rule at learning rate
-// lr. SGD, Adam, AdamW and RMSprop are built on it.
+// lr. SGD, Adam, AdamW, RMSprop, Adagrad, Adadelta, Adamax, NAdam, RAdam
+// and Lion are built on it.
 func New(params []*tensor.Param, lr float64, rule Rule) *Optimizer {
 	o := &Optimizer{params: params, rule: rule, lr: lr, scale: 1, states: make([]State, len(params))}
 	if lr < 0 || math.IsNaN(lr) {
@@ -259,6 +260,9 @@ type config struct {
 	lr, momentum, dampening, weightDecay float64
 	beta1, beta2, eps, alpha             float64
 	nesterov, master                     bool
+	lrDecay, initial, rho                float64
+	momentumDecay                        float64
+	trust                                bool
 }
 
 // LR sets the learning rate.
@@ -286,6 +290,19 @@ func Eps(eps float64) Option { return func(c *config) { c.eps = eps } }
 
 // Alpha sets RMSprop's smoothing constant.
 func Alpha(a float64) Option { return func(c *config) { c.alpha = a } }
+
+// LRDecay sets Adagrad's learning rate decay: step t uses lr/(1+(t-1)·d).
+func LRDecay(d float64) Option { return func(c *config) { c.lrDecay = d } }
+
+// InitialAccumulator sets the value Adagrad's sum of squared gradients
+// starts at.
+func InitialAccumulator(v float64) Option { return func(c *config) { c.initial = v } }
+
+// Rho sets Adadelta's decay rate for its running averages.
+func Rho(r float64) Option { return func(c *config) { c.rho = r } }
+
+// MomentumDecay sets NAdam's momentum decay, ψ.
+func MomentumDecay(d float64) Option { return func(c *config) { c.momentumDecay = d } }
 
 // MasterWeights keeps a float32 master copy of every BFloat16 and Float16
 // parameter in its state, named "master", and updates that: the rule runs
@@ -337,6 +354,14 @@ func configure(opts []Option, c config) (config, error) {
 		return c, bad("beta2", c.beta2)
 	case !(c.alpha >= 0 && c.alpha < 1):
 		return c, bad("alpha", c.alpha)
+	case c.lrDecay < 0 || math.IsNaN(c.lrDecay):
+		return c, bad("learning rate decay", c.lrDecay)
+	case c.initial < 0 || math.IsNaN(c.initial):
+		return c, bad("initial accumulator", c.initial)
+	case !(c.rho >= 0 && c.rho < 1):
+		return c, bad("rho", c.rho)
+	case c.momentumDecay < 0 || math.IsNaN(c.momentumDecay):
+		return c, bad("momentum decay", c.momentumDecay)
 	case c.nesterov && (c.momentum == 0 || c.dampening != 0):
 		return c, fmt.Errorf("optim: Nesterov momentum needs momentum > 0 and no dampening: %w", tensor.ErrShape)
 	}
@@ -443,6 +468,146 @@ func RMSprop(params []*tensor.Param, opts ...Option) *Optimizer {
 				next["momentum_buffer"] = step
 			}
 			return p.Sub(step.Mul(f32(lr))), next
+		}
+	})
+}
+
+// Adagrad returns Adagrad, like torch.optim.Adagrad: learning rate 1e-2,
+// Eps 1e-10, with optional LRDecay, InitialAccumulator and L2
+// WeightDecay. Each weight's step shrinks with the sum of its squared
+// gradients, so rare features keep learning fast.
+func Adagrad(params []*tensor.Param, opts ...Option) *Optimizer {
+	c, err := configure(opts, config{lr: 1e-2, eps: 1e-10})
+	return build(params, c, err, func(c config) Rule {
+		return func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+			if c.weightDecay != 0 {
+				g = g.Add(p.Mul(f32(c.weightDecay)))
+			}
+			sum, ok := s["sum"]
+			if !ok {
+				sum = tensor.Full(tensor.Float32, c.initial).Expand(p.Shape()...)
+			}
+			sum = sum.Add(g.Mul(g))
+			clr := lr / (1 + float64(step-1)*c.lrDecay)
+			return p.Sub(g.Div(sum.Sqrt().Add(f32(c.eps))).Mul(f32(clr))), State{"sum": sum}
+		}
+	})
+}
+
+// Adadelta returns Adadelta, like torch.optim.Adadelta: learning rate 1,
+// Rho 0.9, Eps 1e-6, with optional L2 WeightDecay. It scales each step
+// by the ratio of the running sizes of past steps and gradients, so the
+// learning rate matters little.
+func Adadelta(params []*tensor.Param, opts ...Option) *Optimizer {
+	c, err := configure(opts, config{lr: 1, rho: 0.9, eps: 1e-6})
+	return build(params, c, err, func(c config) Rule {
+		return func(lr float64, _ int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+			if c.weightDecay != 0 {
+				g = g.Add(p.Mul(f32(c.weightDecay)))
+			}
+			sq := zeroIfMissing(s, "square_avg", p).Mul(f32(c.rho)).Add(g.Mul(g).Mul(f32(1 - c.rho)))
+			acc := zeroIfMissing(s, "acc_delta", p)
+			delta := acc.Add(f32(c.eps)).Sqrt().Div(sq.Add(f32(c.eps)).Sqrt()).Mul(g)
+			acc = acc.Mul(f32(c.rho)).Add(delta.Mul(delta).Mul(f32(1 - c.rho)))
+			return p.Sub(delta.Mul(f32(lr))), State{"square_avg": sq, "acc_delta": acc}
+		}
+	})
+}
+
+// Adamax returns Adamax, Adam with the infinity norm, like
+// torch.optim.Adamax: learning rate 2e-3, Betas 0.9 and 0.999, Eps 1e-8,
+// with optional L2 WeightDecay.
+func Adamax(params []*tensor.Param, opts ...Option) *Optimizer {
+	c, err := configure(opts, config{lr: 2e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8})
+	return build(params, c, err, func(c config) Rule {
+		return func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+			if c.weightDecay != 0 {
+				g = g.Add(p.Mul(f32(c.weightDecay)))
+			}
+			m := zeroIfMissing(s, "exp_avg", p).Mul(f32(c.beta1)).Add(g.Mul(f32(1 - c.beta1)))
+			u := zeroIfMissing(s, "exp_inf", p).Mul(f32(c.beta2)).Maximum(g.Abs().Add(f32(c.eps)))
+			bc := 1 - math.Pow(c.beta1, float64(step))
+			return p.Sub(m.Div(u).Mul(f32(lr / bc))), State{"exp_avg": m, "exp_inf": u}
+		}
+	})
+}
+
+// NAdam returns Adam with Nesterov momentum, like torch.optim.NAdam:
+// learning rate 2e-3, Betas 0.9 and 0.999, Eps 1e-8, MomentumDecay 4e-3,
+// with optional L2 WeightDecay.
+func NAdam(params []*tensor.Param, opts ...Option) *Optimizer {
+	c, err := configure(opts, config{lr: 2e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8, momentumDecay: 4e-3})
+	return build(params, c, err, func(c config) Rule {
+		mu := func(t int) float64 { return c.beta1 * (1 - 0.5*math.Pow(0.96, float64(t)*c.momentumDecay)) }
+		return func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+			if c.weightDecay != 0 {
+				g = g.Add(p.Mul(f32(c.weightDecay)))
+			}
+			// The product of the momentum factors so far is a function of
+			// the step alone, so it needs no state.
+			prod := 1.0
+			for t := 1; t <= step; t++ {
+				prod *= mu(t)
+			}
+			mt, mnext := mu(step), mu(step+1)
+			m := zeroIfMissing(s, "exp_avg", p).Mul(f32(c.beta1)).Add(g.Mul(f32(1 - c.beta1)))
+			v := zeroIfMissing(s, "exp_avg_sq", p).Mul(f32(c.beta2)).Add(g.Mul(g).Mul(f32(1 - c.beta2)))
+			bc2 := 1 - math.Pow(c.beta2, float64(step))
+			denom := v.Mul(f32(1 / bc2)).Sqrt().Add(f32(c.eps))
+			upd := g.Mul(f32(lr * (1 - mt) / (1 - prod))).Add(m.Mul(f32(lr * mnext / (1 - prod*mnext))))
+			return p.Sub(upd.Div(denom)), State{"exp_avg": m, "exp_avg_sq": v}
+		}
+	})
+}
+
+// RAdam returns Rectified Adam, like torch.optim.RAdam: learning rate
+// 1e-3, Betas 0.9 and 0.999, Eps 1e-8, with optional L2 WeightDecay. It
+// takes plain momentum steps until there are enough gradients to trust
+// Adam's variance estimate, so it needs no warmup.
+func RAdam(params []*tensor.Param, opts ...Option) *Optimizer {
+	c, err := configure(opts, config{lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8})
+	return build(params, c, err, func(c config) Rule {
+		rhoInf := 2/(1-c.beta2) - 1
+		return func(lr float64, step int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+			if c.weightDecay != 0 {
+				g = g.Add(p.Mul(f32(c.weightDecay)))
+			}
+			m := zeroIfMissing(s, "exp_avg", p).Mul(f32(c.beta1)).Add(g.Mul(f32(1 - c.beta1)))
+			v := zeroIfMissing(s, "exp_avg_sq", p).Mul(f32(c.beta2)).Add(g.Mul(g).Mul(f32(1 - c.beta2)))
+			next := State{"exp_avg": m, "exp_avg_sq": v}
+			b2t := math.Pow(c.beta2, float64(step))
+			bc1, bc2 := 1-math.Pow(c.beta1, float64(step)), 1-b2t
+			rho := rhoInf - 2*float64(step)*b2t/bc2
+			mhat := m.Mul(f32(1 / bc1))
+			if rho <= 5 {
+				return p.Sub(mhat.Mul(f32(lr))), next
+			}
+			r := math.Sqrt((rho - 4) * (rho - 2) * rhoInf / ((rhoInf - 4) * (rhoInf - 2) * rho))
+			adapt := v.Sqrt().Add(f32(c.eps)).Recip().Mul(f32(math.Sqrt(bc2)))
+			return p.Sub(mhat.Mul(adapt).Mul(f32(lr * r))), next
+		}
+	})
+}
+
+// Lion returns Lion, the optimizer Chen et al. found by search, like
+// lion-pytorch: learning rate 1e-4, Betas 0.9 and 0.99, decoupled
+// WeightDecay. Every weight moves by exactly lr each step, in the
+// direction of the sign of a blend of momentum and gradient; it keeps
+// one moment instead of Adam's two, and wants a learning rate 3 to 10
+// times smaller than AdamW's.
+func Lion(params []*tensor.Param, opts ...Option) *Optimizer {
+	c, err := configure(opts, config{lr: 1e-4, beta1: 0.9, beta2: 0.99})
+	return build(params, c, err, func(c config) Rule {
+		return func(lr float64, _ int, p, g *tensor.Tensor, s State) (*tensor.Tensor, State) {
+			if c.weightDecay != 0 {
+				p = p.Mul(f32(1 - lr*c.weightDecay))
+			}
+			m := zeroIfMissing(s, "exp_avg", p)
+			blend := m.Mul(f32(c.beta1)).Add(g.Mul(f32(1 - c.beta1)))
+			// sign(x), and 0 at 0.
+			sign := blend.Greater(f32(0)).Cast(tensor.Float32).Sub(blend.Less(f32(0)).Cast(tensor.Float32))
+			m = m.Mul(f32(c.beta2)).Add(g.Mul(f32(1 - c.beta2)))
+			return p.Sub(sign.Mul(f32(lr))), State{"exp_avg": m}
 		}
 	})
 }
