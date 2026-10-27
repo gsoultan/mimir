@@ -68,7 +68,7 @@ func ColSample(f float64) Option { return func(c *config) { c.colsample = f } }
 
 // PerNode sets how many features a forest draws at each node to choose a
 // split from. The default is the square root of the features for
-// Classification and a third of them for Regression.
+// Classification and every feature for Regression, as in scikit-learn.
 func PerNode(n int) Option { return func(c *config) { c.perNode = n } }
 
 // Bins sets the most bins each feature is sorted into, from 2 to 255. The
