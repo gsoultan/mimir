@@ -17,7 +17,7 @@ import (
 // lower Gini impurity; a Regression forest's leaves hold mean answers and
 // its splits lower squared error.
 func RandomForest(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Option) (*Model, error) {
-	perNode := max(1, int(math.Round(float64(d.Features)/3)))
+	perNode := d.Features
 	if task == tabular.Classification {
 		perNode = max(1, int(math.Round(math.Sqrt(float64(d.Features)))))
 	}
