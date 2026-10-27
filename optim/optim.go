@@ -51,7 +51,8 @@ type Optimizer struct {
 	scale  float64 // the factor the gradients carry, which Step divides out
 	steps  int
 	states []State
-	err    error // a configuration error, reported by Step
+	clip   float64 // the most the gradients' norm may be, or 0
+	err    error   // a configuration error, reported by Step
 }
 
 // New returns an optimizer that updates params with rule at learning rate
@@ -75,7 +76,7 @@ func (o *Optimizer) Params() []*tensor.Param { return slices.Clone(o.params) }
 // gives it o's state.
 func (o *Optimizer) Over(params []*tensor.Param) *Optimizer {
 	c := New(params, o.lr, o.rule)
-	c.scale, c.err = o.scale, cmp.Or(c.err, o.err)
+	c.scale, c.clip, c.err = o.scale, o.clip, cmp.Or(c.err, o.err)
 	if len(params) != len(o.params) {
 		c.err = fmt.Errorf("optim: %d parameters for an optimizer of %d: %w", len(params), len(o.params), tensor.ErrShape)
 	}
@@ -99,6 +100,19 @@ func (o *Optimizer) GradScale() float64 { return o.scale }
 // and costs no memory. The default is 1. A scale whose reciprocal is not
 // a positive, finite float32 is a configuration error that Step reports.
 func (o *Optimizer) SetGradScale(scale float64) { o.scale = scale }
+
+// ClipNorm returns the most the gradients' global norm may be, 0 for no
+// limit; see SetClipNorm.
+func (o *Optimizer) ClipNorm() float64 { return o.clip }
+
+// SetClipNorm limits the global L2 norm of the gradients, all parameters'
+// together, to n before each step, scaling them down alike when it is
+// larger, like torch.nn.utils.clip_grad_norm_: the guard against the one
+// huge step that throws away what a network learned, which RNNs,
+// transformers and reinforcement learning want. The norm is computed in
+// the step's own schedule, so it costs no extra pass or host read. 0, the
+// default, turns it off.
+func (o *Optimizer) SetClipNorm(n float64) { o.clip = n }
 
 // GradsFinite reports whether every gradient that Step would use is
 // finite. It sums the gradients in one schedule and tests the sum on the
@@ -160,9 +174,31 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		value *tensor.Tensor
 		state State
 	}
+	if o.clip < 0 || math.IsNaN(o.clip) {
+		return fmt.Errorf("optim: clip norm %v: %w", o.clip, tensor.ErrShape)
+	}
 	step := o.steps + 1
 	var updates []update
 	var targets, dsts []*tensor.Tensor
+	var factor *tensor.Tensor // the clipping's scale, when clipping
+	if o.clip > 0 {
+		var sq *tensor.Tensor
+		for _, p := range o.params {
+			if g := p.Grad(); g != nil && p.Trainable() {
+				g = g.Cast(tensor.Float32)
+				s := g.Mul(g).Sum()
+				if sq == nil {
+					sq = s
+				} else {
+					sq = sq.Add(s)
+				}
+			}
+		}
+		if sq != nil {
+			norm := sq.Sqrt().Mul(f32(1 / o.scale))
+			factor = f32(o.clip).Div(norm.Add(f32(1e-6))).Minimum(f32(1))
+		}
+	}
 	for i, p := range o.params {
 		g := p.Grad()
 		if g == nil || !p.Trainable() {
@@ -170,6 +206,9 @@ func (o *Optimizer) Step(ctx context.Context) error {
 		}
 		if o.scale != 1 {
 			g = g.Mul(f32(1 / o.scale))
+		}
+		if factor != nil {
+			g = g.Mul(factor.Cast(g.DType()))
 		}
 		cur := p.Value().Detach()
 		v, s := o.rule(o.lr, step, cur, g, o.states[i])
@@ -260,6 +299,7 @@ type config struct {
 	lr, momentum, dampening, weightDecay float64
 	beta1, beta2, eps, alpha             float64
 	nesterov, master                     bool
+	clip                                 float64
 	lrDecay, initial, rho                float64
 	momentumDecay                        float64
 	trust                                bool
@@ -290,6 +330,10 @@ func Eps(eps float64) Option { return func(c *config) { c.eps = eps } }
 
 // Alpha sets RMSprop's smoothing constant.
 func Alpha(a float64) Option { return func(c *config) { c.alpha = a } }
+
+// ClipNorm limits the gradients' global norm before each step; see
+// Optimizer.SetClipNorm.
+func ClipNorm(n float64) Option { return func(c *config) { c.clip = n } }
 
 // LRDecay sets Adagrad's learning rate decay: step t uses lr/(1+(t-1)·d).
 func LRDecay(d float64) Option { return func(c *config) { c.lrDecay = d } }
@@ -375,6 +419,7 @@ func build(params []*tensor.Param, c config, err error, rule func(c config) Rule
 		r = master(r)
 	}
 	o := New(params, c.lr, r)
+	o.clip = c.clip
 	if err != nil {
 		o.err = err
 	}

@@ -373,3 +373,36 @@ func TestRAdamRectifies(t *testing.T) {
 		}
 	}
 }
+
+func TestClipNorm(t *testing.T) {
+	// Gradients 2·(p - target) = (6, 8), norm 10, clipped to 1: (0.6, 0.8).
+	p := tensor.NewParam(tensor.FromSlice([]float32{3, 4}, 2))
+	opt := optim.SGD([]*tensor.Param{p}, optim.LR(1), optim.ClipNorm(1))
+	if err := p.Value().Mul(p.Value()).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := opt.Step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := p.Value().Data[float32](t.Context())
+	if math.Abs(float64(got[0])-2.4) > 1e-5 || math.Abs(float64(got[1])-3.2) > 1e-5 {
+		t.Errorf("after a clipped step %v, want [2.4 3.2]", got)
+	}
+	// A norm already below the limit is left alone.
+	opt.ZeroGrad()
+	opt.SetClipNorm(100)
+	if err := p.Value().Mul(p.Value()).Sum().Backward(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := opt.Step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = p.Value().Data[float32](t.Context())
+	if math.Abs(float64(got[0])+2.4) > 1e-4 {
+		t.Errorf("after an unclipped step %v, want [-2.4 -3.2]", got)
+	}
+	opt.SetClipNorm(-1)
+	if err := opt.Step(t.Context()); err == nil {
+		t.Error("stepped with a negative clip norm")
+	}
+}
