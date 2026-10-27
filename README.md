@@ -587,6 +587,39 @@ Four more packages learn from tables without a model of answers per row:
 k-means, mixtures, isolation forests and recommenders convert to an
 `nn.Module` like the trees and linear models do.
 
+## Pictures, text and picking a model
+
+Package `vision` builds ResNet-18, 34 and 50, MobileNetV2 and the Vision
+Transformer with torchvision's shapes and parameter counts, for photos
+or, with `vision.Small()`, pictures of 32 to 64 pixels. Package `text`
+has BERT's WordPiece tokenizer and BERT itself, in its base, mini and
+tiny sizes, and `text.BuildVocab` makes a vocabulary for one taught from
+scratch. Each model splits into `Features` and a linear head:
+`SetHead` starts a new head for other classes and `HeadParameters` are
+what an optimizer teaches to fine-tune the head alone, which is transfer
+learning from a model trained before.
+
+```go
+m := vision.ResNet18(10, vision.Small())
+opt := optim.AdamW(nn.Parameters(m), optim.LR(1e-3))
+// ... train it, then teach it new classes on its features:
+m.SetHead(3)
+head := optim.AdamW(m.HeadParameters(), optim.LR(1e-2))
+```
+
+`nn` has the layers these are built of: `Conv1d`, `Conv3d`,
+`ConvTranspose1d` and `ConvTranspose2d`, depthwise convolution,
+`GroupNorm`, `GlobalAvgPool` and `Upsample`.
+
+Package `automl` picks the best model for a table: it scores boosted
+trees, random forests and linear models with a range of settings by
+cross-validation, then fits the winner to the whole table.
+
+```go
+r, err := automl.Search(ctx, d, tabular.Classification, automl.Trials(20))
+fmt.Println(r.Winner, r.Metric) // e.g. "boost L2=5 LearningRate=0.1 ... 0.21 log loss"
+```
+
 ## Reinforcement learning
 
 `examples/rl/cartpole` simulates Gymnasium's CartPole-v1 in pure Go, and
@@ -745,12 +778,14 @@ read.
 | Sorting | `Sort`, `Argsort`, `TopK` (stable; NaN sorts last) |
 | Fourier | `FFT`, `IFFT`, `RFFT`, `IRFFT` (any length; complex numbers as a trailing axis of 2) |
 | Linear algebra | `Cholesky`, `TriangularSolve`, `Solve`, `Inv`, `Det`, `SlogDet`, `QR`, `SVD`, `Eigh` (batched, with gradients; on the CPU, so GPU tensors make a round trip) |
-| Convolution | `Conv2d` (stride, padding, dilation, groups), `MaxPool2d`, `AvgPool2d` |
+| Convolution | `Conv1d`, `Conv2d`, `Conv3d` (stride, padding, dilation, groups), `ConvTranspose1d`, `ConvTranspose2d`, `MaxPool2d`, `AvgPool2d` |
 | Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
 | Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `Donate`, `ErrDonated`, `FromBytes` over mapped files |
 | Devices | `CPUs`, `GPUs`, `NewGroup` with `AllReduce`, `Broadcast`, `AllGather`, `ReduceScatter`, `ReduceGrads`, `BroadcastParams` (CPU devices, or CUDA GPUs over NCCL) |
 | Sharding | `NewMesh`, `P`, `PartitionSpec` (`WithSections`), `Shard`, `WithSharding`, `Sharding`, `Param.Shard`, `Mesh.Traffic` |
-| Layers (`nn`) | `Linear`, `Conv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `Flatten`, `Cast` |
+| Layers (`nn`) | `Linear`, `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d`, `ConvTranspose2d`, `DepthwiseConv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `GroupNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `GlobalAvgPool`, `Upsample`, `Flatten`, `Cast` |
+| Pictures (`vision`) | `ResNet18`, `ResNet34`, `ResNet50`, `NewMobileNetV2`, `NewViT` (`ViTB16`, `ViTTiny`); `Features`, `SetHead`, `HeadParameters` |
+| Text (`text`) | WordPiece `Tokenizer`, `BuildVocab`, `NewBERT` (`BERTBase`, `BERTMini`, `BERTTiny`) |
 | Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
 | Graph layers (`nn`) | `Graph` (`Source`, `Target`, `Sum`, `Mean`, `Max`, `Softmax`, `Adjacency`), `GCNConv`, `SAGEConv`, `GATConv` |
 | Placement (`nn`) | `Replicate`, `Shard`, `Rules`, `FullyShard`, `TensorParallel` |
@@ -763,6 +798,7 @@ read.
 | Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax; early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
 | Unsupervised (`cluster`, `decompose`, `tree`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Silhouette`; `PCA`; `IsolationForest` |
 | Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`; `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
+| Model search (`automl`) | `Search` over boosted trees, forests and linear models, with trials, folds, time budgets and families |
 | Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -790,6 +826,9 @@ cluster/             k-means, Gaussian mixtures, DBSCAN and silhouettes
 decompose/           principal component analysis
 forecast/            forecasts of many series with one boosted-tree model
 recommend/           recommendations by matrix factorization
+automl/              picks and tunes the best model for a table
+vision/              ResNet, MobileNetV2 and ViT
+text/                WordPiece tokenizer and BERT
 backend/             Backend interface, DType, Op, View, Kernel, collectives
 backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives
 backend/metal/       Metal backend: Metal Performance Shaders and tensor operations, through purego
