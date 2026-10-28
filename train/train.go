@@ -80,6 +80,7 @@ type config struct {
 	parallel  []tensor.Device // the devices of DataParallel, or nil
 	mesh      *tensor.Mesh    // the mesh of Sharded, or nil
 	shardRule nn.ShardRule
+	precise   int // batches PreciseBatchNorm averages, or 0
 	configErr error
 }
 
@@ -194,6 +195,27 @@ func DynamicLossScale() Option {
 	return func(c *config) { c.scale, c.dynamic = initialLossScale, true }
 }
 
+// PreciseBatchNorm recomputes the running statistics of the model's
+// batch normalization layers after every epoch, before Eval and
+// Checkpoint: it runs the model in training mode over up to n batches of
+// the training data, without gradients, and sets each layer's running
+// mean and variance to the plain average of what those batches saw, as
+// precise BN does (Wu and Johnson, 2021). The running averages kept
+// while training follow weights that keep changing, so after few steps,
+// as on a small dataset, they can be far from what the trained model
+// sees, and it answers much worse in inference mode than in training; a
+// deep network of many normalized layers, such as a MobileNet, can
+// answer every example alike. Each pass costs a forward pass over n
+// batches. A model without batch normalization is left alone.
+func PreciseBatchNorm(n int) Option {
+	return func(c *config) {
+		c.precise = n
+		if n < 1 {
+			c.fail("precise batch norm over %d batches", n)
+		}
+	}
+}
+
 // OnEpoch calls f after every epoch. Returning ErrStop ends training; any
 // other error ends it with that error.
 func OnEpoch(f func(Epoch) error) Option {
@@ -288,6 +310,11 @@ func Fit(ctx context.Context, model nn.Module, opt *optim.Optimizer, ds data.Dat
 		if err != nil {
 			return stopped(err)
 		}
+		if c.precise > 0 {
+			if err := l.preciseBatchNorm(ctx, model, ds); err != nil {
+				return err
+			}
+		}
 		if c.eval != nil {
 			if stats.Metrics, err = Evaluate(ctx, model, c.eval, c.loss, c.metrics...); err != nil {
 				return err
@@ -375,6 +402,63 @@ func (l *loop) epoch(ctx context.Context, model nn.Module, opt *optim.Optimizer,
 		Steps:    opt.Steps(),
 		Duration: time.Since(began),
 	}, nil
+}
+
+// preciseBatchNorm sets the running statistics of model's batch
+// normalization layers to the average of up to c.precise batches of ds,
+// each in the chunks a training step uses.
+func (l *loop) preciseBatchNorm(ctx context.Context, model nn.Module, ds data.Dataset) error {
+	bns := nn.BatchNorms(model)
+	if len(bns) == 0 {
+		return nil
+	}
+	momenta := make([]float64, len(bns))
+	for i, b := range bns {
+		momenta[i] = b.Momentum
+	}
+	defer func() {
+		for i, b := range bns {
+			b.Momentum = momenta[i]
+		}
+	}()
+	nn.Train(model)
+	batches, passes := 0, 0
+	for b, err := range ds.All(ctx) {
+		if err != nil {
+			return err
+		}
+		if batches == l.c.precise {
+			break
+		}
+		batches++
+		x := b.X.To(l.dev)
+		if l.c.mesh != nil {
+			x = l.shard(b.X)
+		}
+		rows, chunk := l.chunks(x)
+		for lo := 0; lo < rows; lo += chunk {
+			cx := x
+			if chunk < rows {
+				cx = rowsOf(x, lo, min(lo+chunk, rows))
+			}
+			// The k-th pass weighs 1/k, so each ends as the plain average
+			// of the passes so far, and the first replaces what was there.
+			passes++
+			for _, b := range bns {
+				b.Momentum = 1 / float64(passes)
+			}
+			// Computing the statistics with the pass, rather than when
+			// next read, lets the pass's activations go.
+			stats := []*tensor.Tensor{model.Forward(cx)}
+			for _, b := range bns {
+				stats = append(stats, b.RunningMean.Value(), b.RunningVar.Value())
+			}
+			if err := tensor.Realize(ctx, stats...); err != nil {
+				return fmt.Errorf("train: precise batch norm: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // batch returns t on the device the model is on. A copy that To makes

@@ -108,6 +108,19 @@ func Train(m Module) { setTraining(m, true) }
 // through and batch normalization uses its running statistics.
 func Eval(m Module) { setTraining(m, false) }
 
+// BatchNorms returns every batch normalization layer reachable from m.
+func BatchNorms(m Module) []*BatchNorm {
+	var out []*BatchNorm
+	w := walker{seen: map[unsafe.Pointer]bool{}}
+	w.visit(reflect.ValueOf(m), "", func(_ string, v reflect.Value) bool {
+		if b, ok := v.Interface().(*BatchNorm); ok {
+			out = append(out, b)
+		}
+		return true
+	})
+	return out
+}
+
 func setTraining(m Module, on bool) {
 	w := walker{seen: map[unsafe.Pointer]bool{}}
 	w.visit(reflect.ValueOf(m), "", func(_ string, v reflect.Value) bool {
