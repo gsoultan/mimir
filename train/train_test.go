@@ -3,6 +3,7 @@ package train_test
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -168,5 +169,67 @@ func TestFitErrors(t *testing.T) {
 	}
 	if err := train.Fit(t.Context(), m, opt, ds, train.Loss(loss.CrossEntropy), train.Checkpoint(bad)); err == nil {
 		t.Error("resumed from a corrupt checkpoint")
+	}
+}
+
+// PreciseBatchNorm leaves each running statistic at the plain average of
+// what the batches it ran over saw, and the momentum as it was.
+func TestPreciseBatchNorm(t *testing.T) {
+	ctx := t.Context()
+	x, err := tensor.Randn(5, 120, 2).Mul(tensor.Scalar[float32](3)).Add(tensor.Scalar[float32](4)).Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := data.FromTensors(tensor.FromSlice(x, 120, 2), tensor.Zeros(tensor.Float32, 120, 2), data.BatchSize(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// want returns the average over the first n batches of each column's
+	// mean and unbiased variance.
+	want := func(n int) (mean, variance [2]float64) {
+		for b := range n {
+			for c := range 2 {
+				var s, q float64
+				for i := b * 40; i < (b+1)*40; i++ {
+					s += float64(x[2*i+c])
+				}
+				m := s / 40
+				for i := b * 40; i < (b+1)*40; i++ {
+					d := float64(x[2*i+c]) - m
+					q += d * d
+				}
+				mean[c] += m / float64(n)
+				variance[c] += q / 39 / float64(n)
+			}
+		}
+		return mean, variance
+	}
+	for _, n := range []int{2, 3, 10} {
+		bn := nn.NewBatchNorm1d(2)
+		err := train.Fit(ctx, bn, optim.SGD(nn.Parameters(bn), optim.LR(1e-9)), ds,
+			train.Loss(loss.MSE), train.PreciseBatchNorm(n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mean, variance := want(min(n, 3))
+		got := func(p *tensor.Param) []float32 {
+			v, err := p.Value().Data[float32](ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return v
+		}
+		gm, gv := got(bn.RunningMean), got(bn.RunningVar)
+		for c := range 2 {
+			if math.Abs(float64(gm[c])-mean[c]) > 1e-3 || math.Abs(float64(gv[c])-variance[c]) > 1e-2 {
+				t.Errorf("over %d batches, column %d: running mean %v var %v, want %v and %v", n, c, gm[c], gv[c], mean[c], variance[c])
+			}
+		}
+		if bn.Momentum != 0.1 {
+			t.Errorf("momentum left at %v", bn.Momentum)
+		}
+	}
+	if err := train.Fit(ctx, nn.NewBatchNorm1d(2), nil, ds, train.Loss(loss.MSE), train.PreciseBatchNorm(0)); !errors.Is(err, train.ErrConfig) {
+		t.Errorf("PreciseBatchNorm(0): %v", err)
 	}
 }
