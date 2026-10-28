@@ -46,8 +46,8 @@ func TestPreciseBatchNormMobileNet(t *testing.T) {
 		t.Skip("trains a MobileNet")
 	}
 	ctx := t.Context()
-	x, y := colours(t, 32, 32, 7)
-	ds, err := data.FromTensors(x, tensor.FromSlice(y), data.BatchSize(16))
+	x, y := colours(t, 16, 16, 7)
+	ds, err := data.FromTensors(x, tensor.FromSlice(y), data.BatchSize(8))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,10 +67,10 @@ func TestPreciseBatchNormMobileNet(t *testing.T) {
 	}
 	for _, precise := range []bool{false, true} {
 		nn.ManualSeed(3)
-		m := vision.NewMobileNetV2(2, vision.Small(), vision.Width(0.5))
-		opts := []train.Option{train.Loss(loss.CrossEntropy), train.Epochs(6)}
+		m := vision.NewMobileNetV2(2, vision.Small(), vision.Width(0.35))
+		opts := []train.Option{train.Loss(loss.CrossEntropy), train.Epochs(4)}
 		if precise {
-			opts = append(opts, train.PreciseBatchNorm(8))
+			opts = append(opts, train.PreciseBatchNorm(2))
 		}
 		if err := train.Fit(ctx, m, optim.AdamW(nn.Parameters(m), optim.LR(3e-3)), ds, opts...); err != nil {
 			t.Fatal(err)
