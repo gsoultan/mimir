@@ -16,11 +16,13 @@ import (
 // row's class one-hot, the fall in Gini impurity, as in a classification
 // tree.
 type grower struct {
-	b       *binned
-	k       int
-	g, h    []float32 // n×k, row by row
-	feats   []int     // the features the tree may split on
-	perNode int       // features to draw at each node, or 0 for all of feats
+	b *binned
+	k int
+	// gh holds each row's gradients, hessians and a count of one, a
+	// histogram bin's stride apart, as interleave lays them out.
+	gh      []float32
+	feats   []int // the features the tree may split on
+	perNode int   // features to draw at each node, or 0 for all of feats
 	rng     *rand.Rand
 	workers int
 	cfg     *config
@@ -29,13 +31,20 @@ type grower struct {
 	free    [][]float64
 	// leafOf, when not nil, is set to the leaf each grown row ends in.
 	leafOf []int32
-	og, oh []float32 // the gradients and hessians of a node's rows, in order
 	tmp    []int32
 }
 
+func (gr *grower) workerCount() int {
+	if gr.workers <= 0 {
+		return runtime.GOMAXPROCS(0)
+	}
+	return gr.workers
+}
+
 // stride is the length of one bin's sums: G and H for each output, then
-// the row count.
-func (gr *grower) stride() int { return 2*gr.k + 1 }
+// the row count, padded to a multiple of four so a bin is whole vector
+// registers and, for up to three outputs, one 32- or 64-byte line.
+func (gr *grower) stride() int { return (2*gr.k + 1 + 3) &^ 3 }
 
 type split struct {
 	gain     float64
@@ -48,16 +57,255 @@ type split struct {
 // grow grows a tree from rows, which it reorders.
 func (gr *grower) grow(rows []int32) Tree {
 	gr.t = Tree{}
-	k := gr.k
+	k, sz := gr.k, gr.stride()
 	sums := make([]float64, 2*k)
 	for _, r := range rows {
 		for j := range k {
-			sums[j] += float64(gr.g[int(r)*k+j])
-			sums[k+j] += float64(gr.h[int(r)*k+j])
+			sums[j] += float64(gr.gh[int(r)*sz+j])
+			sums[k+j] += float64(gr.gh[int(r)*sz+k+j])
 		}
 	}
-	gr.node(rows, nil, sums, 0)
+	if gr.perNode == 0 {
+		gr.levels(rows, sums)
+	} else {
+		gr.node(rows, nil, sums, 0)
+	}
 	return gr.t
+}
+
+// newNode adds a leaf whose rows' sums of G and H are sums, and returns
+// its id.
+func (gr *grower) newNode(sums []float64) int32 {
+	k := gr.k
+	id := int32(len(gr.t.Feature))
+	gr.t.Feature = append(gr.t.Feature, -1)
+	gr.t.Threshold = append(gr.t.Threshold, 0)
+	gr.t.MissingLeft = append(gr.t.MissingLeft, false)
+	gr.t.Left = append(gr.t.Left, -1)
+	gr.t.Right = append(gr.t.Right, -1)
+	for j := range k {
+		gr.t.Value = append(gr.t.Value, float32(-sums[j]/(sums[k+j]+gr.cfg.l2)))
+	}
+	return id
+}
+
+// A level node is a node of the level levels is growing: its rows are
+// rows[lo:hi] of the tree's rows.
+type levelNode struct {
+	lo, hi int
+	id     int32
+	sums   []float64
+	hist   []float64
+	// parent, when not nil, is the parent's histogram, from which this
+	// node's is found by taking away its sibling's.
+	parent  []float64
+	sibling int // the index of the sibling in the level
+	sp      split
+}
+
+// levels grows the tree from rows a level at a time, the way XGBoost's
+// depthwise growth does, and gives the same tree node grows: every node
+// of a level that may split has its histogram summed in one pass over
+// the level's rows, shared evenly among the workers whatever the size of
+// each node, and the nodes find and make their splits side by side. As
+// in node, the larger child's histogram is its parent's less the smaller
+// child's.
+func (gr *grower) levels(rows []int32, sums []float64) {
+	cfg, workers := gr.cfg, gr.workerCount()
+	level := []levelNode{{lo: 0, hi: len(rows), id: gr.newNode(sums), sums: sums}}
+	for depth := 0; len(level) > 0; depth++ {
+		// The nodes that may split.
+		var open []int
+		isOpen := make([]bool, len(level))
+		for i := range level {
+			n := &level[i]
+			if depth >= cfg.maxDepth || n.hi-n.lo < 2*cfg.minLeaf {
+				gr.leaf(rows[n.lo:n.hi], n.id)
+				continue
+			}
+			open = append(open, i)
+			isOpen[i] = true
+		}
+		// Sum the histograms of the open nodes that have no parent's to
+		// take theirs from, or are the smaller of two open siblings; the
+		// others' are their parent's less their sibling's.
+		var need []int
+		for _, i := range open {
+			n := &level[i]
+			if n.parent == nil || !isOpen[n.sibling] {
+				need = append(need, i)
+				continue
+			}
+			mine, theirs := n.hi-n.lo, level[n.sibling].hi-level[n.sibling].lo
+			if mine < theirs || (mine == theirs && i < n.sibling) {
+				need = append(need, i)
+			}
+		}
+		gr.levelHistograms(rows, level, need)
+		taken := make([]bool, len(level))
+		var derive []int
+		for _, i := range open {
+			if level[i].hist == nil {
+				derive = append(derive, i)
+				taken[i] = true
+			}
+		}
+		parallel(len(derive), workers, 1, func(lo, hi int) {
+			for _, i := range derive[lo:hi] {
+				n := &level[i]
+				for j, v := range level[n.sibling].hist {
+					n.parent[j] -= v
+				}
+				n.hist = n.parent
+			}
+		})
+		for i := range level {
+			// Release each parent's histogram that no child took over,
+			// once for the pair.
+			if n := &level[i]; n.parent != nil && i < n.sibling && !taken[i] && !taken[n.sibling] {
+				gr.release(n.parent)
+			}
+		}
+		for i := range level {
+			level[i].parent = nil
+		}
+		// Find each open node's best split, and send its rows left or right.
+		inner := 1
+		if len(open) < workers {
+			inner = workers
+		}
+		parallel(len(open), workers/inner, 1, func(lo, hi int) {
+			for _, i := range open[lo:hi] {
+				n := &level[i]
+				n.sp = gr.best(n.hist, gr.feats, n.sums, n.hi-n.lo, inner)
+			}
+		})
+		var split []int
+		for _, i := range open {
+			n := &level[i]
+			if n.sp.gain <= cfg.minGain {
+				gr.leaf(rows[n.lo:n.hi], n.id)
+				gr.release(n.hist)
+				n.hist = nil
+				continue
+			}
+			split = append(split, i)
+		}
+		mid := make([]int, len(level))
+		if len(split) < workers {
+			for _, i := range split {
+				n := &level[i]
+				mid[i] = n.lo + gr.partition(rows[n.lo:n.hi], n.sp)
+			}
+		} else {
+			parallel(len(split), workers, 1, func(lo, hi int) {
+				for _, i := range split[lo:hi] {
+					n := &level[i]
+					mid[i] = n.lo + partitionSerial(gr.b, rows[n.lo:n.hi], n.sp)
+				}
+			})
+		}
+		// The next level: each split node's two children, in order.
+		next := make([]levelNode, 0, 2*len(split))
+		k := gr.k
+		for _, i := range split {
+			n := &level[i]
+			sp := n.sp
+			gr.gain[sp.feature] += sp.gain
+			gr.t.Feature[n.id] = int32(sp.feature)
+			gr.t.Threshold[n.id] = gr.b.edges[sp.feature][sp.bin-1]
+			gr.t.MissingLeft[n.id] = sp.missLeft
+			rs := make([]float64, 2*k)
+			for j := range rs {
+				rs[j] = n.sums[j] - sp.left[j]
+			}
+			l, r := gr.newNode(sp.left), gr.newNode(rs)
+			gr.t.Left[n.id], gr.t.Right[n.id] = l, r
+			li := len(next)
+			next = append(next,
+				levelNode{lo: n.lo, hi: mid[i], id: l, sums: sp.left, parent: n.hist, sibling: li + 1},
+				levelNode{lo: mid[i], hi: n.hi, id: r, sums: rs, parent: n.hist, sibling: li})
+		}
+		for _, i := range open {
+			level[i].hist = nil
+		}
+		level = next
+	}
+}
+
+// levelHistograms sums the histograms of the nodes need of level, over
+// their rows, in one pass that the workers share evenly.
+func (gr *grower) levelHistograms(rows []int32, level []levelNode, need []int) {
+	if len(need) == 0 {
+		return
+	}
+	sz, workers := gr.stride(), gr.workerCount()
+	total := 0
+	for _, i := range need {
+		total += level[i].hi - level[i].lo
+	}
+	offs := gr.offsets(gr.feats)
+	const grain = 8192
+	work := min(workers, max(total/grain, 1))
+	// Each worker takes an equal run of the nodes' rows, laid end to end.
+	// A piece is the part of one node's rows that one worker sums: the
+	// first piece of a node sums into the node's histogram, the others
+	// into histograms of their own, added in afterwards.
+	type piece struct {
+		node   int // index into need
+		lo, hi int // rows of the node, from rows' start
+		at     int // where the piece starts end to end
+		hist   []float64
+	}
+	pieces := make([][]piece, work)
+	step := (total + work - 1) / work
+	var extra []piece
+	at := 0
+	for ni, i := range need {
+		n := &level[i]
+		n.hist = gr.allocDirty()
+		for lo := n.lo; lo < n.hi; {
+			w := at / step
+			hi := min(n.hi, lo+(w+1)*step-at)
+			p := piece{node: ni, lo: lo, hi: hi, at: at, hist: n.hist}
+			if lo != n.lo {
+				p.hist = gr.allocDirty()
+				extra = append(extra, p)
+			}
+			pieces[w] = append(pieces[w], p)
+			at += hi - lo
+			lo = hi
+		}
+	}
+	parallel(work, work, 1, func(wlo, whi int) {
+		for w := wlo; w < whi; w++ {
+			for _, p := range pieces[w] {
+				clear(p.hist)
+				addRows(p.hist, gr.b, gr.feats, offs, rows[p.lo:p.hi], gr.gh, sz)
+			}
+		}
+	})
+	// Add the extra pieces in, each node's in order, the nodes side by side.
+	var groups [][]piece
+	for i, p := range extra {
+		if i == 0 || p.node != extra[i-1].node {
+			groups = append(groups, nil)
+		}
+		groups[len(groups)-1] = append(groups[len(groups)-1], p)
+	}
+	parallel(len(groups), workers, 1, func(lo, hi int) {
+		for _, g := range groups[lo:hi] {
+			dst := level[need[g[0].node]].hist
+			for _, p := range g {
+				for j, v := range p.hist {
+					dst[j] += v
+				}
+			}
+		}
+	})
+	for _, p := range extra {
+		gr.release(p.hist)
+	}
 }
 
 // node grows the subtree of rows at depth, whose sums of G and H are
@@ -91,7 +339,7 @@ func (gr *grower) node(rows []int32, hist, sums []float64, depth int) int32 {
 	if hist == nil {
 		hist = gr.histogram(rows, feats)
 	}
-	best := gr.best(hist, feats, sums, len(rows))
+	best := gr.best(hist, feats, sums, len(rows), gr.workers)
 	if best.gain <= cfg.minGain {
 		gr.release(hist)
 		gr.leaf(rows, id)
@@ -134,15 +382,8 @@ func (gr *grower) node(rows []int32, hist, sums []float64, depth int) int32 {
 // histogram sums each row's gradients, hessians and count into its bin of
 // every feature in feats.
 func (gr *grower) histogram(rows []int32, feats []int) []float64 {
-	k := gr.k
-	// Gather the rows' gradients once, so they are read in order.
-	gr.og, gr.oh = slices.Grow(gr.og[:0], len(rows)*k)[:len(rows)*k], slices.Grow(gr.oh[:0], len(rows)*k)[:len(rows)*k]
-	parallel(len(rows), gr.workers, 16384, func(lo, hi int) {
-		for i, r := range rows[lo:hi] {
-			copy(gr.og[(lo+i)*k:], gr.g[int(r)*k:int(r)*k+k])
-			copy(gr.oh[(lo+i)*k:], gr.h[int(r)*k:int(r)*k+k])
-		}
-	})
+	sz := gr.stride()
+	offs := gr.offsets(feats)
 	const grain = 8192
 	work := min(max(gr.workers, 1), max(len(rows)/grain, 1))
 	if gr.workers <= 0 {
@@ -157,7 +398,7 @@ func (gr *grower) histogram(rows []int32, feats []int) []float64 {
 			w = 1
 		}
 		parallel(len(feats), w, 4, func(lo, hi int) {
-			gr.accumulate(hist, rows, gr.og, gr.oh, feats[lo:hi])
+			addRows(hist, gr.b, feats[lo:hi], offs[lo:hi], rows, gr.gh, sz)
 		})
 		return hist
 	}
@@ -171,7 +412,7 @@ func (gr *grower) histogram(rows []int32, feats []int) []float64 {
 	var wg sync.WaitGroup
 	for w := range work {
 		lo, hi := min(w*step, len(rows)), min((w+1)*step, len(rows))
-		wg.Go(func() { gr.accumulate(parts[w], rows[lo:hi], gr.og[lo*k:hi*k], gr.oh[lo*k:hi*k], feats) })
+		wg.Go(func() { addRows(parts[w], gr.b, feats, offs, rows[lo:hi], gr.gh, sz) })
 	}
 	wg.Wait()
 	for _, p := range parts[1:] {
@@ -183,54 +424,33 @@ func (gr *grower) histogram(rows []int32, feats []int) []float64 {
 	return hist
 }
 
-// accumulate adds rows, whose gradients and hessians are og and oh, into
-// hist for the features in feats.
-func (gr *grower) accumulate(hist []float64, rows []int32, og, oh []float32, feats []int) {
-	b, k, s := gr.b, gr.k, gr.stride()
-	f, off := b.f, b.off
-	all := len(feats) == f // then feats[j] is j
-	if k == 1 {
-		oh = oh[:len(og)]
-		for i, r := range rows {
-			row := b.bins[int(r)*f : int(r)*f+f]
-			g, h := float64(og[i]), float64(oh[i])
-			if all {
-				off := off[:len(row)]
-				for j, bn := range row {
-					e := (off[j] + int(bn)) * 3
-					c := hist[e : e+3 : e+3]
-					c[0] += g
-					c[1] += h
-					c[2]++
-				}
-				continue
-			}
-			for _, j := range feats {
-				e := (off[j] + int(row[j])) * 3
-				hist[e] += g
-				hist[e+1] += h
-				hist[e+2]++
-			}
-		}
-		return
+// interleave lays out the gradients g and hessians h of k outputs a row
+// at a time, a stride of sz apart: the row's gradients, its hessians, a
+// count of one, and zeros, as a histogram bin holds them.
+func interleave(g, h []float32, k, sz int) []float32 {
+	n := len(g) / k
+	gh := make([]float32, n*sz)
+	for i := range n {
+		d := gh[i*sz : i*sz+sz]
+		copy(d, g[i*k:i*k+k])
+		copy(d[k:], h[i*k:i*k+k])
+		d[2*k] = 1
 	}
-	for i, r := range rows {
-		row := b.bins[int(r)*f : int(r)*f+f]
-		g, h := og[i*k:i*k+k], oh[i*k:i*k+k]
-		for _, j := range feats {
-			e := (off[j] + int(row[j])) * s
-			for o := range k {
-				hist[e+o] += float64(g[o])
-				hist[e+k+o] += float64(h[o])
-			}
-			hist[e+2*k]++
-		}
+	return gh
+}
+
+// offsets returns where in a histogram the bins of each of feats start.
+func (gr *grower) offsets(feats []int) []int {
+	offs := make([]int, len(feats))
+	for i, j := range feats {
+		offs[i] = gr.b.off[j]
 	}
+	return offs
 }
 
 // best finds the split of most gain on any feature of feats, given the
 // node's histogram, its sums of G and H and its row count.
-func (gr *grower) best(hist []float64, feats []int, sums []float64, count int) split {
+func (gr *grower) best(hist []float64, feats []int, sums []float64, count, workers int) split {
 	k, s, cfg := gr.k, gr.stride(), gr.cfg
 	score := func(v []float64) float64 {
 		var sc float64
@@ -239,68 +459,29 @@ func (gr *grower) best(hist []float64, feats []int, sums []float64, count int) s
 		}
 		return sc
 	}
-	weight := func(v []float64) float64 {
-		var w float64
-		for j := range k {
-			w += v[k+j]
-		}
-		return w
-	}
 	total := make([]float64, s)
 	copy(total, sums)
 	total[2*k] = float64(count)
 	parent := score(total)
 	results := make([]split, len(feats))
-	work := gr.workers
+	work := workers
 	if count < 1024 {
 		work = 1
 	}
 	parallel(len(feats), work, 4, func(lo, hi int) {
-		cum, left, right := make([]float64, s), make([]float64, s), make([]float64, s)
+		left, right := make([]float64, s), make([]float64, s)
 		for fi := lo; fi < hi; fi++ {
 			j := feats[fi]
 			base := gr.b.off[j] * s
 			if k == 1 {
-				results[fi] = gr.best1(hist[base:base+gr.b.nb[j]*3], j, total, parent)
+				results[fi] = gr.best1(hist[base:base+gr.b.nb[j]*s], j, total, parent)
 				continue
 			}
-			miss := hist[base : base+s]
-			clear(cum)
-			best := split{feature: j}
-			try := func(bin int, missLeft bool) {
-				for i := range s {
-					left[i] = cum[i]
-					if missLeft {
-						left[i] += miss[i]
-					}
-					right[i] = total[i] - left[i]
-				}
-				if left[2*k] < float64(cfg.minLeaf) || right[2*k] < float64(cfg.minLeaf) ||
-					weight(left) < cfg.minWeight || weight(right) < cfg.minWeight {
-					return
-				}
-				if g := score(left) + score(right) - parent; g > best.gain {
-					best = split{gain: g, feature: j, bin: bin, missLeft: missLeft, left: slices.Clone(left[:2*k])}
-				}
+			if k == 3 {
+				results[fi] = gr.best3(hist[base:base+gr.b.nb[j]*s], j, total, parent)
+				continue
 			}
-			for bin := 1; bin < gr.b.nb[j]-1; bin++ {
-				e := hist[base+bin*s : base+bin*s+s]
-				if e[2*k] == 0 {
-					continue
-				}
-				for i := range s {
-					cum[i] += e[i]
-				}
-				if miss[2*k] > 0 {
-					try(bin, true)
-					try(bin, false)
-				} else {
-					// No row of this node is missing the feature: send
-					// missing values with the larger side.
-					try(bin, cum[2*k] >= total[2*k]-cum[2*k])
-				}
-			}
-			results[fi] = best
+			results[fi] = gr.bestK(hist[base:base+gr.b.nb[j]*s], j, total, parent, left, right)
 		}
 	})
 	var best split
@@ -315,26 +496,12 @@ func (gr *grower) best(hist []float64, feats []int, sums []float64, count int) s
 // partition reorders rows so those that sp sends left come first, and
 // returns how many do.
 func (gr *grower) partition(rows []int32, sp split) int {
-	bins, f := gr.b.bins[sp.feature:], gr.b.f
-	goesLeft := func(r int32) bool {
-		bn := bins[int(r)*f]
-		return (bn == 0 && sp.missLeft) || (bn != 0 && int(bn) <= sp.bin)
-	}
 	const grain = 32768
 	if len(rows) < 2*grain || gr.workers == 1 {
-		lo, hi := 0, len(rows)
-		for lo < hi {
-			if goesLeft(rows[lo]) {
-				lo++
-			} else {
-				hi--
-				rows[lo], rows[hi] = rows[hi], rows[lo]
-			}
-		}
-		return lo
+		return partitionSerial(gr.b, rows, sp)
 	}
-	// Each goroutine counts, then copies, its run of rows to the left
-	// and right of where the runs before it end.
+	// Each goroutine partitions its run of rows in place, then the runs'
+	// left and right parts are copied together, lefts first.
 	work := gr.workers
 	if work <= 0 {
 		work = runtime.GOMAXPROCS(0)
@@ -345,11 +512,7 @@ func (gr *grower) partition(rows []int32, sp split) int {
 	var wg sync.WaitGroup
 	for w := range work {
 		wg.Go(func() {
-			for _, r := range rows[min(w*step, len(rows)):min((w+1)*step, len(rows))] {
-				if goesLeft(r) {
-					lefts[w]++
-				}
-			}
+			lefts[w] = partitionSerial(gr.b, rows[min(w*step, len(rows)):min((w+1)*step, len(rows))], sp)
 		})
 	}
 	wg.Wait()
@@ -360,24 +523,34 @@ func (gr *grower) partition(rows []int32, sp split) int {
 	gr.tmp = slices.Grow(gr.tmp[:0], len(rows))[:len(rows)]
 	l, r := 0, total
 	for w := range work {
+		lo, hi := min(w*step, len(rows)), min((w+1)*step, len(rows))
 		lw, rw := l, r
 		l += lefts[w]
-		r += min((w+1)*step, len(rows)) - min(w*step, len(rows)) - lefts[w]
+		r += hi - lo - lefts[w]
 		wg.Go(func() {
-			for _, row := range rows[min(w*step, len(rows)):min((w+1)*step, len(rows))] {
-				if goesLeft(row) {
-					gr.tmp[lw] = row
-					lw++
-				} else {
-					gr.tmp[rw] = row
-					rw++
-				}
-			}
+			copy(gr.tmp[lw:], rows[lo:lo+lefts[w]])
+			copy(gr.tmp[rw:], rows[lo+lefts[w]:hi])
 		})
 	}
 	wg.Wait()
-	copy(rows, gr.tmp)
+	parallel(len(rows), work, grain, func(lo, hi int) { copy(rows[lo:hi], gr.tmp[lo:hi]) })
 	return total
+}
+
+// partitionSerial is partition on one goroutine.
+func partitionSerial(b *binned, rows []int32, sp split) int {
+	bins, f := b.bins[sp.feature:], b.f
+	lo, hi := 0, len(rows)
+	for lo < hi {
+		bn := bins[int(rows[lo])*f]
+		if (bn == 0 && sp.missLeft) || (bn != 0 && int(bn) <= sp.bin) {
+			lo++
+		} else {
+			hi--
+			rows[lo], rows[hi] = rows[hi], rows[lo]
+		}
+	}
+	return lo
 }
 
 // leaf records that rows end in leaf id.
@@ -400,10 +573,127 @@ func (gr *grower) alloc() []float64 {
 	return make([]float64, n)
 }
 
+// allocDirty is alloc without the clearing, for a histogram its user
+// clears.
+func (gr *grower) allocDirty() []float64 {
+	if l := len(gr.free); l > 0 {
+		h := gr.free[l-1]
+		gr.free = gr.free[:l-1]
+		return h
+	}
+	return make([]float64, gr.b.total*gr.stride())
+}
+
 func (gr *grower) release(h []float64) {
 	if h != nil {
 		gr.free = append(gr.free, h)
 	}
+}
+
+// bestK is best's search of one feature for more than one output, given
+// the feature's bins h, a stride of sums each, and two stride-long
+// scratch slices.
+func (gr *grower) bestK(h []float64, j int, total []float64, parent float64, left, right []float64) split {
+	k, s, cfg := gr.k, gr.stride(), gr.cfg
+	l2, minLeaf, minWeight := cfg.l2, float64(cfg.minLeaf), cfg.minWeight
+	miss := h[:s:s]
+	cum := make([]float64, s)
+	best := split{feature: j}
+	var bestLeft []float64
+	try := func(bin int, missLeft bool) {
+		for i := range s {
+			left[i] = cum[i]
+			if missLeft {
+				left[i] += miss[i]
+			}
+			right[i] = total[i] - left[i]
+		}
+		if left[2*k] < minLeaf || right[2*k] < minLeaf {
+			return
+		}
+		var wl, wr, sl, sr float64
+		for o := range k {
+			wl += left[k+o]
+			wr += right[k+o]
+		}
+		if wl < minWeight || wr < minWeight {
+			return
+		}
+		for o := range k {
+			sl += left[o] * left[o] / (left[k+o] + l2)
+		}
+		for o := range k {
+			sr += right[o] * right[o] / (right[k+o] + l2)
+		}
+		if g := sl + sr - parent; g > best.gain {
+			best = split{gain: g, feature: j, bin: bin, missLeft: missLeft}
+			bestLeft = append(bestLeft[:0], left[:2*k]...)
+		}
+	}
+	for bin := 1; bin < len(h)/s-1; bin++ {
+		e := h[bin*s : bin*s+s : bin*s+s]
+		if e[2*k] == 0 {
+			continue
+		}
+		for i, v := range e {
+			cum[i] += v
+		}
+		if miss[2*k] > 0 {
+			try(bin, true)
+			try(bin, false)
+		} else {
+			// No row of this node is missing the feature: send
+			// missing values with the larger side.
+			try(bin, cum[2*k] >= total[2*k]-cum[2*k])
+		}
+	}
+	best.left = bestLeft
+	return best
+}
+
+// best3 is bestK for three outputs, written out so its sums stay in
+// registers; it adds in the same order, so it finds the same split.
+func (gr *grower) best3(h []float64, j int, total []float64, parent float64) split {
+	cfg := gr.cfg
+	l2, minLeaf, minWeight := cfg.l2, float64(cfg.minLeaf), cfg.minWeight
+	t := total[:7:7]
+	m := h[:7:7]
+	var c0, c1, c2, c3, c4, c5, c6 float64
+	best := split{feature: j}
+	var b0, b1, b2, b3, b4, b5 float64
+	try := func(bin int, missLeft bool) {
+		g0, g1, g2, w0, w1, w2, n := c0, c1, c2, c3, c4, c5, c6
+		if missLeft {
+			g0, g1, g2, w0, w1, w2, n = g0+m[0], g1+m[1], g2+m[2], w0+m[3], w1+m[4], w2+m[5], n+m[6]
+		}
+		rg0, rg1, rg2, rw0, rw1, rw2, rn := t[0]-g0, t[1]-g1, t[2]-g2, t[3]-w0, t[4]-w1, t[5]-w2, t[6]-n
+		if n < minLeaf || rn < minLeaf || (w0+w1)+w2 < minWeight || (rw0+rw1)+rw2 < minWeight {
+			return
+		}
+		sl := (g0*g0/(w0+l2) + g1*g1/(w1+l2)) + g2*g2/(w2+l2)
+		sr := (rg0*rg0/(rw0+l2) + rg1*rg1/(rw1+l2)) + rg2*rg2/(rw2+l2)
+		if g := sl + sr - parent; g > best.gain {
+			best = split{gain: g, feature: j, bin: bin, missLeft: missLeft}
+			b0, b1, b2, b3, b4, b5 = g0, g1, g2, w0, w1, w2
+		}
+	}
+	for bin := 1; bin < len(h)/8-1; bin++ {
+		e := h[bin*8 : bin*8+7 : bin*8+7]
+		if e[6] == 0 {
+			continue
+		}
+		c0, c1, c2, c3, c4, c5, c6 = c0+e[0], c1+e[1], c2+e[2], c3+e[3], c4+e[4], c5+e[5], c6+e[6]
+		if m[6] > 0 {
+			try(bin, true)
+			try(bin, false)
+		} else {
+			try(bin, c6 >= t[6]-c6)
+		}
+	}
+	if best.gain > 0 {
+		best.left = []float64{b0, b1, b2, b3, b4, b5}
+	}
+	return best
 }
 
 // best1 is best's search of one feature for one output, given the
@@ -424,13 +714,13 @@ func (gr *grower) best1(h []float64, j int, total []float64, parent float64) spl
 			best = split{gain: g, feature: j, bin: bin, missLeft: missLeft, left: []float64{lg, lh}}
 		}
 	}
-	for bin := 1; bin < len(h)/3-1; bin++ {
-		if h[bin*3+2] == 0 {
+	for bin := 1; bin < len(h)/4-1; bin++ {
+		if h[bin*4+2] == 0 {
 			continue
 		}
-		cg += h[bin*3]
-		ch += h[bin*3+1]
-		cc += h[bin*3+2]
+		cg += h[bin*4]
+		ch += h[bin*4+1]
+		cc += h[bin*4+2]
 		switch {
 		case mc > 0:
 			try(bin, cg+mg, ch+mh, cc+mc, true)
