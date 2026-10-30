@@ -52,8 +52,9 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 	m.Base = base(m, d.Y)
 
 	b := bin(d, c.bins, rng, c.workers)
-	gr := &grower{b: b, k: k, g: make([]float32, n*k), h: make([]float32, n*k), rng: rng,
-		workers: c.workers, cfg: c, gain: make([]float64, f)}
+	gr := &grower{b: b, k: k, rng: rng, workers: c.workers, cfg: c, gain: make([]float64, f)}
+	sz := gr.stride()
+	gr.gh = interleave(make([]float32, n*k), make([]float32, n*k), k, sz)
 	if c.subsample == 1 {
 		gr.leafOf = make([]int32, n)
 	}
@@ -77,7 +78,7 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		gradients(m, raw, d.Y, gr.g, gr.h)
+		gradients(m, raw, d.Y, gr.gh, sz, c.workers)
 		rows = rows[:0]
 		if c.subsample < 1 {
 			for _, r := range all {
@@ -101,12 +102,15 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		m.Trees = append(m.Trees, t)
 		if gr.leafOf != nil {
 			// Every row grew the tree, so each knows its leaf.
-			for i, l := range gr.leafOf {
-				v := t.Value[int(l)*k : int(l)*k+k]
-				for j, vj := range v {
-					raw[i*k+j] += m.Scale * vj
+			parallel(n, c.workers, 16384, func(lo, hi int) {
+				for i := lo; i < hi; i++ {
+					l := gr.leafOf[i]
+					v := t.Value[int(l)*k : int(l)*k+k]
+					for j, vj := range v {
+						raw[i*k+j] += m.Scale * vj
+					}
 				}
-			}
+			})
 		} else {
 			add(m, &t, d.X, raw, c.workers)
 		}
@@ -187,33 +191,36 @@ func add(m *Model, t *Tree, x []float32, raw []float32, workers int) {
 	})
 }
 
-// gradients sets g and h to the gradient and hessian of m's loss at raw.
-func gradients(m *Model, raw, y, g, h []float32) {
+// gradients sets the gradients and hessians of m's loss at raw in gh, as
+// interleave lays them out with stride sz, on up to workers goroutines.
+func gradients(m *Model, raw, y, gh []float32, sz, workers int) {
 	k := m.Outputs
-	switch m.Link {
-	case Identity:
-		for i, v := range raw {
-			g[i], h[i] = v-y[i], 1
-		}
-	case Sigmoid:
-		for i, v := range raw {
-			p := sigmoid(v)
-			g[i], h[i] = p-y[i], max(p*(1-p), 1e-6)
-		}
-	case Softmax:
-		p := make([]float32, k)
-		for i := range len(y) {
-			copy(p, raw[i*k:(i+1)*k])
-			softmax(p)
-			for j, pj := range p {
-				t := float32(0)
-				if int(y[i]) == j {
-					t = 1
+	parallel(len(y), workers, 16384, func(lo, hi int) {
+		switch m.Link {
+		case Identity:
+			for i := lo; i < hi; i++ {
+				gh[i*sz], gh[i*sz+1] = raw[i]-y[i], 1
+			}
+		case Sigmoid:
+			for i := lo; i < hi; i++ {
+				p := sigmoid(raw[i])
+				gh[i*sz], gh[i*sz+1] = p-y[i], max(p*(1-p), 1e-6)
+			}
+		case Softmax:
+			p := make([]float32, k)
+			for i := lo; i < hi; i++ {
+				copy(p, raw[i*k:(i+1)*k])
+				softmax(p)
+				for j, pj := range p {
+					t := float32(0)
+					if int(y[i]) == j {
+						t = 1
+					}
+					gh[i*sz+j], gh[i*sz+k+j] = pj-t, max(pj*(1-pj), 1e-6)
 				}
-				g[i*k+j], h[i*k+j] = pj-t, max(pj*(1-pj), 1e-6)
 			}
 		}
-	}
+	})
 }
 
 // logLoss returns m's mean loss at raw for answers y: squared error for
