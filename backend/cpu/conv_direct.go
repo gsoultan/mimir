@@ -24,8 +24,11 @@ const directMaxTaps = 320
 
 // directPositions bounds the output positions, over every item, of a
 // forward convolution of many channels that runs as a direct one rather
-// than Winograd's, whose transforms of the weights and the tiles' edges
-// cost more than they save on few positions.
+// than Winograd's. Where the CPU transforms Winograd's weights in vector
+// registers (winoWeightsPanel), Winograd's was measured faster down to one
+// item of 7×7, and the backend's init sets this to 0; with the Go
+// transform, the direct convolution wins on one 14×14 image by a third.
+// The tests set it to compare the two.
 var directPositions = 2048
 
 // directConv is a 2-D convolution of stride 1 of N items of G groups of C

@@ -3,6 +3,7 @@ package llm_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
@@ -290,5 +291,54 @@ func TestEmbedding(t *testing.T) {
 	}
 	if _, err := m.Embedding(ctx, []int32{int32(m.Config.Vocab)}); err == nil {
 		t.Error("embedding of a token past the vocabulary")
+	}
+}
+
+// TestStepsMatchForward checks the steps that decode one token at a time
+// against the forward pass over the whole sequence, at positions on both
+// sides of a step's window growing, with the weights quantized and not,
+// and after a parameter's value changes under the recorded steps. With
+// quantized weights a step and the forward pass quantize the activations
+// in blocks of different sizes, and agree only to a few percent.
+func TestStepsMatchForward(t *testing.T) {
+	for _, tc := range models {
+		for _, deq := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/deq=%v", tc.name, deq), func(t *testing.T) {
+				f := open(t, tc.path)
+				m := load(t, f, deq)
+				seq := make([]int32, 300)
+				for i := range seq {
+					seq[i] = int32((i*37 + 11) % m.Config.Vocab)
+				}
+				vocab := m.Config.Vocab
+				tol := 1e-4
+				if !deq {
+					tol = 3e-2
+				}
+				want := forward(t, m, seq)
+				caches := m.NewCaches(len(seq))
+				for i, id := range seq {
+					if i == 200 {
+						// The model's norm takes a new value, equal to the
+						// old: the steps must read the new one.
+						p := m.Norm.Weight
+						if err := p.Set(p.Value().Mul(tensor.Scalar[float32](1))); err != nil {
+							t.Fatal(err)
+						}
+					}
+					l, err := m.Logits(t.Context(), []int32{id}, caches, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					switch i {
+					case 0, 1, 199, 200, 254, 255, 256, 257, 299:
+						near(t, fmt.Sprintf("step %d", i), data(t, l), want[i*vocab:(i+1)*vocab], tol)
+					}
+				}
+				if caches[0].Len() != len(seq) {
+					t.Errorf("caches hold %d positions, want %d", caches[0].Len(), len(seq))
+				}
+			})
+		}
 	}
 }

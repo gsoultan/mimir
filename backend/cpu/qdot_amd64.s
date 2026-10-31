@@ -213,7 +213,7 @@ DATA q6kScaleShuffle<>+126(SB)/2, $0x0f0e
 GLOBL q6kScaleShuffle<>(SB), RODATA|NOPTR, $128
 
 // func qdotQ8_0AVX2x1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x1(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -226,6 +226,7 @@ TEXT ·qdotQ8_0AVX2x1(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x1_loop:
 	VMOVDQU      2(CX), Y2
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y2, Y2, Y3
 	MOVWLZX      (CX), BX
 	VMOVD        BX, X4
@@ -259,7 +260,7 @@ qdotQ8_0AVX2x1_done:
 	RET
 
 // func qdotQ8_0AVX2x2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x2(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -275,6 +276,7 @@ TEXT ·qdotQ8_0AVX2x2(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x2_loop:
 	VMOVDQU      2(CX), Y3
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y3, Y3, Y4
 	MOVWLZX      (CX), SI
 	VMOVD        SI, X5
@@ -326,7 +328,7 @@ qdotQ8_0AVX2x2_done:
 	RET
 
 // func qdotQ8_0AVX2x3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x3(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -344,6 +346,7 @@ TEXT ·qdotQ8_0AVX2x3(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x3_loop:
 	VMOVDQU      2(CX), Y4
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y4, Y4, Y5
 	MOVWLZX      (CX), DI
 	VMOVD        DI, X6
@@ -413,7 +416,7 @@ qdotQ8_0AVX2x3_done:
 	RET
 
 // func qdotQ8_0AVX2x4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x4(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -433,6 +436,7 @@ TEXT ·qdotQ8_0AVX2x4(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x4_loop:
 	VMOVDQU      2(CX), Y5
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y5, Y5, Y6
 	MOVWLZX      (CX), R8
 	VMOVD        R8, X7
@@ -1982,6 +1986,1490 @@ qdotQ6KAVX2x4_loop:
 	JNZ          qdotQ6KAVX2x4_loop
 
 qdotQ6KAVX2x4_done:
+	MOVQ   out+32(FP), AX
+	MOVQ   ldo+40(FP), CX
+	SHLQ   $0x02, CX
+	VMOVSS X0, (AX)
+	ADDQ   CX, AX
+	VMOVSS X1, (AX)
+	ADDQ   CX, AX
+	VMOVSS X2, (AX)
+	ADDQ   CX, AX
+	VMOVSS X3, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ4KAVX2Px1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ4KAVX2Px1(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	VXORPS X0, X0, X0
+	TESTQ  AX, AX
+	JZ     qdotQ4KAVX2Px1_done
+
+qdotQ4KAVX2Px1_loop:
+	PREFETCHT0   2176(CX)
+	MOVL         4(CX), BX
+	MOVL         8(CX), SI
+	MOVL         12(CX), DI
+	MOVL         BX, R8
+	SHRL         $0x06, R8
+	ANDL         $0x03030303, R8
+	SHLL         $0x04, R8
+	MOVL         DI, R9
+	ANDL         $0x0f0f0f0f, R9
+	ORL          R8, R9
+	SHLQ         $0x20, R9
+	ANDL         $0x3f3f3f3f, BX
+	ORQ          BX, R9
+	MOVL         SI, R8
+	SHRL         $0x06, R8
+	ANDL         $0x03030303, R8
+	SHLL         $0x04, R8
+	MOVL         DI, BX
+	SHRL         $0x04, BX
+	ANDL         $0x0f0f0f0f, BX
+	ORL          R8, BX
+	SHLQ         $0x20, BX
+	ANDL         $0x3f3f3f3f, SI
+	ORQ          SI, BX
+	VMOVQ        R9, X1
+	VPMOVZXBW    X1, X1
+	VINSERTI128  $0x01, X1, Y1, Y1
+	VPXOR        Y2, Y2, Y2
+	VMOVDQU      16(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y4
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VPSHUFB      q4kScaleShuffle<>+0(SB), Y1, Y5
+	VPSHUFB      q4kScaleShuffle<>+32(SB), Y1, Y6
+	VPMADDUBSW   4(DX), Y4, Y4
+	VPMADDWD     Y5, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VPMADDUBSW   36(DX), Y3, Y4
+	VPMADDWD     Y6, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VMOVDQU      48(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y4
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VPSHUFB      q4kScaleShuffle<>+64(SB), Y1, Y5
+	VPSHUFB      q4kScaleShuffle<>+96(SB), Y1, Y6
+	VPMADDUBSW   68(DX), Y4, Y4
+	VPMADDWD     Y5, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VPMADDUBSW   100(DX), Y3, Y4
+	VPMADDWD     Y6, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VMOVDQU      80(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y4
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VPSHUFB      q4kScaleShuffle<>+128(SB), Y1, Y5
+	VPSHUFB      q4kScaleShuffle<>+160(SB), Y1, Y6
+	VPMADDUBSW   132(DX), Y4, Y4
+	VPMADDWD     Y5, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VPMADDUBSW   164(DX), Y3, Y4
+	VPMADDWD     Y6, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VMOVDQU      112(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y4
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VPSHUFB      q4kScaleShuffle<>+192(SB), Y1, Y5
+	VPSHUFB      q4kScaleShuffle<>+224(SB), Y1, Y6
+	VPMADDUBSW   196(DX), Y4, Y4
+	VPMADDWD     Y5, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VPMADDUBSW   228(DX), Y3, Y4
+	VPMADDWD     Y6, Y4, Y4
+	VPADDD       Y4, Y2, Y2
+	VMOVQ        BX, X3
+	VPUNPCKLBW   X3, X3, X3
+	VPMOVZXBW    X3, Y3
+	VMOVD        (CX), X1
+	VCVTPH2PS    X1, X1
+	VPMADDWD     260(DX), Y3, Y3
+	VPHADDD      Y3, Y2, Y2
+	VEXTRACTI128 $0x01, Y2, X3
+	VPADDD       X3, X2, X3
+	VPHADDD      X3, X3, X3
+	VCVTDQ2PS    X3, X3
+	VBROADCASTSS (DX), X2
+	VMULPS       X1, X2, X2
+	VMULPS       X2, X3, X3
+	VADDPS       X3, X0, X0
+	ADDQ         $0x00000124, DX
+	ADDQ         $0x00000090, CX
+	DECQ         AX
+	JNZ          qdotQ4KAVX2Px1_loop
+
+qdotQ4KAVX2Px1_done:
+	VMOVSHDUP X0, X1
+	VSUBSS    X1, X0, X0
+	MOVQ      out+32(FP), AX
+	MOVQ      ldo+40(FP), CX
+	SHLQ      $0x02, CX
+	VMOVSS    X0, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ4KAVX2Px2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ4KAVX2Px2(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	MOVQ   xstride+24(FP), BX
+	LEAQ   (DX)(BX*1), BX
+	VXORPS X0, X0, X0
+	VXORPS X1, X1, X1
+	TESTQ  AX, AX
+	JZ     qdotQ4KAVX2Px2_done
+
+qdotQ4KAVX2Px2_loop:
+	PREFETCHT0   2176(CX)
+	MOVL         4(CX), SI
+	MOVL         8(CX), DI
+	MOVL         12(CX), R8
+	MOVL         SI, R9
+	SHRL         $0x06, R9
+	ANDL         $0x03030303, R9
+	SHLL         $0x04, R9
+	MOVL         R8, R10
+	ANDL         $0x0f0f0f0f, R10
+	ORL          R9, R10
+	SHLQ         $0x20, R10
+	ANDL         $0x3f3f3f3f, SI
+	ORQ          SI, R10
+	MOVL         DI, R9
+	SHRL         $0x06, R9
+	ANDL         $0x03030303, R9
+	SHLL         $0x04, R9
+	MOVL         R8, SI
+	SHRL         $0x04, SI
+	ANDL         $0x0f0f0f0f, SI
+	ORL          R9, SI
+	SHLQ         $0x20, SI
+	ANDL         $0x3f3f3f3f, DI
+	ORQ          DI, SI
+	VMOVQ        R10, X2
+	VPMOVZXBW    X2, X2
+	VINSERTI128  $0x01, X2, Y2, Y2
+	VPXOR        Y3, Y3, Y3
+	VPXOR        Y4, Y4, Y4
+	VMOVDQU      16(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y6
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VPSHUFB      q4kScaleShuffle<>+0(SB), Y2, Y7
+	VPSHUFB      q4kScaleShuffle<>+32(SB), Y2, Y8
+	VPMADDUBSW   4(DX), Y6, Y9
+	VPMADDWD     Y7, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   36(DX), Y5, Y9
+	VPMADDWD     Y8, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   4(BX), Y6, Y6
+	VPMADDWD     Y7, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VPMADDUBSW   36(BX), Y5, Y6
+	VPMADDWD     Y8, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VMOVDQU      48(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y6
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VPSHUFB      q4kScaleShuffle<>+64(SB), Y2, Y7
+	VPSHUFB      q4kScaleShuffle<>+96(SB), Y2, Y8
+	VPMADDUBSW   68(DX), Y6, Y9
+	VPMADDWD     Y7, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   100(DX), Y5, Y9
+	VPMADDWD     Y8, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   68(BX), Y6, Y6
+	VPMADDWD     Y7, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VPMADDUBSW   100(BX), Y5, Y6
+	VPMADDWD     Y8, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VMOVDQU      80(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y6
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VPSHUFB      q4kScaleShuffle<>+128(SB), Y2, Y7
+	VPSHUFB      q4kScaleShuffle<>+160(SB), Y2, Y8
+	VPMADDUBSW   132(DX), Y6, Y9
+	VPMADDWD     Y7, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   164(DX), Y5, Y9
+	VPMADDWD     Y8, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   132(BX), Y6, Y6
+	VPMADDWD     Y7, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VPMADDUBSW   164(BX), Y5, Y6
+	VPMADDWD     Y8, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VMOVDQU      112(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y6
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VPSHUFB      q4kScaleShuffle<>+192(SB), Y2, Y7
+	VPSHUFB      q4kScaleShuffle<>+224(SB), Y2, Y8
+	VPMADDUBSW   196(DX), Y6, Y9
+	VPMADDWD     Y7, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   228(DX), Y5, Y9
+	VPMADDWD     Y8, Y9, Y9
+	VPADDD       Y9, Y3, Y3
+	VPMADDUBSW   196(BX), Y6, Y6
+	VPMADDWD     Y7, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VPMADDUBSW   228(BX), Y5, Y6
+	VPMADDWD     Y8, Y6, Y6
+	VPADDD       Y6, Y4, Y4
+	VMOVQ        SI, X5
+	VPUNPCKLBW   X5, X5, X5
+	VPMOVZXBW    X5, Y5
+	VMOVD        (CX), X2
+	VCVTPH2PS    X2, X2
+	VPMADDWD     260(DX), Y5, Y6
+	VPHADDD      Y6, Y3, Y3
+	VEXTRACTI128 $0x01, Y3, X6
+	VPADDD       X6, X3, X6
+	VPHADDD      X6, X6, X6
+	VCVTDQ2PS    X6, X6
+	VBROADCASTSS (DX), X3
+	VMULPS       X2, X3, X3
+	VMULPS       X3, X6, X6
+	VADDPS       X6, X0, X0
+	ADDQ         $0x00000124, DX
+	VPMADDWD     260(BX), Y5, Y3
+	VPHADDD      Y3, Y4, Y3
+	VEXTRACTI128 $0x01, Y3, X4
+	VPADDD       X4, X3, X4
+	VPHADDD      X4, X4, X4
+	VCVTDQ2PS    X4, X4
+	VBROADCASTSS (BX), X3
+	VMULPS       X2, X3, X3
+	VMULPS       X3, X4, X4
+	VADDPS       X4, X1, X1
+	ADDQ         $0x00000124, BX
+	ADDQ         $0x00000090, CX
+	DECQ         AX
+	JNZ          qdotQ4KAVX2Px2_loop
+
+qdotQ4KAVX2Px2_done:
+	VMOVSHDUP X0, X2
+	VSUBSS    X2, X0, X0
+	VMOVSHDUP X1, X2
+	VSUBSS    X2, X1, X1
+	MOVQ      out+32(FP), AX
+	MOVQ      ldo+40(FP), CX
+	SHLQ      $0x02, CX
+	VMOVSS    X0, (AX)
+	ADDQ      CX, AX
+	VMOVSS    X1, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ4KAVX2Px3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ4KAVX2Px3(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	MOVQ   xstride+24(FP), BX
+	LEAQ   (DX)(BX*1), SI
+	LEAQ   (SI)(BX*1), BX
+	VXORPS X0, X0, X0
+	VXORPS X1, X1, X1
+	VXORPS X2, X2, X2
+	TESTQ  AX, AX
+	JZ     qdotQ4KAVX2Px3_done
+
+qdotQ4KAVX2Px3_loop:
+	PREFETCHT0   2176(CX)
+	MOVL         4(CX), DI
+	MOVL         8(CX), R8
+	MOVL         12(CX), R9
+	MOVL         DI, R10
+	SHRL         $0x06, R10
+	ANDL         $0x03030303, R10
+	SHLL         $0x04, R10
+	MOVL         R9, R11
+	ANDL         $0x0f0f0f0f, R11
+	ORL          R10, R11
+	SHLQ         $0x20, R11
+	ANDL         $0x3f3f3f3f, DI
+	ORQ          DI, R11
+	MOVL         R8, R10
+	SHRL         $0x06, R10
+	ANDL         $0x03030303, R10
+	SHLL         $0x04, R10
+	MOVL         R9, DI
+	SHRL         $0x04, DI
+	ANDL         $0x0f0f0f0f, DI
+	ORL          R10, DI
+	SHLQ         $0x20, DI
+	ANDL         $0x3f3f3f3f, R8
+	ORQ          R8, DI
+	VMOVQ        R11, X3
+	VPMOVZXBW    X3, X3
+	VINSERTI128  $0x01, X3, Y3, Y3
+	VPXOR        Y4, Y4, Y4
+	VPXOR        Y5, Y5, Y5
+	VPXOR        Y6, Y6, Y6
+	VMOVDQU      16(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y8
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VPSHUFB      q4kScaleShuffle<>+0(SB), Y3, Y9
+	VPSHUFB      q4kScaleShuffle<>+32(SB), Y3, Y10
+	VPMADDUBSW   4(DX), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   36(DX), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   4(SI), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   36(SI), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   4(BX), Y8, Y8
+	VPMADDWD     Y9, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VPMADDUBSW   36(BX), Y7, Y8
+	VPMADDWD     Y10, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VMOVDQU      48(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y8
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VPSHUFB      q4kScaleShuffle<>+64(SB), Y3, Y9
+	VPSHUFB      q4kScaleShuffle<>+96(SB), Y3, Y10
+	VPMADDUBSW   68(DX), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   100(DX), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   68(SI), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   100(SI), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   68(BX), Y8, Y8
+	VPMADDWD     Y9, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VPMADDUBSW   100(BX), Y7, Y8
+	VPMADDWD     Y10, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VMOVDQU      80(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y8
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VPSHUFB      q4kScaleShuffle<>+128(SB), Y3, Y9
+	VPSHUFB      q4kScaleShuffle<>+160(SB), Y3, Y10
+	VPMADDUBSW   132(DX), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   164(DX), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   132(SI), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   164(SI), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   132(BX), Y8, Y8
+	VPMADDWD     Y9, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VPMADDUBSW   164(BX), Y7, Y8
+	VPMADDWD     Y10, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VMOVDQU      112(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y8
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VPSHUFB      q4kScaleShuffle<>+192(SB), Y3, Y9
+	VPSHUFB      q4kScaleShuffle<>+224(SB), Y3, Y10
+	VPMADDUBSW   196(DX), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   228(DX), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y4, Y4
+	VPMADDUBSW   196(SI), Y8, Y11
+	VPMADDWD     Y9, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   228(SI), Y7, Y11
+	VPMADDWD     Y10, Y11, Y11
+	VPADDD       Y11, Y5, Y5
+	VPMADDUBSW   196(BX), Y8, Y8
+	VPMADDWD     Y9, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VPMADDUBSW   228(BX), Y7, Y8
+	VPMADDWD     Y10, Y8, Y8
+	VPADDD       Y8, Y6, Y6
+	VMOVQ        DI, X7
+	VPUNPCKLBW   X7, X7, X7
+	VPMOVZXBW    X7, Y7
+	VMOVD        (CX), X3
+	VCVTPH2PS    X3, X3
+	VPMADDWD     260(DX), Y7, Y8
+	VPHADDD      Y8, Y4, Y4
+	VEXTRACTI128 $0x01, Y4, X8
+	VPADDD       X8, X4, X8
+	VPHADDD      X8, X8, X8
+	VCVTDQ2PS    X8, X8
+	VBROADCASTSS (DX), X4
+	VMULPS       X3, X4, X4
+	VMULPS       X4, X8, X8
+	VADDPS       X8, X0, X0
+	ADDQ         $0x00000124, DX
+	VPMADDWD     260(SI), Y7, Y4
+	VPHADDD      Y4, Y5, Y4
+	VEXTRACTI128 $0x01, Y4, X5
+	VPADDD       X5, X4, X5
+	VPHADDD      X5, X5, X5
+	VCVTDQ2PS    X5, X5
+	VBROADCASTSS (SI), X4
+	VMULPS       X3, X4, X4
+	VMULPS       X4, X5, X5
+	VADDPS       X5, X1, X1
+	ADDQ         $0x00000124, SI
+	VPMADDWD     260(BX), Y7, Y4
+	VPHADDD      Y4, Y6, Y4
+	VEXTRACTI128 $0x01, Y4, X5
+	VPADDD       X5, X4, X5
+	VPHADDD      X5, X5, X5
+	VCVTDQ2PS    X5, X5
+	VBROADCASTSS (BX), X4
+	VMULPS       X3, X4, X4
+	VMULPS       X4, X5, X5
+	VADDPS       X5, X2, X2
+	ADDQ         $0x00000124, BX
+	ADDQ         $0x00000090, CX
+	DECQ         AX
+	JNZ          qdotQ4KAVX2Px3_loop
+
+qdotQ4KAVX2Px3_done:
+	VMOVSHDUP X0, X3
+	VSUBSS    X3, X0, X0
+	VMOVSHDUP X1, X3
+	VSUBSS    X3, X1, X1
+	VMOVSHDUP X2, X3
+	VSUBSS    X3, X2, X2
+	MOVQ      out+32(FP), AX
+	MOVQ      ldo+40(FP), CX
+	SHLQ      $0x02, CX
+	VMOVSS    X0, (AX)
+	ADDQ      CX, AX
+	VMOVSS    X1, (AX)
+	ADDQ      CX, AX
+	VMOVSS    X2, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ4KAVX2Px4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ4KAVX2Px4(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	MOVQ   xstride+24(FP), BX
+	LEAQ   (DX)(BX*1), SI
+	LEAQ   (SI)(BX*1), DI
+	LEAQ   (DI)(BX*1), BX
+	VXORPS X0, X0, X0
+	VXORPS X1, X1, X1
+	VXORPS X2, X2, X2
+	VXORPS X3, X3, X3
+	TESTQ  AX, AX
+	JZ     qdotQ4KAVX2Px4_done
+
+qdotQ4KAVX2Px4_loop:
+	PREFETCHT0   2176(CX)
+	MOVL         4(CX), R8
+	MOVL         8(CX), R9
+	MOVL         12(CX), R10
+	MOVL         R8, R11
+	SHRL         $0x06, R11
+	ANDL         $0x03030303, R11
+	SHLL         $0x04, R11
+	MOVL         R10, R12
+	ANDL         $0x0f0f0f0f, R12
+	ORL          R11, R12
+	SHLQ         $0x20, R12
+	ANDL         $0x3f3f3f3f, R8
+	ORQ          R8, R12
+	MOVL         R9, R11
+	SHRL         $0x06, R11
+	ANDL         $0x03030303, R11
+	SHLL         $0x04, R11
+	MOVL         R10, R8
+	SHRL         $0x04, R8
+	ANDL         $0x0f0f0f0f, R8
+	ORL          R11, R8
+	SHLQ         $0x20, R8
+	ANDL         $0x3f3f3f3f, R9
+	ORQ          R9, R8
+	VMOVQ        R12, X4
+	VPMOVZXBW    X4, X4
+	VINSERTI128  $0x01, X4, Y4, Y4
+	VPXOR        Y5, Y5, Y5
+	VPXOR        Y6, Y6, Y6
+	VPXOR        Y7, Y7, Y7
+	VPXOR        Y8, Y8, Y8
+	VMOVDQU      16(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y10
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VPSHUFB      q4kScaleShuffle<>+0(SB), Y4, Y11
+	VPSHUFB      q4kScaleShuffle<>+32(SB), Y4, Y12
+	VPMADDUBSW   4(DX), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   36(DX), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   4(SI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   36(SI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   4(DI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   36(DI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   4(BX), Y10, Y10
+	VPMADDWD     Y11, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VPMADDUBSW   36(BX), Y9, Y10
+	VPMADDWD     Y12, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VMOVDQU      48(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y10
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VPSHUFB      q4kScaleShuffle<>+64(SB), Y4, Y11
+	VPSHUFB      q4kScaleShuffle<>+96(SB), Y4, Y12
+	VPMADDUBSW   68(DX), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   100(DX), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   68(SI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   100(SI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   68(DI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   100(DI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   68(BX), Y10, Y10
+	VPMADDWD     Y11, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VPMADDUBSW   100(BX), Y9, Y10
+	VPMADDWD     Y12, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VMOVDQU      80(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y10
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VPSHUFB      q4kScaleShuffle<>+128(SB), Y4, Y11
+	VPSHUFB      q4kScaleShuffle<>+160(SB), Y4, Y12
+	VPMADDUBSW   132(DX), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   164(DX), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   132(SI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   164(SI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   132(DI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   164(DI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   132(BX), Y10, Y10
+	VPMADDWD     Y11, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VPMADDUBSW   164(BX), Y9, Y10
+	VPMADDWD     Y12, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VMOVDQU      112(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y10
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VPSHUFB      q4kScaleShuffle<>+192(SB), Y4, Y11
+	VPSHUFB      q4kScaleShuffle<>+224(SB), Y4, Y12
+	VPMADDUBSW   196(DX), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   228(DX), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y5, Y5
+	VPMADDUBSW   196(SI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   228(SI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y6, Y6
+	VPMADDUBSW   196(DI), Y10, Y13
+	VPMADDWD     Y11, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   228(DI), Y9, Y13
+	VPMADDWD     Y12, Y13, Y13
+	VPADDD       Y13, Y7, Y7
+	VPMADDUBSW   196(BX), Y10, Y10
+	VPMADDWD     Y11, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VPMADDUBSW   228(BX), Y9, Y10
+	VPMADDWD     Y12, Y10, Y10
+	VPADDD       Y10, Y8, Y8
+	VMOVQ        R8, X9
+	VPUNPCKLBW   X9, X9, X9
+	VPMOVZXBW    X9, Y9
+	VMOVD        (CX), X4
+	VCVTPH2PS    X4, X4
+	VPMADDWD     260(DX), Y9, Y10
+	VPHADDD      Y10, Y5, Y5
+	VEXTRACTI128 $0x01, Y5, X10
+	VPADDD       X10, X5, X10
+	VPHADDD      X10, X10, X10
+	VCVTDQ2PS    X10, X10
+	VBROADCASTSS (DX), X5
+	VMULPS       X4, X5, X5
+	VMULPS       X5, X10, X10
+	VADDPS       X10, X0, X0
+	ADDQ         $0x00000124, DX
+	VPMADDWD     260(SI), Y9, Y5
+	VPHADDD      Y5, Y6, Y5
+	VEXTRACTI128 $0x01, Y5, X6
+	VPADDD       X6, X5, X6
+	VPHADDD      X6, X6, X6
+	VCVTDQ2PS    X6, X6
+	VBROADCASTSS (SI), X5
+	VMULPS       X4, X5, X5
+	VMULPS       X5, X6, X6
+	VADDPS       X6, X1, X1
+	ADDQ         $0x00000124, SI
+	VPMADDWD     260(DI), Y9, Y5
+	VPHADDD      Y5, Y7, Y5
+	VEXTRACTI128 $0x01, Y5, X6
+	VPADDD       X6, X5, X6
+	VPHADDD      X6, X6, X6
+	VCVTDQ2PS    X6, X6
+	VBROADCASTSS (DI), X5
+	VMULPS       X4, X5, X5
+	VMULPS       X5, X6, X6
+	VADDPS       X6, X2, X2
+	ADDQ         $0x00000124, DI
+	VPMADDWD     260(BX), Y9, Y5
+	VPHADDD      Y5, Y8, Y5
+	VEXTRACTI128 $0x01, Y5, X6
+	VPADDD       X6, X5, X6
+	VPHADDD      X6, X6, X6
+	VCVTDQ2PS    X6, X6
+	VBROADCASTSS (BX), X5
+	VMULPS       X4, X5, X5
+	VMULPS       X5, X6, X6
+	VADDPS       X6, X3, X3
+	ADDQ         $0x00000124, BX
+	ADDQ         $0x00000090, CX
+	DECQ         AX
+	JNZ          qdotQ4KAVX2Px4_loop
+
+qdotQ4KAVX2Px4_done:
+	VMOVSHDUP X0, X4
+	VSUBSS    X4, X0, X0
+	VMOVSHDUP X1, X4
+	VSUBSS    X4, X1, X1
+	VMOVSHDUP X2, X4
+	VSUBSS    X4, X2, X2
+	VMOVSHDUP X3, X4
+	VSUBSS    X4, X3, X3
+	MOVQ      out+32(FP), AX
+	MOVQ      ldo+40(FP), CX
+	SHLQ      $0x02, CX
+	VMOVSS    X0, (AX)
+	ADDQ      CX, AX
+	VMOVSS    X1, (AX)
+	ADDQ      CX, AX
+	VMOVSS    X2, (AX)
+	ADDQ      CX, AX
+	VMOVSS    X3, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ6KAVX2Px1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ6KAVX2Px1(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	VXORPS X0, X0, X0
+	TESTQ  AX, AX
+	JZ     qdotQ6KAVX2Px1_done
+
+qdotQ6KAVX2Px1_loop:
+	PREFETCHT0   2176(CX)
+	VPXOR        Y1, Y1, Y1
+	VPMOVSXBW    192(CX), X2
+	VINSERTI128  $0x01, X2, Y2, Y2
+	VMOVDQU      (CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      128(CX), Y4
+	VPSLLW       $0x04, Y4, Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y2, Y4
+	VPMADDUBSW   4(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VMOVDQU      32(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      128(CX), Y4
+	VPSLLW       $0x02, Y4, Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y2, Y4
+	VPMADDUBSW   36(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VMOVDQU      (CX), Y3
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      128(CX), Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y2, Y4
+	VPMADDUBSW   68(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VMOVDQU      32(CX), Y3
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      128(CX), Y4
+	VPSRLW       $0x02, Y4, Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y2, Y4
+	VPMADDUBSW   100(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VPMOVSXBW    200(CX), X5
+	VINSERTI128  $0x01, X5, Y5, Y5
+	VMOVDQU      64(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      160(CX), Y4
+	VPSLLW       $0x04, Y4, Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y5, Y4
+	VPMADDUBSW   132(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VMOVDQU      96(CX), Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      160(CX), Y4
+	VPSLLW       $0x02, Y4, Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y5, Y4
+	VPMADDUBSW   164(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VMOVDQU      64(CX), Y3
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      160(CX), Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y5, Y4
+	VPMADDUBSW   196(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VMOVDQU      96(CX), Y3
+	VPSRLW       $0x04, Y3, Y3
+	VPAND        qNibbles<>+0(SB), Y3, Y3
+	VMOVDQU      160(CX), Y4
+	VPSRLW       $0x02, Y4, Y4
+	VPAND        qHigh2<>+0(SB), Y4, Y4
+	VPOR         Y4, Y3, Y3
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y5, Y4
+	VPMADDUBSW   228(DX), Y3, Y3
+	VPMADDWD     Y4, Y3, Y3
+	VPADDD       Y3, Y1, Y1
+	VPMOVSXBW    192(CX), Y3
+	MOVWLZX      208(CX), BX
+	VMOVD        BX, X2
+	VCVTPH2PS    X2, X2
+	VPMADDWD     260(DX), Y3, Y3
+	VPSLLD       $0x05, Y3, Y3
+	VPSUBD       Y3, Y1, Y1
+	VEXTRACTI128 $0x01, Y1, X3
+	VPADDD       X3, X1, X3
+	VPHADDD      X3, X3, X3
+	VPHADDD      X3, X3, X3
+	VCVTDQ2PS    X3, X3
+	VMULSS       (DX), X2, X1
+	VMULSS       X3, X1, X1
+	VADDSS       X1, X0, X0
+	ADDQ         $0x00000124, DX
+	ADDQ         $0x000000d2, CX
+	DECQ         AX
+	JNZ          qdotQ6KAVX2Px1_loop
+
+qdotQ6KAVX2Px1_done:
+	MOVQ   out+32(FP), AX
+	MOVQ   ldo+40(FP), CX
+	SHLQ   $0x02, CX
+	VMOVSS X0, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ6KAVX2Px2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ6KAVX2Px2(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	MOVQ   xstride+24(FP), BX
+	LEAQ   (DX)(BX*1), BX
+	VXORPS X0, X0, X0
+	VXORPS X1, X1, X1
+	TESTQ  AX, AX
+	JZ     qdotQ6KAVX2Px2_done
+
+qdotQ6KAVX2Px2_loop:
+	PREFETCHT0   2176(CX)
+	VPXOR        Y2, Y2, Y2
+	VPXOR        Y3, Y3, Y3
+	VPMOVSXBW    192(CX), X4
+	VINSERTI128  $0x01, X4, Y4, Y4
+	VMOVDQU      (CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      128(CX), Y6
+	VPSLLW       $0x04, Y6, Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y4, Y6
+	VPMADDUBSW   4(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   4(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VMOVDQU      32(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      128(CX), Y6
+	VPSLLW       $0x02, Y6, Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y4, Y6
+	VPMADDUBSW   36(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   36(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VMOVDQU      (CX), Y5
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      128(CX), Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y4, Y6
+	VPMADDUBSW   68(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   68(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VMOVDQU      32(CX), Y5
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      128(CX), Y6
+	VPSRLW       $0x02, Y6, Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y4, Y6
+	VPMADDUBSW   100(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   100(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VPMOVSXBW    200(CX), X7
+	VINSERTI128  $0x01, X7, Y7, Y7
+	VMOVDQU      64(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      160(CX), Y6
+	VPSLLW       $0x04, Y6, Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y7, Y6
+	VPMADDUBSW   132(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   132(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VMOVDQU      96(CX), Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      160(CX), Y6
+	VPSLLW       $0x02, Y6, Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y7, Y6
+	VPMADDUBSW   164(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   164(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VMOVDQU      64(CX), Y5
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      160(CX), Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y7, Y6
+	VPMADDUBSW   196(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   196(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VMOVDQU      96(CX), Y5
+	VPSRLW       $0x04, Y5, Y5
+	VPAND        qNibbles<>+0(SB), Y5, Y5
+	VMOVDQU      160(CX), Y6
+	VPSRLW       $0x02, Y6, Y6
+	VPAND        qHigh2<>+0(SB), Y6, Y6
+	VPOR         Y6, Y5, Y5
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y7, Y6
+	VPMADDUBSW   228(DX), Y5, Y8
+	VPMADDWD     Y6, Y8, Y8
+	VPADDD       Y8, Y2, Y2
+	VPMADDUBSW   228(BX), Y5, Y5
+	VPMADDWD     Y6, Y5, Y5
+	VPADDD       Y5, Y3, Y3
+	VPMOVSXBW    192(CX), Y5
+	MOVWLZX      208(CX), SI
+	VMOVD        SI, X4
+	VCVTPH2PS    X4, X4
+	VPMADDWD     260(DX), Y5, Y6
+	VPSLLD       $0x05, Y6, Y6
+	VPSUBD       Y6, Y2, Y2
+	VEXTRACTI128 $0x01, Y2, X6
+	VPADDD       X6, X2, X6
+	VPHADDD      X6, X6, X6
+	VPHADDD      X6, X6, X6
+	VCVTDQ2PS    X6, X6
+	VMULSS       (DX), X4, X2
+	VMULSS       X6, X2, X2
+	VADDSS       X2, X0, X0
+	ADDQ         $0x00000124, DX
+	VPMADDWD     260(BX), Y5, Y2
+	VPSLLD       $0x05, Y2, Y2
+	VPSUBD       Y2, Y3, Y3
+	VEXTRACTI128 $0x01, Y3, X2
+	VPADDD       X2, X3, X2
+	VPHADDD      X2, X2, X2
+	VPHADDD      X2, X2, X2
+	VCVTDQ2PS    X2, X2
+	VMULSS       (BX), X4, X3
+	VMULSS       X2, X3, X3
+	VADDSS       X3, X1, X1
+	ADDQ         $0x00000124, BX
+	ADDQ         $0x000000d2, CX
+	DECQ         AX
+	JNZ          qdotQ6KAVX2Px2_loop
+
+qdotQ6KAVX2Px2_done:
+	MOVQ   out+32(FP), AX
+	MOVQ   ldo+40(FP), CX
+	SHLQ   $0x02, CX
+	VMOVSS X0, (AX)
+	ADDQ   CX, AX
+	VMOVSS X1, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ6KAVX2Px3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ6KAVX2Px3(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	MOVQ   xstride+24(FP), BX
+	LEAQ   (DX)(BX*1), SI
+	LEAQ   (SI)(BX*1), BX
+	VXORPS X0, X0, X0
+	VXORPS X1, X1, X1
+	VXORPS X2, X2, X2
+	TESTQ  AX, AX
+	JZ     qdotQ6KAVX2Px3_done
+
+qdotQ6KAVX2Px3_loop:
+	PREFETCHT0   2176(CX)
+	VPXOR        Y3, Y3, Y3
+	VPXOR        Y4, Y4, Y4
+	VPXOR        Y5, Y5, Y5
+	VPMOVSXBW    192(CX), X6
+	VINSERTI128  $0x01, X6, Y6, Y6
+	VMOVDQU      (CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      128(CX), Y8
+	VPSLLW       $0x04, Y8, Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y6, Y8
+	VPMADDUBSW   4(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   4(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   4(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VMOVDQU      32(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      128(CX), Y8
+	VPSLLW       $0x02, Y8, Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y6, Y8
+	VPMADDUBSW   36(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   36(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   36(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VMOVDQU      (CX), Y7
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      128(CX), Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y6, Y8
+	VPMADDUBSW   68(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   68(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   68(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VMOVDQU      32(CX), Y7
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      128(CX), Y8
+	VPSRLW       $0x02, Y8, Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y6, Y8
+	VPMADDUBSW   100(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   100(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   100(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VPMOVSXBW    200(CX), X9
+	VINSERTI128  $0x01, X9, Y9, Y9
+	VMOVDQU      64(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      160(CX), Y8
+	VPSLLW       $0x04, Y8, Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y9, Y8
+	VPMADDUBSW   132(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   132(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   132(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VMOVDQU      96(CX), Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      160(CX), Y8
+	VPSLLW       $0x02, Y8, Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y9, Y8
+	VPMADDUBSW   164(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   164(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   164(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VMOVDQU      64(CX), Y7
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      160(CX), Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y9, Y8
+	VPMADDUBSW   196(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   196(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   196(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VMOVDQU      96(CX), Y7
+	VPSRLW       $0x04, Y7, Y7
+	VPAND        qNibbles<>+0(SB), Y7, Y7
+	VMOVDQU      160(CX), Y8
+	VPSRLW       $0x02, Y8, Y8
+	VPAND        qHigh2<>+0(SB), Y8, Y8
+	VPOR         Y8, Y7, Y7
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y9, Y8
+	VPMADDUBSW   228(DX), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y3, Y3
+	VPMADDUBSW   228(SI), Y7, Y10
+	VPMADDWD     Y8, Y10, Y10
+	VPADDD       Y10, Y4, Y4
+	VPMADDUBSW   228(BX), Y7, Y7
+	VPMADDWD     Y8, Y7, Y7
+	VPADDD       Y7, Y5, Y5
+	VPMOVSXBW    192(CX), Y7
+	MOVWLZX      208(CX), DI
+	VMOVD        DI, X6
+	VCVTPH2PS    X6, X6
+	VPMADDWD     260(DX), Y7, Y8
+	VPSLLD       $0x05, Y8, Y8
+	VPSUBD       Y8, Y3, Y3
+	VEXTRACTI128 $0x01, Y3, X8
+	VPADDD       X8, X3, X8
+	VPHADDD      X8, X8, X8
+	VPHADDD      X8, X8, X8
+	VCVTDQ2PS    X8, X8
+	VMULSS       (DX), X6, X3
+	VMULSS       X8, X3, X3
+	VADDSS       X3, X0, X0
+	ADDQ         $0x00000124, DX
+	VPMADDWD     260(SI), Y7, Y3
+	VPSLLD       $0x05, Y3, Y3
+	VPSUBD       Y3, Y4, Y4
+	VEXTRACTI128 $0x01, Y4, X3
+	VPADDD       X3, X4, X3
+	VPHADDD      X3, X3, X3
+	VPHADDD      X3, X3, X3
+	VCVTDQ2PS    X3, X3
+	VMULSS       (SI), X6, X4
+	VMULSS       X3, X4, X4
+	VADDSS       X4, X1, X1
+	ADDQ         $0x00000124, SI
+	VPMADDWD     260(BX), Y7, Y3
+	VPSLLD       $0x05, Y3, Y3
+	VPSUBD       Y3, Y5, Y5
+	VEXTRACTI128 $0x01, Y5, X3
+	VPADDD       X3, X5, X3
+	VPHADDD      X3, X3, X3
+	VPHADDD      X3, X3, X3
+	VCVTDQ2PS    X3, X3
+	VMULSS       (BX), X6, X4
+	VMULSS       X3, X4, X4
+	VADDSS       X4, X2, X2
+	ADDQ         $0x00000124, BX
+	ADDQ         $0x000000d2, CX
+	DECQ         AX
+	JNZ          qdotQ6KAVX2Px3_loop
+
+qdotQ6KAVX2Px3_done:
+	MOVQ   out+32(FP), AX
+	MOVQ   ldo+40(FP), CX
+	SHLQ   $0x02, CX
+	VMOVSS X0, (AX)
+	ADDQ   CX, AX
+	VMOVSS X1, (AX)
+	ADDQ   CX, AX
+	VMOVSS X2, (AX)
+	VZEROUPPER
+	RET
+
+// func qdotQ6KAVX2Px4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+// Requires: AVX, AVX2, F16C, MMX+
+TEXT ·qdotQ6KAVX2Px4(SB), NOSPLIT, $0-48
+	MOVQ   nb+0(FP), AX
+	MOVQ   w+8(FP), CX
+	MOVQ   x+16(FP), DX
+	MOVQ   xstride+24(FP), BX
+	LEAQ   (DX)(BX*1), SI
+	LEAQ   (SI)(BX*1), DI
+	LEAQ   (DI)(BX*1), BX
+	VXORPS X0, X0, X0
+	VXORPS X1, X1, X1
+	VXORPS X2, X2, X2
+	VXORPS X3, X3, X3
+	TESTQ  AX, AX
+	JZ     qdotQ6KAVX2Px4_done
+
+qdotQ6KAVX2Px4_loop:
+	PREFETCHT0   2176(CX)
+	VPXOR        Y4, Y4, Y4
+	VPXOR        Y5, Y5, Y5
+	VPXOR        Y6, Y6, Y6
+	VPXOR        Y7, Y7, Y7
+	VPMOVSXBW    192(CX), X8
+	VINSERTI128  $0x01, X8, Y8, Y8
+	VMOVDQU      (CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      128(CX), Y10
+	VPSLLW       $0x04, Y10, Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y8, Y10
+	VPMADDUBSW   4(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   4(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   4(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   4(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VMOVDQU      32(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      128(CX), Y10
+	VPSLLW       $0x02, Y10, Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y8, Y10
+	VPMADDUBSW   36(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   36(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   36(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   36(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VMOVDQU      (CX), Y9
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      128(CX), Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y8, Y10
+	VPMADDUBSW   68(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   68(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   68(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   68(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VMOVDQU      32(CX), Y9
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      128(CX), Y10
+	VPSRLW       $0x02, Y10, Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y8, Y10
+	VPMADDUBSW   100(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   100(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   100(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   100(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VPMOVSXBW    200(CX), X11
+	VINSERTI128  $0x01, X11, Y11, Y11
+	VMOVDQU      64(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      160(CX), Y10
+	VPSLLW       $0x04, Y10, Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+0(SB), Y11, Y10
+	VPMADDUBSW   132(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   132(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   132(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   132(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VMOVDQU      96(CX), Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      160(CX), Y10
+	VPSLLW       $0x02, Y10, Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+32(SB), Y11, Y10
+	VPMADDUBSW   164(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   164(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   164(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   164(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VMOVDQU      64(CX), Y9
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      160(CX), Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+64(SB), Y11, Y10
+	VPMADDUBSW   196(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   196(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   196(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   196(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VMOVDQU      96(CX), Y9
+	VPSRLW       $0x04, Y9, Y9
+	VPAND        qNibbles<>+0(SB), Y9, Y9
+	VMOVDQU      160(CX), Y10
+	VPSRLW       $0x02, Y10, Y10
+	VPAND        qHigh2<>+0(SB), Y10, Y10
+	VPOR         Y10, Y9, Y9
+	VPSHUFB      q6kScaleShuffle<>+96(SB), Y11, Y10
+	VPMADDUBSW   228(DX), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y4, Y4
+	VPMADDUBSW   228(SI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y5, Y5
+	VPMADDUBSW   228(DI), Y9, Y12
+	VPMADDWD     Y10, Y12, Y12
+	VPADDD       Y12, Y6, Y6
+	VPMADDUBSW   228(BX), Y9, Y9
+	VPMADDWD     Y10, Y9, Y9
+	VPADDD       Y9, Y7, Y7
+	VPMOVSXBW    192(CX), Y9
+	MOVWLZX      208(CX), R8
+	VMOVD        R8, X8
+	VCVTPH2PS    X8, X8
+	VPMADDWD     260(DX), Y9, Y10
+	VPSLLD       $0x05, Y10, Y10
+	VPSUBD       Y10, Y4, Y4
+	VEXTRACTI128 $0x01, Y4, X10
+	VPADDD       X10, X4, X10
+	VPHADDD      X10, X10, X10
+	VPHADDD      X10, X10, X10
+	VCVTDQ2PS    X10, X10
+	VMULSS       (DX), X8, X4
+	VMULSS       X10, X4, X4
+	VADDSS       X4, X0, X0
+	ADDQ         $0x00000124, DX
+	VPMADDWD     260(SI), Y9, Y4
+	VPSLLD       $0x05, Y4, Y4
+	VPSUBD       Y4, Y5, Y5
+	VEXTRACTI128 $0x01, Y5, X4
+	VPADDD       X4, X5, X4
+	VPHADDD      X4, X4, X4
+	VPHADDD      X4, X4, X4
+	VCVTDQ2PS    X4, X4
+	VMULSS       (SI), X8, X5
+	VMULSS       X4, X5, X5
+	VADDSS       X5, X1, X1
+	ADDQ         $0x00000124, SI
+	VPMADDWD     260(DI), Y9, Y4
+	VPSLLD       $0x05, Y4, Y4
+	VPSUBD       Y4, Y6, Y6
+	VEXTRACTI128 $0x01, Y6, X4
+	VPADDD       X4, X6, X4
+	VPHADDD      X4, X4, X4
+	VPHADDD      X4, X4, X4
+	VCVTDQ2PS    X4, X4
+	VMULSS       (DI), X8, X5
+	VMULSS       X4, X5, X5
+	VADDSS       X5, X2, X2
+	ADDQ         $0x00000124, DI
+	VPMADDWD     260(BX), Y9, Y4
+	VPSLLD       $0x05, Y4, Y4
+	VPSUBD       Y4, Y7, Y7
+	VEXTRACTI128 $0x01, Y7, X4
+	VPADDD       X4, X7, X4
+	VPHADDD      X4, X4, X4
+	VPHADDD      X4, X4, X4
+	VCVTDQ2PS    X4, X4
+	VMULSS       (BX), X8, X5
+	VMULSS       X4, X5, X5
+	VADDSS       X5, X3, X3
+	ADDQ         $0x00000124, BX
+	ADDQ         $0x000000d2, CX
+	DECQ         AX
+	JNZ          qdotQ6KAVX2Px4_loop
+
+qdotQ6KAVX2Px4_done:
 	MOVQ   out+32(FP), AX
 	MOVQ   ldo+40(FP), CX
 	SHLQ   $0x02, CX

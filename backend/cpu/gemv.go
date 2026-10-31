@@ -7,17 +7,54 @@ import "context"
 // whose few rows make packing B for the GEMM cost as much as multiplying.
 const gemvRows = 8
 
+// gemvCols is the most columns of a product of any number of rows that
+// sgemv computes as dot products: the GEMM would compute a whole panel
+// of columns for them, as a classifier's few over a batch.
+const gemvCols = 4
+
 // sgemv computes the float32 product of matmul as dot products of the rows
 // of the left operand with the columns of the right, when the product has
-// at most gemvRows rows, sums no batches and both operands are read along
-// contiguous rows of their memory, as a Linear layer reads its transposed
-// weight: each worker streams the columns of a block once. It reports
-// whether it computed the product. Each element is one dot product
-// whatever the number of workers.
+// at most gemvRows rows or gemvCols columns, sums no batches and both
+// operands are read along contiguous rows of their memory, as a Linear
+// layer reads its transposed weight: each worker streams the columns of a
+// block once, or, for a product of few columns, the rows of its block.
+// It reports whether it computed the product. Each element is one dot
+// product whatever the number of workers.
 func (b *Backend) sgemv(ctx context.Context, out []float32, x operand, offX []int, y operand, offY []int, m, n, k, sums int, epi *evaluator) (bool, error) {
 	rows := len(out) / n
-	if rows > gemvRows || sums != 1 || x.cs != 1 || y.rs != 1 || k < 16 {
+	if sums != 1 || x.cs != 1 || y.rs != 1 || k < 16 {
 		return false, nil
+	}
+	if rows > gemvRows {
+		if n > gemvCols {
+			return false, nil
+		}
+		// Each column of y against four rows of x at a time, which stream
+		// together, in groups of rows of one item.
+		err := b.parallelFor(ctx, rows, max(4, minUnitFlops/(2*n*k)), func(lo, hi int) error {
+			var d [4]float32
+			for r := lo; r < hi; {
+				o, i := r/m, r%m
+				rows := min(4, hi-r, m-i)
+				xi := x.data[offX[o]+i*x.rs:]
+				for c := range n {
+					col := y.data[offY[o]+c*y.cs:][:k]
+					if rows == 4 {
+						dots4(&d, col, xi, x.rs)
+					} else {
+						for j := range rows {
+							d[j] = dot(col, xi[j*x.rs:])
+						}
+					}
+					for j := range rows {
+						out[(r+j)*n+c] = d[j]
+					}
+				}
+				r += rows
+			}
+			return epi.apply(lo*n, hi*n)
+		})
+		return true, err
 	}
 	// Workers take groups of four columns, whose dot products stream the
 	// four together, and each group runs every row of x while its columns

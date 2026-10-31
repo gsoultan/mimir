@@ -11,13 +11,25 @@ func init() {
 	if !f.avx2 || !f.f16c {
 		return
 	}
+	// The K-quant kernels that prefetch their weights are faster on Intel
+	// cores and slower on AMD's; see prefetchAhead in tools/asmgen/qamd64.
+	q8 := [maxRows]qdot{qdotQ8_0AVX2x1, qdotQ8_0AVX2x2, qdotQ8_0AVX2x3, qdotQ8_0AVX2x4}
 	avx2 := map[backend.DType]*[maxRows]qdot{
-		backend.Q8_0: {qdotQ8_0AVX2x1, qdotQ8_0AVX2x2, qdotQ8_0AVX2x3, qdotQ8_0AVX2x4},
+		backend.Q8_0: &q8,
 		backend.Q4_K: {qdotQ4KAVX2x1, qdotQ4KAVX2x2, qdotQ4KAVX2x3, qdotQ4KAVX2x4},
 		backend.Q6_K: {qdotQ6KAVX2x1, qdotQ6KAVX2x2, qdotQ6KAVX2x3, qdotQ6KAVX2x4},
 	}
+	prefetch := map[backend.DType]*[maxRows]qdot{
+		backend.Q8_0: &q8,
+		backend.Q4_K: {qdotQ4KAVX2Px1, qdotQ4KAVX2Px2, qdotQ4KAVX2Px3, qdotQ4KAVX2Px4},
+		backend.Q6_K: {qdotQ6KAVX2Px1, qdotQ6KAVX2Px2, qdotQ6KAVX2Px3, qdotQ6KAVX2Px4},
+	}
 	qdotSets["avx2"] = avx2
+	qdotSets["avx2-prefetch"] = prefetch
 	qdotISA, qdots = "avx2", avx2
+	if f.intel {
+		qdotISA, qdots = "avx2-prefetch", prefetch
+	}
 	tiles := map[backend.DType]qtile{backend.Q4_K: qtileQ4KAVX2, backend.Q6_K: qtileQ6KAVX2}
 	qtileSets["avx2"] = tiles
 	qtiles = tiles

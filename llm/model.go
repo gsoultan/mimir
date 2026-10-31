@@ -192,6 +192,8 @@ type Model struct {
 	Rope   *nn.RotaryEmbedding
 	// alpha is that of the LoRA pairs, for WriteAdapter.
 	alpha float64
+	// decoding holds the recorded decoding steps (see step).
+	decoding decoder
 }
 
 // Load reads the model in f, whose metadata is md, to dev. Its weights
@@ -380,6 +382,11 @@ func (m *Model) Logits(ctx context.Context, tokens []int32, caches []*nn.KVCache
 	for _, t := range tokens {
 		if t < 0 || int(t) >= c.Vocab {
 			return nil, fmt.Errorf("llm: token %d of a vocabulary of %d: %w", t, c.Vocab, tensor.ErrIndex)
+		}
+	}
+	if len(tokens) == 1 && !all {
+		if logits, ok, err := m.step(ctx, tokens[0], caches); err != nil || ok {
+			return logits, err
 		}
 	}
 	dev := m.Embed.Weight.Value().Device()

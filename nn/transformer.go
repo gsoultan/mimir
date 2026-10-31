@@ -121,6 +121,16 @@ func (r *RotaryEmbedding) table(n int, d tensor.Device) (cos, sin *tensor.Tensor
 	}
 	n = max(n, 2*tableLen(r.tables[d]), 64)
 	half := r.Dim / 2
+	c, s := r.angles(0, n)
+	t := &ropeTable{n: n, cos: tensor.FromSlice(c, n, half).To(d), sin: tensor.FromSlice(s, n, half).To(d)}
+	r.tables[d] = t
+	return t.cos, t.sin
+}
+
+// angles returns the cosines and sines of positions [offset, offset+n),
+// each [n, Dim/2] in row-major order.
+func (r *RotaryEmbedding) angles(offset, n int) (cos, sin []float32) {
+	half := r.Dim / 2
 	inv := make([]float64, half)
 	for i := range inv {
 		inv[i] = math.Pow(r.Base, -float64(2*i)/float64(r.Dim))
@@ -128,16 +138,65 @@ func (r *RotaryEmbedding) table(n int, d tensor.Device) (cos, sin *tensor.Tensor
 			inv[i] = r.Scaling(inv[i])
 		}
 	}
-	c, s := make([]float32, n*half), make([]float32, n*half)
+	cos, sin = make([]float32, n*half), make([]float32, n*half)
 	for p := range n {
 		for i, f := range inv {
-			sn, cs := math.Sincos(float64(p) * f)
-			c[p*half+i], s[p*half+i] = float32(cs), float32(sn)
+			sn, cs := math.Sincos(float64(offset+p) * f)
+			cos[p*half+i], sin[p*half+i] = float32(cs), float32(sn)
 		}
 	}
-	t := &ropeTable{n: n, cos: tensor.FromSlice(c, n, half).To(d), sin: tensor.FromSlice(s, n, half).To(d)}
-	r.tables[d] = t
-	return t.cos, t.sin
+	return cos, sin
+}
+
+// Turn returns how Rotate turns positions [offset, offset+n) on d: the
+// cosine of each feature's angle and its sine, signed as the feature
+// turns, each [n, Dim], as tensors of their own. A decoding step that
+// takes them as inputs builds the same graph at every position, so it
+// can be recorded once and replayed (see tensor.Record).
+func (r *RotaryEmbedding) Turn(offset, n int, d tensor.Device) (cos, sin *tensor.Tensor) {
+	c, s := r.angles(offset, n)
+	half := r.Dim / 2
+	cs, sn := make([]float32, n*r.Dim), make([]float32, n*r.Dim)
+	for p := range n {
+		for i := range half {
+			a, b := 2*i, 2*i+1 // the features that pair i turns
+			if !r.Interleaved {
+				a, b = i, i+half
+			}
+			cs[p*r.Dim+a], cs[p*r.Dim+b] = c[p*half+i], c[p*half+i]
+			sn[p*r.Dim+a], sn[p*r.Dim+b] = -s[p*half+i], s[p*half+i]
+		}
+	}
+	return tensor.FromSlice(cs, n, r.Dim).To(d), tensor.FromSlice(sn, n, r.Dim).To(d)
+}
+
+// Rotate rotates x, of shape [..., S, Dim], by cos and sin as Turn
+// returns them for its positions: x·cos plus x with the features of each
+// pair swapped, times sin. It is Apply as one elementwise kernel, for
+// heads that rotate all their features.
+func (r *RotaryEmbedding) Rotate(x, cos, sin *tensor.Tensor) *tensor.Tensor {
+	if x.Err() != nil {
+		return x
+	}
+	shape := x.Shape()
+	rank := len(shape)
+	if rank < 2 || r.Dim <= 0 || r.Dim%2 != 0 || r.Dim != shape[rank-1] || !slices.Equal(cos.Shape(), []int{shape[rank-2], r.Dim}) || !slices.Equal(sin.Shape(), cos.Shape()) {
+		return tensor.Failed(fmt.Errorf("nn: rotary embedding of %d features by %v and %v for %v: %w", r.Dim, cos.Shape(), sin.Shape(), shape, tensor.ErrShape))
+	}
+	// The swap is a flip of the pairs, a view, when the features are seen
+	// as pairs: the whole rotation is computed over that shape, so that
+	// its kernel reads the flipped view in place of a copy.
+	pairs := []int{2, r.Dim / 2}
+	flip := -2
+	if r.Interleaved {
+		pairs, flip = []int{r.Dim / 2, 2}, -1
+	}
+	paired := func(t *tensor.Tensor) *tensor.Tensor {
+		ts := t.Shape()
+		return t.Reshape(slices.Concat(ts[:len(ts)-1], pairs)...)
+	}
+	x = paired(x)
+	return x.Mul(paired(cos)).Add(x.Flip(flip).Mul(paired(sin))).Reshape(shape...)
 }
 
 func tableLen(t *ropeTable) int {
@@ -347,6 +406,60 @@ func (c *KVCache) Append(ctx context.Context, k, v *tensor.Tensor) (keys, values
 	c.n += s
 	held := [][2]int{{0, c.shape[0]}, {0, c.shape[1]}, {0, c.n}, {0, c.shape[3]}}
 	return c.keys.Shrink(held), c.values.Shrink(held), nil
+}
+
+// A decoding step that is recorded once and replayed at every position
+// (see tensor.Record) cannot name the position its keys and values go to
+// in its graph, as Append does. It writes them with Write, at a position
+// it takes as an input, Positions, computes them over the memory of
+// Buffers with RecordInto or ReplayInto, and hands the results back with
+// Advance.
+
+// Buffers returns the tensors that hold the cache's keys and values,
+// [B, KV heads, capacity, dim], to compute a step over.
+func (c *KVCache) Buffers() (keys, values *tensor.Tensor) { return c.keys, c.values }
+
+// Positions returns the position p as Write takes it: an Int32 tensor of
+// shape [B, KV heads, 1, dim] holding p.
+func (c *KVCache) Positions(p int) *tensor.Tensor {
+	idx := make([]int32, c.shape[0]*c.shape[1]*c.shape[3])
+	for i := range idx {
+		idx[i] = int32(p)
+	}
+	return tensor.FromSlice(idx, c.shape[0], c.shape[1], 1, c.shape[3])
+}
+
+// Write returns the cache's keys and values, [B, KV heads, capacity,
+// dim], with the keys k and values v of one position, [B, KV heads, 1,
+// dim], written at the position pos holds (see Positions), without
+// computing them. Computed over Buffers, it writes only that position.
+func (c *KVCache) Write(k, v, pos *tensor.Tensor) (keys, values *tensor.Tensor, err error) {
+	if c.err != nil {
+		return nil, nil, c.err
+	}
+	if err := errors.Join(k.Err(), v.Err(), pos.Err()); err != nil {
+		return nil, nil, err
+	}
+	want := []int{c.shape[0], c.shape[1], 1, c.shape[3]}
+	if !slices.Equal(k.Shape(), want) || !slices.Equal(v.Shape(), want) || !slices.Equal(pos.Shape(), want) {
+		return nil, nil, fmt.Errorf("nn: write keys %v and values %v at %v to a cache of %v: %w", k.Shape(), v.Shape(), pos.Shape(), c.shape, tensor.ErrShape)
+	}
+	if c.n >= c.shape[2] {
+		return nil, nil, fmt.Errorf("nn: write a position to a full cache of %d: %w", c.shape[2], tensor.ErrShape)
+	}
+	return c.keys.Scatter(2, pos, k.Detach().Cast(c.dt)), c.values.Scatter(2, pos, v.Detach().Cast(c.dt)), nil
+}
+
+// Advance makes keys and values, which a step computed over the memory
+// of Buffers, the cache's, holding s more positions. A nil keys marks the
+// step failed, which leaves the cache unusable until Reset.
+func (c *KVCache) Advance(keys, values *tensor.Tensor, s int) {
+	if keys == nil || values == nil {
+		c.err = errors.New("nn: cache step failed")
+		return
+	}
+	c.keys, c.values = keys, values
+	c.n = min(c.n+s, c.shape[2])
 }
 
 // SelfAttention is causal multi-head self-attention as decoders use it,

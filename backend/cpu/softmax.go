@@ -18,13 +18,18 @@ type rowRoutines struct {
 	scale       func(x *float32, n int, a float32)
 	softmaxGrad func(p, dp *float32, n int, d float32)
 	dot4        func(x, y *float32, stride, n int, out *float32)
-	exp2        func(dst, src *float32, n int)
-	addVV       func(dst, a, b *float32, n int)
-	mulVV       func(dst, a, b *float32, n int)
-	addVS       func(dst, a *float32, s float32, n int)
-	mulVS       func(dst, a *float32, s float32, n int)
-	recip       func(dst, a *float32, n int)
-	sqrt        func(dst, a *float32, n int)
+	// dotRows is dot4 over rows rows, a multiple of 4, and axpyRows adds
+	// to the 4·lanes elements at out the n rows of y, stride apart, times
+	// the coefficients at p; see forwardFew.
+	dotRows  func(x, y *float32, stride, n, rows int, out *float32)
+	axpyRows func(p, y *float32, stride, n int, out *float32)
+	exp2     func(dst, src *float32, n int)
+	addVV    func(dst, a, b *float32, n int)
+	mulVV    func(dst, a, b *float32, n int)
+	addVS    func(dst, a *float32, s float32, n int)
+	mulVS    func(dst, a *float32, s float32, n int)
+	recip    func(dst, a *float32, n int)
+	sqrt     func(dst, a *float32, n int)
 	// The rest may be nil where the routines above are not.
 	maxVV   func(dst, a, b *float32, n int)
 	maxVS   func(dst, a *float32, s float32, n int) // s not NaN; -0 and +0 tie either way
@@ -32,6 +37,7 @@ type rowRoutines struct {
 	cmpltVS func(dst, a *float32, s float32, n int) // 1 where a < s
 	cmpltSV func(dst, a *float32, s float32, n int) // 1 where s < a
 	sum     func(x *float32, n int) float64         // in float64
+	fillVS  func(dst *float32, s float32, n int)    // dst[i] = s
 }
 
 // vectorPart returns how many leading elements of a row of n the vector
