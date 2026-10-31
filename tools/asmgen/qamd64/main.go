@@ -25,6 +25,13 @@ import (
 
 const maxRows = 4
 
+// prefetchAhead is how many bytes ahead of the weights it reads a dot
+// product kernel prefetches. The weights of a decoding step stream from
+// memory once, faster than the hardware prefetchers alone follow a row of
+// a few hundred bytes: a prefetch each block, two kilobytes ahead, keeps
+// more lines in flight.
+const prefetchAhead = 2176
+
 var rowsOf = [...]string{1: "one row of activations", 2: "two rows of activations", 3: "three rows of activations", 4: "four rows of activations"}
 
 func main() {
@@ -152,6 +159,7 @@ func q8_0(rows int) {
 	// VPMADDUBSW multiplies the two, w·x, in pairs.
 	q, aq := YMM(), YMM()
 	VMOVDQU(Mem{Base: w, Disp: 2}, q)
+	PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
 	VPSIGNB(q, q, aq)
 	dw := half(Mem{Base: w})
 	for r := range rows {
@@ -203,6 +211,7 @@ func q4K(rows int) {
 	JZ(LabelRef(name + "_done"))
 
 	Label(name + "_loop")
+	PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
 	// Unpack the eight 6-bit scales and mins as ggml's dot product does:
 	// with u0, u1, u2 the three words of the 12 bytes,
 	//
@@ -322,6 +331,7 @@ func q6K(rows int) {
 	JZ(LabelRef(name + "_done"))
 
 	Label(name + "_loop")
+	PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
 	isum := make([]VecVirtual, rows)
 	for r := range isum {
 		isum[r] = YMM()

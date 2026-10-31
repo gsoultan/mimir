@@ -63,6 +63,8 @@ func main() {
 		scaleRow(v)
 		softmaxGrad(v)
 		dot4(v)
+		dotRows(v)
+		axpyRows(v)
 		sum(v)
 		exp2(v)
 		for _, op := range []string{"add", "mul", "max"} {
@@ -418,6 +420,124 @@ func dot4(v isa) {
 	for r := range acc {
 		VADDPS(acc[r][1], acc[r][0], acc[r][0])
 		MOVSS(horizontal(v, acc[r][0], VADDPS), Mem{Base: out, Disp: 4 * r})
+	}
+	VZEROUPPER()
+	RET()
+}
+
+// dotRows computes the dot products of a vector with rows rows of a
+// matrix, four at a time as dot4 does, writing each row's sum to out.
+// rows is a multiple of 4. A query of a decoding step scores every key of
+// its cache this way, in one call.
+func dotRows(v isa) {
+	name := "dotRows" + v.name
+	TEXT(name, NOSPLIT, "func(x *float32, y *float32, stride int, n int, rows int, out *float32)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets out[r], for r < rows, a multiple of 4, to the sum of the products of the n elements at x, a multiple of %d, and those of row r of y, which starts stride elements after row r-1.", name, v.lanes))
+	x0 := Load(Param("x"), GP64())
+	stride := Load(Param("stride"), GP64())
+	n0 := Load(Param("n"), GP64())
+	rows := Load(Param("rows"), GP64())
+	out := Load(Param("out"), GP64())
+	y := Load(Param("y"), GP64())
+	SHLQ(U8(2), stride)
+	stride4 := GP64()
+	LEAQ(Mem{Base: stride, Index: stride, Scale: 4}, stride4) // 5 strides
+	SUBQ(stride, stride4)                                     // 4 strides
+	TESTQ(rows, rows)
+	JZ(LabelRef(name + "_end"))
+	Label(name + "_rows")
+	px, n := GP64(), GP64()
+	MOVQ(x0, px)
+	MOVQ(n0, n)
+	var r4 [4]Register
+	r4[0] = GP64()
+	MOVQ(y, r4[0])
+	for r := 1; r < 4; r++ {
+		r4[r] = GP64()
+		LEAQ(Mem{Base: r4[r-1], Index: stride, Scale: 1}, r4[r])
+	}
+	var acc [4][2]VecVirtual
+	for r := range acc {
+		for i := range acc[r] {
+			acc[r][i] = v.vec()
+			VXORPS(acc[r][i], acc[r][i], acc[r][i])
+		}
+	}
+	step := 2 * v.lanes
+	CMPQ(n, U32(step))
+	JL(LabelRef(name + "_tail"))
+	Label(name + "_wide")
+	xa, xb := v.vec(), v.vec()
+	VMOVUPS(Mem{Base: px}, xa)
+	VMOVUPS(Mem{Base: px, Disp: 4 * v.lanes}, xb)
+	for r := range r4 {
+		VFMADD231PS(Mem{Base: r4[r]}, xa, acc[r][0])
+		VFMADD231PS(Mem{Base: r4[r], Disp: 4 * v.lanes}, xb, acc[r][1])
+		ADDQ(U32(4*step), r4[r])
+	}
+	ADDQ(U32(4*step), px)
+	SUBQ(U32(step), n)
+	CMPQ(n, U32(step))
+	JGE(LabelRef(name + "_wide"))
+	Label(name + "_tail")
+	TESTQ(n, n)
+	JZ(LabelRef(name + "_done"))
+	xt := v.vec()
+	VMOVUPS(Mem{Base: px}, xt)
+	for r := range r4 {
+		VFMADD231PS(Mem{Base: r4[r]}, xt, acc[r][0])
+	}
+	Label(name + "_done")
+	for r := range acc {
+		VADDPS(acc[r][1], acc[r][0], acc[r][0])
+		MOVSS(horizontal(v, acc[r][0], VADDPS), Mem{Base: out, Disp: 4 * r})
+	}
+	ADDQ(U32(16), out)
+	ADDQ(stride4, y)
+	SUBQ(U32(4), rows)
+	JNZ(LabelRef(name + "_rows"))
+	Label(name + "_end")
+	VZEROUPPER()
+	RET()
+}
+
+// axpyRows adds to a vector of 4 registers' width the rows of a matrix,
+// each times a coefficient: out += Σ p[j]·y[j], over n rows. A query of a
+// decoding step sums the values of its cache this way, reading each
+// value once and keeping the sum in registers.
+func axpyRows(v isa) {
+	name := "axpyRows" + v.name
+	width := 4 * v.lanes
+	TEXT(name, NOSPLIT, "func(p *float32, y *float32, stride int, n int, out *float32)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s adds to the %d elements at out, for each of the n rows of y, which start stride elements apart, the row times p[j].", name, width))
+	pp := Load(Param("p"), GP64())
+	y := Load(Param("y"), GP64())
+	stride := Load(Param("stride"), GP64())
+	n := Load(Param("n"), GP64())
+	out := Load(Param("out"), GP64())
+	SHLQ(U8(2), stride)
+	var acc [4]VecVirtual
+	for i := range acc {
+		acc[i] = v.vec()
+		VMOVUPS(Mem{Base: out, Disp: 4 * v.lanes * i}, acc[i])
+	}
+	TESTQ(n, n)
+	JZ(LabelRef(name + "_done"))
+	Label(name + "_loop")
+	c := v.vec()
+	VBROADCASTSS(Mem{Base: pp}, c)
+	for i := range acc {
+		VFMADD231PS(Mem{Base: y, Disp: 4 * v.lanes * i}, c, acc[i])
+	}
+	ADDQ(U32(4), pp)
+	ADDQ(stride, y)
+	DECQ(n)
+	JNZ(LabelRef(name + "_loop"))
+	Label(name + "_done")
+	for i := range acc {
+		VMOVUPS(acc[i], Mem{Base: out, Disp: 4 * v.lanes * i})
 	}
 	VZEROUPPER()
 	RET()

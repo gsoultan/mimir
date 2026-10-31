@@ -213,7 +213,7 @@ DATA q6kScaleShuffle<>+126(SB)/2, $0x0f0e
 GLOBL q6kScaleShuffle<>(SB), RODATA|NOPTR, $128
 
 // func qdotQ8_0AVX2x1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x1(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -226,6 +226,7 @@ TEXT ·qdotQ8_0AVX2x1(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x1_loop:
 	VMOVDQU      2(CX), Y2
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y2, Y2, Y3
 	MOVWLZX      (CX), BX
 	VMOVD        BX, X4
@@ -259,7 +260,7 @@ qdotQ8_0AVX2x1_done:
 	RET
 
 // func qdotQ8_0AVX2x2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x2(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -275,6 +276,7 @@ TEXT ·qdotQ8_0AVX2x2(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x2_loop:
 	VMOVDQU      2(CX), Y3
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y3, Y3, Y4
 	MOVWLZX      (CX), SI
 	VMOVD        SI, X5
@@ -326,7 +328,7 @@ qdotQ8_0AVX2x2_done:
 	RET
 
 // func qdotQ8_0AVX2x3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x3(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -344,6 +346,7 @@ TEXT ·qdotQ8_0AVX2x3(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x3_loop:
 	VMOVDQU      2(CX), Y4
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y4, Y4, Y5
 	MOVWLZX      (CX), DI
 	VMOVD        DI, X6
@@ -413,7 +416,7 @@ qdotQ8_0AVX2x3_done:
 	RET
 
 // func qdotQ8_0AVX2x4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ8_0AVX2x4(SB), NOSPLIT, $0-48
 	MOVQ     nb+0(FP), AX
 	MOVQ     w+8(FP), CX
@@ -433,6 +436,7 @@ TEXT ·qdotQ8_0AVX2x4(SB), NOSPLIT, $0-48
 
 qdotQ8_0AVX2x4_loop:
 	VMOVDQU      2(CX), Y5
+	PREFETCHT0   2176(CX)
 	VPSIGNB      Y5, Y5, Y6
 	MOVWLZX      (CX), R8
 	VMOVD        R8, X7
@@ -520,7 +524,7 @@ qdotQ8_0AVX2x4_done:
 	RET
 
 // func qdotQ4KAVX2x1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ4KAVX2x1(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -530,6 +534,7 @@ TEXT ·qdotQ4KAVX2x1(SB), NOSPLIT, $0-48
 	JZ     qdotQ4KAVX2x1_done
 
 qdotQ4KAVX2x1_loop:
+	PREFETCHT0   2176(CX)
 	MOVL         4(CX), BX
 	MOVL         8(CX), SI
 	MOVL         12(CX), DI
@@ -637,7 +642,7 @@ qdotQ4KAVX2x1_done:
 	RET
 
 // func qdotQ4KAVX2x2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ4KAVX2x2(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -650,6 +655,7 @@ TEXT ·qdotQ4KAVX2x2(SB), NOSPLIT, $0-48
 	JZ     qdotQ4KAVX2x2_done
 
 qdotQ4KAVX2x2_loop:
+	PREFETCHT0   2176(CX)
 	MOVL         4(CX), SI
 	MOVL         8(CX), DI
 	MOVL         12(CX), R8
@@ -797,7 +803,7 @@ qdotQ4KAVX2x2_done:
 	RET
 
 // func qdotQ4KAVX2x3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ4KAVX2x3(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -812,6 +818,7 @@ TEXT ·qdotQ4KAVX2x3(SB), NOSPLIT, $0-48
 	JZ     qdotQ4KAVX2x3_done
 
 qdotQ4KAVX2x3_loop:
+	PREFETCHT0   2176(CX)
 	MOVL         4(CX), DI
 	MOVL         8(CX), R8
 	MOVL         12(CX), R9
@@ -999,7 +1006,7 @@ qdotQ4KAVX2x3_done:
 	RET
 
 // func qdotQ4KAVX2x4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ4KAVX2x4(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -1016,6 +1023,7 @@ TEXT ·qdotQ4KAVX2x4(SB), NOSPLIT, $0-48
 	JZ     qdotQ4KAVX2x4_done
 
 qdotQ4KAVX2x4_loop:
+	PREFETCHT0   2176(CX)
 	MOVL         4(CX), R8
 	MOVL         8(CX), R9
 	MOVL         12(CX), R10
@@ -1243,7 +1251,7 @@ qdotQ4KAVX2x4_done:
 	RET
 
 // func qdotQ6KAVX2x1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ6KAVX2x1(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -1253,6 +1261,7 @@ TEXT ·qdotQ6KAVX2x1(SB), NOSPLIT, $0-48
 	JZ     qdotQ6KAVX2x1_done
 
 qdotQ6KAVX2x1_loop:
+	PREFETCHT0   2176(CX)
 	VPXOR        Y1, Y1, Y1
 	VPMOVSXBW    192(CX), X2
 	VINSERTI128  $0x01, X2, Y2, Y2
@@ -1369,7 +1378,7 @@ qdotQ6KAVX2x1_done:
 	RET
 
 // func qdotQ6KAVX2x2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ6KAVX2x2(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -1382,6 +1391,7 @@ TEXT ·qdotQ6KAVX2x2(SB), NOSPLIT, $0-48
 	JZ     qdotQ6KAVX2x2_done
 
 qdotQ6KAVX2x2_loop:
+	PREFETCHT0   2176(CX)
 	VPXOR        Y2, Y2, Y2
 	VPXOR        Y3, Y3, Y3
 	VPMOVSXBW    192(CX), X4
@@ -1537,7 +1547,7 @@ qdotQ6KAVX2x2_done:
 	RET
 
 // func qdotQ6KAVX2x3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ6KAVX2x3(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -1552,6 +1562,7 @@ TEXT ·qdotQ6KAVX2x3(SB), NOSPLIT, $0-48
 	JZ     qdotQ6KAVX2x3_done
 
 qdotQ6KAVX2x3_loop:
+	PREFETCHT0   2176(CX)
 	VPXOR        Y3, Y3, Y3
 	VPXOR        Y4, Y4, Y4
 	VPXOR        Y5, Y5, Y5
@@ -1746,7 +1757,7 @@ qdotQ6KAVX2x3_done:
 	RET
 
 // func qdotQ6KAVX2x4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
-// Requires: AVX, AVX2, F16C
+// Requires: AVX, AVX2, F16C, MMX+
 TEXT ·qdotQ6KAVX2x4(SB), NOSPLIT, $0-48
 	MOVQ   nb+0(FP), AX
 	MOVQ   w+8(FP), CX
@@ -1763,6 +1774,7 @@ TEXT ·qdotQ6KAVX2x4(SB), NOSPLIT, $0-48
 	JZ     qdotQ6KAVX2x4_done
 
 qdotQ6KAVX2x4_loop:
+	PREFETCHT0   2176(CX)
 	VPXOR        Y4, Y4, Y4
 	VPXOR        Y5, Y5, Y5
 	VPXOR        Y6, Y6, Y6
