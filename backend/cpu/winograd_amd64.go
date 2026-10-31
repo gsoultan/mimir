@@ -8,5 +8,6 @@ func init() {
 	if x86Features().avx512 {
 		winoInputRow, winoGradRow, winoOutputRow = winoInputAVX512, winoGradAVX512, winoOutputAVX512
 		winoInputChannels, winoGradChannels = winoInputChannelsAVX512, winoGradChannelsAVX512
+		winoWeightsPanel = winoWeightsAVX512
 	}
 }

@@ -84,6 +84,11 @@ func maxVSAVX512(dst *float32, a *float32, s float32, n int)
 //go:noescape
 func cmpltVVAVX512(dst *float32, a *float32, b *float32, n int)
 
+// fillVSAVX512 sets the n elements at dst, a multiple of 16, to s.
+//
+//go:noescape
+func fillVSAVX512(dst *float32, s float32, n int)
+
 // cmpltVSAVX512 sets the n elements at dst, a multiple of 16, to 1 where the element at a is less than s, and 0 elsewhere.
 //
 //go:noescape
@@ -183,6 +188,11 @@ func maxVSAVX2(dst *float32, a *float32, s float32, n int)
 //
 //go:noescape
 func cmpltVVAVX2(dst *float32, a *float32, b *float32, n int)
+
+// fillVSAVX2 sets the n elements at dst, a multiple of 8, to s.
+//
+//go:noescape
+func fillVSAVX2(dst *float32, s float32, n int)
 
 // cmpltVSAVX2 sets the n elements at dst, a multiple of 8, to 1 where the element at a is less than s, and 0 elsewhere.
 //

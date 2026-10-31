@@ -72,6 +72,7 @@ func main() {
 			binaryVS(v, op)
 		}
 		cmpltVV(v)
+		fillVS(v)
 		cmpltVS(v, false)
 		cmpltVS(v, true)
 		recip(v)
@@ -237,6 +238,20 @@ func binaryVS(v isa, op string) {
 		// With a as the second source, a maximum is NaN where a is.
 		arith(op, Mem{Base: pa, Disp: disp}, sv, x)
 		VMOVUPS(x, Mem{Base: pd, Disp: disp})
+	})
+}
+
+// fillVS emits dst[i] = s.
+func fillVS(v isa) {
+	name := "fillVS" + v.name
+	TEXT(name, NOSPLIT, "func(dst *float32, s float32, n int)")
+	Pragma("noescape")
+	Doc(fmt.Sprintf("%s sets the n elements at dst, a multiple of %d, to s.", name, v.lanes))
+	pd := Load(Param("dst"), GP64())
+	sv := broadcast(v, "s")
+	n := Load(Param("n"), GP64())
+	elementLoop(v, name, []Register{pd}, n, func(disp int) {
+		VMOVUPS(sv, Mem{Base: pd, Disp: disp})
 	})
 }
 

@@ -76,6 +76,19 @@ DATA wino_hi<>+56(SB)/4, $0x0000000f
 DATA wino_hi<>+60(SB)/4, $0x0000001f
 GLOBL wino_hi<>(SB), RODATA|NOPTR, $64
 
+DATA wino_iota8<>+0(SB)/4, $0x00000000
+DATA wino_iota8<>+4(SB)/4, $0x00000001
+DATA wino_iota8<>+8(SB)/4, $0x00000002
+DATA wino_iota8<>+12(SB)/4, $0x00000003
+DATA wino_iota8<>+16(SB)/4, $0x00000004
+DATA wino_iota8<>+20(SB)/4, $0x00000005
+DATA wino_iota8<>+24(SB)/4, $0x00000006
+DATA wino_iota8<>+28(SB)/4, $0x00000007
+GLOBL wino_iota8<>(SB), RODATA|NOPTR, $32
+
+DATA wino_half<>+0(SB)/4, $(0.5)
+GLOBL wino_half<>(SB), RODATA|NOPTR, $4
+
 // func winoInputAVX512(dst *float32, xs int, src *float32, pw int, step int, tiles int)
 // Requires: AVX, AVX512F
 TEXT ·winoInputAVX512(SB), NOSPLIT, $0-48
@@ -690,5 +703,164 @@ winoGradChannelsAVX512_tile:
 	JNZ           winoGradChannelsAVX512_tile
 
 winoGradChannelsAVX512_done:
+	VZEROUPPER
+	RET
+
+// func winoWeightsAVX512(dst *float32, xs int, src *float32, so int, si int, sh int, sw int, cin int)
+// Requires: AVX, AVX2, AVX512F, AVX512VL
+TEXT ·winoWeightsAVX512(SB), NOSPLIT, $8-64
+	MOVQ         dst+0(FP), AX
+	MOVQ         xs+8(FP), CX
+	SHLQ         $0x02, CX
+	MOVQ         src+16(FP), DX
+	MOVQ         so+24(FP), BX
+	MOVQ         si+32(FP), SI
+	SHLQ         $0x02, SI
+	MOVQ         sh+40(FP), DI
+	SHLQ         $0x02, DI
+	MOVQ         sw+48(FP), R8
+	SHLQ         $0x02, R8
+	MOVQ         cin+56(FP), R9
+	VMOVUPS      wino_iota8<>+0(SB), Y0
+	VPBROADCASTD BX, Y1
+	VPMULLD      Y1, Y0, Y0
+	VBROADCASTSS wino_half<>+0(SB), Y1
+	MOVQ         DX, BX
+	ADDQ         R8, BX
+	MOVQ         DX, R10
+	ADDQ         R8, R10
+	ADDQ         R8, R10
+	MOVQ         DX, R11
+	ADDQ         DI, R11
+	MOVQ         DX, R12
+	ADDQ         DI, R12
+	ADDQ         R8, R12
+	MOVQ         DX, R13
+	ADDQ         DI, R13
+	ADDQ         R8, R13
+	ADDQ         R8, R13
+	MOVQ         DX, R14
+	ADDQ         DI, R14
+	ADDQ         DI, R14
+	MOVQ         DX, R15
+	ADDQ         DI, R15
+	ADDQ         DI, R15
+	ADDQ         R8, R15
+	MOVQ         DX, BP
+	ADDQ         DI, BP
+	ADDQ         DI, BP
+	ADDQ         R8, BP
+	ADDQ         R8, BP
+	TESTQ        R9, R9
+	JLE          winoWeightsAVX512_done
+
+winoWeightsAVX512_channel:
+	KXNORW     K1, K1, K1
+	VGATHERDPS (DX)(Y0*4), K1, Y2
+	KXNORW     K1, K1, K1
+	VGATHERDPS (BX)(Y0*4), K1, Y3
+	KXNORW     K1, K1, K1
+	VGATHERDPS (R10)(Y0*4), K1, Y4
+	KXNORW     K1, K1, K1
+	VGATHERDPS (R11)(Y0*4), K1, Y5
+	KXNORW     K1, K1, K1
+	VGATHERDPS (R12)(Y0*4), K1, Y6
+	KXNORW     K1, K1, K1
+	VGATHERDPS (R13)(Y0*4), K1, Y7
+	KXNORW     K1, K1, K1
+	VGATHERDPS (R14)(Y0*4), K1, Y8
+	KXNORW     K1, K1, K1
+	VGATHERDPS (R15)(Y0*4), K1, Y9
+	KXNORW     K1, K1, K1
+	VGATHERDPS (BP)(Y0*4), K1, Y10
+	VADDPS     Y5, Y2, Y11
+	VSUBPS     Y5, Y2, Y12
+	VADDPS     Y8, Y11, Y11
+	VMULPS     Y1, Y11, Y11
+	VADDPS     Y8, Y12, Y12
+	VMULPS     Y1, Y12, Y12
+	VADDPS     Y6, Y3, Y13
+	VSUBPS     Y6, Y3, Y14
+	VADDPS     Y9, Y13, Y13
+	VMULPS     Y1, Y13, Y13
+	VADDPS     Y9, Y14, Y14
+	VMULPS     Y1, Y14, Y14
+	VADDPS     Y7, Y4, Y15
+	VSUBPS     Y7, Y4, Y16
+	VADDPS     Y10, Y15, Y15
+	VMULPS     Y1, Y15, Y15
+	VADDPS     Y10, Y16, Y16
+	VMULPS     Y1, Y16, Y16
+	MOVQ       AX, DI
+	VADDPS     Y3, Y2, Y17
+	VSUBPS     Y3, Y2, Y18
+	VADDPS     Y4, Y17, Y17
+	VMULPS     Y1, Y17, Y17
+	VADDPS     Y4, Y18, Y18
+	VMULPS     Y1, Y18, Y18
+	VMOVUPS    Y2, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y17, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y18, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y4, (DI)
+	ADDQ       CX, DI
+	VADDPS     Y13, Y11, Y17
+	VSUBPS     Y13, Y11, Y13
+	VADDPS     Y15, Y17, Y17
+	VMULPS     Y1, Y17, Y17
+	VADDPS     Y15, Y13, Y13
+	VMULPS     Y1, Y13, Y13
+	VMOVUPS    Y11, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y17, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y13, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y15, (DI)
+	ADDQ       CX, DI
+	VADDPS     Y14, Y12, Y11
+	VSUBPS     Y14, Y12, Y13
+	VADDPS     Y16, Y11, Y11
+	VMULPS     Y1, Y11, Y11
+	VADDPS     Y16, Y13, Y13
+	VMULPS     Y1, Y13, Y13
+	VMOVUPS    Y12, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y11, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y13, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y16, (DI)
+	ADDQ       CX, DI
+	VADDPS     Y9, Y8, Y11
+	VSUBPS     Y9, Y8, Y12
+	VADDPS     Y10, Y11, Y11
+	VMULPS     Y1, Y11, Y11
+	VADDPS     Y10, Y12, Y12
+	VMULPS     Y1, Y12, Y12
+	VMOVUPS    Y8, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y11, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y12, (DI)
+	ADDQ       CX, DI
+	VMOVUPS    Y10, (DI)
+	ADDQ       CX, DI
+	ADDQ       $0x00000020, AX
+	ADDQ       SI, DX
+	ADDQ       SI, BX
+	ADDQ       SI, R10
+	ADDQ       SI, R11
+	ADDQ       SI, R12
+	ADDQ       SI, R13
+	ADDQ       SI, R14
+	ADDQ       SI, R15
+	ADDQ       SI, BP
+	DECQ       R9
+	JNZ        winoWeightsAVX512_channel
+
+winoWeightsAVX512_done:
 	VZEROUPPER
 	RET

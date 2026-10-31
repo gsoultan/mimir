@@ -144,6 +144,9 @@ func (be *Backend) sgemm(ctx context.Context, g *gemmKernel, out []float32, a op
 			return nil
 		})
 	}
+	if groups := deepGroups(g, m, n, k, outputs, be.workers); groups > 1 {
+		return be.sgemmDeep(ctx, g, out, a, offA, b, offB, m, n, k, groups, epi)
+	}
 	for o := range outputs {
 		ta, tb := terms(o)
 		if err := be.sgemmShared(ctx, g, a, ta, b, tb, out[o*m*n:][:m*n], m, n, k, epi, o*m*n); err != nil {
@@ -223,80 +226,128 @@ func groupWorkers(groups, workers int) int {
 }
 
 // sgemmShared computes the m×n product c = Σ a[i]·b[i], where matrix i of
-// a starts at offA[i] and of b at offB[i], with every worker. For each
-// block of B, the workers pack its panels together and then compute parts
-// of the output from them, each packing the rows of A that it needs.
-// Packing B separately for each part would repeat it for every part. The
-// epilogue rewrites each part once its last block of A and B is done; c
-// starts at element base of the epilogue's output.
+// a starts at offA[i] and of b at offB[i], with every worker: each
+// computes parts of the output, packing the rows of A and the columns of
+// B that its part needs. Packing B once for every part and reading the
+// panels from the cores that packed them was measured slower on a VM
+// where cores share cache lines slowly, even where it packed less; see
+// planParts for how the parts limit the repeated packing. The epilogue
+// rewrites each part once it is done; c starts at element base of the
+// epilogue's output.
 func (be *Backend) sgemmShared(ctx context.Context, g *gemmKernel, a operand, offA []int, b operand, offB []int, c []float32, m, n, k int, epi *evaluator, base int) error {
 	if k == 0 {
 		clear(c)
 		return epi.apply(base, base+m*n)
 	}
-	shared := gemmWorkspaces.Get().(*gemmWorkspace)
-	defer gemmWorkspaces.Put(shared)
-	for jc := 0; jc < n; jc += g.nc {
-		nc := min(g.nc, n-jc)
-		p := spreadRows(g, planGEMM(g, m, nc, k, be.workers), m, min(k, g.kc), be.workers)
-		for t := range offA {
-			at, bt := a, b
-			at.off, bt.off = offA[t], offB[t]
-			for pc := 0; pc < k; pc += g.kc {
-				kc := min(g.kc, k-pc)
-				shared.b = grow(shared.b, roundUp(nc, g.nr)*kc+packSlack)
-				bp := shared.b
-				panels := (nc + g.nr - 1) / g.nr
-				err := be.parallelFor(ctx, panels, packGrain/(kc*g.nr), func(lo, hi int) error {
-					// Bound the panels so that packing stores nothing into those
-					// of other chunks.
-					j0 := lo * g.nr
-					packB(bp[j0*kc:hi*g.nr*kc], bt, pc, kc, jc+j0, min(hi*g.nr, nc)-j0, g.nr)
-					return nil
-				})
-				if err != nil {
+	p := planParts(g, m, n, k, be.workers)
+	return be.parallelFor(ctx, p.mParts*p.nParts, 1, func(lo, hi int) error {
+		ws := gemmWorkspaces.Get().(*gemmWorkspace)
+		defer gemmWorkspaces.Put(ws)
+		for u := lo; u < hi; u++ {
+			i0, j0 := u/p.nParts*p.mStep, u%p.nParts*p.nStep
+			i1, j1 := min(i0+p.mStep, m), min(j0+p.nStep, n)
+			gemmBlock(g, ws, a, offA, b, offB, k, c, n, i0, i1, j0, j1)
+			if j0 == 0 && j1 == n {
+				// Whole rows: one contiguous range, which the epilogue
+				// runs in wide tiles.
+				if err := epi.apply(base+i0*n, base+i1*n); err != nil {
 					return err
 				}
-				last := t == len(offA)-1 && pc+kc >= k
-				err = be.parallelFor(ctx, p.mParts*p.nParts, 1, func(lo, hi int) error {
-					ws := gemmWorkspaces.Get().(*gemmWorkspace)
-					defer gemmWorkspaces.Put(ws)
-					for u := lo; u < hi; u++ {
-						i0, j0 := u/p.nParts*p.mStep, u%p.nParts*p.nStep
-						i1, j1 := min(i0+p.mStep, m), min(j0+p.nStep, nc)
-						for ic := i0; ic < i1; ic += g.mc {
-							mc := min(g.mc, i1-ic)
-							ws.a = grow(ws.a, roundUp(mc, g.mr)*kc+packSlack)
-							packA(ws.a, at, ic, mc, pc, kc, g.mr)
-							macroKernel(g, ws.a, bp[j0*kc:], kc, mc, j1-j0, c[ic*n+jc+j0:], n, t > 0 || pc > 0, &ws.tile)
-						}
-						if !last {
-							continue
-						}
-						if j0 == 0 && j1 == n {
-							// Whole rows: one contiguous range, which the
-							// epilogue runs in wide tiles.
-							if err := epi.apply(base+i0*n, base+i1*n); err != nil {
-								return err
-							}
-							continue
-						}
-						for i := i0; i < i1; i++ {
-							row := base + i*n + jc
-							if err := epi.apply(row+j0, row+j1); err != nil {
-								return err
-							}
-						}
-					}
-					return nil
-				})
-				if err != nil {
+				continue
+			}
+			for i := i0; i < i1; i++ {
+				if err := epi.apply(base+i*n+j0, base+i*n+j1); err != nil {
 					return err
 				}
 			}
 		}
+		return nil
+	})
+}
+
+// sgemmDeep computes each output's product like sgemmShared, with the
+// sum over k split into groups slices computed in parallel, the first
+// into out and the others into partial sums that are then added to out
+// in order: the way to share a product of few rows and columns summed
+// over many, such as a dense layer's over a batch, which parts of the
+// output would share only by packing the same operands again and again.
+// groups depends on the shapes alone (see deepGroups), so the result does
+// not depend on the number of workers.
+func (be *Backend) sgemmDeep(ctx context.Context, g *gemmKernel, out []float32, a operand, offA []int, b operand, offB []int, m, n, k, groups int, epi *evaluator) error {
+	size := m * n
+	outputs := len(out) / size
+	shared := gemmWorkspaces.Get().(*gemmWorkspace)
+	defer gemmWorkspaces.Put(shared)
+	shared.partials = grow(shared.partials, (groups-1)*len(out))
+	partials := shared.partials
+	slice := (k + groups - 1) / groups
+	err := be.parallelFor(ctx, outputs*groups, 1, func(lo, hi int) error {
+		ws := gemmWorkspaces.Get().(*gemmWorkspace)
+		defer gemmWorkspaces.Put(ws)
+		for u := lo; u < hi; u++ {
+			o, j := u/groups, u%groups
+			k0 := j * slice
+			c := out[o*size:][:size]
+			if j > 0 {
+				c = partials[(j-1)*len(out)+o*size:][:size]
+			}
+			gemmBlock(g, ws, a, []int{offA[o] + k0*a.cs}, b, []int{offB[o] + k0*b.rs}, min(slice, k-k0), c, n, 0, m, 0, n)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	return nil
+	return be.parallelFor(ctx, len(out), elementGrain, func(lo, hi int) error {
+		c := out[lo:hi]
+		for j := range groups - 1 {
+			addVec(c, partials[j*len(out)+lo:][:len(c)])
+		}
+		return epi.apply(lo, hi)
+	})
+}
+
+// addVec adds the elements of src to those of dst.
+func addVec(dst, src []float32) {
+	src = src[:len(dst)]
+	if rowVector != nil {
+		if n := vectorPart(len(dst)); n > 0 {
+			rowVector.addVV(&dst[0], &dst[0], &src[0], n)
+			dst, src = dst[n:], src[n:]
+		}
+	}
+	for i, v := range src {
+		dst[i] += v
+	}
+}
+
+// reduceCost is the cost of summing one element of a partial sum into
+// the output, in multiply-adds: the sums stream through memory.
+const reduceCost = 16
+
+// deepGroups returns the number of slices that sgemmDeep splits the sum
+// over k of an m×n product into, or 1 where the product is better shared
+// as parts of its output: the largest power of two of slices g.kc deep at
+// least, up to maxGroups, whose partial sums fit maxPartials, when that
+// costs the busiest of workers workers less than parts of the output
+// would (see planCost). It depends on the shapes alone, besides workers,
+// so that the result of a product does not depend on workers.
+func deepGroups(g *gemmKernel, m, n, k, outputs, workers int) int {
+	groups := 1
+	for 2*groups <= min(maxGroups, k/g.kc) && (2*groups-1)*outputs*m*n <= maxPartials {
+		groups *= 2
+	}
+	if groups == 1 {
+		return 1
+	}
+	_, parts := planCost(g, m, n, k, workers, true)
+	slice := (k + groups - 1) / groups
+	rounds := (outputs*groups + workers - 1) / workers
+	deep := rounds*(m*n*slice+(m+n)*slice*packCost) + (groups-1)*m*n*reduceCost
+	if outputs*deep < parts {
+		return groups
+	}
+	return 1
 }
 
 // sgemmWide computes out[i] = a·b[i] for every matrix i of b, which starts
@@ -437,12 +488,23 @@ func planParts(g *gemmKernel, m, n, k, workers int) gemmPlan {
 }
 
 func planSplit(g *gemmKernel, m, n, k, workers int, packsB bool) gemmPlan {
+	p, _ := planCost(g, m, n, k, workers, packsB)
+	return p
+}
+
+// planCost is planSplit with the cost of the plan for the busiest worker,
+// in multiply-adds, counting a packed element as packCost of them.
+func planCost(g *gemmKernel, m, n, k, workers int, packsB bool) (gemmPlan, int) {
 	p := gemmPlan{mStep: max(m, 1), nStep: max(n, 1), mParts: 1, nParts: 1}
+	mt, nt := (m+g.mr-1)/g.mr, (n+g.nr-1)/g.nr
+	whole := mt * g.mr * (nt*g.nr + packCost)
+	if packsB {
+		whole += nt * g.nr * packCost
+	}
 	want := min(workers, 2*m*n*max(k, 1)/minUnitFlops)
 	if want <= 1 {
-		return p
+		return p, whole * max(k, 1)
 	}
-	mt, nt := (m+g.mr-1)/g.mr, (n+g.nr-1)/g.nr
 	best := -1
 	for pn := 1; pn <= min(want, nt); pn++ {
 		pm := min((want+pn-1)/pn, mt)
@@ -460,7 +522,7 @@ func planSplit(g *gemmKernel, m, n, k, workers int, packsB bool) gemmPlan {
 		}
 	}
 	p.mParts, p.nParts = (m+p.mStep-1)/p.mStep, (n+p.nStep-1)/p.nStep
-	return p
+	return p, best * max(k, 1)
 }
 
 // gemmBlock computes rows [i0, i1) and columns [j0, j1) of c = Σ a[i]·b[i],
