@@ -48,7 +48,7 @@ func epilogue(k *backend.Kernel, out backend.Buffer, ins []backend.Buffer) (*eva
 	if n, _ := backend.NumElements(shape); n != out.Len() {
 		return nil, fmt.Errorf("epilogue of shape %v for %d elements: %w", shape, out.Len(), backend.ErrInternal)
 	}
-	return newEvaluator(shape, views, k.Attrs.Program, nil, []backend.Buffer{out}, append([]backend.Buffer{out}, ins[2:]...))
+	return cachedEvaluator(k, evalEpilogue, shape, views, k.Attrs.Program, nil, []backend.Buffer{out}, append([]backend.Buffer{out}, ins[2:]...))
 }
 
 // matmul computes [..., M, K] x [..., K, N] -> [..., M, N], summing the

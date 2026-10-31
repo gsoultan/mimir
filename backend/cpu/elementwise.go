@@ -152,20 +152,9 @@ func compile(out backend.DType, prog []backend.Instr, stores []int, ins []backen
 		outOf[j] = i + 1
 		writer = append(writer, j)
 	}
-	p := &program{steps: make([]step, len(prog)), inF: make([][]float32, len(ins)), inI: make([][]int32, len(ins)), inH: make([][]uint16, len(ins))}
-	for i, buf := range ins {
-		switch buf := buf.(type) {
-		case *buffer[float32]:
-			p.inF[i] = buf.data
-		case *buffer[int32]:
-			p.inI[i] = buf.data
-		case *buffer[bf16]:
-			p.inH[i] = bitsOf(buf.data)
-		case *buffer[f16]:
-			p.inH[i] = bitsOf(buf.data)
-		default:
-			return nil, fmt.Errorf("foreign buffer %T: %w", buf, backend.ErrDType)
-		}
+	p := &program{steps: make([]step, len(prog))}
+	if err := p.bindInputs(ins); err != nil {
+		return nil, err
 	}
 	scalar := make([]bool, len(prog))
 	lastUse := make([]int, len(prog))
@@ -321,7 +310,7 @@ func check(in backend.Instr, j int, prog []backend.Instr, ins []backend.Buffer) 
 // runProgram computes the elementwise program prog into outs[0], and the
 // values it stores into the other outputs.
 func runProgram(ctx context.Context, b *Backend, k *backend.Kernel, prog []backend.Instr, stores []int, outs, ins []backend.Buffer) error {
-	e, err := newEvaluator(k.Shape, k.In, prog, stores, outs, ins)
+	e, err := cachedEvaluator(k, evalProgram, k.Shape, k.In, prog, stores, outs, ins)
 	if err != nil || e == nil {
 		return err
 	}
@@ -433,6 +422,34 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 	if e.p, err = compile(outs[0].DType(), prog, stores, ins, aliasOf, e.strides); err != nil {
 		return nil, err
 	}
+	if err := e.bindOutputs(outs); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// bindInputs makes p read ins.
+func (p *program) bindInputs(ins []backend.Buffer) error {
+	p.inF, p.inI, p.inH = make([][]float32, len(ins)), make([][]int32, len(ins)), make([][]uint16, len(ins))
+	for i, buf := range ins {
+		switch buf := buf.(type) {
+		case *buffer[float32]:
+			p.inF[i] = buf.data
+		case *buffer[int32]:
+			p.inI[i] = buf.data
+		case *buffer[bf16]:
+			p.inH[i] = bitsOf(buf.data)
+		case *buffer[f16]:
+			p.inH[i] = bitsOf(buf.data)
+		default:
+			return fmt.Errorf("foreign buffer %T: %w", buf, backend.ErrDType)
+		}
+	}
+	return nil
+}
+
+// bindOutputs makes e write outs.
+func (e *evaluator) bindOutputs(outs []backend.Buffer) error {
 	for _, out := range outs {
 		switch out := out.(type) {
 		case *buffer[float32]:
@@ -444,10 +461,10 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 		case *buffer[f16]:
 			e.outH = append(e.outH, bitsOf(out.data))
 		default:
-			return nil, fmt.Errorf("foreign buffer %T: %w", out, backend.ErrDType)
+			return fmt.Errorf("foreign buffer %T: %w", out, backend.ErrDType)
 		}
 	}
-	return e, nil
+	return nil
 }
 
 // apply computes output elements [lo, hi) with pooled scratch memory. It
