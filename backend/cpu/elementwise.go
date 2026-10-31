@@ -362,6 +362,7 @@ type evaluator struct {
 	gather []int   // the gathered inputs
 	pat    [][]int // by gathered input
 	runs   []int   // by gathered input: the length of its contiguous runs, or 0
+	reps   []int   // by gathered input: the length of its runs of one element, or 0
 }
 
 // newEvaluator prepares prog to compute outs[0], indexed by shape, and the
@@ -407,11 +408,17 @@ func newEvaluator(shape []int, views []backend.View, prog []backend.Instr, store
 			e.pat = append(e.pat, pat)
 			// An input read at stride 1 along the rows, such as a bias
 			// broadcast over them, is gathered a row at a time.
-			runs := 0
-			if view.Strides[r-1] == 1 && shape[r-1] > 1 {
+			runs, reps := 0, 0
+			switch {
+			case view.Strides[r-1] == 1 && shape[r-1] > 1:
 				runs = shape[r-1]
+			case view.Strides[r-1] == 0 && shape[r-1] > 1:
+				// An input broadcast along the rows, such as a bias of
+				// each channel's plane, fills a row from one element.
+				reps = shape[r-1]
 			}
 			e.runs = append(e.runs, runs)
+			e.reps = append(e.reps, reps)
 		}
 	}
 	aliasOf := make([]int, len(ins))
@@ -537,11 +544,15 @@ func (e *evaluator) runWide(s *scratch, lo, hi int) error {
 			n := min(e.block-j, m-k)
 			for g, v := range e.gather {
 				pat := e.pat[g][j : j+n]
-				runs, first := e.runs[g], 0
+				runs, reps, first := e.runs[g], e.reps[g], 0
 				if runs > 0 {
 					first = runs - j%runs // what is left of the run j is in
+				} else if reps > 0 {
+					first = reps - j%reps
 				}
 				switch {
+				case e.p.inF[v] != nil && reps > 0:
+					fillAt(s.inF[v][k:k+n], e.p.inF[v], c.offs[v], pat, reps, first)
 				case e.p.inF[v] != nil:
 					gatherAt(s.inF[v][k:k+n], e.p.inF[v], c.offs[v], pat, runs, first)
 				case e.p.inH[v] != nil:
@@ -579,6 +590,29 @@ func linear(shape, strides []int) bool {
 		}
 	}
 	return true
+}
+
+// fillAt sets dst to the elements of src at off plus each offset in pat,
+// which is runs of one offset repeated, the first run first long and the
+// rest reps long: each run is filled from its one element.
+func fillAt(dst, src []float32, off int, pat []int, reps, first int) {
+	for i, n := 0, first; i < len(pat); i, n = i+n, reps {
+		n = min(n, len(pat)-i)
+		fillRow(dst[i:i+n], src[off+pat[i]])
+	}
+}
+
+// fillRow sets every element of dst to v.
+func fillRow(dst []float32, v float32) {
+	if rowVector != nil && rowVector.fillVS != nil {
+		if n := vectorPart(len(dst)); n > 0 {
+			rowVector.fillVS(&dst[0], v, n)
+			dst = dst[n:]
+		}
+	}
+	for i := range dst {
+		dst[i] = v
+	}
 }
 
 // gatherAt sets dst to the elements of src at off plus each offset in pat.

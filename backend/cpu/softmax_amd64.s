@@ -1146,6 +1146,38 @@ cmpltVVAVX512_done:
 	VZEROUPPER
 	RET
 
+// func fillVSAVX512(dst *float32, s float32, n int)
+// Requires: AVX, AVX512F, SSE
+TEXT ·fillVSAVX512(SB), NOSPLIT, $0-24
+	MOVQ         dst+0(FP), AX
+	MOVSS        s+8(FP), X0
+	VBROADCASTSS X0, Z0
+	MOVQ         n+16(FP), CX
+	CMPQ         CX, $0x00000040
+	JL           fillVSAVX512_one
+
+fillVSAVX512_wide:
+	VMOVUPS Z0, (AX)
+	VMOVUPS Z0, 64(AX)
+	VMOVUPS Z0, 128(AX)
+	VMOVUPS Z0, 192(AX)
+	ADDQ    $0x00000100, AX
+	SUBQ    $0x00000040, CX
+	CMPQ    CX, $0x00000040
+	JGE     fillVSAVX512_wide
+
+fillVSAVX512_one:
+	TESTQ   CX, CX
+	JZ      fillVSAVX512_done
+	VMOVUPS Z0, (AX)
+	ADDQ    $0x00000040, AX
+	SUBQ    $0x00000010, CX
+	JMP     fillVSAVX512_one
+
+fillVSAVX512_done:
+	VZEROUPPER
+	RET
+
 // func cmpltVSAVX512(dst *float32, a *float32, s float32, n int)
 // Requires: AVX, AVX512F, SSE
 TEXT ·cmpltVSAVX512(SB), NOSPLIT, $0-32
@@ -2054,6 +2086,38 @@ cmpltVVAVX2_one:
 	JMP     cmpltVVAVX2_one
 
 cmpltVVAVX2_done:
+	VZEROUPPER
+	RET
+
+// func fillVSAVX2(dst *float32, s float32, n int)
+// Requires: AVX, AVX2, SSE
+TEXT ·fillVSAVX2(SB), NOSPLIT, $0-24
+	MOVQ         dst+0(FP), AX
+	MOVSS        s+8(FP), X0
+	VBROADCASTSS X0, Y0
+	MOVQ         n+16(FP), CX
+	CMPQ         CX, $0x00000020
+	JL           fillVSAVX2_one
+
+fillVSAVX2_wide:
+	VMOVUPS Y0, (AX)
+	VMOVUPS Y0, 32(AX)
+	VMOVUPS Y0, 64(AX)
+	VMOVUPS Y0, 96(AX)
+	ADDQ    $0x00000080, AX
+	SUBQ    $0x00000020, CX
+	CMPQ    CX, $0x00000020
+	JGE     fillVSAVX2_wide
+
+fillVSAVX2_one:
+	TESTQ   CX, CX
+	JZ      fillVSAVX2_done
+	VMOVUPS Y0, (AX)
+	ADDQ    $0x00000020, AX
+	SUBQ    $0x00000008, CX
+	JMP     fillVSAVX2_one
+
+fillVSAVX2_done:
 	VZEROUPPER
 	RET
 

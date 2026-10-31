@@ -24,9 +24,10 @@ const directMaxTaps = 320
 
 // directPositions bounds the output positions, over every item, of a
 // forward convolution of many channels that runs as a direct one rather
-// than Winograd's, whose transforms of the weights and the tiles' edges
-// cost more than they save on few positions.
-var directPositions = 2048
+// than Winograd's. Winograd's was measured faster down to one item of
+// 7×7, since its weights transform in vector registers, so none do; the
+// tests set it to compare the two.
+var directPositions = 0
 
 // directConv is a 2-D convolution of stride 1 of N items of G groups of C
 // channels, H×W, padded by pt rows above and pl columns to the left, with
