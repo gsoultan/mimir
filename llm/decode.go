@@ -76,9 +76,13 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 	// hundred small kernels; a GPU decodes through Logits' general path,
 	// whose kernels it queues as it builds them. A step's program also
 	// runs on one device, so caches kept on another, as on a default
-	// device apart from the model's, take the general path too.
+	// device apart from the model's, take the general path too. The
+	// caches were allocated on the default device, and once a general
+	// step has appended to them, their buffers are the results of
+	// kernels that take the model's device, so the default device is
+	// what tells where their memory is.
 	dev := m.Embed.Weight.Value().Device()
-	if dev.Name() != "cpu" {
+	if dev.Name() != "cpu" || !tensor.DefaultDevice().Equal(dev) {
 		return nil, false, nil
 	}
 	for _, c := range caches {
