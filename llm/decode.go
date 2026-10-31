@@ -72,9 +72,15 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 	if n >= capacity || m.Rope == nil || m.Rope.Dim != m.Config.HeadDim {
 		return nil, false, nil
 	}
-	// A step's program runs on one device, so caches kept on another, as
-	// on a default device apart from the model's, take the general path.
+	// The step pays for the CPU's cost of building and launching a few
+	// hundred small kernels; a GPU decodes through Logits' general path,
+	// whose kernels it queues as it builds them. A step's program also
+	// runs on one device, so caches kept on another, as on a default
+	// device apart from the model's, take the general path too.
 	dev := m.Embed.Weight.Value().Device()
+	if dev.Name() != "cpu" {
+		return nil, false, nil
+	}
 	for _, c := range caches {
 		if k, v := c.Buffers(); !k.Device().Equal(dev) || !v.Device().Equal(dev) {
 			return nil, false, nil
