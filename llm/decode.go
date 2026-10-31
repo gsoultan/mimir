@@ -70,7 +70,14 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 	if n >= capacity || m.Rope == nil || m.Rope.Dim != m.Config.HeadDim {
 		return nil, false, nil
 	}
+	// A step's program runs on one device, so caches kept on another, as
+	// on a default device apart from the model's, take the general path.
 	dev := m.Embed.Weight.Value().Device()
+	for _, c := range caches {
+		if k, v := c.Buffers(); !k.Device().Equal(dev) || !v.Device().Equal(dev) {
+			return nil, false, nil
+		}
+	}
 	key := stepKey{min(capacity, (n/stepWindow+1)*stepWindow), capacity}
 	leaves := m.stepLeaves(token, n, key.window, caches, dev)
 	dsts := make([]*tensor.Tensor, 0, 2*len(caches)+1)
