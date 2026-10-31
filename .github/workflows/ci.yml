@@ -211,15 +211,10 @@ jobs:
           go-version-file: go.mod
           cache: false
       - run: go install golang.org/x/perf/cmd/benchstat@latest
-      - name: benchmark the pull request
-        run: go test -run='^$' -bench=. -count=6 ./... | tee "$RUNNER_TEMP/head.txt"
-      - name: benchmark the base branch
+      - name: benchmark the base branch and the pull request in turn
         run: |
-          git checkout --quiet ${{ github.event.pull_request.base.sha }}
-          if [ -f go.mod ]; then
-            go test -run='^$' -bench=. -count=6 ./... | tee "$RUNNER_TEMP/base.txt" || true
-          fi
-          touch "$RUNNER_TEMP/base.txt"
+          git worktree add --quiet "$RUNNER_TEMP/base" ${{ github.event.pull_request.base.sha }}
+          ci/benchpair.sh "$RUNNER_TEMP/base" "$PWD" 6 "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt"
       - name: compare
         run: |
           {
@@ -229,6 +224,4 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: fail on a slowdown
-        run: |
-          git checkout --quiet ${{ github.event.pull_request.head.sha }}
-          ci/benchgate.sh "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt"
+        run: ci/benchgate.sh "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt"

@@ -5,12 +5,12 @@ package cpu
 //go:generate sh -c "cd ../../tools/asmgen && go run ./softmax -out ../../backend/cpu/softmax_amd64.s -stubs ../../backend/cpu/softmax_stub_amd64.go -pkg cpu"
 
 var (
-	rowAVX512 = rowRoutines{lanes: 16, max: rowMaxAVX512, expShift: expShiftAVX512, scale: scaleRowAVX512, softmaxGrad: softmaxGradAVX512, dot4: dot4AVX512, exp2: exp2AVX512,
+	rowAVX512 = rowRoutines{lanes: 16, max: rowMaxAVX512, expShift: expShiftAVX512, scale: scaleRowAVX512, softmaxGrad: softmaxGradAVX512, dot4: dot4AVX512, dotRows: dotRowsAVX512, axpyRows: axpyRowsAVX512, exp2: exp2AVX512,
 		addVV: addVVAVX512, mulVV: mulVVAVX512, addVS: addVSAVX512, mulVS: mulVSAVX512, recip: recipAVX512, sqrt: sqrtAVX512,
-		maxVV: maxVVAVX512, maxVS: maxVSAVX512, cmpltVV: cmpltVVAVX512, cmpltVS: cmpltVSAVX512, cmpltSV: cmpltSVAVX512, sum: sumAVX512}
-	rowAVX2 = rowRoutines{lanes: 8, max: rowMaxAVX2, expShift: expShiftAVX2, scale: scaleRowAVX2, softmaxGrad: softmaxGradAVX2, dot4: dot4AVX2, exp2: exp2AVX2,
+		maxVV: maxVVAVX512, maxVS: maxVSAVX512, cmpltVV: cmpltVVAVX512, cmpltVS: cmpltVSAVX512, cmpltSV: cmpltSVAVX512, sum: sumAVX512, fillVS: fillVSAVX512}
+	rowAVX2 = rowRoutines{lanes: 8, max: rowMaxAVX2, expShift: expShiftAVX2, scale: scaleRowAVX2, softmaxGrad: softmaxGradAVX2, dot4: dot4AVX2, dotRows: dotRowsAVX2, axpyRows: axpyRowsAVX2, exp2: exp2AVX2,
 		addVV: addVVAVX2, mulVV: mulVVAVX2, addVS: addVSAVX2, mulVS: mulVSAVX2, recip: recipAVX2, sqrt: sqrtAVX2,
-		maxVV: maxVVAVX2, maxVS: maxVSAVX2, cmpltVV: cmpltVVAVX2, cmpltVS: cmpltVSAVX2, cmpltSV: cmpltSVAVX2, sum: sumAVX2}
+		maxVV: maxVVAVX2, maxVS: maxVSAVX2, cmpltVV: cmpltVVAVX2, cmpltVS: cmpltVSAVX2, cmpltSV: cmpltSVAVX2, sum: sumAVX2, fillVS: fillVSAVX2}
 )
 
 func init() {

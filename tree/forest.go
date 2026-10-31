@@ -75,6 +75,7 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 
 	rng := rand.New(rand.NewPCG(c.seed, 0x666f72657374))
 	b := bin(d, c.bins, rng, c.workers)
+	gh := interleave(g, h, m.Outputs, (&grower{k: m.Outputs}).stride())
 	feats := make([]int, f)
 	for i := range feats {
 		feats[i] = i
@@ -112,7 +113,7 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 						rows[i] = int32(i)
 					}
 				}
-				gr := &grower{b: b, k: m.Outputs, g: g, h: h, feats: feats, perNode: perNode, rng: r,
+				gr := &grower{b: b, k: m.Outputs, gh: gh, feats: feats, perNode: perNode, rng: r,
 					workers: inner, cfg: c, gain: make([]float64, f)}
 				m.Trees[t] = gr.grow(rows)
 				gains[t] = gr.gain

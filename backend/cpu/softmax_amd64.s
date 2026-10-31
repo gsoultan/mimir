@@ -607,6 +607,153 @@ dot4AVX512_done:
 	VZEROUPPER
 	RET
 
+// func dotRowsAVX512(x *float32, y *float32, stride int, n int, rows int, out *float32)
+// Requires: AVX, AVX512DQ, AVX512F, SSE
+TEXT ·dotRowsAVX512(SB), NOSPLIT, $0-48
+	MOVQ  x+0(FP), AX
+	MOVQ  stride+16(FP), CX
+	MOVQ  n+24(FP), DX
+	MOVQ  rows+32(FP), BX
+	MOVQ  out+40(FP), SI
+	MOVQ  y+8(FP), DI
+	SHLQ  $0x02, CX
+	LEAQ  (CX)(CX*4), R8
+	SUBQ  CX, R8
+	TESTQ BX, BX
+	JZ    dotRowsAVX512_end
+
+dotRowsAVX512_rows:
+	MOVQ   AX, R9
+	MOVQ   DX, R10
+	MOVQ   DI, R11
+	LEAQ   (R11)(CX*1), R12
+	LEAQ   (R12)(CX*1), R13
+	LEAQ   (R13)(CX*1), R14
+	VXORPS Z0, Z0, Z0
+	VXORPS Z1, Z1, Z1
+	VXORPS Z2, Z2, Z2
+	VXORPS Z3, Z3, Z3
+	VXORPS Z4, Z4, Z4
+	VXORPS Z5, Z5, Z5
+	VXORPS Z6, Z6, Z6
+	VXORPS Z7, Z7, Z7
+	CMPQ   R10, $0x00000020
+	JL     dotRowsAVX512_tail
+
+dotRowsAVX512_wide:
+	VMOVUPS     (R9), Z8
+	VMOVUPS     64(R9), Z9
+	VFMADD231PS (R11), Z8, Z0
+	VFMADD231PS 64(R11), Z9, Z1
+	ADDQ        $0x00000080, R11
+	VFMADD231PS (R12), Z8, Z2
+	VFMADD231PS 64(R12), Z9, Z3
+	ADDQ        $0x00000080, R12
+	VFMADD231PS (R13), Z8, Z4
+	VFMADD231PS 64(R13), Z9, Z5
+	ADDQ        $0x00000080, R13
+	VFMADD231PS (R14), Z8, Z6
+	VFMADD231PS 64(R14), Z9, Z7
+	ADDQ        $0x00000080, R14
+	ADDQ        $0x00000080, R9
+	SUBQ        $0x00000020, R10
+	CMPQ        R10, $0x00000020
+	JGE         dotRowsAVX512_wide
+
+dotRowsAVX512_tail:
+	TESTQ       R10, R10
+	JZ          dotRowsAVX512_done
+	VMOVUPS     (R9), Z8
+	VFMADD231PS (R11), Z8, Z0
+	VFMADD231PS (R12), Z8, Z2
+	VFMADD231PS (R13), Z8, Z4
+	VFMADD231PS (R14), Z8, Z6
+
+dotRowsAVX512_done:
+	VADDPS        Z1, Z0, Z0
+	VEXTRACTF64X4 $0x01, Z0, Y1
+	VADDPS        Y1, Y0, Y0
+	VEXTRACTF128  $0x01, Y0, X1
+	VADDPS        X1, X0, X0
+	VPERMILPS     $0x4e, X0, X1
+	VADDPS        X1, X0, X0
+	VPERMILPS     $0xb1, X0, X1
+	VADDPS        X1, X0, X0
+	MOVSS         X0, (SI)
+	VADDPS        Z3, Z2, Z2
+	VEXTRACTF64X4 $0x01, Z2, Y0
+	VADDPS        Y0, Y2, Y2
+	VEXTRACTF128  $0x01, Y2, X0
+	VADDPS        X0, X2, X2
+	VPERMILPS     $0x4e, X2, X0
+	VADDPS        X0, X2, X2
+	VPERMILPS     $0xb1, X2, X0
+	VADDPS        X0, X2, X2
+	MOVSS         X2, 4(SI)
+	VADDPS        Z5, Z4, Z4
+	VEXTRACTF64X4 $0x01, Z4, Y0
+	VADDPS        Y0, Y4, Y4
+	VEXTRACTF128  $0x01, Y4, X0
+	VADDPS        X0, X4, X4
+	VPERMILPS     $0x4e, X4, X0
+	VADDPS        X0, X4, X4
+	VPERMILPS     $0xb1, X4, X0
+	VADDPS        X0, X4, X4
+	MOVSS         X4, 8(SI)
+	VADDPS        Z7, Z6, Z6
+	VEXTRACTF64X4 $0x01, Z6, Y0
+	VADDPS        Y0, Y6, Y6
+	VEXTRACTF128  $0x01, Y6, X0
+	VADDPS        X0, X6, X6
+	VPERMILPS     $0x4e, X6, X0
+	VADDPS        X0, X6, X6
+	VPERMILPS     $0xb1, X6, X0
+	VADDPS        X0, X6, X6
+	MOVSS         X6, 12(SI)
+	ADDQ          $0x00000010, SI
+	ADDQ          R8, DI
+	SUBQ          $0x00000004, BX
+	JNZ           dotRowsAVX512_rows
+
+dotRowsAVX512_end:
+	VZEROUPPER
+	RET
+
+// func axpyRowsAVX512(p *float32, y *float32, stride int, n int, out *float32)
+// Requires: AVX, AVX512F
+TEXT ·axpyRowsAVX512(SB), NOSPLIT, $0-40
+	MOVQ    p+0(FP), AX
+	MOVQ    y+8(FP), CX
+	MOVQ    stride+16(FP), DX
+	MOVQ    n+24(FP), BX
+	MOVQ    out+32(FP), SI
+	SHLQ    $0x02, DX
+	VMOVUPS (SI), Z0
+	VMOVUPS 64(SI), Z1
+	VMOVUPS 128(SI), Z2
+	VMOVUPS 192(SI), Z3
+	TESTQ   BX, BX
+	JZ      axpyRowsAVX512_done
+
+axpyRowsAVX512_loop:
+	VBROADCASTSS (AX), Z4
+	VFMADD231PS  (CX), Z4, Z0
+	VFMADD231PS  64(CX), Z4, Z1
+	VFMADD231PS  128(CX), Z4, Z2
+	VFMADD231PS  192(CX), Z4, Z3
+	ADDQ         $0x00000004, AX
+	ADDQ         DX, CX
+	DECQ         BX
+	JNZ          axpyRowsAVX512_loop
+
+axpyRowsAVX512_done:
+	VMOVUPS Z0, (SI)
+	VMOVUPS Z1, 64(SI)
+	VMOVUPS Z2, 128(SI)
+	VMOVUPS Z3, 192(SI)
+	VZEROUPPER
+	RET
+
 // func sumAVX512(x *float32, n int) float64
 // Requires: AVX, AVX512DQ, AVX512F, SSE2
 TEXT ·sumAVX512(SB), NOSPLIT, $0-24
@@ -999,6 +1146,38 @@ cmpltVVAVX512_done:
 	VZEROUPPER
 	RET
 
+// func fillVSAVX512(dst *float32, s float32, n int)
+// Requires: AVX, AVX512F, SSE
+TEXT ·fillVSAVX512(SB), NOSPLIT, $0-24
+	MOVQ         dst+0(FP), AX
+	MOVSS        s+8(FP), X0
+	VBROADCASTSS X0, Z0
+	MOVQ         n+16(FP), CX
+	CMPQ         CX, $0x00000040
+	JL           fillVSAVX512_one
+
+fillVSAVX512_wide:
+	VMOVUPS Z0, (AX)
+	VMOVUPS Z0, 64(AX)
+	VMOVUPS Z0, 128(AX)
+	VMOVUPS Z0, 192(AX)
+	ADDQ    $0x00000100, AX
+	SUBQ    $0x00000040, CX
+	CMPQ    CX, $0x00000040
+	JGE     fillVSAVX512_wide
+
+fillVSAVX512_one:
+	TESTQ   CX, CX
+	JZ      fillVSAVX512_done
+	VMOVUPS Z0, (AX)
+	ADDQ    $0x00000040, AX
+	SUBQ    $0x00000010, CX
+	JMP     fillVSAVX512_one
+
+fillVSAVX512_done:
+	VZEROUPPER
+	RET
+
 // func cmpltVSAVX512(dst *float32, a *float32, s float32, n int)
 // Requires: AVX, AVX512F, SSE
 TEXT ·cmpltVSAVX512(SB), NOSPLIT, $0-32
@@ -1377,6 +1556,145 @@ dot4AVX2_done:
 	VPERMILPS    $0xb1, X6, X0
 	VADDPS       X0, X6, X6
 	MOVSS        X6, 12(AX)
+	VZEROUPPER
+	RET
+
+// func dotRowsAVX2(x *float32, y *float32, stride int, n int, rows int, out *float32)
+// Requires: AVX, FMA3, SSE
+TEXT ·dotRowsAVX2(SB), NOSPLIT, $0-48
+	MOVQ  x+0(FP), AX
+	MOVQ  stride+16(FP), CX
+	MOVQ  n+24(FP), DX
+	MOVQ  rows+32(FP), BX
+	MOVQ  out+40(FP), SI
+	MOVQ  y+8(FP), DI
+	SHLQ  $0x02, CX
+	LEAQ  (CX)(CX*4), R8
+	SUBQ  CX, R8
+	TESTQ BX, BX
+	JZ    dotRowsAVX2_end
+
+dotRowsAVX2_rows:
+	MOVQ   AX, R9
+	MOVQ   DX, R10
+	MOVQ   DI, R11
+	LEAQ   (R11)(CX*1), R12
+	LEAQ   (R12)(CX*1), R13
+	LEAQ   (R13)(CX*1), R14
+	VXORPS Y0, Y0, Y0
+	VXORPS Y1, Y1, Y1
+	VXORPS Y2, Y2, Y2
+	VXORPS Y3, Y3, Y3
+	VXORPS Y4, Y4, Y4
+	VXORPS Y5, Y5, Y5
+	VXORPS Y6, Y6, Y6
+	VXORPS Y7, Y7, Y7
+	CMPQ   R10, $0x00000010
+	JL     dotRowsAVX2_tail
+
+dotRowsAVX2_wide:
+	VMOVUPS     (R9), Y8
+	VMOVUPS     32(R9), Y9
+	VFMADD231PS (R11), Y8, Y0
+	VFMADD231PS 32(R11), Y9, Y1
+	ADDQ        $0x00000040, R11
+	VFMADD231PS (R12), Y8, Y2
+	VFMADD231PS 32(R12), Y9, Y3
+	ADDQ        $0x00000040, R12
+	VFMADD231PS (R13), Y8, Y4
+	VFMADD231PS 32(R13), Y9, Y5
+	ADDQ        $0x00000040, R13
+	VFMADD231PS (R14), Y8, Y6
+	VFMADD231PS 32(R14), Y9, Y7
+	ADDQ        $0x00000040, R14
+	ADDQ        $0x00000040, R9
+	SUBQ        $0x00000010, R10
+	CMPQ        R10, $0x00000010
+	JGE         dotRowsAVX2_wide
+
+dotRowsAVX2_tail:
+	TESTQ       R10, R10
+	JZ          dotRowsAVX2_done
+	VMOVUPS     (R9), Y8
+	VFMADD231PS (R11), Y8, Y0
+	VFMADD231PS (R12), Y8, Y2
+	VFMADD231PS (R13), Y8, Y4
+	VFMADD231PS (R14), Y8, Y6
+
+dotRowsAVX2_done:
+	VADDPS       Y1, Y0, Y0
+	VEXTRACTF128 $0x01, Y0, X1
+	VADDPS       X1, X0, X0
+	VPERMILPS    $0x4e, X0, X1
+	VADDPS       X1, X0, X0
+	VPERMILPS    $0xb1, X0, X1
+	VADDPS       X1, X0, X0
+	MOVSS        X0, (SI)
+	VADDPS       Y3, Y2, Y2
+	VEXTRACTF128 $0x01, Y2, X0
+	VADDPS       X0, X2, X2
+	VPERMILPS    $0x4e, X2, X0
+	VADDPS       X0, X2, X2
+	VPERMILPS    $0xb1, X2, X0
+	VADDPS       X0, X2, X2
+	MOVSS        X2, 4(SI)
+	VADDPS       Y5, Y4, Y4
+	VEXTRACTF128 $0x01, Y4, X0
+	VADDPS       X0, X4, X4
+	VPERMILPS    $0x4e, X4, X0
+	VADDPS       X0, X4, X4
+	VPERMILPS    $0xb1, X4, X0
+	VADDPS       X0, X4, X4
+	MOVSS        X4, 8(SI)
+	VADDPS       Y7, Y6, Y6
+	VEXTRACTF128 $0x01, Y6, X0
+	VADDPS       X0, X6, X6
+	VPERMILPS    $0x4e, X6, X0
+	VADDPS       X0, X6, X6
+	VPERMILPS    $0xb1, X6, X0
+	VADDPS       X0, X6, X6
+	MOVSS        X6, 12(SI)
+	ADDQ         $0x00000010, SI
+	ADDQ         R8, DI
+	SUBQ         $0x00000004, BX
+	JNZ          dotRowsAVX2_rows
+
+dotRowsAVX2_end:
+	VZEROUPPER
+	RET
+
+// func axpyRowsAVX2(p *float32, y *float32, stride int, n int, out *float32)
+// Requires: AVX, FMA3
+TEXT ·axpyRowsAVX2(SB), NOSPLIT, $0-40
+	MOVQ    p+0(FP), AX
+	MOVQ    y+8(FP), CX
+	MOVQ    stride+16(FP), DX
+	MOVQ    n+24(FP), BX
+	MOVQ    out+32(FP), SI
+	SHLQ    $0x02, DX
+	VMOVUPS (SI), Y0
+	VMOVUPS 32(SI), Y1
+	VMOVUPS 64(SI), Y2
+	VMOVUPS 96(SI), Y3
+	TESTQ   BX, BX
+	JZ      axpyRowsAVX2_done
+
+axpyRowsAVX2_loop:
+	VBROADCASTSS (AX), Y4
+	VFMADD231PS  (CX), Y4, Y0
+	VFMADD231PS  32(CX), Y4, Y1
+	VFMADD231PS  64(CX), Y4, Y2
+	VFMADD231PS  96(CX), Y4, Y3
+	ADDQ         $0x00000004, AX
+	ADDQ         DX, CX
+	DECQ         BX
+	JNZ          axpyRowsAVX2_loop
+
+axpyRowsAVX2_done:
+	VMOVUPS Y0, (SI)
+	VMOVUPS Y1, 32(SI)
+	VMOVUPS Y2, 64(SI)
+	VMOVUPS Y3, 96(SI)
 	VZEROUPPER
 	RET
 
@@ -1768,6 +2086,38 @@ cmpltVVAVX2_one:
 	JMP     cmpltVVAVX2_one
 
 cmpltVVAVX2_done:
+	VZEROUPPER
+	RET
+
+// func fillVSAVX2(dst *float32, s float32, n int)
+// Requires: AVX, AVX2, SSE
+TEXT ·fillVSAVX2(SB), NOSPLIT, $0-24
+	MOVQ         dst+0(FP), AX
+	MOVSS        s+8(FP), X0
+	VBROADCASTSS X0, Y0
+	MOVQ         n+16(FP), CX
+	CMPQ         CX, $0x00000020
+	JL           fillVSAVX2_one
+
+fillVSAVX2_wide:
+	VMOVUPS Y0, (AX)
+	VMOVUPS Y0, 32(AX)
+	VMOVUPS Y0, 64(AX)
+	VMOVUPS Y0, 96(AX)
+	ADDQ    $0x00000080, AX
+	SUBQ    $0x00000020, CX
+	CMPQ    CX, $0x00000020
+	JGE     fillVSAVX2_wide
+
+fillVSAVX2_one:
+	TESTQ   CX, CX
+	JZ      fillVSAVX2_done
+	VMOVUPS Y0, (AX)
+	ADDQ    $0x00000020, AX
+	SUBQ    $0x00000008, CX
+	JMP     fillVSAVX2_one
+
+fillVSAVX2_done:
 	VZEROUPPER
 	RET
 

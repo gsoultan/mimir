@@ -36,6 +36,13 @@ const (
 	attnRows = 64  // query rows of a tile
 	attnKeys = 128 // keys of a block
 	attnFew  = 16  // query rows of a problem that forwardFew computes
+	// attnAxpyRows is the most query rows of a problem whose products
+	// with the values forwardFew sums row by row instead of as a tile.
+	attnAxpyRows = 4
+	// attnSerial is the most multiply-adds of a kernel of few rows that
+	// one goroutine computes alone, in less time than the helpers take to
+	// join it.
+	attnSerial = 1 << 14
 )
 
 // attnGeom is the layout of an attention kernel's inputs: per problem,
@@ -251,7 +258,12 @@ func (g *attnGeom) prepare(k *backend.Kernel, pr int, t attnTile, j0, bc int, s 
 		if maskAt < len(g.in) {
 			m := &g.in[maskAt]
 			off := m.at(pr, hd, i, j0)
-			for j := range row {
+			j := 0
+			if rv := rowVector; rv != nil && m.y == 1 && len(row) >= rv.lanes {
+				j = len(row) &^ (rv.lanes - 1)
+				rv.addVV(&row[0], &row[0], &m.data[off], j)
+			}
+			for ; j < len(row); j++ {
 				row[j] += m.data[off+j*m.y]
 			}
 		}
@@ -276,6 +288,14 @@ func attention(ctx context.Context, b *Backend, k *backend.Kernel, out []float32
 		return nil
 	}
 	if g.rows <= attnFew && g.in[1].y == 1 {
+		if g.problems*g.rows*s.K*s.D < attnSerial {
+			ws := attnWorkspaces.Get().(*attnWorkspace)
+			defer attnWorkspaces.Put(ws)
+			for pr := range g.problems {
+				g.forwardFew(k, ws, pr, out)
+			}
+			return nil
+		}
 		return b.parallelFor(ctx, g.problems, 1, func(lo, hi int) error {
 			ws := attnWorkspaces.Get().(*attnWorkspace)
 			defer attnWorkspaces.Put(ws)
@@ -420,12 +440,22 @@ func (g *attnGeom) forwardFew(k *backend.Kernel, ws *attnWorkspace, pr int, out 
 		hd, i := r/s.Q, r%s.Q
 		qr := ws.q[:s.D]
 		off := q.at(pr, hd, i, 0)
-		for p := range qr {
+		p := 0
+		if rv := rowVector; rv != nil && q.y == 1 && s.D >= rv.lanes {
+			p = s.D &^ (rv.lanes - 1)
+			rv.mulVS(&qr[0], &q.data[off], scale, p)
+		}
+		for ; p < len(qr); p++ {
 			qr[p] = q.data[off+p*q.y] * scale
 		}
 		row := ws.s[r*n:][:n]
 		seen := visible(k, i, 0, n)
 		j := 0
+		if rv := rowVector; rv != nil && rv.dotRows != nil && seen >= 4 && s.D%rv.lanes == 0 && s.D > 0 {
+			j = seen &^ 3
+			_ = keys[(j-1)*kx+s.D-1]
+			rv.dotRows(&qr[0], &keys[0], kx, s.D, j, &row[0])
+		}
 		for ; j+4 <= seen; j += 4 {
 			dots4(&d, qr, keys[j*kx:], kx)
 			copy(row[j:], d[:])
@@ -448,11 +478,39 @@ func (g *attnGeom) forwardFew(k *backend.Kernel, ws *attnWorkspace, pr int, out 
 		clear(o)
 		return
 	}
-	ws.p = grow(ws.p, roundUp(rows, gk.mr)*n+packSlack)
-	packA(ws.p, operand{data: ws.s, rs: n, cs: 1}, 0, rows, 0, n, gk.mr)
-	ws.v = grow(ws.v, roundUp(s.DV, gk.nr)*n+packSlack)
-	packB(ws.v, v.rows(&ws.kr, pr, n, s.DV), 0, n, 0, s.DV, gk.nr)
-	macroKernel(gk, ws.p, ws.v, n, rows, s.DV, o, s.DV, false, &ws.tile)
+	vo := v.rows(&ws.kr, pr, n, s.DV)
+	if rows <= attnAxpyRows && vo.cs == 1 {
+		// A few rows, as one query of each head of a group decoding a
+		// token: summing the values row by row, each read once for every
+		// query, costs less than packing them for the tile kernel.
+		clear(o)
+		vals := vo.data[vo.off:]
+		_ = vals[(n-1)*vo.rs+s.DV-1]
+		c := 0
+		if rv := rowVector; rv != nil && rv.axpyRows != nil {
+			for ; c+4*rv.lanes <= s.DV; c += 4 * rv.lanes {
+				for r := range rows {
+					rv.axpyRows(&ws.s[r*n], &vals[c], vo.rs, n, &o[r*s.DV+c])
+				}
+			}
+		}
+		if c < s.DV {
+			for j := range n {
+				vrow := vals[j*vo.rs+c:][:s.DV-c]
+				for r := range rows {
+					if p := ws.s[r*n+j]; p != 0 {
+						axpy(p, vrow, o[r*s.DV+c:][:s.DV-c])
+					}
+				}
+			}
+		}
+	} else {
+		ws.p = grow(ws.p, roundUp(rows, gk.mr)*n+packSlack)
+		packA(ws.p, operand{data: ws.s, rs: n, cs: 1}, 0, rows, 0, n, gk.mr)
+		ws.v = grow(ws.v, roundUp(s.DV, gk.nr)*n+packSlack)
+		packB(ws.v, vo, 0, n, 0, s.DV, gk.nr)
+		macroKernel(gk, ws.p, ws.v, n, rows, s.DV, o, s.DV, false, &ws.tile)
+	}
 	for r, l := range ws.l[:rows] {
 		if l == 0 {
 			clear(o[r*s.DV:][:s.DV])

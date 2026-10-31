@@ -28,3 +28,8 @@ func winoInputChannelsAVX512(dst *float32, xs int, src *float32, rs int, cs int,
 //
 //go:noescape
 func winoGradChannelsAVX512(dst *float32, xs int, src *float32, rs int, cs int, tiles int, step int, half int)
+
+// winoWeightsAVX512 stores at dst+ξ·xs+8i+o, for the 8 output channels o and cin input channels i whose 3×3 windows g are at src+o·so+i·si, element (kh, kw) at kh·sh+kw·sw on, element ξ of the transform G g G^T of each window.
+//
+//go:noescape
+func winoWeightsAVX512(dst *float32, xs int, src *float32, so int, si int, sh int, sw int, cin int)

@@ -258,7 +258,7 @@ var actScratch = sync.Pool{New: func() any { return new([]byte) }}
 
 // qmatmulRowWork is the least number of weights' multiply-adds worth a
 // worker of its own.
-const qmatmulRowWork = 1 << 16
+const qmatmulRowWork = 1 << 14
 
 // qmatmulChunks is how many chunks of the rows of W each worker takes,
 // on average: the workers claim them in turn, so that one slowed down by

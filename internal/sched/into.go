@@ -29,6 +29,7 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 	for i, n := range p.order {
 		pos[n] = i
 	}
+	r := p.readers(targets)
 	into := map[*graph.Node]*graph.Node{}
 	taken := map[*graph.Storage]bool{}
 	for i, t := range targets {
@@ -43,12 +44,61 @@ func (p *plan) destinations(targets, dsts []*graph.Node) map[*graph.Node]*graph.
 		if _, ok := pos[writer]; !ok || writer.Op.IsView() && !p.work[writer].swap || writer.Op == backend.OpConst {
 			continue // no kernel writes t, or one of a single element
 		}
-		if p.overwrites(writer, d, targets, pos) {
+		if p.overwrites(writer, d, r, pos) {
 			into[t] = d
 			taken[d.Mem] = true
 		}
 	}
 	return into
+}
+
+// reader is a kernel input whose values are a storage's values, or a view
+// of them: input i of the kernel of n.
+type reader struct {
+	n  *graph.Node
+	i  int
+	in *graph.Node
+}
+
+// readers holds, for each storage, the kernel inputs that read it, and
+// whether a target reads it.
+type readers struct {
+	kernels map[*graph.Storage][]reader
+	targets map[*graph.Storage]bool
+}
+
+// readers maps each storage to what reads it in the plan, in one pass, so
+// that checking each destination does not walk the whole plan again.
+func (p *plan) readers(targets []*graph.Node) readers {
+	mem := map[*graph.Node]*graph.Storage{}
+	var memOf func(n *graph.Node) *graph.Storage
+	memOf = func(n *graph.Node) *graph.Storage {
+		if n.Realized() {
+			return n.Mem
+		}
+		m, ok := mem[n]
+		if !ok {
+			if n.Op.IsView() {
+				m = memOf(n.Inputs[0])
+			}
+			mem[n] = m
+		}
+		return m
+	}
+	r := readers{kernels: map[*graph.Storage][]reader{}, targets: map[*graph.Storage]bool{}}
+	for _, t := range targets {
+		if m := memOf(t); m != nil {
+			r.targets[m] = true
+		}
+	}
+	for _, n := range p.order {
+		for i, in := range p.work[n].deps {
+			if m := memOf(in); m != nil {
+				r.kernels[m] = append(r.kernels[m], reader{n, i, in})
+			}
+		}
+	}
+	return r
 }
 
 // candidate reports whether the target t could be computed on be into the
@@ -83,39 +133,21 @@ func ownBuffer(n *graph.Node) bool {
 // memory of d: no target reads d's values, and no kernel reads them after
 // writer, which reads them only elementwise and contiguously, or as the
 // tensor a slice scatter or a scatter writes into, if at all.
-func (p *plan) overwrites(writer, d *graph.Node, targets []*graph.Node, pos map[*graph.Node]int) bool {
-	// reads reports whether n's values are d's values, or a view of them.
-	known := map[*graph.Node]bool{}
-	var reads func(n *graph.Node) bool
-	reads = func(n *graph.Node) bool {
-		if n.Realized() {
-			return n.Mem == d.Mem
-		}
-		r, ok := known[n]
-		if !ok {
-			r = n.Op.IsView() && reads(n.Inputs[0])
-			known[n] = r
-		}
-		return r
-	}
-	if slices.ContainsFunc(targets, reads) {
+func (p *plan) overwrites(writer, d *graph.Node, r readers, pos map[*graph.Node]int) bool {
+	if r.targets[d.Mem] {
 		return false
 	}
 	w := p.work[writer]
 	elementwise := w.prog != nil && w.gemm == nil || w.prog == nil && !w.swap && writer.Op.IsElementwise()
 	scatter := (writer.Op == backend.OpSliceScatter || writer.Op == backend.OpScatter) && w.prog == nil
-	for _, n := range p.order {
-		for i, in := range p.work[n].deps {
-			if !reads(in) {
-				continue
-			}
-			switch {
-			case pos[n] < pos[writer]:
-			case n != writer || !elementwise && !(scatter && i == 0):
-				return false
-			case !in.Realized() || !ownBuffer(in) || !slices.Equal(in.Shape, writer.Shape):
-				return false
-			}
+	for _, k := range r.kernels[d.Mem] {
+		n, i, in := k.n, k.i, k.in
+		switch {
+		case pos[n] < pos[writer]:
+		case n != writer || !elementwise && !(scatter && i == 0):
+			return false
+		case !in.Realized() || !ownBuffer(in) || !slices.Equal(in.Shape, writer.Shape):
+			return false
 		}
 	}
 	return true

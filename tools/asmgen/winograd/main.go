@@ -35,13 +35,18 @@ func constants() {
 		idx["lo"] = append(idx["lo"], i, 16+i)
 		idx["hi"] = append(idx["hi"], 8+i, 24+i)
 	}
-	for _, name := range []string{"even", "odd", "lo", "hi"} {
+	for i := range uint32(8) {
+		idx["iota8"] = append(idx["iota8"], i)
+	}
+	for _, name := range []string{"even", "odd", "lo", "hi", "iota8"} {
 		m := GLOBL("wino_"+name, RODATA|NOPTR)
 		for i, v := range idx[name] {
 			DATA(4*i, U32(v))
 		}
 		consts[name] = m
 	}
+	consts["half"] = GLOBL("wino_half", RODATA|NOPTR)
+	DATA(0, F32(0.5))
 }
 
 func main() {
@@ -52,6 +57,7 @@ func main() {
 	output()
 	inputChannels()
 	gradChannels()
+	weights()
 	Generate()
 }
 
@@ -473,4 +479,103 @@ func gradChannels() {
 		}
 	}
 	l.end()
+}
+
+// weights emits the weight transform of a panel of 8 output channels,
+// one input channel at a time, with output channels in lanes: the 9
+// weights of each window are gathered from their strides, and the 16
+// elements of the transformed window stored 8 channels at a time.
+func weights() {
+	name := "winoWeightsAVX512"
+	TEXT(name, NOSPLIT, "func(dst *float32, xs int, src *float32, so int, si int, sh int, sw int, cin int)")
+	Pragma("noescape")
+	Doc(name + " stores at dst+ξ·xs+8i+o, for the 8 output channels o and cin input channels i whose 3×3 windows g are at src+o·so+i·si, element (kh, kw) at kh·sh+kw·sw on, element ξ of the transform G g G^T of each window.")
+	dst := Load(Param("dst"), GP64())
+	xs := Load(Param("xs"), GP64())
+	SHLQ(U8(2), xs)
+	src := Load(Param("src"), GP64())
+	so := Load(Param("so"), GP64())
+	si := Load(Param("si"), GP64())
+	SHLQ(U8(2), si)
+	sh := Load(Param("sh"), GP64())
+	SHLQ(U8(2), sh)
+	sw := Load(Param("sw"), GP64())
+	SHLQ(U8(2), sw)
+	cin := Load(Param("cin"), GP64())
+	// The lanes' offsets, o·so, and the windows' elements as 9 pointers.
+	idx, sov := YMM(), YMM()
+	VMOVUPS(consts["iota8"], idx)
+	VPBROADCASTD(so.(GPVirtual).As32(), sov)
+	VPMULLD(sov, idx, idx)
+	half := YMM()
+	VBROADCASTSS(consts["half"], half)
+	var at [3][3]Register
+	for kh := range 3 {
+		for kw := range 3 {
+			if kh == 0 && kw == 0 {
+				at[kh][kw] = src
+				continue
+			}
+			p := GP64()
+			MOVQ(src, p)
+			for range kh {
+				ADDQ(sh, p)
+			}
+			for range kw {
+				ADDQ(sw, p)
+			}
+			at[kh][kw] = p
+		}
+	}
+	TESTQ(cin, cin)
+	JLE(LabelRef(name + "_done"))
+	Label(name + "_channel")
+	var g [3][3]VecVirtual
+	for kh := range 3 {
+		for kw := range 3 {
+			g[kh][kw] = YMM()
+			KXNORW(K1, K1, K1) // a gather consumes its mask
+			VGATHERDPS(Mem{Base: at[kh][kw], Index: idx, Scale: 4}, K1, g[kh][kw])
+		}
+	}
+	// G g: rows g0, (g0+g1+g2)/2, (g0-g1+g2)/2, g2, by columns kw, the
+	// sums associated as the Go transform's are.
+	var t [4][3]VecVirtual
+	for kw := range 3 {
+		t[0][kw], t[1][kw], t[2][kw], t[3][kw] = gRows(g[0][kw], g[1][kw], g[2][kw], half)
+	}
+	// Then the same over the columns of each row, stored as ξ = 4r+c.
+	p := GP64()
+	MOVQ(dst, p)
+	for r := range 4 {
+		v0, v1, v2, v3 := gRows(t[r][0], t[r][1], t[r][2], half)
+		for _, v := range []VecVirtual{v0, v1, v2, v3} {
+			VMOVUPS(v, Mem{Base: p})
+			ADDQ(xs, p)
+		}
+	}
+	ADDQ(U32(32), dst)
+	for kh := range 3 {
+		for kw := range 3 {
+			ADDQ(si, at[kh][kw])
+		}
+	}
+	DECQ(cin)
+	JNZ(LabelRef(name + "_channel"))
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
+}
+
+// gRows returns the transform G of the rows g0, g1, g2: g0, (g0+g1+g2)/2,
+// (g0-g1+g2)/2 and g2, summed left to right.
+func gRows(g0, g1, g2, half VecVirtual) (VecVirtual, VecVirtual, VecVirtual, VecVirtual) {
+	a, b := YMM(), YMM()
+	VADDPS(g1, g0, a)
+	VSUBPS(g1, g0, b)
+	VADDPS(g2, a, a)
+	VMULPS(half, a, a)
+	VADDPS(g2, b, b)
+	VMULPS(half, b, b)
+	return g0, a, b, g2
 }

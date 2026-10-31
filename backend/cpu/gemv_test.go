@@ -48,6 +48,8 @@ func testGEMV(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 8))
 	for _, s := range []struct{ batch, m, n, k int }{
 		{1, 1, 300, 16}, {1, 1, 5, 2048}, {1, 8, 70, 37}, {4, 2, 33, 100}, {2, 3, 1, 64}, {1, 2, 4097, 24},
+		// Products of many rows and few columns, computed row by row.
+		{1, 300, 3, 80}, {1, 257, 4, 37}, {3, 100, 1, 64}, {2, 65, 2, 16},
 	} {
 		// The left operand is row-major, the right the transpose of a
 		// row-major weight, as a Linear layer reads it, shared by the
@@ -96,11 +98,12 @@ func testGEMV(t *testing.T) {
 			}
 		}
 	}
-	// Products of more rows, or read otherwise, are left to the GEMM.
+	// Products of more rows and columns, or read otherwise, are left to
+	// the GEMM.
 	be := New()
-	a, b := layout(rng, "row-major", 9, 32), layout(rng, "column-major", 32, 4)
-	if ok, _ := be.sgemv(t.Context(), make([]float32, 36), a, []int{a.off}, b, []int{0}, 9, 4, 32, 1, nil); ok {
-		t.Error("9 rows computed as dot products")
+	a, b := layout(rng, "row-major", 9, 32), layout(rng, "column-major", 32, 5)
+	if ok, _ := be.sgemv(t.Context(), make([]float32, 45), a, []int{a.off}, b, []int{0}, 9, 5, 32, 1, nil); ok {
+		t.Error("9 rows of 5 columns computed as dot products")
 	}
 	b = layout(rng, "row-major", 32, 4)
 	if ok, _ := be.sgemv(t.Context(), make([]float32, 4), a, []int{a.off}, b, []int{b.off}, 1, 4, 32, 1, nil); ok {

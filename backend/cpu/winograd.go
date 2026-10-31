@@ -287,17 +287,73 @@ type winoFilters struct {
 	off, sg, so, si, sh, sw int
 }
 
+// winoWeightsPanel, where the CPU has it, is the transform of a panel of
+// 8 output channels, one input channel at a time:
+//
+//	winoWeightsPanel(dst, xs, src, so, si, sh, sw, cin)
+//
+// stores at dst+ξ·xs+8i+o, for the 8 output channels o and cin input
+// channels i whose windows are at src+o·so+i·si, element (kh, kw) at
+// kh·sh+kw·sw on, element ξ of the transform of each window.
+var winoWeightsPanel func(dst *float32, xs int, src *float32, so, si, sh, sw, cin int)
+
+// winoWeightBuffers holds the transformed weights between convolutions,
+// which transform the same weights on every call.
+var winoWeightBuffers sync.Pool
+
 // winoWeights returns the transformed weights G g G^T of each group, as
 // the micro-kernel's packed A panels, mr output channels each: element
 // (o, i) of transform ξ of group g at (g·16+ξ)·xs + (o/mr·cin+i)·mr + o%mr,
-// zero past the last channel, and xs.
-func (be *Backend) winoWeights(ctx context.Context, c winoConv, mr int, w winoFilters) ([]float32, int, error) {
+// zero past the last channel, and xs. The caller gives the buffer back
+// with winoWeightBuffers.Put once its products are done.
+func (be *Backend) winoWeights(ctx context.Context, c winoConv, mr int, w winoFilters) (*[]float32, int, error) {
 	panels := (c.cout + mr - 1) / mr
 	xs := panels*c.cin*mr + winoSkew
-	u := make([]float32, c.g*16*xs)
+	buf, _ := winoWeightBuffers.Get().(*[]float32)
+	if buf == nil {
+		buf = new([]float32)
+	}
+	*buf = grow(*buf, c.g*16*xs)
+	u := *buf
+	if mr == 8 && winoWeightsPanel != nil && c.cin > 0 {
+		// Whole panels in vector registers; a ragged last panel below.
+		whole := c.cout / mr
+		err := be.parallelFor(ctx, c.g*whole, max(1, elementGrain/max(32*mr*c.cin, 1)), func(lo, hi int) error {
+			for r := lo; r < hi; r++ {
+				g, p := r/whole, r%whole
+				winoWeightsPanel(&u[g*16*xs+p*c.cin*mr], xs, &w.data[w.off+g*w.sg+p*mr*w.so], w.so, w.si, w.sh, w.sw, c.cin)
+			}
+			return nil
+		})
+		if err != nil {
+			return buf, xs, err
+		}
+		if whole*mr == c.cout {
+			return buf, xs, nil
+		}
+		err = be.parallelFor(ctx, c.g*(c.cout-whole*mr), max(1, elementGrain/max(32*c.cin, 1)), func(lo, hi int) error {
+			per := c.cout - whole*mr
+			for r := lo; r < hi; r++ {
+				winoWeightsGo(u, xs, c, mr, w, r/per, whole*mr+r%per)
+			}
+			return nil
+		})
+		return buf, xs, err
+	}
 	err := be.parallelFor(ctx, c.g*c.cout, max(1, elementGrain/max(32*c.cin, 1)), func(lo, hi int) error {
 		for r := lo; r < hi; r++ {
-			g, o := r/c.cout, r%c.cout
+			winoWeightsGo(u, xs, c, mr, w, r/c.cout, r%c.cout)
+		}
+		return nil
+	})
+	return buf, xs, err
+}
+
+// winoWeightsGo transforms the windows of output channel o of group g
+// into u (see winoWeights).
+func winoWeightsGo(u []float32, xs int, c winoConv, mr int, w winoFilters, g, o int) {
+	{
+		{
 			for i := range c.cin {
 				at := w.off + g*w.sg + o*w.so + i*w.si
 				// G g: rows g0, (g0+g1+g2)/2, (g0-g1+g2)/2, g2; then the
@@ -316,9 +372,7 @@ func (be *Backend) winoWeights(ctx context.Context, c winoConv, mr int, w winoFi
 				}
 			}
 		}
-		return nil
-	})
-	return u, xs, err
+	}
 }
 
 // winoKernel is the micro-kernel of the transforms' products.
@@ -330,10 +384,12 @@ func winoKernel() *gemmKernel { return gemmKernels[0] }
 func (be *Backend) winoForward(ctx context.Context, c winoConv, x winoImage, w winoFilters, out []float32, epi *evaluator) error {
 	g := winoKernel()
 	mr, nr := g.mr, g.nr
-	u, us, err := be.winoWeights(ctx, c, mr, w)
+	ub, us, err := be.winoWeights(ctx, c, mr, w)
 	if err != nil {
 		return err
 	}
+	defer winoWeightBuffers.Put(ub)
+	u := *ub
 	th, tw := c.tiles()
 	sw := slotWidth(tw+1, nr)
 	panels := (c.cout + mr - 1) / mr
