@@ -9,5 +9,6 @@ func init() {
 		winoInputRow, winoGradRow, winoOutputRow = winoInputAVX512, winoGradAVX512, winoOutputAVX512
 		winoInputChannels, winoGradChannels = winoInputChannelsAVX512, winoGradChannelsAVX512
 		winoWeightsPanel = winoWeightsAVX512
+		directPositions = 0 // see conv_direct.go
 	}
 }
