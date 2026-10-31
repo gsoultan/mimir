@@ -183,13 +183,20 @@ func (r *RotaryEmbedding) Rotate(x, cos, sin *tensor.Tensor) *tensor.Tensor {
 	if rank < 2 || r.Dim <= 0 || r.Dim%2 != 0 || r.Dim != shape[rank-1] || !slices.Equal(cos.Shape(), []int{shape[rank-2], r.Dim}) || !slices.Equal(sin.Shape(), cos.Shape()) {
 		return tensor.Failed(fmt.Errorf("nn: rotary embedding of %d features by %v and %v for %v: %w", r.Dim, cos.Shape(), sin.Shape(), shape, tensor.ErrShape))
 	}
-	var swapped *tensor.Tensor
+	// The swap is a flip of the pairs, a view, when the features are seen
+	// as pairs: the whole rotation is computed over that shape, so that
+	// its kernel reads the flipped view in place of a copy.
+	pairs := []int{2, r.Dim / 2}
+	flip := -2
 	if r.Interleaved {
-		swapped = x.Reshape(slices.Concat(shape[:rank-1], []int{r.Dim / 2, 2})...).Flip(-1).Reshape(shape...)
-	} else {
-		swapped = x.Reshape(slices.Concat(shape[:rank-1], []int{2, r.Dim / 2})...).Flip(-2).Reshape(shape...)
+		pairs, flip = []int{r.Dim / 2, 2}, -1
 	}
-	return x.Mul(cos).Add(swapped.Mul(sin))
+	paired := func(t *tensor.Tensor) *tensor.Tensor {
+		ts := t.Shape()
+		return t.Reshape(slices.Concat(ts[:len(ts)-1], pairs)...)
+	}
+	x = paired(x)
+	return x.Mul(paired(cos)).Add(x.Flip(flip).Mul(paired(sin))).Reshape(shape...)
 }
 
 func tableLen(t *ropeTable) int {

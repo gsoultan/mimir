@@ -32,9 +32,11 @@ type decoder struct {
 	mu    sync.Mutex
 	steps map[stepKey]*recorded
 	// fused holds each block's fused products, made from the parameter
-	// values in made.
+	// values in made, and rope the rotary embedding the step applies to
+	// their queries and keys (see fusedFor).
 	fused []fused
 	made  []*tensor.Tensor
+	rope  *nn.RotaryEmbedding
 }
 
 // fused is a block's queries, keys and values as one product, and its
@@ -78,19 +80,19 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 			return nil, false, nil
 		}
 	}
+	params := paramValues(m)
+	fs, rope, err := m.fusedFor(ctx, params)
+	if err != nil {
+		return nil, false, err
+	}
 	key := stepKey{min(capacity, (n/stepWindow+1)*stepWindow), capacity}
-	leaves := m.stepLeaves(token, n, key.window, caches, dev)
+	leaves := m.stepLeaves(token, n, key.window, caches, rope, dev)
 	dsts := make([]*tensor.Tensor, 0, 2*len(caches)+1)
 	for _, c := range caches {
 		k, v := c.Buffers()
 		dsts = append(dsts, k, v)
 	}
 	dsts = append(dsts, nil)
-	params := paramValues(m)
-	fs, err := m.fusedFor(ctx, params)
-	if err != nil {
-		return nil, false, err
-	}
 
 	m.decoding.mu.Lock()
 	r := m.decoding.steps[key]
@@ -106,7 +108,7 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 		}
 	}
 	if out == nil {
-		targets, err := m.stepGraph(leaves, key.window, caches, fs)
+		targets, err := m.stepGraph(leaves, key.window, caches, fs, rope)
 		if err != nil {
 			return nil, false, err
 		}
@@ -137,8 +139,8 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 // attending to a window of the caches: the token, the rotary angles of
 // its position, the mask of the window, the position the caches write,
 // and then each cache's keys and values.
-func (m *Model) stepLeaves(token int32, n, window int, caches []*nn.KVCache, dev tensor.Device) []*tensor.Tensor {
-	cos, sin := m.Rope.Turn(n, 1, dev)
+func (m *Model) stepLeaves(token int32, n, window int, caches []*nn.KVCache, rope *nn.RotaryEmbedding, dev tensor.Device) []*tensor.Tensor {
+	cos, sin := rope.Turn(n, 1, dev)
 	mask := make([]float32, window)
 	for j := n + 1; j < window; j++ {
 		mask[j] = float32(math.Inf(-1))
@@ -159,7 +161,7 @@ func (m *Model) stepLeaves(token int32, n, window int, caches []*nn.KVCache, dev
 // stepGraph builds the graph of a step over leaves, as stepLeaves
 // returns them: each cache's keys and values with the step's written in,
 // then the logits.
-func (m *Model) stepGraph(leaves []*tensor.Tensor, window int, caches []*nn.KVCache, fs []fused) ([]*tensor.Tensor, error) {
+func (m *Model) stepGraph(leaves []*tensor.Tensor, window int, caches []*nn.KVCache, fs []fused, rope *nn.RotaryEmbedding) ([]*tensor.Tensor, error) {
 	c := m.Config
 	tok, cos, sin, mask, pos := leaves[0], leaves[1], leaves[2], leaves[3], leaves[4]
 	x := m.Embed.Forward(tok) // [1, 1, embed]
@@ -169,12 +171,17 @@ func (m *Model) stepGraph(leaves []*tensor.Tensor, window int, caches []*nn.KVCa
 		h := rmsNorm(x, b.AttnNorm)
 		var q, k, v *tensor.Tensor
 		if f := fs[i].qkv; f != nil {
-			parts := f.Forward(h).Split(-1, c.Heads*c.HeadDim, c.KVHeads*c.HeadDim, c.KVHeads*c.HeadDim)
-			q, k, v = heads(parts[0], c.Heads, c.HeadDim), heads(parts[1], c.KVHeads, c.HeadDim), heads(parts[2], c.KVHeads, c.HeadDim)
+			// The queries and keys, which lie together in the product,
+			// rotate as one tensor of heads, and part afterwards as views.
+			parts := f.Forward(h).Split(-1, (c.Heads+c.KVHeads)*c.HeadDim, c.KVHeads*c.HeadDim)
+			qk := rope.Rotate(heads(parts[0], c.Heads+c.KVHeads, c.HeadDim), cos, sin)
+			q = qk.Shrink([][2]int{{0, 1}, {0, c.Heads}, {0, 1}, {0, c.HeadDim}})
+			k = qk.Shrink([][2]int{{0, 1}, {c.Heads, c.Heads + c.KVHeads}, {0, 1}, {0, c.HeadDim}})
+			v = heads(parts[1], c.KVHeads, c.HeadDim)
 		} else {
 			q, k, v = b.project(h, c)
+			q, k = rope.Rotate(q, cos, sin), rope.Rotate(k, cos, sin)
 		}
-		q, k = m.Rope.Rotate(q, cos, sin), m.Rope.Rotate(k, cos, sin)
 		keys, values, err := caches[i].Write(k, v, pos)
 		if err != nil {
 			return nil, err
@@ -196,26 +203,58 @@ func (m *Model) stepGraph(leaves []*tensor.Tensor, window int, caches []*nn.KVCa
 }
 
 // fusedFor returns each block's fused products, made from params, the
-// values of m's parameters, which it makes again when they change.
-func (m *Model) fusedFor(ctx context.Context, params []*tensor.Tensor) ([]fused, error) {
+// values of m's parameters, which it makes again when they change, and
+// the rotary embedding the step applies to their queries and keys.
+//
+// Rotating interleaved pairs of features, (2i, 2i+1), reads a tensor in
+// pairs, which costs an elementwise kernel several times what rotating
+// halves does, (i, i+Dim/2). When every block's queries, keys and values
+// fuse, their rows are copied anyway, so the fused product puts the
+// features of each query and key head in halves order, and the step
+// rotates halves: attention, a dot product of queries with keys, does
+// not see the order of their features.
+func (m *Model) fusedFor(ctx context.Context, params []*tensor.Tensor) ([]fused, *nn.RotaryEmbedding, error) {
 	d := &m.decoding
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.fused != nil && slices.Equal(d.made, params) {
-		return d.fused, nil
+		return d.fused, d.rope, nil
+	}
+	c := m.Config
+	rope := m.Rope
+	var qkOrder [][]int
+	if rope.Interleaved && !slices.ContainsFunc(m.Blocks, func(b *Block) bool { return !fusible(b.Q, b.K, b.V) }) {
+		rope = &nn.RotaryEmbedding{Dim: rope.Dim, Base: rope.Base, Scaling: rope.Scaling}
+		qkOrder = [][]int{halvesOrder(c.Heads, c.HeadDim), halvesOrder(c.KVHeads, c.HeadDim), nil}
 	}
 	fs := make([]fused, len(m.Blocks))
 	for i, b := range m.Blocks {
 		var err error
-		if fs[i].qkv, err = fuse(ctx, b.Q, b.K, b.V); err != nil {
-			return nil, err
+		if fs[i].qkv, err = fuse(ctx, qkOrder, b.Q, b.K, b.V); err != nil {
+			return nil, nil, err
 		}
-		if fs[i].gateUp, err = fuse(ctx, b.Gate, b.Up); err != nil {
-			return nil, err
+		if fs[i].gateUp, err = fuse(ctx, nil, b.Gate, b.Up); err != nil {
+			return nil, nil, err
 		}
 	}
-	d.fused, d.made = fs, params
-	return fs, nil
+	d.fused, d.made, d.rope = fs, params, rope
+	return fs, rope, nil
+}
+
+// halvesOrder returns, for heads heads of dim features in interleaved
+// order, the feature of each in halves order: feature i of a head, for
+// i < dim/2, is the interleaved feature 2i, and feature i+dim/2 is 2i+1.
+func halvesOrder(heads, dim int) []int {
+	order := make([]int, 0, heads*dim)
+	for h := range heads {
+		for i := range dim / 2 {
+			order = append(order, h*dim+2*i)
+		}
+		for i := range dim / 2 {
+			order = append(order, h*dim+2*i+1)
+		}
+	}
+	return order
 }
 
 // maxFused is the most bytes of weights fuse copies into one product. A
@@ -225,16 +264,22 @@ func (m *Model) fusedFor(ctx context.Context, params []*tensor.Tensor) ([]fused,
 // its weights would cost time once and memory for good.
 const maxFused = 4 << 20
 
-// fuse returns one linear layer whose outputs are those of ms, one after
-// another, or nil when they are not all plain linear layers of one input
-// width and weight dtype, with biases on all or none. Its weight holds
-// the rows of theirs, which for a block-quantized dtype are whole blocks.
-func fuse(ctx context.Context, ms ...nn.Module) (*nn.Linear, error) {
+// fusible reports whether fuse makes one product of ms: plain linear
+// layers of one input width and weight dtype, on one device, with biases
+// on all or none, whose weights fit in maxFused bytes together.
+func fusible(ms ...nn.Module) bool {
+	_, ok := linears(ms)
+	return ok
+}
+
+// linears returns ms as the linear layers fuse makes one product of, as
+// fusible checks.
+func linears(ms []nn.Module) ([]*nn.Linear, bool) {
 	ls := make([]*nn.Linear, len(ms))
 	for i, m := range ms {
 		l, ok := m.(*nn.Linear)
 		if !ok {
-			return nil, nil
+			return nil, false
 		}
 		ls[i] = l
 	}
@@ -244,31 +289,57 @@ func fuse(ctx context.Context, ms ...nn.Module) (*nn.Linear, error) {
 	size := 0
 	for _, l := range ls {
 		w := l.Weight.Value()
-		if w.Rank() != 2 || w.Shape()[1] != in || w.DType() != dt || w.Device() != dev || (l.Bias != nil) != bias {
-			return nil, nil
+		if w.Rank() != 2 || w.Shape()[1] != in || w.DType() != dt || !w.Device().Equal(dev) || (l.Bias != nil) != bias {
+			return nil, false
 		}
 		b, _ := dt.Bytes(w.Shape()[0] * in)
 		size += b
 	}
-	if size > maxFused {
+	return ls, size <= maxFused
+}
+
+// fuse returns one linear layer whose outputs are those of ms, one after
+// another, or nil when they are not fusible. Its weight holds the rows of
+// theirs, which for a block-quantized dtype are whole blocks, in the
+// order that orders gives for each layer, if not nil: row i of the fused
+// layer's part for layer l is row orders[l][i] of that layer's.
+func fuse(ctx context.Context, orders [][]int, ms ...nn.Module) (*nn.Linear, error) {
+	ls, ok := linears(ms)
+	if !ok {
 		return nil, nil
 	}
-	data := make([]byte, 0, size)
+	w0 := ls[0].Weight.Value()
+	in, dt, dev := w0.Shape()[1], w0.DType(), w0.Device()
+	rowBytes, _ := dt.Bytes(in)
+	var data []byte
 	rows := 0
-	for _, l := range ls {
-		w := l.Weight.Value()
+	for l, lin := range ls {
+		w := lin.Weight.Value()
 		b, err := w.Bytes(ctx)
 		if err != nil {
 			return nil, err
 		}
-		data = append(data, b...)
+		if orders == nil || orders[l] == nil {
+			data = append(data, b...)
+		} else {
+			for _, r := range orders[l] {
+				data = append(data, b[r*rowBytes:(r+1)*rowBytes]...)
+			}
+		}
 		rows += w.Shape()[0]
 	}
 	f := &nn.Linear{Weight: tensor.NewBuffer(tensor.FromBytes(dt, data, rows, in).To(dev))}
-	if bias {
+	if ls[0].Bias != nil {
 		bs := make([]*tensor.Tensor, len(ls))
-		for i, l := range ls {
-			bs[i] = l.Bias.Value()
+		for l, lin := range ls {
+			bs[l] = lin.Bias.Value()
+			if orders != nil && orders[l] != nil {
+				idx := make([]int32, len(orders[l]))
+				for i, r := range orders[l] {
+					idx[i] = int32(r)
+				}
+				bs[l] = bs[l].Gather(0, tensor.FromSlice(idx, len(idx)).To(dev))
+			}
 		}
 		f.Bias = tensor.NewBuffer(tensor.Cat(0, bs...))
 	}

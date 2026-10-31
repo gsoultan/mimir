@@ -29,6 +29,16 @@ func softmaxGradAVX512(p *float32, dp *float32, n int, d float32)
 //go:noescape
 func dot4AVX512(x *float32, y *float32, stride int, n int, out *float32)
 
+// dotRowsAVX512 sets out[r], for r < rows, a multiple of 4, to the sum of the products of the n elements at x, a multiple of 16, and those of row r of y, which starts stride elements after row r-1.
+//
+//go:noescape
+func dotRowsAVX512(x *float32, y *float32, stride int, n int, rows int, out *float32)
+
+// axpyRowsAVX512 adds to the 64 elements at out, for each of the n rows of y, which start stride elements apart, the row times p[j].
+//
+//go:noescape
+func axpyRowsAVX512(p *float32, y *float32, stride int, n int, out *float32)
+
 // sumAVX512 returns the sum in float64 of the n elements at x, a multiple of 16.
 //
 //go:noescape
@@ -118,6 +128,16 @@ func softmaxGradAVX2(p *float32, dp *float32, n int, d float32)
 //
 //go:noescape
 func dot4AVX2(x *float32, y *float32, stride int, n int, out *float32)
+
+// dotRowsAVX2 sets out[r], for r < rows, a multiple of 4, to the sum of the products of the n elements at x, a multiple of 8, and those of row r of y, which starts stride elements after row r-1.
+//
+//go:noescape
+func dotRowsAVX2(x *float32, y *float32, stride int, n int, rows int, out *float32)
+
+// axpyRowsAVX2 adds to the 32 elements at out, for each of the n rows of y, which start stride elements apart, the row times p[j].
+//
+//go:noescape
+func axpyRowsAVX2(p *float32, y *float32, stride int, n int, out *float32)
 
 // sumAVX2 returns the sum in float64 of the n elements at x, a multiple of 8.
 //
