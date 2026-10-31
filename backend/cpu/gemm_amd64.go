@@ -29,15 +29,18 @@ type x86 struct {
 	avx, avx2, fma, avx512 bool
 	f16c                   bool // VCVTPH2PS, converting float16
 	avx512vnni             bool // VPDPBUSD and VPDPWSSD, on ZMM registers too
+	intel                  bool // vendor string GenuineIntel
 }
 
 // x86Features reports the vector extensions that both the CPU and the
 // operating system support.
 func x86Features() x86 {
-	maxID, _, _, _ := cpuid(0, 0)
+	maxID, vb, vc, vd := cpuid(0, 0)
 	if maxID < 7 {
 		return x86{}
 	}
+	// "GenuineIntel" as EBX, EDX, ECX.
+	intel := vb == 0x756e6547 && vd == 0x49656e69 && vc == 0x6c65746e
 	_, _, ecx1, _ := cpuid(1, 0)
 	const osxsave, avx, fma, f16c = 1 << 27, 1 << 28, 1 << 12, 1 << 29
 	if ecx1&osxsave == 0 || ecx1&avx == 0 {
@@ -60,5 +63,6 @@ func x86Features() x86 {
 		f16c:       ecx1&f16c != 0,
 		avx512:     avx512,
 		avx512vnni: avx512 && ecx7&avx512vnni != 0,
+		intel:      intel,
 	}
 }
