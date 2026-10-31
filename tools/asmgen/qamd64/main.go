@@ -30,7 +30,21 @@ const maxRows = 4
 // memory once, faster than the hardware prefetchers alone follow a row of
 // a few hundred bytes: a prefetch each block, two kilobytes ahead, keeps
 // more lines in flight.
+//
+// That holds for Intel cores. The K-quant kernels come in two variants,
+// with and without the prefetch, because on AMD Zen the prefetch costs a
+// quarter (Q4_K) to three quarters (Q6_K) of the kernel's time, while on
+// Intel Cascade Lake it saves a fifth of Q4_K's; qdot_amd64.go picks by
+// vendor.
 const prefetchAhead = 2176
+
+// prefetchSuffix names the variant of a kernel that prefetches weights.
+func prefetchSuffix(prefetch bool) string {
+	if prefetch {
+		return "P"
+	}
+	return ""
+}
 
 var rowsOf = [...]string{1: "one row of activations", 2: "two rows of activations", 3: "three rows of activations", 4: "four rows of activations"}
 
@@ -40,11 +54,13 @@ func main() {
 	for rows := 1; rows <= maxRows; rows++ {
 		q8_0(rows)
 	}
-	for rows := 1; rows <= maxRows; rows++ {
-		q4K(rows)
-	}
-	for rows := 1; rows <= maxRows; rows++ {
-		q6K(rows)
+	for _, prefetch := range []bool{false, true} {
+		for rows := 1; rows <= maxRows; rows++ {
+			q4K(rows, prefetch)
+		}
+		for rows := 1; rows <= maxRows; rows++ {
+			q6K(rows, prefetch)
+		}
 	}
 	qtile(false)
 	qtile(true)
@@ -199,8 +215,8 @@ func q8_0(rows int) {
 // super-blocks of a float32 scale, 256 int8 and the int16 sums of each
 // 16. A row's accumulator holds the float32 sums of qdotQ4KGo, acc in
 // lane 0 and accm in lane 1.
-func q4K(rows int) {
-	name := fmt.Sprintf("qdotQ4KAVX2x%d", rows)
+func q4K(rows int, prefetch bool) {
+	name := fmt.Sprintf("qdotQ4KAVX2%sx%d", prefetchSuffix(prefetch), rows)
 	nb, w, x := prologue(name, rows, "multiplies Q4_K weights by "+rowsOf[rows])
 	acc := make([]VecVirtual, rows)
 	for r := range acc {
@@ -211,7 +227,9 @@ func q4K(rows int) {
 	JZ(LabelRef(name + "_done"))
 
 	Label(name + "_loop")
-	PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
+	if prefetch {
+		PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
+	}
 	// Unpack the eight 6-bit scales and mins as ggml's dot product does:
 	// with u0, u1, u2 the three words of the 12 bytes,
 	//
@@ -319,8 +337,8 @@ func q4K(rows int) {
 // 16. The quants of 6 bits, 0 to 63, multiply as unsigned bytes, and 32
 // times each group's sum, times its scale, is taken from the products,
 // as qdotQ6KGo takes it.
-func q6K(rows int) {
-	name := fmt.Sprintf("qdotQ6KAVX2x%d", rows)
+func q6K(rows int, prefetch bool) {
+	name := fmt.Sprintf("qdotQ6KAVX2%sx%d", prefetchSuffix(prefetch), rows)
 	nb, w, x := prologue(name, rows, "multiplies Q6_K weights by "+rowsOf[rows])
 	acc := make([]VecVirtual, rows)
 	for r := range acc {
@@ -331,7 +349,9 @@ func q6K(rows int) {
 	JZ(LabelRef(name + "_done"))
 
 	Label(name + "_loop")
-	PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
+	if prefetch {
+		PREFETCHT0(Mem{Base: w, Disp: prefetchAhead})
+	}
 	isum := make([]VecVirtual, rows)
 	for r := range isum {
 		isum[r] = YMM()

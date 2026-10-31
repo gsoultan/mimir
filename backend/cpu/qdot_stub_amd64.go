@@ -64,6 +64,46 @@ func qdotQ6KAVX2x3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
 //go:noescape
 func qdotQ6KAVX2x4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
 
+// qdotQ4KAVX2Px1 multiplies Q4_K weights by one row of activations; see qdot.
+//
+//go:noescape
+func qdotQ4KAVX2Px1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ4KAVX2Px2 multiplies Q4_K weights by two rows of activations; see qdot.
+//
+//go:noescape
+func qdotQ4KAVX2Px2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ4KAVX2Px3 multiplies Q4_K weights by three rows of activations; see qdot.
+//
+//go:noescape
+func qdotQ4KAVX2Px3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ4KAVX2Px4 multiplies Q4_K weights by four rows of activations; see qdot.
+//
+//go:noescape
+func qdotQ4KAVX2Px4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ6KAVX2Px1 multiplies Q6_K weights by one row of activations; see qdot.
+//
+//go:noescape
+func qdotQ6KAVX2Px1(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ6KAVX2Px2 multiplies Q6_K weights by two rows of activations; see qdot.
+//
+//go:noescape
+func qdotQ6KAVX2Px2(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ6KAVX2Px3 multiplies Q6_K weights by three rows of activations; see qdot.
+//
+//go:noescape
+func qdotQ6KAVX2Px3(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
+// qdotQ6KAVX2Px4 multiplies Q6_K weights by four rows of activations; see qdot.
+//
+//go:noescape
+func qdotQ6KAVX2Px4(nb int, w *byte, x *byte, xstride int, out *float32, ldo int)
+
 // qtileQ4KAVX2 multiplies two rows of unpacked weights by sixteen rows of interleaved activations; see qtile.
 //
 //go:noescape
