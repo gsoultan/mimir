@@ -230,6 +230,12 @@ func TestAgglomerativeFindsTheBlobs(t *testing.T) {
 	if one := l.Cut(1); slices.Max(one) != 0 {
 		t.Errorf("a cut into 1 group gives %v", one)
 	}
+	if c := l.Centers(x, 3); c.K() != 3 || !reflect.DeepEqual(c.Centers, l.Means.Centers) || c.Silhouette(x, 1) < 0.5 {
+		t.Errorf("Centers at 3 gives %v", c)
+	}
+	if c := l.Centers(x, 2); c.K() != 2 || c.Silhouette(x, 1) >= l.Means.Silhouette(x, 1) {
+		t.Errorf("a cut into 2 should sit worse than 3")
+	}
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(l); err != nil {
 		t.Fatal(err)

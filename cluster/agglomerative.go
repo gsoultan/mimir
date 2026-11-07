@@ -153,6 +153,15 @@ func Agglomerative(ctx context.Context, x []float32, features, k int, opts ...Op
 	return l, nil
 }
 
+// Centers returns the centers of the k groups the hierarchy of the
+// training rows x cuts into, to assign new rows and score the cut by
+// Silhouette, so a table is grouped once and its number of groups
+// picked afterwards.
+func (l *Linkage) Centers(x []float32, k int) *Means {
+	k = min(max(k, 1), len(l.Merges)+1)
+	return l.means(l.Scaler.Transform(x), l.Cut(k), k)
+}
+
 // Cut returns the group of each training row, 0 to k-1 numbered by first
 // row, with the hierarchy cut into k groups, or into one when k is more
 // than the rows or less than 1.
