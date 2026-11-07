@@ -1,6 +1,7 @@
 package forecast
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -83,5 +84,60 @@ func TestForecastBadInput(t *testing.T) {
 	}
 	if _, err := Fit(context.Background(), [][]float32{{1, 2, 3, 4}}, Season(-1)); !errors.Is(err, tensor.ErrShape) {
 		t.Errorf("negative season: error %v", err)
+	}
+}
+
+func TestSmoothLearnsTheWeek(t *testing.T) {
+	h := weekly(98, 50, 99)
+	m, err := Smooth(h[:84], Season(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Error >= m.Naive {
+		t.Errorf("one-step error %v is no better than the naive %v", m.Error, m.Naive)
+	}
+	got := m.Forecast(14)
+	var mape float64
+	for i, v := range got {
+		mape += math.Abs(float64(v-h[84+i])) / float64(h[84+i])
+	}
+	if mape /= 14; mape > 0.08 {
+		t.Errorf("two-week forecast %v is off by %.1f%% on average", got, 100*mape)
+	}
+	// A trend, no season, and a gap.
+	s := make([]float32, 40)
+	for i := range s {
+		s[i] = float32(100 + 2*i)
+	}
+	s[20] = float32(math.NaN())
+	m, err = Smooth(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next := m.Forecast(3); math.Abs(float64(next[0])-180) > 4 || next[2] <= next[0] {
+		t.Errorf("the trend forecast gives %v", next)
+	}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(m); err != nil {
+		t.Fatal(err)
+	}
+	var back Smoothing
+	if err := json.NewDecoder(&buf).Decode(&back); err != nil || back.Forecast(3)[0] != m.Forecast(3)[0] {
+		t.Errorf("JSON round trip: %v", err)
+	}
+}
+
+func TestSmoothBadInput(t *testing.T) {
+	for _, c := range []struct {
+		n    int
+		opts []Option
+	}{{2, nil}, {10, []Option{Season(7)}}, {10, []Option{Season(-1)}}, {10, []Option{Season(1)}}, {10, []Option{Holdout(-1)}}} {
+		if _, err := Smooth(weekly(c.n, 1, 1), c.opts...); !errors.Is(err, tensor.ErrShape) {
+			t.Errorf("%d steps, %d options: %v", c.n, len(c.opts), err)
+		}
+	}
+	nan := float32(math.NaN())
+	if _, err := Smooth([]float32{nan, nan, 1}); !errors.Is(err, tensor.ErrShape) {
+		t.Errorf("one value present: %v", err)
 	}
 }

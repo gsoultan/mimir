@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/gsoultan/mimir/io/mim"
@@ -201,5 +202,55 @@ func TestBadInput(t *testing.T) {
 		if !errors.Is(err, tensor.ErrShape) {
 			t.Errorf("error %v, want ErrShape", err)
 		}
+	}
+}
+
+func TestAgglomerativeFindsTheBlobs(t *testing.T) {
+	x, y := blobs(100, three, []float64{1, 1, 1}, 7)
+	l, err := Agglomerative(context.Background(), x, 2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := agree(l.Labels, y, 3); a < 0.95 {
+		t.Errorf("labels agree with the blobs on %.0f%% of rows", 100*a)
+	}
+	if a := agree(l.Assign(x), y, 3); a < 0.95 {
+		t.Errorf("assigned groups agree with the blobs on %.0f%% of rows", 100*a)
+	}
+	if len(l.Merges) != 299 || l.K() != 3 {
+		t.Errorf("%d merges, %d groups", len(l.Merges), l.K())
+	}
+	h := l.Heights()
+	if h[298] < 10*h[296] {
+		t.Errorf("the last merge, %v, should tower over the third last, %v", h[298], h[296])
+	}
+	if two := l.Cut(2); slices.Max(two) != 1 || agree(two, y, 3) > 0.7 {
+		t.Errorf("a cut into 2 groups gives %v", two)
+	}
+	if one := l.Cut(1); slices.Max(one) != 0 {
+		t.Errorf("a cut into 1 group gives %v", one)
+	}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(l); err != nil {
+		t.Fatal(err)
+	}
+	var back Linkage
+	if err := json.NewDecoder(&buf).Decode(&back); err != nil || !reflect.DeepEqual(back.Assign(x), l.Assign(x)) {
+		t.Errorf("JSON round trip: %v", err)
+	}
+}
+
+func TestAgglomerativeBadInput(t *testing.T) {
+	x, _ := blobs(5, three, []float64{1, 1, 1}, 1)
+	if _, err := Agglomerative(context.Background(), x, 2, 16); !errors.Is(err, tensor.ErrShape) {
+		t.Errorf("too many groups: %v", err)
+	}
+	if _, err := Agglomerative(context.Background(), x[:7], 2, 2); !errors.Is(err, tensor.ErrShape) {
+		t.Errorf("ragged rows: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Agglomerative(ctx, x, 2, 2); !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled: %v", err)
 	}
 }
