@@ -612,17 +612,22 @@ nb, err := bayes.Multinomial(ctx, wordCounts)
 
 ## Groups, outliers, forecasts and recommendations
 
-Four more packages learn from tables without a model of answers per row:
+Five more packages learn from tables without a model of answers per row:
 
 - `cluster` groups rows by `KMeans` (k-means++ starts), `GaussianMixture`
-  (diagonal covariances, by EM) and `DBSCAN` (any shape, with noise), and
-  scores a grouping by its `Silhouette`.
+  (diagonal covariances, by EM), `DBSCAN` (any shape, with noise) and
+  `Agglomerative` (Ward's hierarchy, cut into any number of groups after
+  the fact), and scores a grouping by its `Silhouette`.
 - `decompose.PCA` finds the directions rows vary in most, to draw a table
   in two dimensions or shrink it.
 - `tree.IsolationForest` scores how unusual each row is, from 0 to 1.
 - `forecast` predicts what comes next in many series at once with one
   boosted-tree model over each step's recent values and its place in the
-  season, and checks itself against the naive seasonal forecast.
+  season, and checks itself against the naive seasonal forecast;
+  `forecast.Smooth` fits Holt-Winters exponential smoothing (level,
+  damped trend and season) to one short series.
+- `rules.Mine` finds what goes together in baskets of items, as
+  association rules with support, confidence and lift, by Apriori.
 - `recommend` factorizes who did what with which item by alternating
   least squares, for clicks and purchases or for ratings, and recommends
   items and finds similar ones.
@@ -877,8 +882,8 @@ read.
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 | Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax; early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
 | Kernels, neighbours, naive Bayes (`svm`, `neighbors`, `bayes`) | `svm.Fit` (C-SVC and ε-SVR; linear, RBF, polynomial, sigmoid kernels; Platt probabilities), `neighbors.Fit` (uniform or by distance; Euclidean, Manhattan, cosine), `bayes.Gaussian`, `Multinomial`, `Bernoulli` |
-| Unsupervised (`cluster`, `decompose`, `tree`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Silhouette`; `PCA`; `IsolationForest` |
-| Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`; `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
+| Unsupervised (`cluster`, `decompose`, `tree`, `rules`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Agglomerative`, `Silhouette`; `PCA`; `IsolationForest`; `rules.Mine` |
+| Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`, `forecast.Smooth` (Holt-Winters); `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
 | Model search (`automl`) | `Search` over boosted trees, forests, linear models, SVMs, neighbours and naive Bayes, with trials, folds, time budgets and families |
 | Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |
 
@@ -903,9 +908,10 @@ metrics/             accuracy, and scores of a table model's answers
 tabular/             tables of numbers to learn from, splits and cross-validation
 tree/                decision trees, random forests and gradient-boosted trees
 linear/              linear and logistic regression
-cluster/             k-means, Gaussian mixtures, DBSCAN and silhouettes
+cluster/             k-means, Gaussian mixtures, DBSCAN, Ward's hierarchy and silhouettes
 decompose/           principal component analysis
-forecast/            forecasts of many series with one boosted-tree model
+forecast/            forecasts of many series with one boosted-tree model, Holt-Winters smoothing
+rules/               association rules of baskets by Apriori
 recommend/           recommendations by matrix factorization
 automl/              picks and tunes the best model for a table
 svm/                 support vector machines
