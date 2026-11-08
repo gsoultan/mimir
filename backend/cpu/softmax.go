@@ -1,6 +1,9 @@
 package cpu
 
-import "math"
+import (
+	"math"
+	"sync"
+)
 
 // The attention kernels apply softmax to rows of scores a block at a time.
 // These row operations run on vector routines where the CPU has them; the
@@ -84,7 +87,11 @@ func expShift(x []float32, shift float32) float32 {
 // element takes the same path wherever it is in a, so the result does
 // not depend on how a kernel splits its elements.
 func exp2Floats(dst, a []float32) {
-	var buf [256]float32
+	// The scratch is pooled: handed to the vector routine by pointer, it
+	// would otherwise go on the heap on every call, a kilobyte per row.
+	sc := exp2Scratch.Get().(*exp2Buffers)
+	defer exp2Scratch.Put(sc)
+	buf := &sc.buf
 	for len(a) > 0 {
 		c := min(len(a), len(buf))
 		src := buf[:c]
@@ -95,7 +102,8 @@ func exp2Floats(dst, a []float32) {
 		}
 		if n < c {
 			// The rest, padded to a vector.
-			var tail [16]float32
+			tail := &sc.tail
+			clear(tail[:])
 			copy(tail[:], src[n:])
 			rowVector.exp2(&tail[0], &tail[0], rowVector.lanes)
 			copy(dst[n:c], tail[:])
@@ -108,6 +116,14 @@ func exp2Floats(dst, a []float32) {
 		dst, a = dst[c:], a[c:]
 	}
 }
+
+// exp2Buffers is the scratch of one exp2Floats call.
+type exp2Buffers struct {
+	buf  [256]float32
+	tail [16]float32
+}
+
+var exp2Scratch = sync.Pool{New: func() any { return new(exp2Buffers) }}
 
 // scaleRow multiplies every element of x by a.
 func scaleRow(x []float32, a float32) {
