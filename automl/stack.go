@@ -73,12 +73,6 @@ func (b *Blend) Predict(x []float32) []float32 {
 	return out
 }
 
-// oof is a candidate's answers for rows it didn't learn from.
-type oof struct {
-	trial int       // index into the trials
-	p     []float32 // answers, outputs per row, for the rows of the scored set
-}
-
 // blend picks weights for the candidates' out-of-fold answers p, all for
 // the rows whose answers are y, by greedy ensemble selection with
 // replacement, starting from the best alone. It returns the weights and
