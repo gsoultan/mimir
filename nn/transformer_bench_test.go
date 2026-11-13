@@ -17,6 +17,7 @@ package nn_test
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/nn"
 	"github.com/gsoultan/mimir/optim"
@@ -29,6 +30,22 @@ import (
 // work a program does once, which timing would report as seconds per
 // step when b.N is small.
 const warmup = 3
+
+// warm runs step warmup times, and then on until warmupTime has passed
+// since it began: a GPU that idled, as it does while a benchmark binary
+// builds, runs at low clocks until it has been busy for a while, a few
+// hundred milliseconds on a T4, so a short benchmark would otherwise time
+// some steps at the clocks of an idle GPU. tools/bench/attention.py warms
+// PyTorch the same way.
+func warm(step func()) {
+	start := time.Now()
+	for i := 0; i < warmup || time.Since(start) < warmupTime; i++ {
+		step()
+	}
+}
+
+// warmupTime is the least time warm runs steps for.
+const warmupTime = 300 * time.Millisecond
 
 // BenchmarkDecoderBlockStep times one training step of a GPT-2 small
 // block (768 features in 12 heads) over 8 sequences: the forward pass, a
@@ -87,9 +104,7 @@ func decoderBlockStep(b *testing.B, batch, seq, embed, heads int, feed string) {
 		}
 		opt.ZeroGrad()
 	}
-	for range warmup {
-		step()
-	}
+	warm(step)
 	faults, counted := pageFaults()
 	for b.Loop() {
 		step()
@@ -133,9 +148,7 @@ func BenchmarkDecode(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		for range warmup {
-			step()
-		}
+		warm(step)
 		for b.Loop() {
 			step()
 		}
@@ -172,9 +185,7 @@ func decodeBlock(b *testing.B, block *nn.DecoderBlock, past int) {
 			b.Fatal(err)
 		}
 	}
-	for range warmup {
-		step()
-	}
+	warm(step)
 	for b.Loop() {
 		step()
 	}
