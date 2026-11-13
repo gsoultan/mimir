@@ -189,54 +189,6 @@ func (p *pool) take(key poolKey, at uintptr, obtain bool) (backend.Buffer, bool,
 	return buf, true, nil
 }
 
-// holds reports whether the pool holds a free buffer of key at address
-// at.
-func (p *pool) holds(key poolKey, at uintptr) bool {
-	for _, b := range p.free[key] {
-		if uintptr(addressOf(b.buf)) == at {
-			return true
-		}
-	}
-	return false
-}
-
-// countOther returns how many free buffers of key are at addresses that
-// wanted lacks.
-func (p *pool) countOther(key poolKey, wanted map[uintptr]bool) int {
-	n := 0
-	for _, b := range p.free[key] {
-		if !wanted[uintptr(addressOf(b.buf))] {
-			n++
-		}
-	}
-	return n
-}
-
-// takeOther takes the most recently freed buffer of key at an address
-// that wanted lacks, and reports whether there was one.
-func (p *pool) takeOther(key poolKey, wanted map[uintptr]bool) (backend.Buffer, bool) {
-	bufs := p.free[key]
-	for i := len(bufs) - 1; i >= 0; i-- {
-		if !wanted[uintptr(addressOf(bufs[i].buf))] {
-			buf := bufs[i].buf
-			p.free[key] = append(bufs[:i], bufs[i+1:]...)
-			return buf, true
-		}
-	}
-	return nil, false
-}
-
-// obtain returns a new buffer of key from the backend.
-func (p *pool) obtain(key poolKey) (backend.Buffer, error) {
-	buf, err := p.be.Alloc(key.dt, key.n)
-	if err != nil {
-		return nil, err
-	}
-	p.obtained += key.bytes()
-	p.track(buf)
-	return buf, nil
-}
-
 // unfree takes buf off the free lists, if it is on them, and reports
 // whether it was. The most recently freed buffers are at the end.
 func (p *pool) unfree(buf backend.Buffer) bool {
