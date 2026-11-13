@@ -169,7 +169,11 @@ const (
 	// In[0], [B..., m, n], batched over the leading ones. Factorizations
 	// other than OpCholesky write a one-dimensional output that holds
 	// their parts in turn, each contiguous and shaped as FactorParts
-	// returns.
+	// returns. Eigenvectors and singular vectors are unique up to their
+	// signs, which devices set alike: the first element of each
+	// eigenvector, and of each left singular vector, whose magnitude is
+	// at least half the largest is positive, and each right singular
+	// vector flips with its left one.
 	OpCholesky        // the lower factor L of a positive definite [B..., n, n], read from its lower triangle, with zeros above the diagonal; ErrSingular unless positive definite
 	OpTriangularSolve // X of A·X = B for a triangular In[0] [B..., n, n], read from its lower triangle or, with Attrs.Upper, its upper, with ones on the diagonal if Attrs.Unit, and In[1] [B..., n, k]; ErrSingular on a zero diagonal
 	OpLU              // P·A = L·U with partial pivoting: L and U packed in [B..., n, n] with L's unit diagonal implied, the permutation [B..., n], whose element i is the row of A that row i of P·A is, and its sign [B...]; a zero pivot is kept

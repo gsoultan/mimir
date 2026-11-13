@@ -385,6 +385,8 @@ func (b *Backend) sync() error {
 		return fmt.Errorf("cuda: %w", backend.ErrDivideByZero)
 	case word&gen.ErrIndex != 0:
 		return fmt.Errorf("cuda: %w", backend.ErrIndex)
+	case word&gen.ErrSingular != 0:
+		return fmt.Errorf("cuda: %w", backend.ErrSingular)
 	}
 	return nil
 }

@@ -56,6 +56,7 @@ const GroupSize = 256
 const (
 	ErrDivideByZero = 1 << iota
 	ErrIndex
+	ErrSingular
 )
 
 // Launch is one kernel launch: kernel k of Src, run as Groups groups of
@@ -479,6 +480,9 @@ func Plan(d *Dialect, k *backend.Kernel, outs, ins []backend.Buffer) (*Launch, e
 	}
 	if n == 0 {
 		return nil, nil
+	}
+	if k.Op >= backend.OpCholesky && k.Op <= backend.OpEigh {
+		return planLinalg(d, k, outs, ins)
 	}
 	g := newGen(d, k, outs, ins)
 	if k.Op == backend.OpQMatMul {

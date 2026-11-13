@@ -242,6 +242,8 @@ func (b *Backend) Sync(ctx context.Context) error {
 		err = fmt.Errorf("metal: %w", backend.ErrDivideByZero)
 	case w&gen.ErrIndex != 0:
 		err = fmt.Errorf("metal: %w", backend.ErrIndex)
+	case w&gen.ErrSingular != 0:
+		err = fmt.Errorf("metal: %w", backend.ErrSingular)
 	}
 	*word = 0
 	return err
