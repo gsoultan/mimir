@@ -191,9 +191,7 @@ func BenchmarkStepOverhead(b *testing.B) {
 						}
 						opt.ZeroGrad()
 					}
-					for range warmup {
-						step()
-					}
+					warm(step)
 					dev.times(be)
 					var total time.Duration
 					for b.Loop() {

@@ -73,6 +73,18 @@ type program struct {
 	keyOf []int32          // by pooled buffer: the index of its key in peaks
 	short []int            // by peak: the buffers of its key the run has yet to obtain
 	mems  []*graph.Storage // by pooled buffer: the storage of the results it holds
+	// isResult says, by pooled buffer, whether it holds a target's result.
+	isResult []bool
+	// The results that a run takes buffers for first (see setAside): by
+	// pooled buffer, whether it is one; the addresses the program's other
+	// buffers took in the last run; the buffers of each key they take
+	// from the pool and the bytes of those they obtain; and the peaks of
+	// the others.
+	early       []bool
+	wanted      map[uintptr]bool
+	asidePooled map[poolKey]int
+	asideExtra  int64
+	runPeaks    []peak
 
 	donated []donation // the donated leaves the program gives to the pool
 
@@ -380,10 +392,15 @@ func peaks(tmps []poolKey, events []int32) []peak {
 // gives back its buffers. The pool serves the most recently freed buffer
 // of a key first, so a program that holds at most n buffers of a key at
 // once takes n of them from the pool, as far as the pool has them, and
-// the rest from the backend.
+// the rest from the backend. The results set aside (see setAside) take
+// theirs first.
 func (p *program) simulate(m *pool) *sim {
 	s := m.simulate()
-	for _, pk := range p.peaks {
+	s.extra += p.asideExtra
+	for key, n := range p.asidePooled {
+		s.pooled[key] -= n
+	}
+	for _, pk := range p.runPeaks {
 		have := s.pooled[pk.key]
 		taken := min(have, pk.n)
 		s.pooled[pk.key] = have - taken
@@ -396,9 +413,10 @@ func (p *program) simulate(m *pool) *sim {
 // ErrMemoryBudget, as pool.reserve does, without the allocations of a sim
 // when the run fits the budget.
 func (p *program) reserve(m *pool) error {
-	var extra int64
-	for _, pk := range p.peaks {
-		if have := len(m.free[pk.key]); pk.n > have {
+	p.setAside(m)
+	extra := p.asideExtra
+	for _, pk := range p.runPeaks {
+		if have := len(m.free[pk.key]) - p.asidePooled[pk.key]; pk.n > have {
 			extra += int64(pk.n-have) * pk.key.bytes()
 		}
 	}
@@ -407,6 +425,80 @@ func (p *program) reserve(m *pool) error {
 	}
 	m.predicted += extra
 	return nil
+}
+
+// setAside decides which results of the run take their buffers before
+// the program's other buffers, and what that costs.
+//
+// A result leaves the pool with its buffer, which the next run cannot
+// take again while the caller holds the result. Were that buffer one
+// that another buffer of the program took earlier in the run and gave
+// back, the next run would have to move that one, and a backend would
+// derive anew what it derived from it, such as a CUDA graph. So a
+// replayed result whose buffer the caller still holds takes one first,
+// one that no other buffer of the program took in the last run, or a new
+// one, and the others keep theirs.
+func (p *program) setAside(m *pool) {
+	p.early = p.early[:0]
+	p.asideExtra = 0
+	clear(p.asidePooled)
+	base := p.leaves + p.targets
+	isResult := p.resultTmps(base)
+	var aside []int
+	for e, res := range isResult {
+		if res && p.last[e] != 0 && !m.holds(p.tmps[e], p.last[e]) {
+			aside = append(aside, e)
+		}
+	}
+	p.early = slices.Grow(p.early, len(p.tmps))[:len(p.tmps)]
+	clear(p.early)
+	if len(aside) == 0 {
+		p.runPeaks = p.peaks
+		return
+	}
+	if p.wanted == nil {
+		p.wanted = map[uintptr]bool{}
+	}
+	clear(p.wanted)
+	for e, a := range p.last {
+		if a != 0 && !isResult[e] {
+			p.wanted[a] = true
+		}
+	}
+	if p.asidePooled == nil {
+		p.asidePooled = map[poolKey]int{}
+	}
+	for _, e := range aside {
+		p.early[e] = true
+		key := p.tmps[e]
+		if p.asidePooled[key] < m.countOther(key, p.wanted) {
+			p.asidePooled[key]++
+		} else {
+			p.asideExtra += key.bytes()
+		}
+	}
+	p.runPeaks = peaksWithout(p.tmps, p.events, p.early, p.peaks)
+}
+
+// peaksWithout returns all, the peaks of the pooled buffers tmps that
+// events take and give back, counted without the buffers skip marks.
+func peaksWithout(tmps []poolKey, events []int32, skip []bool, all []peak) []peak {
+	held, top := map[poolKey]int{}, map[poolKey]int{}
+	for _, e := range events {
+		switch {
+		case e >= 0 && !skip[e]:
+			k := tmps[e]
+			held[k]++
+			top[k] = max(top[k], held[k])
+		case e < 0 && !skip[^e]:
+			held[tmps[^e]]--
+		}
+	}
+	out := make([]peak, len(all))
+	for i, pk := range all {
+		out[i] = peak{pk.key, top[pk.key]}
+	}
+	return out
 }
 
 // run computes targets, writing them over dsts as compiled, on m's
@@ -436,10 +528,27 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 		n.Mem.Refs = 0
 		n.Mem.Donated = true
 	}
+	// The results that reserve set aside take their buffers first, as it
+	// predicted.
+	for e, early := range p.early {
+		if !early {
+			continue
+		}
+		buf, ok := m.takeOther(p.tmps[e], p.wanted)
+		if !ok {
+			var err error
+			if buf, err = m.obtain(p.tmps[e]); err != nil {
+				p.giveBack(m)
+				return err
+			}
+		}
+		p.bufs[base+e], p.held[e] = buf, true
+		p.last[e] = uintptr(addressOf(buf))
+	}
 	// The run obtains from the backend the buffers that the pool lacks at
 	// its peaks, as reserve predicted: those that results of earlier runs
 	// took away.
-	for i, pk := range p.peaks {
+	for i, pk := range p.runPeaks {
 		p.short[i] = max(pk.n-len(m.free[pk.key]), 0)
 	}
 	for _, e := range p.events {
@@ -447,6 +556,9 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 			m.release(p.bufs[base+int(^e)])
 			p.held[^e] = false
 			continue
+		}
+		if int(e) < len(p.early) && p.early[e] {
+			continue // taken before the others
 		}
 		k := p.keyOf[e]
 		buf, obtained, err := m.take(p.tmps[e], p.last[e], p.last[e] != 0 && p.short[k] > 0)
@@ -512,6 +624,20 @@ func (p *program) run(ctx context.Context, m *pool, w *walker, targets, dsts []*
 		generation.Add(1)
 	}
 	return nil
+}
+
+// resultTmps returns, by pooled buffer, whether it holds a target's
+// result; base is the slot of the first pooled buffer.
+func (p *program) resultTmps(base int) []bool {
+	if p.isResult == nil {
+		p.isResult = make([]bool, len(p.tmps))
+		for _, slot := range p.results {
+			if k := int(slot) - base; slot >= 0 && k >= 0 {
+				p.isResult[k] = true
+			}
+		}
+	}
+	return p.isResult
 }
 
 // launchUnlocked is launch, and the Sync after it, run without mu: it

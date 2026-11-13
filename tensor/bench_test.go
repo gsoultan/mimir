@@ -17,6 +17,7 @@ package tensor_test
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/gsoultan/mimir/tensor"
 )
@@ -40,6 +41,22 @@ func realized(b *testing.B, seed uint64, shape ...int) *tensor.Tensor {
 // step's speed wrong by seconds when b.N is small.
 const warmup = 3
 
+// warm runs step warmup times, and then on until warmupTime has passed
+// since it began: a GPU that idled, as it does while a benchmark binary
+// builds, runs at low clocks until it has been busy for a while, a few
+// hundred milliseconds on a T4, so a short benchmark would otherwise time
+// some steps at the clocks of an idle GPU. tools/bench/attention.py warms
+// PyTorch the same way.
+func warm(step func()) {
+	start := time.Now()
+	for i := 0; i < warmup || time.Since(start) < warmupTime; i++ {
+		step()
+	}
+}
+
+// warmupTime is the least time warm runs steps for.
+const warmupTime = 300 * time.Millisecond
+
 // run times the realization of f's result, after warmup untimed ones.
 func run(b *testing.B, f func() *tensor.Tensor) {
 	b.Helper()
@@ -48,9 +65,7 @@ func run(b *testing.B, f func() *tensor.Tensor) {
 			b.Fatal(err)
 		}
 	}
-	for range warmup {
-		realize()
-	}
+	warm(realize)
 	for b.Loop() {
 		realize()
 	}
