@@ -143,7 +143,11 @@ func (m *Model) Module() *Module {
 				if t.Cats != nil && f >= 0 {
 					set = t.Cats[n]
 				}
-				catOff, catSize = append(catOff, int32(len(catLeft))), append(catSize, int32(64*len(set)))
+				off := int32(0) // a node with no set reads entry 0, unused
+				if set != nil {
+					off = int32(len(catLeft))
+				}
+				catOff, catSize = append(catOff, off), append(catSize, int32(64*len(set)))
 				for c := range 64 * len(set) {
 					catLeft = append(catLeft, int32(set[c>>6]>>(c&63)&1))
 				}

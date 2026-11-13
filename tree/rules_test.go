@@ -121,7 +121,7 @@ func TestCategoryModuleAnswersAsPredict(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Ask about missing, unknown and odd codes too.
-		q := tabular.Data{X: append([]float32(nil), d.X[:40*d.Features]...), Features: d.Features}
+		q := tabular.Data{X: append([]float32(nil), d.X...), Features: d.Features}
 		if oneHot {
 			clear(q.Row(0)[:12])
 			q.Row(1)[3], q.Row(1)[5] = 1, 1
@@ -447,5 +447,29 @@ func TestBadRulesAndLosses(t *testing.T) {
 		if err := run(); !errors.Is(err, tensor.ErrShape) {
 			t.Errorf("%s: %v, want ErrShape", name, err)
 		}
+	}
+}
+
+// TestCategoryModuleAfterTheLastSet checks a Module whose last trees
+// split on no category, so their nodes come after every set.
+func TestCategoryModuleAfterTheLastSet(t *testing.T) {
+	ctx := context.Background()
+	m := &Model{Task: tabular.Regression, Features: 2, Outputs: 1, Link: Identity, Scale: 1, Base: []float32{0},
+		Categories: []Category{{Feature: 0}},
+		Trees: []Tree{
+			{Feature: []int32{0, -1, -1}, Threshold: []float32{0, 0, 0}, MissingLeft: []bool{false, false, false},
+				Left: []int32{1, -1, -1}, Right: []int32{2, -1, -1}, Value: []float32{0, 1, 2},
+				Cats: [][]uint64{{0b1010}, nil, nil}},
+			{Feature: []int32{1, -1, -1}, Threshold: []float32{0.5, 0, 0}, MissingLeft: []bool{true, false, false},
+				Left: []int32{1, -1, -1}, Right: []int32{2, -1, -1}, Value: []float32{0, 10, 20}},
+		}}
+	x := []float32{1, 0, 2, 1, 3, 0.2, 0, 0.9, float32(math.NaN()), 0.1}
+	want := m.Predict(x)
+	got, err := m.Module().Forward(tensor.FromSlice(x, 5, 2)).Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("module answers %v, want %v", got, want)
 	}
 }
