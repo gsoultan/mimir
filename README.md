@@ -680,6 +680,23 @@ spectrograms, mel spectrograms and MFCCs with tensor operations, so they
 run inside a model on any device; `audio.NewClassifier` tells sounds
 apart from their log mel spectrogram with a four-block CNN.
 
+Package `audio/whisper` turns speech into text with OpenAI's Whisper
+(tiny to large, English-only or multilingual), and package `vision/clip`
+puts photos and words in one space with CLIP, to search photos by words
+or label them from a list without training. Both read a Hugging Face
+checkpoint that mimir-model's `mim-import` converts with its config.
+
+```go
+w, err := whisper.Load(f, md, tensor.DefaultDevice())
+tr, err := w.Transcribe(ctx, clip.Resample(16000).Samples, whisper.Options{})
+fmt.Println(tr.Language, tr.Text()) // en And so my fellow Americans ...
+
+c, err := clip.Load(f, md, tensor.DefaultDevice())
+photos, err := c.EmbedImages(ctx, imgs)
+words, err := c.EmbedTexts(ctx, []string{"a dog on a beach"})
+score := clip.Similarity(photos[0], words[0])
+```
+
 Package `automl` picks the best model for a table: it scores boosted
 trees, random forests, linear models, support vector machines, nearest
 neighbours and naive Bayes with a range of settings by cross-validation,
@@ -867,8 +884,9 @@ read.
 | Devices | `CPUs`, `GPUs`, `NewGroup` with `AllReduce`, `Broadcast`, `AllGather`, `ReduceScatter`, `ReduceGrads`, `BroadcastParams` (CPU devices, or CUDA GPUs over NCCL) |
 | Sharding | `NewMesh`, `P`, `PartitionSpec` (`WithSections`), `Shard`, `WithSharding`, `Sharding`, `Param.Shard`, `Mesh.Traffic` |
 | Layers (`nn`) | `Linear`, `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d`, `ConvTranspose2d`, `DepthwiseConv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `GroupNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `GlobalAvgPool`, `Upsample`, `Flatten`, `Cast` |
+| Pictures and words (`vision/clip`) | `clip.Load`, `EmbedImages`, `EmbedTexts`, `Prepare`, `Similarity`, `Scores` |
 | Pictures (`vision`) | `ResNet18`, `ResNet34`, `ResNet50`, `NewMobileNetV2`, `NewViT` (`ViTB16`, `ViTTiny`); `Features`, `SetHead`, `HeadParameters`; `NewDetector` (CenterNet, on `ResNet.Backbone` or `TinyBackbone`), `NewUNet`; `IoU`, `NMS`, `BoxIoU`, `GIoULoss`, `AveragePrecision`, `MeanIoU` |
-| Sound (`audio`) | `ReadWAV`, `WriteWAV`, `Clip.Resample`, `Spectrogram`, `Filterbank`, `MelSpectrogram`, `MFCC`, `NewClassifier` |
+| Sound (`audio`) | `ReadWAV`, `WriteWAV`, `Clip.Resample`, `Spectrogram`, `Filterbank`, `MelSpectrogram`, `MFCC`, `NewClassifier`; speech to text with `whisper.Load`, `Transcribe`, `LogMel`, `Encode` |
 | Agents (`rl`) | `Env`, `TrainPPO`, `TrainDQN`, `Evaluate`; `CartPole`, `Chain` |
 | Text (`text`) | WordPiece `Tokenizer`, `BuildVocab`, `NewBERT` (`BERTBase`, `BERTMini`, `BERTTiny`) |
 | Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
@@ -918,8 +936,10 @@ svm/                 support vector machines
 neighbors/           k nearest neighbours
 bayes/               naive Bayes
 vision/              ResNet, MobileNetV2, ViT, a CenterNet detector, U-Net and box scores
+vision/clip/         CLIP: photos and words in one space
 text/                WordPiece tokenizer and BERT
 audio/               WAV files, spectrograms, mel features and a sound classifier
+audio/whisper/       Whisper speech to text
 rl/                  PPO and DQN agents and environments
 backend/             Backend interface, DType, Op, View, Kernel, collectives
 backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives
