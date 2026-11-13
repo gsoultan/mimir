@@ -15,6 +15,7 @@
 package tree
 
 import (
+	"math"
 	"math/rand/v2"
 	"runtime"
 	"slices"
@@ -46,6 +47,11 @@ type grower struct {
 	// leafOf, when not nil, is set to the leaf each grown row ends in.
 	leafOf []int32
 	tmp    []int32
+	// mono, when not nil, holds each feature's monotone rule: +1 if the
+	// answer may only rise with it, -1 if only fall, 0 if free. bounds
+	// then holds each node's least and greatest allowed value.
+	mono   []int8
+	bounds [][2]float64
 }
 
 func (gr *grower) workerCount() int {
@@ -66,6 +72,11 @@ type split struct {
 	bin      int // rows in bins 1..bin go left
 	missLeft bool
 	left     []float64 // the left side's sums of G and H
+	// cats, for a split on a category, holds the codes sent left, a bit
+	// each.
+	cats []uint64
+	// wl and wr are the two sides' values, under a monotone rule.
+	wl, wr float64
 }
 
 // grow grows a tree from rows, which it reorders.
@@ -79,17 +90,19 @@ func (gr *grower) grow(rows []int32) Tree {
 			sums[k+j] += float64(gr.gh[int(r)*sz+k+j])
 		}
 	}
+	gr.bounds = gr.bounds[:0]
+	inf := math.Inf(1)
 	if gr.perNode == 0 {
 		gr.levels(rows, sums)
 	} else {
-		gr.node(rows, nil, sums, 0)
+		gr.node(rows, nil, sums, 0, -inf, inf)
 	}
 	return gr.t
 }
 
 // newNode adds a leaf whose rows' sums of G and H are sums, and returns
 // its id.
-func (gr *grower) newNode(sums []float64) int32 {
+func (gr *grower) newNode(sums []float64, lo, hi float64) int32 {
 	k := gr.k
 	id := int32(len(gr.t.Feature))
 	gr.t.Feature = append(gr.t.Feature, -1)
@@ -97,10 +110,50 @@ func (gr *grower) newNode(sums []float64) int32 {
 	gr.t.MissingLeft = append(gr.t.MissingLeft, false)
 	gr.t.Left = append(gr.t.Left, -1)
 	gr.t.Right = append(gr.t.Right, -1)
+	if gr.t.Cats != nil {
+		gr.t.Cats = append(gr.t.Cats, nil)
+	}
+	if gr.mono != nil {
+		gr.bounds = append(gr.bounds, [2]float64{lo, hi})
+	}
 	for j := range k {
-		gr.t.Value = append(gr.t.Value, float32(-sums[j]/(sums[k+j]+gr.cfg.l2)))
+		gr.t.Value = append(gr.t.Value, float32(min(max(-sums[j]/(sums[k+j]+gr.cfg.l2), lo), hi)))
 	}
 	return id
+}
+
+// setSplit makes node id split as sp does.
+func (gr *grower) setSplit(id int32, sp split) {
+	gr.gain[sp.feature] += sp.gain
+	gr.t.Feature[id] = int32(sp.feature)
+	gr.t.MissingLeft[id] = sp.missLeft
+	if sp.cats != nil {
+		if gr.t.Cats == nil {
+			gr.t.Cats = make([][]uint64, len(gr.t.Feature))
+		}
+		gr.t.Cats[id] = sp.cats
+		return
+	}
+	gr.t.Threshold[id] = gr.b.edges[sp.feature][sp.bin-1]
+}
+
+// childBounds returns the bounds on the values of the two sides of sp,
+// of a node bounded by lo and hi: a monotone rule caps the side that must
+// stay lower at the middle of the two, and floors the other there, so no
+// split below can turn the rule around.
+func (gr *grower) childBounds(sp split, lo, hi float64) (llo, lhi, rlo, rhi float64) {
+	llo, lhi, rlo, rhi = lo, hi, lo, hi
+	if gr.mono == nil {
+		return
+	}
+	mid := (sp.wl + sp.wr) / 2
+	switch gr.mono[sp.feature] {
+	case 1:
+		lhi, rlo = mid, mid
+	case -1:
+		llo, rhi = mid, mid
+	}
+	return
 }
 
 // A level node is a node of the level levels is growing: its rows are
@@ -115,6 +168,8 @@ type levelNode struct {
 	parent  []float64
 	sibling int // the index of the sibling in the level
 	sp      split
+	// vlo and vhi bound the node's value, under a monotone rule.
+	vlo, vhi float64
 }
 
 // levels grows the tree from rows a level at a time, the way XGBoost's
@@ -126,7 +181,8 @@ type levelNode struct {
 // child's.
 func (gr *grower) levels(rows []int32, sums []float64) {
 	cfg, workers := gr.cfg, gr.workerCount()
-	level := []levelNode{{lo: 0, hi: len(rows), id: gr.newNode(sums), sums: sums}}
+	inf := math.Inf(1)
+	level := []levelNode{{lo: 0, hi: len(rows), id: gr.newNode(sums, -inf, inf), sums: sums, vlo: -inf, vhi: inf}}
 	for depth := 0; len(level) > 0; depth++ {
 		// The nodes that may split.
 		var open []int
@@ -191,7 +247,7 @@ func (gr *grower) levels(rows []int32, sums []float64) {
 		parallel(len(open), workers/inner, 1, func(lo, hi int) {
 			for _, i := range open[lo:hi] {
 				n := &level[i]
-				n.sp = gr.best(n.hist, gr.feats, n.sums, n.hi-n.lo, inner)
+				n.sp = gr.best(n.hist, gr.feats, n.sums, n.hi-n.lo, inner, n.vlo, n.vhi)
 			}
 		})
 		var split []int
@@ -225,20 +281,18 @@ func (gr *grower) levels(rows []int32, sums []float64) {
 		for _, i := range split {
 			n := &level[i]
 			sp := n.sp
-			gr.gain[sp.feature] += sp.gain
-			gr.t.Feature[n.id] = int32(sp.feature)
-			gr.t.Threshold[n.id] = gr.b.edges[sp.feature][sp.bin-1]
-			gr.t.MissingLeft[n.id] = sp.missLeft
+			gr.setSplit(n.id, sp)
 			rs := make([]float64, 2*k)
 			for j := range rs {
 				rs[j] = n.sums[j] - sp.left[j]
 			}
-			l, r := gr.newNode(sp.left), gr.newNode(rs)
+			llo, lhi, rlo, rhi := gr.childBounds(sp, n.vlo, n.vhi)
+			l, r := gr.newNode(sp.left, llo, lhi), gr.newNode(rs, rlo, rhi)
 			gr.t.Left[n.id], gr.t.Right[n.id] = l, r
 			li := len(next)
 			next = append(next,
-				levelNode{lo: n.lo, hi: mid[i], id: l, sums: sp.left, parent: n.hist, sibling: li + 1},
-				levelNode{lo: mid[i], hi: n.hi, id: r, sums: rs, parent: n.hist, sibling: li})
+				levelNode{lo: n.lo, hi: mid[i], id: l, sums: sp.left, parent: n.hist, sibling: li + 1, vlo: llo, vhi: lhi},
+				levelNode{lo: mid[i], hi: n.hi, id: r, sums: rs, parent: n.hist, sibling: li, vlo: rlo, vhi: rhi})
 		}
 		for _, i := range open {
 			level[i].hist = nil
@@ -325,17 +379,9 @@ func (gr *grower) levelHistograms(rows []int32, level []levelNode, need []int) {
 // node grows the subtree of rows at depth, whose sums of G and H are
 // sums, and returns its root. hist, when not nil, is rows' histogram over
 // gr.feats, which node takes over.
-func (gr *grower) node(rows []int32, hist, sums []float64, depth int) int32 {
+func (gr *grower) node(rows []int32, hist, sums []float64, depth int, vlo, vhi float64) int32 {
 	k := gr.k
-	id := int32(len(gr.t.Feature))
-	gr.t.Feature = append(gr.t.Feature, -1)
-	gr.t.Threshold = append(gr.t.Threshold, 0)
-	gr.t.MissingLeft = append(gr.t.MissingLeft, false)
-	gr.t.Left = append(gr.t.Left, -1)
-	gr.t.Right = append(gr.t.Right, -1)
-	for j := range k {
-		gr.t.Value = append(gr.t.Value, float32(-sums[j]/(sums[k+j]+gr.cfg.l2)))
-	}
+	id := gr.newNode(sums, vlo, vhi)
 	cfg := gr.cfg
 	if depth >= cfg.maxDepth || len(rows) < 2*cfg.minLeaf {
 		gr.release(hist)
@@ -353,7 +399,7 @@ func (gr *grower) node(rows []int32, hist, sums []float64, depth int) int32 {
 	if hist == nil {
 		hist = gr.histogram(rows, feats)
 	}
-	best := gr.best(hist, feats, sums, len(rows), gr.workers)
+	best := gr.best(hist, feats, sums, len(rows), gr.workers, vlo, vhi)
 	if best.gain <= cfg.minGain {
 		gr.release(hist)
 		gr.leaf(rows, id)
@@ -361,10 +407,7 @@ func (gr *grower) node(rows []int32, hist, sums []float64, depth int) int32 {
 	}
 	lo := gr.partition(rows, best)
 	left, right := rows[:lo], rows[lo:]
-	gr.gain[best.feature] += best.gain
-	gr.t.Feature[id] = int32(best.feature)
-	gr.t.Threshold[id] = gr.b.edges[best.feature][best.bin-1]
-	gr.t.MissingLeft[id] = best.missLeft
+	gr.setSplit(id, best)
 	var hl, hr []float64
 	if gr.perNode == 0 {
 		// The larger side's histogram is the parent's less the smaller's.
@@ -387,8 +430,9 @@ func (gr *grower) node(rows []int32, hist, sums []float64, depth int) int32 {
 	for i := range rs {
 		rs[i] = sums[i] - best.left[i]
 	}
-	l := gr.node(left, hl, best.left, depth+1)
-	r := gr.node(right, hr, rs, depth+1)
+	llo, lhi, rlo, rhi := gr.childBounds(best, vlo, vhi)
+	l := gr.node(left, hl, best.left, depth+1, llo, lhi)
+	r := gr.node(right, hr, rs, depth+1, rlo, rhi)
 	gr.t.Left[id], gr.t.Right[id] = l, r
 	return id
 }
@@ -464,7 +508,7 @@ func (gr *grower) offsets(feats []int) []int {
 
 // best finds the split of most gain on any feature of feats, given the
 // node's histogram, its sums of G and H and its row count.
-func (gr *grower) best(hist []float64, feats []int, sums []float64, count, workers int) split {
+func (gr *grower) best(hist []float64, feats []int, sums []float64, count, workers int, vlo, vhi float64) split {
 	k, s, cfg := gr.k, gr.stride(), gr.cfg
 	score := func(v []float64) float64 {
 		var sc float64
@@ -487,6 +531,14 @@ func (gr *grower) best(hist []float64, feats []int, sums []float64, count, worke
 		for fi := lo; fi < hi; fi++ {
 			j := feats[fi]
 			base := gr.b.off[j] * s
+			if gr.b.cat != nil && gr.b.cat[j] > 0 {
+				results[fi] = gr.bestCat(hist[base:base+gr.b.nb[j]*s], j, total, parent)
+				continue
+			}
+			if k == 1 && gr.mono != nil {
+				results[fi] = gr.best1Bounded(hist[base:base+gr.b.nb[j]*s], j, total, vlo, vhi)
+				continue
+			}
 			if k == 1 {
 				results[fi] = gr.best1(hist[base:base+gr.b.nb[j]*s], j, total, parent)
 				continue
@@ -555,6 +607,18 @@ func (gr *grower) partition(rows []int32, sp split) int {
 func partitionSerial(b *binned, rows []int32, sp split) int {
 	bins, f := b.bins[sp.feature:], b.f
 	lo, hi := 0, len(rows)
+	if sp.cats != nil {
+		for lo < hi {
+			bn := bins[int(rows[lo])*f]
+			if (bn == 0 && sp.missLeft) || (bn != 0 && sp.cats[(bn-1)>>6]&(1<<((bn-1)&63)) != 0) {
+				lo++
+			} else {
+				hi--
+				rows[lo], rows[hi] = rows[hi], rows[lo]
+			}
+		}
+		return lo
+	}
 	for lo < hi {
 		bn := bins[int(rows[lo])*f]
 		if (bn == 0 && sp.missLeft) || (bn != 0 && int(bn) <= sp.bin) {
@@ -726,6 +790,54 @@ func (gr *grower) best1(h []float64, j int, total []float64, parent float64) spl
 		}
 		if g := lg*lg/(lh+l2) + rg*rg/(rh+l2) - parent; g > best.gain {
 			best = split{gain: g, feature: j, bin: bin, missLeft: missLeft, left: []float64{lg, lh}}
+		}
+	}
+	for bin := 1; bin < len(h)/4-1; bin++ {
+		if h[bin*4+2] == 0 {
+			continue
+		}
+		cg += h[bin*4]
+		ch += h[bin*4+1]
+		cc += h[bin*4+2]
+		switch {
+		case mc > 0:
+			try(bin, cg+mg, ch+mh, cc+mc, true)
+			try(bin, cg, ch, cc, false)
+		case cc >= tc-cc:
+			try(bin, cg, ch, cc, true)
+		default:
+			try(bin, cg, ch, cc, false)
+		}
+	}
+	return best
+}
+
+// best1Bounded is best1 under monotone rules: each side's value is held
+// within the node's bounds vlo and vhi, a split on a feature with a rule
+// that would turn it around is refused, and gains are scored at the held
+// values, as XGBoost does.
+func (gr *grower) best1Bounded(h []float64, j int, total []float64, vlo, vhi float64) split {
+	cfg := gr.cfg
+	l2, minLeaf, minWeight := cfg.l2, float64(cfg.minLeaf), cfg.minWeight
+	rule := gr.mono[j]
+	tg, th, tc := total[0], total[1], total[2]
+	mg, mh, mc := h[0], h[1], h[2]
+	value := func(g, h float64) float64 { return min(max(-g/(h+l2), vlo), vhi) }
+	score := func(g, h, w float64) float64 { return -(2*g*w + (h+l2)*w*w) }
+	parent := score(tg, th, value(tg, th))
+	var cg, ch, cc float64
+	best := split{feature: j}
+	try := func(bin int, lg, lh, lc float64, missLeft bool) {
+		rg, rh, rc := tg-lg, th-lh, tc-lc
+		if lc < minLeaf || rc < minLeaf || lh < minWeight || rh < minWeight {
+			return
+		}
+		wl, wr := value(lg, lh), value(rg, rh)
+		if rule > 0 && wl > wr || rule < 0 && wl < wr {
+			return
+		}
+		if g := score(lg, lh, wl) + score(rg, rh, wr) - parent; g > best.gain {
+			best = split{gain: g, feature: j, bin: bin, missLeft: missLeft, left: []float64{lg, lh}, wl: wl, wr: wr}
 		}
 	}
 	for bin := 1; bin < len(h)/4-1; bin++ {

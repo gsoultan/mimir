@@ -46,6 +46,7 @@ const (
 	Identity Link = "identity" // the sum is the answer
 	Sigmoid  Link = "sigmoid"  // the sum is the log-odds of class 1
 	Softmax  Link = "softmax"  // the sums are each class's logit
+	Exp      Link = "exp"      // the sum is the log of the answer, as Poisson and Tweedie losses fit
 	// Isolation is declared with IsolationForest.
 )
 
@@ -67,6 +68,13 @@ type Model struct {
 	// Importance is the share of the gain from all splits on each
 	// feature; it sums to 1 unless no tree split.
 	Importance []float64
+	// Categories are the columns read as categories rather than amounts,
+	// as Categorical set them. A tree splits one on a set of its
+	// categories, at the column's first feature.
+	Categories []Category `json:",omitempty"`
+	// Loss is the loss the trees were fit to, as Objective set it, or
+	// empty for squared error or log loss.
+	Loss string `json:",omitempty"`
 }
 
 // Tree is one tree, its nodes in flat slices. Node 0 is the root.
@@ -80,6 +88,19 @@ type Tree struct {
 	Left, Right []int32
 	// Value holds Outputs numbers for each node, the leaves' answers.
 	Value []float32
+	// Cats, when not nil, holds for each node that splits on a category
+	// the set of category codes sent left, a bit each; a node splitting
+	// on an amount holds nil. A code outside the set goes right.
+	Cats [][]uint64 `json:",omitempty"`
+}
+
+// inSet reports whether code v is in the bit set s.
+func inSet(s []uint64, v float32) bool {
+	if !(v >= 0) || v >= float32(64*len(s)) {
+		return false
+	}
+	c := int(v)
+	return s[c>>6]&(1<<(c&63)) != 0
 }
 
 // Nodes returns the number of nodes in t.
@@ -93,6 +114,12 @@ func (t *Tree) leaf(row []float32) int32 {
 		switch {
 		case v != v:
 			if t.MissingLeft[n] {
+				n = t.Left[n]
+			} else {
+				n = t.Right[n]
+			}
+		case t.Cats != nil && t.Cats[n] != nil:
+			if inSet(t.Cats[n], v) {
 				n = t.Left[n]
 			} else {
 				n = t.Right[n]
@@ -118,10 +145,15 @@ func (m *Model) Predict(x []float32) []float32 {
 	k := m.Outputs
 	raw := make([]float32, n*k)
 	parallel(n, 0, 256, func(lo, hi int) {
+		var buf []float32
 		for i := lo; i < hi; i++ {
 			r := raw[i*k : i*k+k]
 			copy(r, m.Base)
 			row := x[i*m.Features : (i+1)*m.Features]
+			if len(m.Categories) > 0 {
+				buf = append(buf[:0], row...)
+				row = codes(buf, m.Categories)
+			}
 			for t := range m.Trees {
 				tr := &m.Trees[t]
 				v := tr.Value[int(tr.leaf(row))*k:]
@@ -151,6 +183,10 @@ func (m *Model) answer(raw []float32, n int) []float32 {
 	case Isolation:
 		for i, v := range raw {
 			raw[i] = float32(math.Exp2(-float64(v)))
+		}
+	case Exp:
+		for i, v := range raw {
+			raw[i] = float32(math.Exp(float64(v)))
 		}
 	}
 	return raw

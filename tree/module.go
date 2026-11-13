@@ -31,6 +31,10 @@ type Shape struct {
 	Outputs      int // the numbers each leaf holds
 	Classes      int // 0 for Regression
 	Link         Link
+	// Categories are the model's category columns, and CatSlots the codes
+	// the sets of all its category splits cover.
+	Categories []Category `json:",omitempty"`
+	CatSlots   int        `json:",omitempty"`
 }
 
 // Module is a Model as an nn.Module, so it trains nowhere but runs, saves
@@ -52,7 +56,18 @@ type Module struct {
 	Missing   *tensor.Param // Int32 [Nodes], the node a row missing the feature goes to
 	Value     *tensor.Param // Float32 [Nodes*Outputs], scaled by the model's Scale
 	Base      *tensor.Param // Float32 [1, Outputs]
-	shape     Shape
+	// Cat, for a model with category columns, holds its category splits.
+	Cat   *CatTables
+	shape Shape
+}
+
+// CatTables hold a Module's category splits. A node splitting on a
+// category reads its column's code, past the row's own features, and goes
+// left when the code's entry of its set is 1.
+type CatTables struct {
+	Offset *tensor.Param // Int32 [Nodes], where a node's set starts in Left
+	Size   *tensor.Param // Int32 [Nodes], the codes its set covers, 0 for a split on an amount
+	Left   *tensor.Param // Int32 [CatSlots], 1 for each code sent left
 }
 
 // NewModule returns a Module of shape s whose tables are zero, for
@@ -68,16 +83,32 @@ func NewModule(s Shape) *Module {
 		Missing:   tensor.NewBuffer(tensor.Zeros(tensor.Int32, nodes)),
 		Value:     tensor.NewBuffer(tensor.Zeros(tensor.Float32, nodes*max(s.Outputs, 1))),
 		Base:      tensor.NewBuffer(tensor.Zeros(tensor.Float32, 1, max(s.Outputs, 1))),
+		Cat:       newCatTables(s, nodes),
 		shape:     s,
+	}
+}
+
+func newCatTables(s Shape, nodes int) *CatTables {
+	if len(s.Categories) == 0 {
+		return nil
+	}
+	return &CatTables{
+		Offset: tensor.NewBuffer(tensor.Zeros(tensor.Int32, nodes)),
+		Size:   tensor.NewBuffer(tensor.Zeros(tensor.Int32, nodes)),
+		Left:   tensor.NewBuffer(tensor.Zeros(tensor.Int32, max(s.CatSlots, 1))),
 	}
 }
 
 // Shape returns the shape of m's Module.
 func (m *Model) Shape() Shape {
-	s := Shape{Trees: len(m.Trees), Features: m.Features, Outputs: m.Outputs, Classes: m.Classes, Link: m.Link}
+	s := Shape{Trees: len(m.Trees), Features: m.Features, Outputs: m.Outputs, Classes: m.Classes, Link: m.Link,
+		Categories: slices.Clone(m.Categories)}
 	for i := range m.Trees {
 		s.Nodes += m.Trees[i].Nodes()
 		s.Depth = max(s.Depth, m.Trees[i].depth(0))
+		for _, set := range m.Trees[i].Cats {
+			s.CatSlots += 64 * len(set)
+		}
 	}
 	return s
 }
@@ -96,12 +127,30 @@ func (m *Model) Module() *Module {
 	roots := make([]int32, 0, s.Trees)
 	feature, left, right, missing := make([]int32, 0, s.Nodes), make([]int32, 0, s.Nodes), make([]int32, 0, s.Nodes), make([]int32, 0, s.Nodes)
 	threshold, value := make([]float32, 0, s.Nodes), make([]float32, 0, s.Nodes*s.Outputs)
+	var catOff, catSize, catLeft []int32
+	group := map[int32]int32{} // a category column's first feature, to its code's column
+	for g, ct := range m.Categories {
+		group[int32(ct.Feature)] = int32(m.Features + g)
+	}
 	for i := range m.Trees {
 		t := &m.Trees[i]
 		off := int32(len(feature))
 		roots = append(roots, off)
 		for n, f := range t.Feature {
 			self := off + int32(n)
+			if len(m.Categories) > 0 {
+				var set []uint64
+				if t.Cats != nil && f >= 0 {
+					set = t.Cats[n]
+				}
+				catOff, catSize = append(catOff, int32(len(catLeft))), append(catSize, int32(64*len(set)))
+				for c := range 64 * len(set) {
+					catLeft = append(catLeft, int32(set[c>>6]>>(c&63)&1))
+				}
+				if set != nil {
+					f = group[f]
+				}
+			}
 			if f < 0 {
 				feature, threshold = append(feature, 0), append(threshold, 0)
 				left, right, missing = append(left, self), append(right, self), append(missing, self)
@@ -122,7 +171,19 @@ func (m *Model) Module() *Module {
 	if len(roots) == 0 {
 		return NewModule(s)
 	}
+	var cat *CatTables
+	if len(m.Categories) > 0 {
+		if len(catLeft) == 0 {
+			catLeft = []int32{0}
+		}
+		cat = &CatTables{
+			Offset: tensor.NewBuffer(tensor.FromSlice(catOff)),
+			Size:   tensor.NewBuffer(tensor.FromSlice(catSize)),
+			Left:   tensor.NewBuffer(tensor.FromSlice(catLeft)),
+		}
+	}
 	return &Module{
+		Cat:       cat,
 		Roots:     tensor.NewBuffer(tensor.FromSlice(roots)),
 		Feature:   tensor.NewBuffer(tensor.FromSlice(feature)),
 		Threshold: tensor.NewBuffer(tensor.FromSlice(threshold)),
@@ -154,9 +215,27 @@ func (mod *Module) Forward(x *tensor.Tensor) *tensor.Tensor {
 		return table.Value().Unsqueeze(0).Expand(n, nodes).Gather(1, node)
 	}
 	node := mod.Roots.Value().Unsqueeze(0).Expand(n, trees)
+	if mod.Cat != nil {
+		x = withCodes(x, s.Categories)
+	}
 	for range s.Depth {
 		v := x.Gather(1, lookup(mod.Feature, node))
-		next := tensor.Where(v.Greater(lookup(mod.Threshold, node)), lookup(mod.Right, node), lookup(mod.Left, node))
+		l, r := lookup(mod.Left, node), lookup(mod.Right, node)
+		next := tensor.Where(v.Greater(lookup(mod.Threshold, node)), r, l)
+		if mod.Cat != nil {
+			size := lookup(mod.Cat.Size, node)
+			sizeF := size.Cast(tensor.Float32)
+			// The code's entry in the node's set, read at a code held
+			// within the set, so a missing or unknown one reads safely.
+			at := tensor.Where(v.Equal(v), v, tensor.Scalar[float32](0)).
+				Maximum(tensor.Scalar[float32](0)).Minimum(sizeF.Sub(tensor.Scalar[float32](1)).Maximum(tensor.Scalar[float32](0)))
+			idx := at.Cast(tensor.Int32).Add(lookup(mod.Cat.Offset, node))
+			slots := mod.Cat.Left.Value().Shape()[0]
+			bit := mod.Cat.Left.Value().Unsqueeze(0).Expand(n, slots).Gather(1, idx)
+			in := tensor.Where(v.Less(tensor.Scalar[float32](0)), r, tensor.Where(v.Less(sizeF), l, r))
+			catNext := tensor.Where(bit.Greater(tensor.Scalar[int32](0)), in, r)
+			next = tensor.Where(size.Greater(tensor.Scalar[int32](0)), catNext, next)
+		}
 		node = tensor.Where(v.Equal(v), next, lookup(mod.Missing, node))
 	}
 	idx := node.Unsqueeze(2).Mul(tensor.Scalar(int32(k))).Add(tensor.Arange[int32](0, int32(k), 1)).Reshape(n, trees*k)
@@ -167,9 +246,30 @@ func (mod *Module) Forward(x *tensor.Tensor) *tensor.Tensor {
 		return tensor.Cat(1, tensor.Zeros(tensor.Float32, n, 1), out)
 	case s.Link == Isolation:
 		return out.Neg().Exp2()
+	case s.Link == Exp:
+		return out.Exp()
 	case s.Link == Identity && s.Classes > 0:
 		// A forest averages probabilities: their logs are logits.
 		return out.Maximum(tensor.Scalar(float32(math.SmallestNonzeroFloat32))).Log()
 	}
 	return out
+}
+
+// withCodes returns x, shape [batch, Features], with a column more for
+// each category column: its code, or NaN when it is missing, as codes
+// reads one.
+func withCodes(x *tensor.Tensor, cats []Category) *tensor.Tensor {
+	n := x.Shape()[0]
+	cols := []*tensor.Tensor{x}
+	nan := tensor.Scalar(float32(math.NaN()))
+	for _, ct := range cats {
+		if ct.Width == 0 {
+			cols = append(cols, x.Shrink([][2]int{{0, n}, {ct.Feature, ct.Feature + 1}}))
+			continue
+		}
+		set := x.Shrink([][2]int{{0, n}, {ct.Feature, ct.Feature + ct.Width}}).Greater(tensor.Scalar[float32](0.5)).Cast(tensor.Float32)
+		code := set.Argmax(1).Cast(tensor.Float32).Unsqueeze(1)
+		cols = append(cols, tensor.Where(set.Max(1).Unsqueeze(1).Greater(tensor.Scalar[float32](0.5)), code, nan))
+	}
+	return tensor.Cat(1, cols...)
 }

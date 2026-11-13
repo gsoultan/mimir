@@ -16,12 +16,15 @@ package tree
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/gsoultan/mimir/tabular"
+	"github.com/gsoultan/mimir/tensor"
 )
 
 // RandomForest grows trees side by side, each from a bootstrap sample of
@@ -59,8 +62,16 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 	if err := c.check(d); err != nil {
 		return nil, err
 	}
+	if c.loss.Name != "" {
+		return nil, fmt.Errorf("tree: %s loss is for boosting: %w", c.loss.Name, tensor.ErrShape)
+	}
+	d, cats, err := coded(d, c.cats)
+	if err != nil {
+		return nil, err
+	}
 	n, f := d.Rows(), d.Features
-	m := &Model{Task: task, Features: f, Outputs: 1, Link: Identity, Scale: 1 / float32(c.trees)}
+	m := &Model{Task: task, Features: f, Outputs: 1, Link: Identity, Scale: 1 / float32(c.trees),
+		Categories: slices.Clone(c.cats)}
 	// A leaf answers -G/H, so g = -y and h = 1 make it the mean answer.
 	var g, h []float32
 	if task == tabular.Classification {
@@ -83,17 +94,18 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 	m.Base = make([]float32, m.Outputs)
 	c.l2, c.minWeight = 0, 0
 	perNode := c.perNode
-	if perNode >= f {
+	if perNode >= len(splittable(f, c.cats)) {
 		perNode = 0
 	}
 
 	rng := rand.New(rand.NewPCG(c.seed, 0x666f72657374))
-	b := bin(d, c.bins, rng, c.workers)
-	gh := interleave(g, h, m.Outputs, (&grower{k: m.Outputs}).stride())
-	feats := make([]int, f)
-	for i := range feats {
-		feats[i] = i
+	mono := c.monoRules(f)
+	if mono != nil && m.Outputs > 1 {
+		return nil, fmt.Errorf("tree: monotone rules for a model of %d classes: %w", m.Classes, tensor.ErrShape)
 	}
+	b := bin(d, cats, c.bins, rng, c.workers)
+	gh := interleave(g, h, m.Outputs, (&grower{k: m.Outputs}).stride())
+	feats := splittable(f, c.cats)
 	seeds := make([]uint64, c.trees)
 	for i := range seeds {
 		seeds[i] = rng.Uint64()
@@ -128,7 +140,7 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 					}
 				}
 				gr := &grower{b: b, k: m.Outputs, gh: gh, feats: feats, perNode: perNode, rng: r,
-					workers: inner, cfg: c, gain: make([]float64, f)}
+					workers: inner, cfg: c, gain: make([]float64, f), mono: mono}
 				m.Trees[t] = gr.grow(rows)
 				gains[t] = gr.gain
 				if c.progress != nil {
@@ -140,7 +152,6 @@ func forest(ctx context.Context, d tabular.Data, task tabular.Task, c *config, o
 			}
 		})
 	}
-	var err error
 	for t := range c.trees {
 		if err = ctx.Err(); err != nil {
 			break

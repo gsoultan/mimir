@@ -31,7 +31,7 @@ func TestAddRowsMatchesGo(t *testing.T) {
 			d.X[i] = float32(math.NaN())
 		}
 		r := rand.New(rand.NewPCG(uint64(k), 9))
-		b := bin(d, 255, r, 1)
+		b := bin(d, nil, 255, r, 1)
 		g, h := make([]float32, b.n*k), make([]float32, b.n*k)
 		for i := range g {
 			g[i], h[i] = r.Float32()-0.5, r.Float32()
@@ -65,7 +65,7 @@ func TestLevelsGrowWhatNodeGrows(t *testing.T) {
 	for _, k := range []int{1, 3} {
 		d := table(40000, 6, uint64(10+k), quadrant)
 		r := rand.New(rand.NewPCG(3, uint64(k)))
-		b := bin(d, 255, r, 1)
+		b := bin(d, nil, 255, r, 1)
 		g, h := make([]float32, b.n*k), make([]float32, b.n*k)
 		for i := range g {
 			g[i], h[i] = r.Float32()-0.5, 0.1+r.Float32()
@@ -92,7 +92,7 @@ func TestLevelsGrowWhatNodeGrows(t *testing.T) {
 					sums[k+j] += float64(gh[int(rw)*sz+k+j])
 				}
 			}
-			gr.node(rows, nil, sums, 0)
+			gr.node(rows, nil, sums, 0, math.Inf(-1), math.Inf(1))
 			return gr.t, gr.leafOf
 		}
 		nt, nl := grow(1, false)

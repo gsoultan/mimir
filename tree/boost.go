@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 
 	"github.com/gsoultan/mimir/tabular"
 	"github.com/gsoultan/mimir/tensor"
@@ -45,9 +46,31 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 			return nil, fmt.Errorf("tree: validation: %w", err)
 		}
 	}
+	if c.loss.Name != "" && task != tabular.Regression {
+		return nil, fmt.Errorf("tree: %s loss for a Classification model: %w", c.loss.Name, tensor.ErrShape)
+	}
+	if err := c.loss.checkAnswers(d.Y); err != nil {
+		return nil, err
+	}
+	d, cats, err := coded(d, c.cats)
+	if err != nil {
+		return nil, err
+	}
+	if c.val != nil && len(c.cats) > 0 {
+		v := *c.val
+		v.X = slices.Clone(v.X)
+		for i := range v.Rows() {
+			codes(v.Row(i), c.cats)
+		}
+		c.val = &v
+	}
 	rng := rand.New(rand.NewPCG(c.seed, 0x6d696d6972))
 	n, f := d.Rows(), d.Features
-	m := &Model{Task: task, Features: f, Outputs: 1, Link: Identity, Scale: float32(c.rate)}
+	m := &Model{Task: task, Features: f, Outputs: 1, Link: Identity, Scale: float32(c.rate),
+		Categories: slices.Clone(c.cats), Loss: c.loss.String()}
+	if c.loss.logLinked() {
+		m.Link = Exp
+	}
 	if task == tabular.Classification {
 		m.Classes = c.numClasses(d)
 		if c.val != nil {
@@ -63,10 +86,18 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		}
 	}
 	k := m.Outputs
-	m.Base = base(m, d.Y)
+	if c.loss.Name != "" {
+		m.Base = []float32{objBase(c.loss, d.Y)}
+	} else {
+		m.Base = base(m, d.Y)
+	}
+	mono := c.monoRules(f)
+	if mono != nil && k > 1 {
+		return nil, fmt.Errorf("tree: monotone rules for a model of %d classes: %w", m.Classes, tensor.ErrShape)
+	}
 
-	b := bin(d, c.bins, rng, c.workers)
-	gr := &grower{b: b, k: k, rng: rng, workers: c.workers, cfg: c, gain: make([]float64, f)}
+	b := bin(d, cats, c.bins, rng, c.workers)
+	gr := &grower{b: b, k: k, rng: rng, workers: c.workers, cfg: c, gain: make([]float64, f), mono: mono}
 	sz := gr.stride()
 	gr.gh = interleave(make([]float32, n*k), make([]float32, n*k), k, sz)
 	if c.subsample == 1 {
@@ -82,17 +113,19 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		all[i] = int32(i)
 	}
 	rows := make([]int32, n)
-	feats := make([]int, f)
-	for i := range feats {
-		feats[i] = i
-	}
+	feats := splittable(f, c.cats)
+	nf := len(feats)
 	bestLoss, bestRound := math.Inf(1), 0
 	gains := [][]float64{}
 	for round := range c.trees {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		gradients(m, raw, d.Y, gr.gh, sz, c.workers)
+		if c.loss.Name != "" {
+			objGradients(c.loss, raw, d.Y, gr.gh, sz, c.workers)
+		} else {
+			gradients(m, raw, d.Y, gr.gh, sz, c.workers)
+		}
 		rows = rows[:0]
 		if c.subsample < 1 {
 			for _, r := range all {
@@ -108,11 +141,22 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		}
 		gr.feats = feats
 		if c.colsample < 1 {
-			rng.Shuffle(f, func(a, b int) { feats[a], feats[b] = feats[b], feats[a] })
-			gr.feats = feats[:max(1, int(math.Round(c.colsample*float64(f))))]
+			rng.Shuffle(nf, func(a, b int) { feats[a], feats[b] = feats[b], feats[a] })
+			gr.feats = feats[:max(1, int(math.Round(c.colsample*float64(nf))))]
 		}
 		before := append([]float64(nil), gr.gain...)
 		t := gr.grow(rows)
+		if c.loss.Name == "quantile" {
+			leafOf := func(r int32) int32 { return t.leaf(d.Row(int(r))) }
+			if gr.leafOf != nil {
+				leafOf = func(r int32) int32 { return gr.leafOf[r] }
+			}
+			var bounds [][2]float64
+			if mono != nil {
+				bounds = gr.bounds
+			}
+			renewQuantiles(&t, rows, leafOf, raw, d.Y, c.loss.Alpha, bounds)
+		}
 		m.Trees = append(m.Trees, t)
 		if gr.leafOf != nil {
 			// Every row grew the tree, so each knows its leaf.
@@ -140,7 +184,13 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 			continue
 		}
 		add(m, &t, c.val.X, vraw, c.workers)
-		if l := logLoss(m, vraw, c.val.Y); l < bestLoss-1e-12 {
+		l := 0.0
+		if c.loss.Name != "" {
+			l = objLoss(c.loss, vraw, c.val.Y)
+		} else {
+			l = logLoss(m, vraw, c.val.Y)
+		}
+		if l < bestLoss-1e-12 {
 			bestLoss, bestRound = l, round
 		} else if round-bestRound >= c.patience {
 			break
