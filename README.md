@@ -860,7 +860,7 @@ read.
 | Attention | `ScaledDotProductAttention` (causal, masks, grouped-query) |
 | Sorting | `Sort`, `Argsort`, `TopK` (stable; NaN sorts last) |
 | Fourier | `FFT`, `IFFT`, `RFFT`, `IRFFT` (any length; complex numbers as a trailing axis of 2) |
-| Linear algebra | `Cholesky`, `TriangularSolve`, `Solve`, `Inv`, `Det`, `SlogDet`, `QR`, `SVD`, `Eigh` (batched, with gradients; on the CPU, so GPU tensors make a round trip) |
+| Linear algebra | `Cholesky`, `TriangularSolve`, `Solve`, `Inv`, `Det`, `SlogDet`, `QR`, `SVD`, `Eigh` (batched, with gradients; on the GPU for GPU tensors, one group of threads per matrix, with matrices over 1024 rows or columns, or 256 for `SVD` and `Eigh`, factorized on the CPU) |
 | Convolution | `Conv1d`, `Conv2d`, `Conv3d` (stride, padding, dilation, groups), `ConvTranspose1d`, `ConvTranspose2d`, `MaxPool2d`, `AvgPool2d` |
 | Autograd | `Backward`, `Grad`, `RequiresGrad`, `Detach`, `Param`, `Func`, `Checkpoint` |
 | Memory | `SetMemoryBudget`, `ErrMemoryBudget`, `Donate`, `ErrDonated`, `FromBytes` over mapped files |

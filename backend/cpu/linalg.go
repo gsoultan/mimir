@@ -147,13 +147,34 @@ func runLinalg(ctx context.Context, b *Backend, k *backend.Kernel, outBuf backen
 				load(a, i)
 				u := mat{data: part(0, i), rows: m, cols: kk, ld: kk}
 				vh := mat{data: part(2, i), rows: kk, cols: n, ld: n}
-				return b.svd(ctx, par, a, u, part(1, i), vh)
+				if err := b.svd(ctx, par, a, u, part(1, i), vh); err != nil {
+					return err
+				}
+				for r := range kk {
+					if negativeLead(m, func(i int) float32 { return u.data[i*u.ld+r] }) {
+						for i := range m {
+							u.data[i*u.ld+r] = -u.data[i*u.ld+r]
+						}
+						scaleRow(vh.row(r), -1)
+					}
+				}
+				return nil
 			}
 		case backend.OpEigh:
 			each = func(ctx context.Context, par bool, i int) error {
 				a := mat{data: part(1, i), rows: n, cols: n, ld: n}
 				load(a, i)
-				return b.eigh(ctx, par, a, part(0, i))
+				if err := b.eigh(ctx, par, a, part(0, i)); err != nil {
+					return err
+				}
+				for c := range n {
+					if negativeLead(n, func(i int) float32 { return a.data[i*a.ld+c] }) {
+						for i := range n {
+							a.data[i*a.ld+c] = -a.data[i*a.ld+c]
+						}
+					}
+				}
+				return nil
 			}
 		}
 	}
@@ -173,6 +194,29 @@ func runLinalg(ctx context.Context, b *Backend, k *backend.Kernel, outBuf backen
 		}
 	}
 	return nil
+}
+
+// negativeLead reports whether the vector of the n elements at(i) leads
+// with a negative element: the first whose magnitude is at least half
+// the largest's. Eigenvectors and singular vectors are unique up to their
+// signs, which every device sets alike: each eigenvector, and each left
+// singular vector, leads with a positive element, and a right singular
+// vector flips with its left one. Half the largest, rather than the
+// largest, makes the choice of element robust to the rounding that
+// differs between devices when elements are about as large as each other.
+func negativeLead(n int, at func(i int) float32) bool {
+	big := float32(0)
+	for i := range n {
+		if x := float32(math.Abs(float64(at(i)))); x > big {
+			big = x
+		}
+	}
+	for i := range n {
+		if x := at(i); float32(math.Abs(float64(x))) >= 0.5*big {
+			return x < 0
+		}
+	}
+	return false
 }
 
 func singular(op backend.Op, at int) error {

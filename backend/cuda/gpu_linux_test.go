@@ -94,7 +94,7 @@ func (g gpuTarget) Run(t *testing.T, k *backend.Kernel, outs, ins []backend.Buff
 	}
 	failed := false
 	if err := g.b.Sync(t.Context()); err != nil {
-		if !errors.Is(err, backend.ErrIndex) && !errors.Is(err, backend.ErrDivideByZero) {
+		if !errors.Is(err, backend.ErrIndex) && !errors.Is(err, backend.ErrDivideByZero) && !errors.Is(err, backend.ErrSingular) {
 			t.Fatal(err)
 		}
 		failed = true
@@ -142,6 +142,7 @@ func TestKernelsCompileWithNVRTC(t *testing.T) {
 		kerneltest.Conv,
 		kerneltest.Sort,
 		kerneltest.FFT,
+		kerneltest.Linalg,
 		kerneltest.Segment,
 	} {
 		cases = append(cases, f(t)...)
