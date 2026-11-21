@@ -13,9 +13,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
 // Package cluster finds groups in tables of numbers without answers to
-// learn from: k-means, Gaussian mixtures and DBSCAN, as scikit-learn's
-// cluster and mixture packages do, and the silhouette that scores how
-// well rows sit in their groups.
+// learn from: k-means, Gaussian mixtures, DBSCAN and Ward's hierarchy, as
+// scikit-learn's cluster and mixture packages do, the silhouette that
+// scores how well rows sit in their groups, and the local outlier factor
+// that finds rows apart from their neighbors.
 //
 //	m, err := cluster.KMeans(ctx, x, features, 5)
 //	if err != nil { ... }

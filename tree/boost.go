@@ -26,8 +26,9 @@ import (
 
 // GradientBoosting grows trees one after another, each fit to the
 // gradients of the loss of the trees before it, as XGBoost and LightGBM
-// do: squared error for Regression, log loss for Classification, with a
-// sigmoid for two classes and a softmax for more.
+// do: squared error for Regression, or another Objective, and log loss
+// for Classification, with a sigmoid for two classes and a softmax for
+// more.
 func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Option) (*Model, error) {
 	c := &config{trees: 100, rate: 0.1, maxDepth: 6, minLeaf: 1, minWeight: 1, l2: 1,
 		subsample: 1, colsample: 1, bins: 255, seed: 1}
@@ -40,6 +41,13 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 	if err := c.check(d); err != nil {
 		return nil, err
 	}
+	if task == tabular.Regression {
+		if err := c.loss.check(d.Y); err != nil {
+			return nil, err
+		}
+	} else if c.loss != (Loss{}) {
+		return nil, fmt.Errorf("tree: %s loss for classification: %w", c.loss, tensor.ErrShape)
+	}
 	if c.val != nil {
 		if err := c.val.Check(task); err != nil {
 			return nil, fmt.Errorf("tree: validation: %w", err)
@@ -47,7 +55,7 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 	}
 	rng := rand.New(rand.NewPCG(c.seed, 0x6d696d6972))
 	n, f := d.Rows(), d.Features
-	m := &Model{Task: task, Features: f, Outputs: 1, Link: Identity, Scale: float32(c.rate)}
+	m := &Model{Task: task, Features: f, Outputs: 1, Link: c.loss.link(), Scale: float32(c.rate)}
 	if task == tabular.Classification {
 		m.Classes = c.numClasses(d)
 		if c.val != nil {
@@ -63,7 +71,11 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		}
 	}
 	k := m.Outputs
-	m.Base = base(m, d.Y)
+	if task == tabular.Regression {
+		m.Base = []float32{c.loss.base(d.Y)}
+	} else {
+		m.Base = base(m, d.Y)
+	}
 
 	b := bin(d, c.bins, rng, c.workers)
 	gr := &grower{b: b, k: k, rng: rng, workers: c.workers, cfg: c, gain: make([]float64, f)}
@@ -92,7 +104,7 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		gradients(m, raw, d.Y, gr.gh, sz, c.workers)
+		gradients(m, c.loss, raw, d.Y, gr.gh, sz, c.workers)
 		rows = rows[:0]
 		if c.subsample < 1 {
 			for _, r := range all {
@@ -113,6 +125,7 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 		}
 		before := append([]float64(nil), gr.gain...)
 		t := gr.grow(rows)
+		c.loss.renew(&t, d.X, f, rows, raw, d.Y, m.Scale)
 		m.Trees = append(m.Trees, t)
 		if gr.leafOf != nil {
 			// Every row grew the tree, so each knows its leaf.
@@ -140,7 +153,7 @@ func GradientBoosting(ctx context.Context, d tabular.Data, task tabular.Task, op
 			continue
 		}
 		add(m, &t, c.val.X, vraw, c.workers)
-		if l := logLoss(m, vraw, c.val.Y); l < bestLoss-1e-12 {
+		if l := logLoss(m, c.loss, vraw, c.val.Y); l < bestLoss-1e-12 {
 			bestLoss, bestRound = l, round
 		} else if round-bestRound >= c.patience {
 			break
@@ -207,13 +220,13 @@ func add(m *Model, t *Tree, x []float32, raw []float32, workers int) {
 
 // gradients sets the gradients and hessians of m's loss at raw in gh, as
 // interleave lays them out with stride sz, on up to workers goroutines.
-func gradients(m *Model, raw, y, gh []float32, sz, workers int) {
+func gradients(m *Model, l Loss, raw, y, gh []float32, sz, workers int) {
 	k := m.Outputs
 	parallel(len(y), workers, 16384, func(lo, hi int) {
 		switch m.Link {
-		case Identity:
+		case Identity, Exp:
 			for i := lo; i < hi; i++ {
-				gh[i*sz], gh[i*sz+1] = raw[i]-y[i], 1
+				gh[i*sz], gh[i*sz+1] = l.grad(raw[i], y[i])
 			}
 		case Sigmoid:
 			for i := lo; i < hi; i++ {
@@ -238,14 +251,13 @@ func gradients(m *Model, raw, y, gh []float32, sz, workers int) {
 }
 
 // logLoss returns m's mean loss at raw for answers y: squared error for
-// Regression, log loss for Classification.
-func logLoss(m *Model, raw, y []float32) float64 {
+// Regression, or l, and log loss for Classification.
+func logLoss(m *Model, l Loss, raw, y []float32) float64 {
 	var s float64
 	switch m.Link {
-	case Identity:
+	case Identity, Exp:
 		for i, v := range raw {
-			e := float64(v - y[i])
-			s += e * e
+			s += l.loss(v, y[i])
 		}
 	default:
 		p := m.answer(append([]float32(nil), raw...), len(y))

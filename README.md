@@ -584,7 +584,11 @@ fmt.Println(metrics.ROCAUC(m.Predict(test.X), test.Y), m.Importance)
 ```
 
 Trees sort each feature into 255 quantile bins first, like LightGBM, and
-learn which side of each split missing values belong on. Linear models
+learn which side of each split missing values belong on. For numbers,
+boosting fits squared error by default, or another `tree.Objective`:
+`tree.Poisson()` for counts, `tree.Tweedie(1.5)` for amounts with many
+zeros (both answer above zero), and `tree.Quantile(0.9)` for a quantile,
+so two models give a range that holds a chosen share of rows. Linear models
 standardize their features, then fit by coordinate descent, L-BFGS or
 FISTA. `tabular.CrossValidate` scores any of them over k folds, and
 `metrics` has accuracy, precision, recall, F1, ROC AUC, log loss, the
@@ -618,6 +622,9 @@ Five more packages learn from tables without a model of answers per row:
   (diagonal covariances, by EM), `DBSCAN` (any shape, with noise) and
   `Agglomerative` (Ward's hierarchy, cut into any number of groups after
   the fact), and scores a grouping by its `Silhouette`.
+  `cluster.LocalOutlier` scores rows by the local outlier factor, which
+  finds a row apart from a dense group even when a looser group elsewhere
+  is as spread out.
 - `decompose.PCA` finds the directions rows vary in most, to draw a table
   in two dimensions or shrink it.
 - `tree.IsolationForest` scores how unusual each row is, from 0 to 1.
@@ -625,7 +632,9 @@ Five more packages learn from tables without a model of answers per row:
   boosted-tree model over each step's recent values and its place in the
   season, and checks itself against the naive seasonal forecast;
   `forecast.Smooth` fits Holt-Winters exponential smoothing (level,
-  damped trend and season) to one short series.
+  damped trend and season) to one short series, and `forecast.Croston`
+  fits Croston's method (with the Syntetos-Boylan correction) to demand
+  that is zero on most steps.
 - `rules.Mine` finds what goes together in baskets of items, as
   association rules with support, confidence and lift, by Apriori.
 - `recommend` factorizes who did what with which item by alternating

@@ -155,3 +155,44 @@ func TestSmoothBadInput(t *testing.T) {
 		t.Errorf("one value present: %v", err)
 	}
 }
+
+func TestCrostonForecastsDemandPerStep(t *testing.T) {
+	r := rand.New(rand.NewPCG(40, 1))
+	series := make([]float32, 300)
+	for i := range series {
+		if r.Float64() < 0.2 {
+			series[i] = float32(4 + r.IntN(5)) // 4 to 8, so 6 on average
+		}
+	}
+	series[17] = float32(math.NaN())
+	m, err := Croston(series)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := m.Forecast(3)
+	if len(f) != 3 || f[0] != f[2] {
+		t.Fatalf("forecast %v", f)
+	}
+	// The true demand per step is 0.2 × 6 = 1.2.
+	if math.Abs(float64(f[0])-1.2) > 0.3 {
+		t.Errorf("forecast %.3f a step, want about 1.2", f[0])
+	}
+	if m.Zeros < 0.7 || m.Zeros > 0.9 {
+		t.Errorf("zeros %.3f", m.Zeros)
+	}
+	if !(m.Error > 0) || !(m.Naive > 0) || m.Alpha <= 0 {
+		t.Errorf("error %v, naive %v, alpha %v", m.Error, m.Naive, m.Alpha)
+	}
+}
+
+func TestCrostonBadInput(t *testing.T) {
+	for name, s := range map[string][]float32{
+		"too short":  {0, 3},
+		"one demand": {0, 0, 5, 0, 0},
+		"below zero": {0, 2, -1, 3},
+	} {
+		if _, err := Croston(s); !errors.Is(err, tensor.ErrShape) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}

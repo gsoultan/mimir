@@ -45,6 +45,7 @@ type config struct {
 	bootstrap bool
 	progress  func(done, total int)
 	samples   int
+	loss      Loss
 }
 
 // Trees sets how many trees to grow: boosting rounds, or forest trees.

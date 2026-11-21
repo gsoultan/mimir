@@ -274,3 +274,37 @@ func TestAgglomerativeBadInput(t *testing.T) {
 		t.Errorf("canceled: %v", err)
 	}
 }
+
+func TestLocalOutlierFindsTheRowNextToTheCrowd(t *testing.T) {
+	r := rand.New(rand.NewPCG(41, 1))
+	var x []float32
+	// A tight group and a loose one, and one row just off the tight one:
+	// nearer its group than the loose rows are to each other.
+	for range 200 {
+		x = append(x, float32(r.NormFloat64()*0.1), float32(r.NormFloat64()*0.1))
+	}
+	for range 200 {
+		x = append(x, 10+float32(r.NormFloat64()*2), float32(r.NormFloat64()*2))
+	}
+	x = append(x, 0.9, 0.9)
+	o, err := LocalOutlier(context.Background(), x, 2, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	odd := o.Scores[400]
+	if odd < 3 {
+		t.Errorf("the odd row scores %.2f", odd)
+	}
+	for i, s := range o.Scores[:400] {
+		if s >= odd {
+			t.Fatalf("row %d scores %.2f, the odd row %.2f", i, s, odd)
+		}
+	}
+	got := o.Score([]float32{0, 0, 0.9, 0.9, 10, 0})
+	if got[0] > 1.5 || got[2] > 1.5 || got[1] < 3 {
+		t.Errorf("new rows score %.2f", got)
+	}
+	if _, err := LocalOutlier(context.Background(), x[:10], 2, 5); !errors.Is(err, tensor.ErrShape) {
+		t.Errorf("5 neighbors of 5 rows: %v", err)
+	}
+}

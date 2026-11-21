@@ -46,7 +46,7 @@ const (
 	Identity Link = "identity" // the sum is the answer
 	Sigmoid  Link = "sigmoid"  // the sum is the log-odds of class 1
 	Softmax  Link = "softmax"  // the sums are each class's logit
-	// Isolation is declared with IsolationForest.
+	// Isolation is declared with IsolationForest, and Exp with Loss.
 )
 
 // Model is a trained forest or boosted ensemble: Base plus Scale times the
@@ -151,6 +151,10 @@ func (m *Model) answer(raw []float32, n int) []float32 {
 	case Isolation:
 		for i, v := range raw {
 			raw[i] = float32(math.Exp2(-float64(v)))
+		}
+	case Exp:
+		for i, v := range raw {
+			raw[i] = float32(math.Exp(float64(v)))
 		}
 	}
 	return raw
