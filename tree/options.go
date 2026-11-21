@@ -45,6 +45,9 @@ type config struct {
 	bootstrap bool
 	progress  func(done, total int)
 	samples   int
+	cats      []Category
+	monotone  map[int]int
+	loss      Objective
 }
 
 // Trees sets how many trees to grow: boosting rounds, or forest trees.
@@ -151,7 +154,53 @@ func (c *config) check(d tabular.Data) error {
 	case c.val != nil && c.patience < 1:
 		return bad("patience", c.patience)
 	}
-	return nil
+	if err := checkCategories(c.cats, d.Features); err != nil {
+		return err
+	}
+	for j, r := range c.monotone {
+		if j < 0 || j >= d.Features || r < -1 || r > 1 {
+			return fmt.Errorf("tree: monotone rule %d on feature %d of %d: %w", r, j, d.Features, tensor.ErrShape)
+		}
+		for _, ct := range c.cats {
+			if r != 0 && j >= ct.Feature && j < ct.Feature+max(ct.Width, 1) {
+				return fmt.Errorf("tree: monotone rule on category column %d: %w", j, tensor.ErrShape)
+			}
+		}
+	}
+	return c.loss.check()
+}
+
+// Monotone sets rules that keep the answer moving one way with a
+// feature, whatever the other features: +1 if it may only rise as the
+// feature grows, -1 if it may only fall, 0 for no rule. "A higher price
+// never raises the chance of buying" is {price: -1}. A rule is for a
+// Regression model or a two-class one, whose single output it bounds; it
+// costs a little accuracy where the data say otherwise.
+func Monotone(rules map[int]int) Option {
+	return func(c *config) {
+		if c.monotone == nil {
+			c.monotone = map[int]int{}
+		}
+		for j, r := range rules {
+			c.monotone[j] = r
+		}
+	}
+}
+
+// monoRules returns the rules as one per feature, or nil when there are
+// none.
+func (c *config) monoRules(f int) []int8 {
+	var out []int8
+	for j, r := range c.monotone {
+		if r == 0 {
+			continue
+		}
+		if out == nil {
+			out = make([]int8, f)
+		}
+		out[j] = int8(r)
+	}
+	return out
 }
 
 // classes returns the number of classes of d.
