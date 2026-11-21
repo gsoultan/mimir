@@ -21,36 +21,50 @@ import (
 	"github.com/gsoultan/mimir/tensor"
 )
 
-// Intermittent is Croston's method for demand that is zero on most
-// steps, such as a spare part sold a few times a month: it smooths the
-// size of the steps with demand and the number of steps between them
-// apart, and forecasts their ratio, the demand per step. Exponential
-// smoothing and boosted trees both chase the zeros on such a series and
-// forecast too little right after a sale and too much after a gap.
+// Intermittent forecasts a series that is 0 at many steps, such as sales
+// of a spare part or a slow seller, where smoothing and trees chase the
+// last few sales and forecast too much or too little. It smooths the size
+// of the demand when there is some apart from how often there is any, as
+// Croston (1972) did, in one of two forms:
 //
-// It uses the Syntetos-Boylan correction, (1 - Alpha/2) times the ratio,
-// which takes out Croston's known bias upward.
+//   - "sba", Croston's method with the bias correction of Syntetos and
+//     Boylan (2005): the size over the steps between demands, times
+//     1-Beta/2.
+//   - "tsb", the method of Teunter, Syntetos and Babai (2011): the size
+//     times the smoothed chance of any demand at a step, which falls
+//     every step without one, so an item no one buys any more is
+//     forecast to fade out.
+//
+// Croston fits both and keeps the one with the smaller error. The forecast
+// is flat: the demand per step to plan stock for.
 type Intermittent struct {
-	// Alpha is how much of each new demand and gap the smoothing takes,
-	// 0 to 1.
-	Alpha float64
-	// Size is the smoothed demand of the steps with demand, and Interval
-	// the smoothed steps from one to the next, after the last step.
-	Size, Interval float64
-	// Zeros is the share of present steps without demand.
+	// Method is "sba" or "tsb".
+	Method string
+	// Alpha is how much of each new demand size the size takes, and
+	// Beta how much of each new gap ("sba") or of each step's demand or
+	// none ("tsb") the gap or chance takes, 0 to 1.
+	Alpha, Beta float64
+	// Size is the smoothed size of a demand, Interval the smoothed steps
+	// from one demand to the next ("sba"), and Chance the smoothed
+	// chance of any demand at a step ("tsb"), after the last step.
+	Size, Interval, Chance float64
+	// Rate is the forecast demand per step.
+	Rate float32
+	// Zeros is the share of the steps with a value that are 0.
 	Zeros float64
+	Steps int
 	// Error is the mean absolute error of one-step forecasts of the held
-	// out steps, and Naive that of forecasting the mean of the steps
-	// before each, both in the series' units divided by its mean
-	// absolute value, as Smoothing's.
+	// out steps, and Naive that of repeating the last value, both in
+	// units of the series' scale, as Smoothing's are.
 	Error, Naive float64
-	Scale        float32
+
+	gap int // steps since the last demand
 }
 
-// Croston fits Croston's method to a series of at least 3 steps, of
-// which at least 2 have demand above zero, picking Alpha by the error of
-// its one-step forecasts. A value of NaN is missing; a value below zero
-// is an error.
+// Croston fits an intermittent demand forecast to series, which must be
+// 0 or more, NaN for an unknown step, with demand at 2 steps at least.
+// The last Holdout steps (by default a tenth, between 1 and 14) are
+// scored; the rest fit the smoothing.
 func Croston(series []float32, opts ...Option) (*Intermittent, error) {
 	c := &config{}
 	for _, o := range opts {
@@ -60,96 +74,190 @@ func Croston(series []float32, opts ...Option) (*Intermittent, error) {
 		return nil, fmt.Errorf("forecast: holdout %d: %w", c.holdout, tensor.ErrShape)
 	}
 	n := len(series)
-	k := scale(series)
 	z := make([]float64, n)
-	demand, present := 0, 0
+	present, demands := 0, 0
 	for i, v := range series {
 		if v < 0 {
-			return nil, fmt.Errorf("forecast: demand %v at step %d: %w", v, i, tensor.ErrShape)
+			return nil, fmt.Errorf("forecast: demand %v at step %d; intermittent demand is 0 or more: %w", v, i, tensor.ErrShape)
 		}
-		z[i] = float64(v / k)
+		z[i] = float64(v)
 		if v == v {
 			present++
 			if v > 0 {
-				demand++
+				demands++
 			}
 		}
 	}
-	if n < 3 || demand < 2 {
-		return nil, fmt.Errorf("forecast: %d steps, %d with demand: %w", n, demand, tensor.ErrShape)
+	if demands < 2 || n < 3 {
+		return nil, fmt.Errorf("forecast: %d steps with demand of %d: %w", demands, n, tensor.ErrShape)
 	}
 	hold := c.holdout
 	if hold == 0 {
-		hold = max(1, min(n/5, 14))
+		hold = max(1, min(n/10, 14))
 	}
 	hold = min(hold, n-2)
-	m := &Intermittent{Scale: k, Zeros: 1 - float64(demand)/float64(present)}
-	// The error of the fitted steps is flat in Alpha over wide ranges,
-	// so a grid is enough.
-	best := math.Inf(1)
-	for a := 0.05; a <= 0.5+1e-9; a += 0.05 {
-		if e, _ := m.run(z[:n-hold], a, 0); e < best {
-			best, m.Alpha = e, a
+	fit := z[:n-hold]
+	if count(fit) < 2 {
+		fit = z // too few demands to hold any out
+	}
+	var best *Intermittent
+	bestErr := math.Inf(1)
+	for _, method := range []string{"sba", "tsb"} {
+		m := &Intermittent{Method: method, Steps: n}
+		e := m.search(fit)
+		if e < bestErr {
+			best, bestErr = m, e
 		}
 	}
-	var naive float64
-	m.Error, naive = m.run(z, m.Alpha, n-hold)
-	m.Naive = naive
+	m := best
+	k := float64(scale(series))
+	m.Zeros = float64(present-demands) / float64(max(present, 1))
+	// Run over every step, scoring the held out ones.
+	m.init(z)
+	var errN, naiveN float64
+	last := math.NaN()
+	for t, v := range z {
+		if t >= n-hold && v == v {
+			m.Error += math.Abs(m.rate()-v) / k
+			errN++
+			if last == last {
+				m.Naive += math.Abs(last-v) / k
+				naiveN++
+			}
+		}
+		if v == v {
+			last = v
+		}
+		m.update(v)
+	}
+	m.Error /= max(errN, 1)
+	m.Naive /= max(naiveN, 1)
+	m.Rate = float32(m.rate())
 	return m, nil
 }
 
-// run smooths z with alpha and returns the mean absolute one-step error
-// over the steps from from on, and that of forecasting the mean of the
-// steps before each, leaving the state after the last step.
-func (m *Intermittent) run(z []float64, alpha float64, from int) (float64, float64) {
-	m.Size, m.Interval = 0, 0
-	gap, started := 1.0, false
-	var err, naive, sum float64
-	errN, seen := 0, 0
+// count returns how many of z are above 0.
+func count(z []float64) int {
+	n := 0
+	for _, v := range z {
+		if v > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// search sets m's Alpha and Beta to those of a grid with the least
+// squared one-step error over z, and returns that error.
+func (m *Intermittent) search(z []float64) float64 {
+	grid := []float64{0.02, 0.05, 0.1, 0.15, 0.2, 0.3}
+	best, ba, bb := math.Inf(1), 0.1, 0.1
+	for _, a := range grid {
+		for _, b := range grid {
+			m.Alpha, m.Beta = a, b
+			if e := m.sse(z); e < best {
+				best, ba, bb = e, a, b
+			}
+		}
+	}
+	m.Alpha, m.Beta = ba, bb
+	return best
+}
+
+// sse returns the squared one-step error of m over z, from the step after
+// its first demand on.
+func (m *Intermittent) sse(z []float64) float64 {
+	m.init(z)
+	var s float64
+	started := false
+	for _, v := range z {
+		if started && v == v {
+			e := m.rate() - v
+			s += e * e
+		}
+		started = started || v > 0
+		m.update(v)
+	}
+	return s
+}
+
+// init starts m's state from z: the mean demand size, the mean gap
+// between demands and the share of steps with any.
+func (m *Intermittent) init(z []float64) {
+	var size float64
+	demands, present, first, last := 0, 0, -1, -1
 	for t, v := range z {
 		if v != v {
-			gap++
 			continue
 		}
-		if t >= from && started {
-			err += math.Abs(m.rate(alpha) - v)
-			naive += math.Abs(sum/float64(max(seen, 1)) - v)
-			errN++
+		present++
+		if v > 0 {
+			size += v
+			demands++
+			if first < 0 {
+				first = t
+			}
+			last = t
 		}
-		sum += v
-		seen++
-		if v == 0 {
-			gap++
-			continue
-		}
-		if !started {
-			// The first demand sets the state; its gap is the steps
-			// up to it.
-			m.Size, m.Interval, started = v, gap, true
-		} else {
-			m.Size += alpha * (v - m.Size)
-			m.Interval += alpha * (gap - m.Interval)
-		}
-		gap = 1
 	}
-	return err / float64(max(errN, 1)), naive / float64(max(errN, 1))
+	m.Size = size / float64(max(demands, 1))
+	m.Interval = 1
+	if demands > 1 {
+		m.Interval = float64(last-first) / float64(demands-1)
+	}
+	m.Chance = float64(demands) / float64(max(present, 1))
+	m.gap = 0
 }
 
-// rate returns the corrected demand per step of the state.
-func (m *Intermittent) rate(alpha float64) float64 {
-	if m.Interval == 0 {
-		return 0
+// rate returns the demand per step m forecasts now.
+func (m *Intermittent) rate() float64 {
+	if m.Method == "tsb" {
+		return m.Chance * m.Size
 	}
-	return (1 - alpha/2) * m.Size / m.Interval
+	return m.Size / m.Interval * (1 - m.Beta/2)
 }
 
-// Forecast returns the next steps values after the series: the same
-// demand per step for each, as Croston's method has no trend or season.
+// update moves m's state past a step of value v, NaN when unknown.
+func (m *Intermittent) update(v float64) {
+	m.gap++
+	if v != v {
+		return
+	}
+	if v > 0 {
+		m.Size += m.Alpha * (v - m.Size)
+		m.Interval += m.Beta * (float64(m.gap) - m.Interval)
+		m.Chance += m.Beta * (1 - m.Chance)
+		m.gap = 0
+		return
+	}
+	m.Chance -= m.Beta * m.Chance
+}
+
+// Forecast returns the next steps steps' demand: Rate at each.
 func (m *Intermittent) Forecast(steps int) []float32 {
 	out := make([]float32, steps)
-	v := float32(m.rate(m.Alpha)) * m.Scale
 	for i := range out {
-		out[i] = v
+		out[i] = m.Rate
 	}
 	return out
+}
+
+// Sparse reports whether series has demand at fewer than 3 in 4 of its
+// known steps, and none below 0: the rule of thumb (Syntetos, Boylan and
+// Croston, 2005, a mean gap above 1.32 steps) for when Croston forecasts
+// better than smoothing.
+func Sparse(series []float32) bool {
+	present, demands := 0, 0
+	for _, v := range series {
+		if v < 0 {
+			return false
+		}
+		if v == v {
+			present++
+			if v > 0 {
+				demands++
+			}
+		}
+	}
+	return present > 0 && demands >= 2 && float64(present)/float64(demands) > 1.32
 }

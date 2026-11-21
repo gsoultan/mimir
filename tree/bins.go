@@ -31,15 +31,19 @@ type binned struct {
 	nb    []int // bins of each feature, the missing bin included
 	off   []int // where each feature's bins start in a histogram
 	total int   // bins of every feature
+	// cat holds how many categories each feature has, 0 for an amount,
+	// or is nil when none has any. A category's bin is 1 more than its
+	// code.
+	cat []int
 }
 
 // sampleRows is how many rows quantiles are taken from.
 const sampleRows = 200_000
 
 // bin sorts d's features into at most maxBins bins of values each.
-func bin(d tabular.Data, maxBins int, rng *rand.Rand, workers int) *binned {
+func bin(d tabular.Data, cat []int, maxBins int, rng *rand.Rand, workers int) *binned {
 	n, f := d.Rows(), d.Features
-	b := &binned{n: n, f: f, bins: make([]uint8, n*f), edges: make([][]float32, f), nb: make([]int, f), off: make([]int, f)}
+	b := &binned{n: n, f: f, bins: make([]uint8, n*f), edges: make([][]float32, f), nb: make([]int, f), off: make([]int, f), cat: cat}
 	sample := make([]int, 0, min(n, sampleRows))
 	if n <= sampleRows {
 		for i := range n {
@@ -53,6 +57,9 @@ func bin(d tabular.Data, maxBins int, rng *rand.Rand, workers int) *binned {
 	parallel(f, workers, 1, func(lo, hi int) {
 		vals := make([]float32, 0, len(sample))
 		for j := lo; j < hi; j++ {
+			if cat != nil && cat[j] > 0 {
+				continue
+			}
 			vals = vals[:0]
 			for _, i := range sample {
 				if v := d.X[i*f+j]; v == v {
@@ -65,6 +72,12 @@ func bin(d tabular.Data, maxBins int, rng *rand.Rand, workers int) *binned {
 	parallel(n, workers, 1024, func(lo, hi int) {
 		for i := lo; i < hi; i++ {
 			for j, v := range d.X[i*f : (i+1)*f] {
+				if cat != nil && cat[j] > 0 {
+					if v == v {
+						b.bins[i*f+j] = uint8(1 + int(v))
+					}
+					continue
+				}
 				if v == v {
 					e := b.edges[j]
 					b.bins[i*f+j] = uint8(1 + sort.Search(len(e), func(k int) bool { return v <= e[k] }))
@@ -74,6 +87,9 @@ func bin(d tabular.Data, maxBins int, rng *rand.Rand, workers int) *binned {
 	})
 	for j := range f {
 		b.nb[j] = len(b.edges[j]) + 2
+		if cat != nil && cat[j] > 0 {
+			b.nb[j] = cat[j] + 1
+		}
 		b.off[j] = b.total
 		b.total += b.nb[j]
 	}
