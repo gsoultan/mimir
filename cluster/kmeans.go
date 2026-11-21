@@ -25,7 +25,8 @@
 // Each standardizes the features first, so a column in grams and one in
 // kilometres weigh alike, and counts a missing value, NaN, as the
 // feature's mean. Models hold only exported fields, so encoding/json
-// saves and loads them; KMeans and Mixture also convert to an nn.Module.
+// saves and loads them; KMeans, Mixture and LocalOutlier also convert to
+// an nn.Module.
 package cluster
 
 import (

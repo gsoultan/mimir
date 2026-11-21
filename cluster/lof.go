@@ -151,3 +151,91 @@ func (o *Outliers) Score(x []float32) []float64 {
 	})
 	return out
 }
+
+// OutlierShape is what sizes an OutlierModule.
+type OutlierShape struct{ Features, Rows, K int }
+
+// OutlierModule is an Outliers as an nn.Module, so it runs, saves and
+// loads wherever a network does. Forward maps x, shape [batch,
+// Features], to [batch, 1], each row's local outlier factor, as Score.
+type OutlierModule struct {
+	Mean    *tensor.Param // Float32 [1, Features]
+	Scale   *tensor.Param // Float32 [1, Features]: 1/std, or 0 for a constant feature
+	Rows    *tensor.Param // Float32 [Rows, Features], standardized
+	Reach   *tensor.Param // Float32 [Rows]
+	Density *tensor.Param // Float32 [Rows]
+	shape   OutlierShape
+}
+
+// NewOutlierModule returns an OutlierModule of shape s whose tables are
+// zero, for saved weights to be loaded into.
+func NewOutlierModule(s OutlierShape) *OutlierModule {
+	f, n := max(s.Features, 1), max(s.Rows, 1)
+	return &OutlierModule{
+		Mean:    tensor.NewBuffer(tensor.Zeros(tensor.Float32, 1, f)),
+		Scale:   tensor.NewBuffer(tensor.Zeros(tensor.Float32, 1, f)),
+		Rows:    tensor.NewBuffer(tensor.Zeros(tensor.Float32, n, f)),
+		Reach:   tensor.NewBuffer(tensor.Zeros(tensor.Float32, n)),
+		Density: tensor.NewBuffer(tensor.Zeros(tensor.Float32, n)),
+		shape:   s,
+	}
+}
+
+// Shape returns the shape of o's Module.
+func (o *Outliers) Shape() OutlierShape {
+	return OutlierShape{Features: o.Features, Rows: len(o.Rows) / o.Features, K: o.K}
+}
+
+// Module returns o as an OutlierModule.
+func (o *Outliers) Module() *OutlierModule {
+	s := o.Shape()
+	f := s.Features
+	scale := make([]float32, f)
+	for j, v := range o.Scaler.Std {
+		if v != 0 {
+			scale[j] = 1 / v
+		}
+	}
+	f32 := func(v []float64) []float32 {
+		out := make([]float32, len(v))
+		for i, x := range v {
+			out[i] = float32(x)
+		}
+		return out
+	}
+	return &OutlierModule{
+		Mean:    tensor.NewBuffer(tensor.FromSlice(slices.Clone(o.Scaler.Mean), 1, f)),
+		Scale:   tensor.NewBuffer(tensor.FromSlice(scale, 1, f)),
+		Rows:    tensor.NewBuffer(tensor.FromSlice(slices.Clone(o.Rows), s.Rows, f)),
+		Reach:   tensor.NewBuffer(tensor.FromSlice(f32(o.Reach), s.Rows)),
+		Density: tensor.NewBuffer(tensor.FromSlice(f32(o.Density), s.Rows)),
+		shape:   s,
+	}
+}
+
+// Shape returns the shape mod was built with.
+func (mod *OutlierModule) Shape() OutlierShape { return mod.shape }
+
+// Forward answers each row of x, shape [batch, Features].
+func (mod *OutlierModule) Forward(x *tensor.Tensor) *tensor.Tensor {
+	if err := x.Err(); err != nil {
+		return x
+	}
+	s := mod.shape
+	if x.Rank() != 2 || x.Shape()[1] != s.Features {
+		return tensor.Failed(fmt.Errorf("cluster: input %v for rows of %d features: %w", x.Shape(), s.Features, tensor.ErrShape))
+	}
+	n := x.Shape()[0]
+	z := x.Sub(mod.Mean.Value()).Mul(mod.Scale.Value())
+	z = tensor.Where(z.Equal(z), z, tensor.Scalar[float32](0)) // a missing value is the mean
+	r := mod.Rows.Value()
+	// |z - r|² = z² - 2 z·r + r², kept from going below 0 by rounding.
+	d2 := z.Mul(z).Sum(1).Reshape(n, 1).Sub(z.MatMulT(r).Mul(tensor.Scalar[float32](2))).Add(r.Mul(r).Sum(1).Reshape(1, s.Rows))
+	d, idx := d2.Maximum(tensor.Scalar[float32](0)).Sqrt().TopK(s.K, 1, false)
+	at := func(table *tensor.Param) *tensor.Tensor {
+		return table.Value().Unsqueeze(0).Expand(n, s.Rows).Gather(1, idx)
+	}
+	k := tensor.Scalar(float32(s.K))
+	own := k.Div(at(mod.Reach).Maximum(d).Sum(1).Maximum(tensor.Scalar[float32](1e-10)))
+	return at(mod.Density).Sum(1).Div(k).Div(own).Reshape(n, 1)
+}

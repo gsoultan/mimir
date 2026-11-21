@@ -641,7 +641,8 @@ Five more packages learn from tables without a model of answers per row:
   least squares, for clicks and purchases or for ratings, and recommends
   items and finds similar ones.
 
-k-means, mixtures, isolation forests and recommenders convert to an
+k-means, mixtures, isolation forests, local outlier factors and
+recommenders convert to an
 `nn.Module` like the trees and linear models do.
 
 ## Pictures, text and picking a model

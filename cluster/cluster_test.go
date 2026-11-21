@@ -308,3 +308,44 @@ func TestLocalOutlierFindsTheRowNextToTheCrowd(t *testing.T) {
 		t.Errorf("5 neighbors of 5 rows: %v", err)
 	}
 }
+
+func TestOutlierModuleAnswersAsScore(t *testing.T) {
+	ctx := context.Background()
+	r := rand.New(rand.NewPCG(42, 1))
+	x := make([]float32, 300*3)
+	for i := range x {
+		x[i] = float32(r.NormFloat64()) * float32(1+i%3)
+	}
+	o, err := LocalOutlier(ctx, x, 3, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := make([]float32, 50*3)
+	for i := range q {
+		q[i] = float32(r.NormFloat64()) * 3
+	}
+	q[4] = float32(math.NaN())
+	want := o.Score(q)
+	var buf bytes.Buffer
+	if err := mim.Save(ctx, &buf, o.Module(), nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := mim.Parse(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	mod := NewOutlierModule(o.Shape())
+	if err := f.Load(mod); err != nil {
+		t.Fatal(err)
+	}
+	got, err := mod.Forward(tensor.FromSlice(q, 50, 3)).Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want {
+		if math.Abs(float64(got[i])-want[i]) > 1e-3*math.Max(1, want[i]) {
+			t.Fatalf("row %d scores %v, want %v", i, got[i], want[i])
+		}
+	}
+}
