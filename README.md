@@ -584,7 +584,14 @@ fmt.Println(metrics.ROCAUC(m.Predict(test.X), test.Y), m.Importance)
 ```
 
 Trees sort each feature into 255 quantile bins first, like LightGBM, and
-learn which side of each split missing values belong on. Linear models
+learn which side of each split missing values belong on. `tree.Categorical`
+reads a column of codes, or a run of one-hot columns, as categories split
+on a set at once, as LightGBM does; `tree.Monotone` keeps the answer
+moving one way with a feature ("a higher price never raises the chance
+of buying"), as XGBoost's monotone constraints do; and `tree.Loss` boosts
+on `tree.Poisson()` for counts, `tree.Tweedie(p)` for amounts with many
+zeros, or `tree.Quantile(alpha)` for the number a share of answers stays
+under, so two quantile models give a range directly. Linear models
 standardize their features, then fit by coordinate descent, L-BFGS or
 FISTA. `tabular.CrossValidate` scores any of them over k folds, and
 `metrics` has accuracy, precision, recall, F1, ROC AUC, log loss, the
@@ -625,7 +632,10 @@ Five more packages learn from tables without a model of answers per row:
   boosted-tree model over each step's recent values and its place in the
   season, and checks itself against the naive seasonal forecast;
   `forecast.Smooth` fits Holt-Winters exponential smoothing (level,
-  damped trend and season) to one short series.
+  damped trend and season) to one short series, and `forecast.Croston`
+  forecasts demand that is 0 at many steps, such as spare parts, by
+  Croston's method with the Syntetos-Boylan correction or by
+  Teunter-Syntetos-Babai, which lets an item that stopped selling fade.
 - `rules.Mine` finds what goes together in baskets of items, as
   association rules with support, confidence and lift, by Apriori.
 - `recommend` factorizes who did what with which item by alternating
@@ -680,10 +690,29 @@ spectrograms, mel spectrograms and MFCCs with tensor operations, so they
 run inside a model on any device; `audio.NewClassifier` tells sounds
 apart from their log mel spectrogram with a four-block CNN.
 
+Package `audio/whisper` turns speech into text with OpenAI's Whisper
+(tiny to large, English-only or multilingual), and package `vision/clip`
+puts photos and words in one space with CLIP, to search photos by words
+or label them from a list without training. Both read a Hugging Face
+checkpoint that mimir-model's `mim-import` converts with its config.
+
+```go
+w, err := whisper.Load(f, md, tensor.DefaultDevice())
+tr, err := w.Transcribe(ctx, clip.Resample(16000).Samples, whisper.Options{})
+fmt.Println(tr.Language, tr.Text()) // en And so my fellow Americans ...
+
+c, err := clip.Load(f, md, tensor.DefaultDevice())
+photos, err := c.EmbedImages(ctx, imgs)
+words, err := c.EmbedTexts(ctx, []string{"a dog on a beach"})
+score := clip.Similarity(photos[0], words[0])
+```
+
 Package `automl` picks the best model for a table: it scores boosted
 trees, random forests, linear models, support vector machines, nearest
 neighbours and naive Bayes with a range of settings by cross-validation,
-then fits the winner to the whole table.
+then fits the winner to the whole table. With `automl.Stack(3)` it also
+blends the three best by greedy ensemble selection over their
+out-of-fold answers, and keeps the blend when it scores better.
 
 ```go
 r, err := automl.Search(ctx, d, tabular.Classification, automl.Trials(20))
@@ -867,8 +896,9 @@ read.
 | Devices | `CPUs`, `GPUs`, `NewGroup` with `AllReduce`, `Broadcast`, `AllGather`, `ReduceScatter`, `ReduceGrads`, `BroadcastParams` (CPU devices, or CUDA GPUs over NCCL) |
 | Sharding | `NewMesh`, `P`, `PartitionSpec` (`WithSections`), `Shard`, `WithSharding`, `Sharding`, `Param.Shard`, `Mesh.Traffic` |
 | Layers (`nn`) | `Linear`, `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d`, `ConvTranspose2d`, `DepthwiseConv2d`, `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `GroupNorm`, `RMSNorm`, `Embedding`, `Dropout`, `Sequential`, `Checkpoint`, activations, pooling, `GlobalAvgPool`, `Upsample`, `Flatten`, `Cast` |
+| Pictures and words (`vision/clip`) | `clip.Load`, `EmbedImages`, `EmbedTexts`, `Prepare`, `Similarity`, `Scores` |
 | Pictures (`vision`) | `ResNet18`, `ResNet34`, `ResNet50`, `NewMobileNetV2`, `NewViT` (`ViTB16`, `ViTTiny`); `Features`, `SetHead`, `HeadParameters`; `NewDetector` (CenterNet, on `ResNet.Backbone` or `TinyBackbone`), `NewUNet`; `IoU`, `NMS`, `BoxIoU`, `GIoULoss`, `AveragePrecision`, `MeanIoU` |
-| Sound (`audio`) | `ReadWAV`, `WriteWAV`, `Clip.Resample`, `Spectrogram`, `Filterbank`, `MelSpectrogram`, `MFCC`, `NewClassifier` |
+| Sound (`audio`) | `ReadWAV`, `WriteWAV`, `Clip.Resample`, `Spectrogram`, `Filterbank`, `MelSpectrogram`, `MFCC`, `NewClassifier`; speech to text with `whisper.Load`, `Transcribe`, `LogMel`, `Encode` |
 | Agents (`rl`) | `Env`, `TrainPPO`, `TrainDQN`, `Evaluate`; `CartPole`, `Chain` |
 | Text (`text`) | WordPiece `Tokenizer`, `BuildVocab`, `NewBERT` (`BERTBase`, `BERTMini`, `BERTTiny`) |
 | Sequence layers (`nn`) | `RNN`, `LSTM`, `GRU`, `MultiheadAttention`, `SelfAttention`, `RotaryEmbedding`, `KVCache`, `MLP`, `GatedMLP`, `DecoderBlock`, `TransformerEncoderLayer` |
@@ -880,11 +910,11 @@ read.
 | Data (`data`, `data/datasets`) | batching, shuffling, `Stream`, `Statistics`, `Normalize`; MNIST, CSV, `CSVShards`, `ParquetShards`, `Mapped`, `Synthetic` |
 | Files (`io`) | Mimir Model (`.mim`), the one model format: save and load parameters, checkpoints and datasets, map in place, run graphs and export; Parquet datasets |
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
-| Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax; early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
+| Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax, Poisson, Tweedie, quantile; category columns, monotone rules, early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
 | Kernels, neighbours, naive Bayes (`svm`, `neighbors`, `bayes`) | `svm.Fit` (C-SVC and ε-SVR; linear, RBF, polynomial, sigmoid kernels; Platt probabilities), `neighbors.Fit` (uniform or by distance; Euclidean, Manhattan, cosine), `bayes.Gaussian`, `Multinomial`, `Bernoulli` |
 | Unsupervised (`cluster`, `decompose`, `tree`, `rules`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Agglomerative`, `Silhouette`; `PCA`; `IsolationForest`; `rules.Mine` |
-| Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`, `forecast.Smooth` (Holt-Winters); `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
-| Model search (`automl`) | `Search` over boosted trees, forests, linear models, SVMs, neighbours and naive Bayes, with trials, folds, time budgets and families |
+| Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`, `forecast.Smooth` (Holt-Winters), `forecast.Croston` (intermittent demand); `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
+| Model search (`automl`) | `Search` over boosted trees, forests, linear models, SVMs, neighbours and naive Bayes, with trials, folds, time budgets and families; `Stack` blends the best |
 | Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |
 
 Element types are `float32`, `int32`, `bfloat16` and `float16`, plus the
@@ -918,8 +948,10 @@ svm/                 support vector machines
 neighbors/           k nearest neighbours
 bayes/               naive Bayes
 vision/              ResNet, MobileNetV2, ViT, a CenterNet detector, U-Net and box scores
+vision/clip/         CLIP: photos and words in one space
 text/                WordPiece tokenizer and BERT
 audio/               WAV files, spectrograms, mel features and a sound classifier
+audio/whisper/       Whisper speech to text
 rl/                  PPO and DQN agents and environments
 backend/             Backend interface, DType, Op, View, Kernel, collectives
 backend/cpu/         pure-Go kernels and worker pool, CPU devices on streams, collectives

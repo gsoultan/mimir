@@ -77,6 +77,7 @@ type config struct {
 	families []string
 	progress func(done, total int)
 	workers  int
+	stack    int
 }
 
 // Trials sets how many candidates Search scores, the defaults of each
@@ -143,12 +144,15 @@ type Trial struct {
 	Score  float64 // log loss or RMSE on held-out rows; lower is better
 	Millis int64
 	Err    error // why it couldn't be fit, if it couldn't
+
+	oof []float32 // answers for the scored rows, when stacking
 }
 
 // Result is what Search found.
 type Result struct {
 	// Best is the best candidate fit to every row: a *tree.Model,
-	// *linear.Model, *svm.Model, *neighbors.Model or *bayes.Model.
+	// *linear.Model, *svm.Model, *neighbors.Model or *bayes.Model, or,
+	// under Stack, a *Blend of several when that scores better.
 	Best tabular.Model
 	// Winner is Best's candidate and score.
 	Winner Trial
@@ -204,7 +208,7 @@ func Search(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Opti
 		}
 		t0 := time.Now()
 		tr := Trial{Candidate: cand}
-		s, err := evaluate(ctx, d, c, fitter(cand, task, c), score)
+		s, p, err := evaluate(ctx, d, c, fitter(cand, task, c), score)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -212,6 +216,9 @@ func Search(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Opti
 			tr.Err, tr.Score = err, math.Inf(1)
 		} else {
 			tr.Score = s
+			if c.stack > 1 {
+				tr.oof = p
+			}
 		}
 		tr.Millis = time.Since(t0).Milliseconds()
 		trials = append(trials, tr)
@@ -235,32 +242,117 @@ func Search(ctx context.Context, d tabular.Data, task tabular.Task, opts ...Opti
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Best: best, Winner: trials[0], Trials: trials, Metric: metric}, nil
+	r := &Result{Best: best, Winner: trials[0], Trials: trials, Metric: metric}
+	if c.stack > 1 {
+		if err := stack(ctx, d, task, c, r, score); err != nil {
+			return nil, err
+		}
+	}
+	for i := range r.Trials {
+		r.Trials[i].oof = nil
+	}
+	return r, nil
 }
+
+// stack replaces r's Best with a Blend of its best candidates when the
+// blend scores better by StackMargin.
+func stack(ctx context.Context, d tabular.Data, task tabular.Task, c *config, r *Result, score tabular.Score) error {
+	var ps [][]float32
+	var members []int
+	for i, t := range r.Trials {
+		if len(members) == c.stack {
+			break
+		}
+		if t.Err == nil && t.oof != nil {
+			ps, members = append(ps, t.oof), append(members, i)
+		}
+	}
+	if len(members) < 2 {
+		return nil
+	}
+	y := d.Y
+	if d.Rows() > holdoutRows {
+		_, held := d.Split(0.2, c.seed)
+		y = held.Y
+	}
+	weights, s := blend(ps, y, score)
+	if !(s < r.Winner.Score*(1-StackMargin)) {
+		return nil
+	}
+	b := &Blend{}
+	for k, i := range members {
+		if weights[k] == 0 {
+			continue
+		}
+		m := r.Best
+		if i != 0 {
+			var err error
+			if m, err = fitter(r.Trials[i].Candidate, task, c)(ctx, d); err != nil {
+				return err
+			}
+		}
+		b.Models = append(b.Models, m)
+		b.Members = append(b.Members, r.Trials[i].Candidate)
+		b.Weights = append(b.Weights, weights[k])
+	}
+	if len(b.Models) < 2 {
+		return nil
+	}
+	r.Best = b
+	r.Winner = Trial{Candidate: Candidate{Family: Stacked, Settings: map[string]float64{}}, Score: s}
+	return nil
+}
+
+// holdoutRows is the most rows candidates are cross-validated on; on more,
+// each is scored on a fifth held out.
+const holdoutRows = 20_000
 
 // evaluate scores fit on d: the mean over folds, or on a held-out fifth
 // of a large table.
-func evaluate(ctx context.Context, d tabular.Data, c *config, fit tabular.Fit, score tabular.Score) (float64, error) {
-	if d.Rows() > 20_000 {
+func evaluate(ctx context.Context, d tabular.Data, c *config, fit tabular.Fit, score tabular.Score) (float64, []float32, error) {
+	if d.Rows() > holdoutRows {
 		train, held := d.Split(0.2, c.seed)
 		m, err := fit(ctx, train)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
-		return score(m.Predict(held.X), held.Y), nil
+		p := m.Predict(held.X)
+		return score(p, held.Y), p, nil
 	}
-	scores, err := tabular.CrossValidate(ctx, d, min(c.folds, d.Rows()), c.seed, fit, score)
-	if err != nil {
-		return 0, err
+	// Folds as tabular.CrossValidate makes them, keeping each row's
+	// answer from the fold that held it out.
+	n, k := d.Rows(), min(c.folds, d.Rows())
+	if k < 2 {
+		return 0, nil, fmt.Errorf("automl: %d folds of %d rows: %w", k, n, tensor.ErrShape)
 	}
+	perm := rand.New(rand.NewPCG(c.seed, 0x6376)).Perm(n)
+	var all []float32
 	var s float64
-	for _, v := range scores {
+	for f := range k {
+		lo, hi := f*n/k, (f+1)*n/k
+		rest := append(append([]int(nil), perm[:lo]...), perm[hi:]...)
+		m, err := fit(ctx, d.Take(rest))
+		if err != nil {
+			return 0, nil, fmt.Errorf("automl: fold %d: %w", f, err)
+		}
+		held := d.Take(perm[lo:hi])
+		p := m.Predict(held.X)
+		v := score(p, held.Y)
 		if math.IsNaN(v) {
-			return 0, errors.New("automl: a fold scored NaN")
+			return 0, nil, errors.New("automl: a fold scored NaN")
 		}
 		s += v
+		if c.stack > 1 && hi > lo {
+			out := len(p) / (hi - lo)
+			if all == nil {
+				all = make([]float32, n*out)
+			}
+			for r, row := range perm[lo:hi] {
+				copy(all[row*out:(row+1)*out], p[r*out:(r+1)*out])
+			}
+		}
 	}
-	return s / float64(len(scores)), nil
+	return s / float64(k), all, nil
 }
 
 // candidates returns the defaults of each family, then boosted trees
