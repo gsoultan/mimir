@@ -26,11 +26,18 @@ import (
 // of a tensor, like torch.linalg, in Float32: half inputs are cast. Batch
 // dimensions of the operands of Solve and TriangularSolve broadcast.
 //
-// The factorizations run on the CPU, blocked around its matrix products.
-// Matrices on a GPU are copied to the CPU when the factorization is
-// built, which computes them there and then, and its results copied
-// back, as To does; the products and elementwise steps of their
-// gradients stay on the GPU.
+// The factorizations and triangular solves run where their matrices
+// live. On the CPU they are blocked around its matrix products. On a GPU
+// a group of threads factorizes each matrix of a batch, so a batch of
+// many small matrices keeps the GPU busy while a single large one uses a
+// small part of it; matrices larger than gpuFactorMax, or gpuSpectralMax
+// for the SVD and Eigh, are copied to the CPU, factorized there and their
+// results copied back, as To does. The products and elementwise steps of
+// solves and gradients stay on the GPU either way. The SVD and Eigh take
+// other algorithms on a GPU than on the CPU, one-sided Jacobi, so their
+// results agree to float32's precision, not to the bit, and singular
+// vectors of a matrix of lower rank complete the others' to bases in
+// other ways.
 //
 // The gradients are those of torch.linalg. Where a factorization is not
 // unique they follow its conventions: eigenvectors and singular vectors
@@ -254,6 +261,36 @@ func solveOperands(a, b *Tensor) (*Tensor, *Tensor, error) {
 	return a, b, firstErr(a, b)
 }
 
+// The largest matrices, by their larger dimension, that a GPU
+// factorizes itself: by Cholesky, LU, QR or a triangular solve, which
+// take O(n³) steps of a group, and by the SVD and Eigh, whose Jacobi
+// sweeps take several times more. Larger ones are factorized on the CPU,
+// whose blocked algorithms use every core on one matrix. The limits are
+// estimates, not yet measured on devices.
+const (
+	gpuFactorMax   = 1024
+	gpuSpectralMax = 256
+)
+
+// onDevice reports whether the device d computes the linear algebra op
+// of matrices of shape itself rather than the CPU: the CPU itself, or a
+// GPU for matrices that are not too large.
+func onDevice(d Device, op backend.Op, shape []int) bool {
+	if d.backend() == cpuBackend {
+		return true
+	}
+	switch d.Name() {
+	case "metal", "cuda", "rocm":
+		r := len(shape)
+		limit := gpuFactorMax
+		if op == backend.OpSVD || op == backend.OpEigh {
+			limit = gpuSpectralMax
+		}
+		return max(shape[r-2], shape[r-1]) <= limit
+	}
+	return false
+}
+
 // onCPU returns t on the CPU, untracked, and the device it was on.
 func (t *Tensor) onCPU() (*Tensor, Device) {
 	x, d := t.detached(), t.Device()
@@ -267,6 +304,13 @@ func (t *Tensor) onCPU() (*Tensor, Device) {
 // Float32 matrices t, on t's device: the flat parts of
 // backend.FactorParts, or Cholesky's L.
 func (t *Tensor) factor(op backend.Op) *Tensor {
+	if d := t.Device(); onDevice(d, op, t.node.Shape) {
+		x := t.detached()
+		if err := firstErr(x); err != nil {
+			return fail(err)
+		}
+		return wrap(graph.Factor(op, x.node))
+	}
 	x, d := t.onCPU()
 	if err := firstErr(x); err != nil {
 		return fail(err)
@@ -295,6 +339,13 @@ func factorParts(flat *Tensor, op backend.Op, shape []int) []*Tensor {
 // a unit diagonal if unit, and matrices b of the same batch shape,
 // untracked.
 func triSolve(a, b *Tensor, upper, unit bool) *Tensor {
+	if d := a.Device(); onDevice(d, backend.OpTriangularSolve, a.node.Shape) && d.Equal(b.Device()) {
+		x, y := a.detached(), b.detached()
+		if err := firstErr(x, y); err != nil {
+			return fail(err)
+		}
+		return wrap(graph.TriangularSolve(x.node, y.node, upper, unit))
+	}
 	x, d := a.onCPU()
 	y, _ := b.onCPU()
 	if err := firstErr(x, y); err != nil {

@@ -59,6 +59,7 @@ func TestMatMulKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.MatMul(
 func TestScanKernels(t *testing.T)        { kerneltest.Run(t, kerneltest.Scan(t), emulators(t)) }
 func TestQuantKernels(t *testing.T)       { kerneltest.Run(t, kerneltest.Quant(t), emulators(t)) }
 func TestAttentionKernels(t *testing.T)   { kerneltest.Run(t, kerneltest.Attention(t), emulators(t)) }
+func TestLinalgKernels(t *testing.T)      { kerneltest.Run(t, kerneltest.Linalg(t), emulators(t)) }
 
 // TestSliceScatterInPlaceWritesTheBlock checks that a slice scatter
 // written over its input writes the block and nothing else.

@@ -80,3 +80,4 @@ func TestFFTKernels(t *testing.T)  { kerneltest.Run(t, kerneltest.FFT(t), target
 func TestSegmentKernels(t *testing.T) {
 	kerneltest.Run(t, kerneltest.Segment(t), targets(t, false))
 }
+func TestLinalgKernels(t *testing.T) { kerneltest.Run(t, kerneltest.Linalg(t), targets(t, false)) }

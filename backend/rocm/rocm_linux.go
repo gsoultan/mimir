@@ -370,6 +370,8 @@ func (b *Backend) sync() error {
 		return fmt.Errorf("rocm: %w", backend.ErrDivideByZero)
 	case word&gen.ErrIndex != 0:
 		return fmt.Errorf("rocm: %w", backend.ErrIndex)
+	case word&gen.ErrSingular != 0:
+		return fmt.Errorf("rocm: %w", backend.ErrSingular)
 	}
 	return nil
 }
