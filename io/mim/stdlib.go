@@ -57,7 +57,8 @@ func init() {
 		"mean.v1":              mean,
 		"variance.v1":          variance,
 		"cumsum.v1":            cumsum,
-		"rope.v1":              rope,
+		"rope.v1":              rope(false),
+		"rope.v2":              rope(true),
 		"attention.v1":         attention(false),
 		"attention.v2":         attention(true),
 		"embedding.v1":         embedding,
@@ -435,8 +436,19 @@ func cumsum(c *call) ([]*tensor.Tensor, error) {
 	return one(y)
 }
 
-func rope(c *call) ([]*tensor.Tensor, error) {
-	if err := c.need(2, 2); err != nil {
+// rope returns rope.v1, or rope.v2 if v2 is set: v2 also scales every
+// frequency by freq_scale and divides each by its entry of the optional
+// freq_factors input, and scales cos and sin by attn_factor.
+func rope(v2 bool) func(c *call) ([]*tensor.Tensor, error) {
+	return func(c *call) ([]*tensor.Tensor, error) { return ropeCall(c, v2) }
+}
+
+func ropeCall(c *call, v2 bool) ([]*tensor.Tensor, error) {
+	most := 2
+	if v2 {
+		most = 3
+	}
+	if err := c.need(2, most); err != nil {
 		return nil, err
 	}
 	x := c.f32(0)
@@ -478,8 +490,26 @@ func rope(c *call) ([]*tensor.Tensor, error) {
 		}
 		ms = c.float("yarn_attn_factor", 0.1*math.Log(factor)+1)
 	}
+	freqs := tensor.FromSlice(freq, 1, 1, 1, half).To(c.r.dev)
+	if v2 {
+		scale, af := c.float("freq_scale", 1), c.float("attn_factor", 1)
+		if !(scale > 0) || math.IsInf(scale, 0) || math.IsNaN(af) || math.IsInf(af, 0) || scale != 1 && factor != 1 {
+			return nil, fmt.Errorf("%w: rope.v2 with freq_scale %g, attn_factor %g and yarn_factor %g", ErrFormat, scale, af, factor)
+		}
+		for i := range freq {
+			freq[i] = float32(float64(freq[i]) * scale)
+		}
+		freqs = tensor.FromSlice(freq, 1, 1, 1, half).To(c.r.dev)
+		if len(c.in) == 3 {
+			if s := c.in[2].Shape(); len(s) != 1 || s[0] != half {
+				return nil, fmt.Errorf("%w: rope.v2 frequency factors of shape %v for %d pairs", ErrFormat, s, half)
+			}
+			freqs = freqs.Div(c.f32(2).Reshape(1, 1, 1, half))
+		}
+		ms *= af
+	}
 	pos := c.in[1].Cast(tensor.Float32)
-	ang := pos.Reshape(pos.Shape()[0], 1, t, 1).Mul(tensor.FromSlice(freq, 1, 1, 1, half).To(c.r.dev))
+	ang := pos.Reshape(pos.Shape()[0], 1, t, 1).Mul(freqs)
 	cos, sin := ang.Cos(), ang.Sin()
 	if ms != 1 {
 		cos, sin = cos.Mul(c.scalar(cos, ms)), sin.Mul(c.scalar(sin, ms))

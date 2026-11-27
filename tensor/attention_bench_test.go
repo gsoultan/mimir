@@ -49,9 +49,7 @@ func BenchmarkAttention(b *testing.B) {
 					k.ZeroGrad()
 					v.ZeroGrad()
 				}
-				for range warmup {
-					step()
-				}
+				warm(step)
 				for b.Loop() {
 					step()
 				}

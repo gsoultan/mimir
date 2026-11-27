@@ -50,14 +50,12 @@ func (m *Model) Hidden(tokens *tensor.Tensor) *tensor.Tensor {
 	if s := tokens.Shape(); len(s) != 2 || tokens.DType() != tensor.Int32 {
 		return tensor.Failed(fmt.Errorf("llm: tokens of %s %v, want Int32 [B, S]: %w", tokens.DType(), s, tensor.ErrShape))
 	}
-	b, s := tokens.Shape()[0], tokens.Shape()[1]
-	x := m.Embed.Forward(tokens.To(m.Embed.Weight.Value().Device())) // [B, S, embed]
-	for _, blk := range m.Blocks {
+	x := m.embed(tokens) // [B, S, embed]
+	for i, blk := range m.Blocks {
 		q, k, v := blk.project(blk.AttnNorm.Forward(x), c)
-		q, k = m.Rope.Apply(q, 0), m.Rope.Apply(k, 0)
-		a := tensor.ScaledDotProductAttention(q, k, v, tensor.Causal())
-		x = x.Add(blk.O.Forward(a.Transpose(1, 2).Reshape(b, s, c.Heads*c.HeadDim)))
-		x = x.Add(blk.mlp(blk.MLPNorm.Forward(x)))
+		r := m.ropeOf(i)
+		q, k = r.Apply(q, 0), r.Apply(k, 0)
+		x = blk.rest(x, m.attend(i, q, k, v, 0), c)
 	}
 	return m.Norm.Forward(x)
 }
@@ -159,7 +157,7 @@ func (m *Model) Score(ctx context.Context, seqs [][]int32, learn [][]bool) (loss
 // Forward returns the logits of every position of tokens, Int32 [B, S],
 // as [B, S, Vocab] (see Hidden).
 func (m *Model) Forward(tokens *tensor.Tensor) *tensor.Tensor {
-	return m.Output.Forward(m.Hidden(tokens))
+	return m.head(m.Hidden(tokens))
 }
 
 // Embedding returns an embedding of the text tokens: the mean of the outputs

@@ -35,9 +35,13 @@ def sync():
 
 
 def timed(name, f, warm, steps):
-    for _ in range(warm):
+    # As mimir's benchmarks warm up: warm steps, then on for at least
+    # 0.3 s, so that the GPU runs at the clocks of a busy one.
+    start = time.perf_counter()
+    while warm > 0 or time.perf_counter() - start < 0.3:
         f()
-    sync()
+        sync()
+        warm -= 1
     times = []
     for _ in range(steps):
         t = time.perf_counter()

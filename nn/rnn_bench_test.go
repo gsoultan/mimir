@@ -45,9 +45,7 @@ func BenchmarkLSTM(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		for range warmup {
-			step()
-		}
+		warm(step)
 		for b.Loop() {
 			step()
 		}
@@ -62,9 +60,7 @@ func BenchmarkLSTM(b *testing.B) {
 				p.ZeroGrad()
 			}
 		}
-		for range warmup {
-			step()
-		}
+		warm(step)
 		for b.Loop() {
 			step()
 		}
@@ -83,9 +79,7 @@ func BenchmarkLSTM(b *testing.B) {
 			}
 			opt.ZeroGrad()
 		}
-		for range warmup {
-			step()
-		}
+		warm(step)
 		for b.Loop() {
 			step()
 		}

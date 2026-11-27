@@ -79,6 +79,9 @@ type RotaryEmbedding struct {
 	// used, to extend the context: see LinearRoPEScaling and
 	// Llama3RoPEScaling.
 	Scaling func(invFreq float64) float64
+	// Mscale, if not 0, multiplies the cosines and sines, which scales the
+	// rotated features, as Phi 3's LongRoPE and YaRN do.
+	Mscale float64
 
 	mu     sync.Mutex
 	tables map[tensor.Device]*ropeTable `nn:"-"`
@@ -152,11 +155,15 @@ func (r *RotaryEmbedding) angles(offset, n int) (cos, sin []float32) {
 			inv[i] = r.Scaling(inv[i])
 		}
 	}
+	ms := 1.0
+	if r.Mscale != 0 {
+		ms = r.Mscale
+	}
 	cos, sin = make([]float32, n*half), make([]float32, n*half)
 	for p := range n {
 		for i, f := range inv {
 			sn, cs := math.Sincos(float64(offset+p) * f)
-			cos[p*half+i], sin[p*half+i] = float32(cs), float32(sn)
+			cos[p*half+i], sin[p*half+i] = float32(ms*cs), float32(ms*sn)
 		}
 	}
 	return cos, sin

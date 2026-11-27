@@ -51,9 +51,7 @@ func forward(b *testing.B, m nn.Module, x *tensor.Tensor) {
 			b.Fatal(err)
 		}
 	}
-	for range warmup {
-		step()
-	}
+	warm(step)
 	for b.Loop() {
 		step()
 	}

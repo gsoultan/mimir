@@ -100,9 +100,7 @@ func BenchmarkConv2d(b *testing.B) {
 					x.ZeroGrad()
 					w.ZeroGrad()
 				}
-				for range warmup {
-					step()
-				}
+				warm(step)
 				for b.Loop() {
 					step()
 				}

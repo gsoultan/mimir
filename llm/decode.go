@@ -83,6 +83,10 @@ func (m *Model) step(ctx context.Context, token int32, caches []*nn.KVCache) (*t
 			return nil, false, nil
 		}
 	}
+	// The recorded step knows the plain blocks of Llama and Qwen 2 only.
+	if a := m.Config.Arch; a != "llama" && a != "qwen2" {
+		return nil, false, nil
+	}
 	if n >= capacity || m.Rope == nil || m.Rope.Dim != m.Config.HeadDim {
 		return nil, false, nil
 	}
@@ -219,7 +223,7 @@ func (m *Model) stepGraph(leaves []*tensor.Tensor, window int, caches []*nn.KVCa
 			parts := f.Forward(h).Split(-1, ff, ff)
 			x = x.Add(b.Down.Forward(parts[0].SiLU().Mul(parts[1])))
 		} else {
-			x = x.Add(b.mlp(h))
+			x = x.Add(b.mlp(h, c))
 		}
 	}
 	logits := m.Output.Forward(rmsNorm(x, m.Norm)).Reshape(c.Vocab)
