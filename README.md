@@ -625,6 +625,9 @@ Five more packages learn from tables without a model of answers per row:
   (diagonal covariances, by EM), `DBSCAN` (any shape, with noise) and
   `Agglomerative` (Ward's hierarchy, cut into any number of groups after
   the fact), and scores a grouping by its `Silhouette`.
+  `cluster.LocalOutlier` scores rows by the local outlier factor, which
+  finds a row apart from a dense group even when a looser group elsewhere
+  is as spread out.
 - `decompose.PCA` finds the directions rows vary in most, to draw a table
   in two dimensions or shrink it.
 - `tree.IsolationForest` scores how unusual each row is, from 0 to 1.
@@ -642,7 +645,8 @@ Five more packages learn from tables without a model of answers per row:
   least squares, for clicks and purchases or for ratings, and recommends
   items and finds similar ones.
 
-k-means, mixtures, isolation forests and recommenders convert to an
+k-means, mixtures, isolation forests, local outlier factors and
+recommenders convert to an
 `nn.Module` like the trees and linear models do.
 
 ## Pictures, text and picking a model
@@ -912,7 +916,7 @@ read.
 | Training (`train`, `metrics`) | `Fit` with evaluation, schedules, early stopping, checkpoints and exact resume, `MicroBatch`, `MemoryBudget`, `LossScale`, `DynamicLossScale`, `DataParallel`, `Sharded`, `Parallel`; `Accuracy` |
 | Tables (`tabular`, `tree`, `linear`) | `DecisionTree`, `RandomForest`, `GradientBoosting` (squared error, logistic, softmax, Poisson, Tweedie, quantile; category columns, monotone rules, early stopping, row and column sampling, feature importance); linear `Regression` (L1, L2), `Logistic`; `Split`, `CrossValidate` |
 | Kernels, neighbours, naive Bayes (`svm`, `neighbors`, `bayes`) | `svm.Fit` (C-SVC and ε-SVR; linear, RBF, polynomial, sigmoid kernels; Platt probabilities), `neighbors.Fit` (uniform or by distance; Euclidean, Manhattan, cosine), `bayes.Gaussian`, `Multinomial`, `Bernoulli` |
-| Unsupervised (`cluster`, `decompose`, `tree`, `rules`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Agglomerative`, `Silhouette`; `PCA`; `IsolationForest`; `rules.Mine` |
+| Unsupervised (`cluster`, `decompose`, `tree`, `rules`) | `KMeans`, `GaussianMixture`, `DBSCAN`, `Agglomerative`, `Silhouette`, `LocalOutlier`; `PCA`; `IsolationForest`; `rules.Mine` |
 | Series and items (`forecast`, `recommend`) | `forecast.Fit` with lags, seasons and gaps, `Forecast`, `forecast.Smooth` (Holt-Winters), `forecast.Croston` (intermittent demand); `recommend.Fit` (implicit or `Ratings`), `Recommend`, `Similar`, `HitRate` |
 | Model search (`automl`) | `Search` over boosted trees, forests, linear models, SVMs, neighbours and naive Bayes, with trials, folds, time budgets and families; `Stack` blends the best |
 | Scores (`metrics`) | `ClassAccuracy`, `Precision`, `Recall`, `F1`, `PerClass`, `ROCAUC`, `LogLoss`, `Confusion`, `MAE`, `RMSE`, `R2` |

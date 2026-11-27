@@ -274,3 +274,78 @@ func TestAgglomerativeBadInput(t *testing.T) {
 		t.Errorf("canceled: %v", err)
 	}
 }
+
+func TestLocalOutlierFindsTheRowNextToTheCrowd(t *testing.T) {
+	r := rand.New(rand.NewPCG(41, 1))
+	var x []float32
+	// A tight group and a loose one, and one row just off the tight one:
+	// nearer its group than the loose rows are to each other.
+	for range 200 {
+		x = append(x, float32(r.NormFloat64()*0.1), float32(r.NormFloat64()*0.1))
+	}
+	for range 200 {
+		x = append(x, 10+float32(r.NormFloat64()*2), float32(r.NormFloat64()*2))
+	}
+	x = append(x, 0.9, 0.9)
+	o, err := LocalOutlier(context.Background(), x, 2, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	odd := o.Scores[400]
+	if odd < 3 {
+		t.Errorf("the odd row scores %.2f", odd)
+	}
+	for i, s := range o.Scores[:400] {
+		if s >= odd {
+			t.Fatalf("row %d scores %.2f, the odd row %.2f", i, s, odd)
+		}
+	}
+	got := o.Score([]float32{0, 0, 0.9, 0.9, 10, 0})
+	if got[0] > 1.5 || got[2] > 1.5 || got[1] < 3 {
+		t.Errorf("new rows score %.2f", got)
+	}
+	if _, err := LocalOutlier(context.Background(), x[:10], 2, 5); !errors.Is(err, tensor.ErrShape) {
+		t.Errorf("5 neighbors of 5 rows: %v", err)
+	}
+}
+
+func TestOutlierModuleAnswersAsScore(t *testing.T) {
+	ctx := context.Background()
+	r := rand.New(rand.NewPCG(42, 1))
+	x := make([]float32, 300*3)
+	for i := range x {
+		x[i] = float32(r.NormFloat64()) * float32(1+i%3)
+	}
+	o, err := LocalOutlier(ctx, x, 3, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := make([]float32, 50*3)
+	for i := range q {
+		q[i] = float32(r.NormFloat64()) * 3
+	}
+	q[4] = float32(math.NaN())
+	want := o.Score(q)
+	var buf bytes.Buffer
+	if err := mim.Save(ctx, &buf, o.Module(), nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := mim.Parse(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	mod := NewOutlierModule(o.Shape())
+	if err := f.Load(mod); err != nil {
+		t.Fatal(err)
+	}
+	got, err := mod.Forward(tensor.FromSlice(q, 50, 3)).Data[float32](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want {
+		if math.Abs(float64(got[i])-want[i]) > 1e-3*math.Max(1, want[i]) {
+			t.Fatalf("row %d scores %v, want %v", i, got[i], want[i])
+		}
+	}
+}
